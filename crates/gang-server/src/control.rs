@@ -322,13 +322,13 @@ where
                     let read_scheduler =
                         clock.timeout_at(deadline, scheduler.snapshot(&mut incoming));
                     let read_supplies = async {
-                        for (((config, pass), scratch), fresh) in configs
+                        for (((config, pass), scratch), known) in configs
                             .iter()
                             .zip(&mut passes)
                             .zip(&mut incoming_supplies)
                             .zip(&mut supplies)
                         {
-                            *fresh = matches!(
+                            if matches!(
                                 clock
                                     .timeout_at(
                                         deadline,
@@ -336,8 +336,8 @@ where
                                     )
                                     .await,
                                 Ok(Ok(()))
-                            );
-                            if *fresh {
+                            ) {
+                                *known = true;
                                 std::mem::swap(&mut pass.supply, scratch);
                             }
                         }

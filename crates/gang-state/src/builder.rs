@@ -768,7 +768,8 @@ fn fill_events(cur: &mut State, events: &[Event], limit: usize) {
     }
 }
 
-/// Reuses row buffers while combining fresh supply with prior rows for failed reads.
+/// Reuses row buffers while combining known supply, including last-good caches, with prior rows
+/// for fleets without a known supply.
 fn fill_instances(
     cur: &mut State,
     prev: &State,
@@ -777,7 +778,7 @@ fn fill_instances(
     hosted: Option<&HostedSnapshot>,
     scratch: &mut Scratch,
 ) {
-    let fresh = fleets
+    let known = fleets
         .iter()
         .enumerate()
         .filter(|(index, _)| supplies.get(*index).copied().unwrap_or(false))
@@ -792,11 +793,50 @@ fn fill_instances(
             fleet.name == row.fleet && supplies.get(index).copied().unwrap_or(false)
         })
     });
-    let source = fresh
+    let physical_order = &scratch.physical_order;
+    let hosted_order = &scratch.hosted_order;
+    let status_name = &mut scratch.status_name;
+    let instance_name = &mut scratch.instance_name;
+    let source = known
         .map(|item| (Some(item), None))
-        .chain(retained.map(|row| (None, Some(row))));
-    refill(&mut cur.instances, source, |row, (fresh, retained)| {
-        if let Some((pass, instance)) = fresh {
+        .chain(retained.map(|row| (None, Some(row))))
+        .filter(|(known, retained)| {
+            let connected = if let Some(hosted) = hosted {
+                if let Some((pass, instance)) = known {
+                    hosted
+                        .workers_on(&pass.policy.name, &instance.id)
+                        .next()
+                        .is_some()
+                } else if let Some(row) = retained {
+                    let workers = &hosted.snapshot().workers;
+                    hosted_order
+                        .binary_search_by(|&index| {
+                            let worker = &workers[index];
+                            name::write_of::<name::Fleets>(status_name, &worker.fleet);
+                            write_text_of::<name::Instances>(
+                                instance_name,
+                                worker.id.instance_name().unwrap_or_default(),
+                            );
+                            (status_name.as_str(), instance_name.as_str())
+                                .cmp(&(row.fleet.as_str(), row.name.as_str()))
+                        })
+                        .is_ok()
+                } else {
+                    false
+                }
+            } else if let Some((pass, instance)) = known {
+                name::write_of::<name::Fleets>(status_name, &pass.policy.name);
+                name::write_of::<name::Instances>(instance_name, &instance.id);
+                physical_worker(prev, physical_order, status_name, instance_name).is_some()
+            } else if let Some(row) = retained {
+                physical_worker(prev, physical_order, &row.fleet, &row.name).is_some()
+            } else {
+                false
+            };
+            !connected
+        });
+    refill(&mut cur.instances, source, |row, (known, retained)| {
+        if let Some((pass, instance)) = known {
             name::write_of::<name::Instances>(&mut row.name, &instance.id);
             name::write_of::<name::Fleets>(&mut row.fleet, &pass.policy.name);
             row.lifecycle = Lifecycle::from(instance.lifecycle);
@@ -820,31 +860,6 @@ fn fill_instances(
             row.launch_time = old.launch_time;
             row.past_boot_grace = old.past_boot_grace;
         }
-        let connected = if let Some(hosted) = hosted {
-            if let Some((pass, instance)) = fresh {
-                hosted
-                    .workers_on(&pass.policy.name, &instance.id)
-                    .next()
-                    .is_some()
-            } else {
-                let workers = &hosted.snapshot().workers;
-                scratch.hosted_order.binary_search_by(|&index| {
-                    let worker = &workers[index];
-                    name::write_of::<name::Fleets>(&mut scratch.status_name, &worker.fleet);
-                    write_text_of::<name::Instances>(
-                        &mut scratch.instance_name,
-                        worker.id.instance_name().unwrap_or_default(),
-                    );
-                    (scratch.status_name.as_str(), scratch.instance_name.as_str())
-                        .cmp(&(row.fleet.as_str(), row.name.as_str()))
-                }).is_ok()
-            }
-        } else {
-            physical_worker(prev, &scratch.physical_order, &row.fleet, &row.name).is_some()
-        };
-        if connected {
-            return false;
-        }
         let old = prev.instances
             .binary_search_by(|old| old.name.cmp(&row.name))
             .ok()
@@ -853,7 +868,7 @@ fn fill_instances(
         let status = if let Some(old) = old {
             old.infrastructure.as_ref()
         } else {
-            physical_worker(prev, &scratch.physical_order, &row.fleet, &row.name)
+            physical_worker(prev, physical_order, &row.fleet, &row.name)
                 .and_then(|old| old.infrastructure.as_ref())
         };
         if row.infrastructure.as_ref() != status {

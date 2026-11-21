@@ -517,6 +517,47 @@ fn steady_partial_observation_allocates_nothing() -> TestResult {
 }
 
 #[test]
+fn steady_hosted_inventory_observation_allocates_nothing() -> TestResult {
+    let mut world = world()?;
+    let hosted = &world.hosted;
+    for pass in &mut world.passes {
+        let fleet = &pass.policy.name;
+        pass.supply
+            .instances
+            .retain(|instance| hosted.workers_on(fleet, &instance.id).next().is_some());
+    }
+    let supplies = vec![true; world.passes.len()];
+    let view = Inputs {
+        pass: PassStatus::Observed {
+            hosted: Some(&world.hosted),
+            supplies: &supplies,
+        },
+        actions: None,
+        ..inputs(&world)
+    };
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut cur = blank();
+    let mut prev = blank();
+    for seq in 1..=WARM_UP_PASSES as u64 {
+        builder.fill(&mut cur, &prev, seq, &view);
+        std::mem::swap(&mut cur, &mut prev);
+    }
+    assert_eq!(prev.workers.len(), HOSTED as usize);
+    assert!(prev.instances.is_empty());
+    let info = allocation_counter::measure(|| {
+        builder.fill(&mut cur, &prev, WARM_UP_PASSES as u64 + 1, &view);
+    });
+    assert_eq!(info.count_total, 0, "steady hosted observation allocated");
+    assert_eq!(
+        info.bytes_total, 0,
+        "steady hosted observation allocated bytes"
+    );
+    assert_eq!(cur.workers.len(), HOSTED as usize);
+    assert!(cur.instances.is_empty());
+    Ok(())
+}
+
+#[test]
 fn observation_reuses_instance_buffers_across_identity_churn() -> TestResult {
     let world = world()?;
     let supplies = vec![true; world.passes.len()];

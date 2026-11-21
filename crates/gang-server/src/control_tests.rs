@@ -27,6 +27,62 @@ use gang_testkit::{
     FakeProvisioner, FakeRepository, FakeScheduler, FleetCall, Opaque, TestResult, worker_on,
 };
 
+struct PartialFailureProvisioner {
+    inner: FakeProvisioner,
+    fail: AtomicBool,
+}
+
+impl ProvisionerPort for PartialFailureProvisioner {
+    type FleetOptions = Opaque;
+
+    async fn supply(
+        &self,
+        fleet: Fleet<'_, Opaque>,
+        into: &mut FleetSupply,
+    ) -> Result<(), PortError> {
+        if self.fail.load(Ordering::SeqCst) {
+            *into = FleetSupply::default();
+            return Err(PortError::unavailable("partial supply read"));
+        }
+        self.inner.supply(fleet, into).await
+    }
+
+    async fn converge(&self, _held: &Held, _fleet: Fleet<'_, Opaque>) -> Result<(), PortError> {
+        Err(PortError::unavailable("control pass disabled"))
+    }
+
+    async fn acknowledge_exit(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        instance: &InstanceId,
+    ) -> Result<(), PortError> {
+        self.inner.acknowledge_exit(held, fleet, instance).await
+    }
+
+    async fn set_desired_capacity(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        desired: u32,
+    ) -> Result<(), PortError> {
+        self.inner.set_desired_capacity(held, fleet, desired).await
+    }
+
+    async fn terminate(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        instance: &InstanceId,
+    ) -> Result<(), PortError> {
+        self.inner.terminate(held, fleet, instance).await
+    }
+
+    fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
+        self.inner.worker_lifetime()
+    }
+}
+
 struct LapsingProvisioner {
     inner: FakeProvisioner,
     clock: Arc<gang_clock::TestClock>,
@@ -2963,6 +3019,83 @@ async fn healthy_observation_is_published_before_the_first_pass() -> TestResult 
         .expect("first publication includes observation");
     assert_eq!(recent.samples.last().unwrap().scheduler_known, Some(true));
     assert_eq!(recent.samples.last().unwrap().passes, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn observation_retains_last_good_supply_when_worker_disconnects() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = PartialFailureProvisioner {
+        inner: FakeProvisioner::default(),
+        fail: AtomicBool::new(false),
+    };
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    let mut viewer = hub.join().expect("dashboard viewer joins");
+    let instance = instance_id("local-1");
+    let launched_at = Timestamp::from_unix_millis(123_000);
+    fleet
+        .inner
+        .set_supply(&fleet_name(), supply_with("local-1", launched_at, 1));
+    scheduler.set_snapshot(snapshot_with(vec![idle_worker(&instance, clock.wall())?]));
+    let control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    let mut run = pin!(control.run());
+    assert!(poll!(run.as_mut()).is_pending());
+    assert!(matches!(
+        viewer.next().await,
+        crate::hub::Next::Frame(_) | crate::hub::Next::Resync(_)
+    ));
+    let initial = served(&hub);
+    assert_eq!(initial.workers.len(), 1);
+    assert!(initial.instances.is_empty());
+    assert_eq!(initial.fleets[0].instances.in_service, 1);
+
+    fleet.fail.store(true, Ordering::SeqCst);
+    scheduler.set_snapshot(SchedulerSnapshot::default());
+    clock.advance(POLL_INTERVAL.get());
+    assert!(poll!(run.as_mut()).is_pending());
+    assert!(matches!(
+        viewer.next().await,
+        crate::hub::Next::Frame(_) | crate::hub::Next::Resync(_)
+    ));
+    let disconnected = served(&hub);
+    assert!(disconnected.workers.is_empty());
+    assert_eq!(disconnected.instances.len(), 1);
+    let row = &disconnected.instances[0];
+    assert_eq!(row.name, name::of::<name::Instances>(&instance));
+    assert_eq!(row.fleet, name::of::<name::Fleets>(&fleet_name()));
+    assert_eq!(row.lifecycle, gang_wire::Lifecycle::InService);
+    assert_eq!(row.launch_time, launched_at);
+    assert_eq!(disconnected.fleets[0].instances.in_service, 1);
+    assert_eq!(disconnected.fleets[0].workers.unconnected, 1);
+
+    fleet.inner.set_supply(&fleet_name(), FleetSupply::default());
+    fleet.fail.store(false, Ordering::SeqCst);
+    clock.advance(POLL_INTERVAL.get());
+    assert!(poll!(run.as_mut()).is_pending());
+    let recovered = served(&hub);
+    assert!(recovered.workers.is_empty());
+    assert!(recovered.instances.is_empty());
+    assert_eq!(recovered.fleets[0].instances.in_service, 0);
+    assert_eq!(recovered.fleets[0].workers.unconnected, 0);
     Ok(())
 }
 

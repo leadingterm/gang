@@ -41,7 +41,8 @@ pub enum PassStatus<'a> {
     Observed {
         /// Fresh scheduler snapshot, or `None` when unavailable.
         hosted: Option<&'a HostedSnapshot>,
-        /// Whether each fleet's supply was read successfully, in fleet order.
+        /// Whether a complete supply has been read successfully for each fleet, in fleet order.
+        /// A later failed read retains the last successful supply.
         supplies: &'a [bool],
     },
 }
