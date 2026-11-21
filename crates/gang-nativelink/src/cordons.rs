@@ -100,7 +100,7 @@ impl InstanceCordons {
         let instance = stale
             .then(|| {
                 WorkerId::instance_name_from_str(&worker.id.0)
-                    .and_then(|name| InstanceId::try_new(name).ok())
+                    .and_then(|name| InstanceId::try_new(name).ok().map(Arc::new))
             })
             .flatten();
         let read = self.state.read().await;
@@ -130,7 +130,7 @@ impl InstanceCordons {
                     Err(position) => entries.insert(
                         position,
                         Entry {
-                            id: Arc::new(instance.clone()),
+                            id: Arc::clone(&instance),
                             present: false,
                             absent_since: None,
                             replacing: true,
