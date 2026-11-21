@@ -463,7 +463,14 @@ run "rejects_invalid_spot_allocation_strategy" {
   command = plan
 
   variables {
-    fleets = [for fleet in var.fleets : merge(fleet, { spot_allocation_strategy = "capacity-optimised-prioritized" })]
+    fleets = [{
+      name                     = "gang-worker-x86-64"
+      capacity                 = "spot"
+      ami_id                   = "ami-0000000000000001"
+      instance_types           = ["c6id.4xlarge"]
+      max_instances            = 4
+      spot_allocation_strategy = "capacity-optimised-prioritized"
+    }]
   }
 
   expect_failures = [var.fleets]
