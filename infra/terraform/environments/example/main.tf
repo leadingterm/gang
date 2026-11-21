@@ -38,7 +38,6 @@ module "gang" {
       instance_types              = ["m8id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "61GiB"
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
     },
@@ -49,7 +48,6 @@ module "gang" {
       instance_types              = ["m7gd.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "61GiB"
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
     },
@@ -62,7 +60,6 @@ module "gang" {
     #   instance_types              = ["m8id.4xlarge"]
     #   max_instances               = 4
     #   vcpus_per_instance          = 15
-    #   memory_per_instance         = "61GiB"
     #   disk_per_instance           = "200GiB"
     #   target_actions_per_instance = 16
     #   fallback                    = { retry_spot_after = "5m" }
@@ -75,7 +72,6 @@ module "gang" {
     #   instance_types              = ["m7gd.4xlarge"]
     #   max_instances               = 4
     #   vcpus_per_instance          = 15
-    #   memory_per_instance         = "61GiB"
     #   disk_per_instance           = "200GiB"
     #   target_actions_per_instance = 16
     #   warm_pool_size              = 2

@@ -144,12 +144,7 @@ async fn queued(
             continue;
         };
         let row = display(row);
-        let properties = &row.info.platform_properties;
-        let (candidates, refusal) = match fleets.admit(
-            properties
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str())),
-        ) {
+        let (candidates, refusal) = match crate::snapshot::candidates(&row.info, fleets) {
             Ok(candidates) => (candidates, None),
             Err(refusal) => (gang_types::FleetSet::EMPTY, Some(refusal)),
         };
@@ -441,6 +436,7 @@ pub(crate) mod tests {
         platform: &[(&str, &str)],
     ) -> Arc<NativeActionInfo> {
         Arc::new(NativeActionInfo {
+            memory_reservation: None,
             command_digest: digest(1, 10),
             input_root_digest: digest(2, 20),
             timeout: Duration::from_mins(1),
@@ -502,6 +498,7 @@ pub(crate) mod tests {
             ]),
             available_platform_properties: HashMap::new(),
             free_memory_kb: None,
+            latest_attempt_deadline: None,
         }
     }
 

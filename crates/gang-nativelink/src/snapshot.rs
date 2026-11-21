@@ -10,9 +10,14 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use gang_clock::Timestamp;
-use gang_spi::{ExecutingDemand, QueuedDemand, SchedulerSnapshot, WorkerState};
-use gang_types::{ActionResources, Bytes, FleetCatalog, FleetName, SourceId, WorkerId, property};
-use nativelink_error::Error;
+use gang_spi::{
+    ExecutingDemand, FleetMemoryCapacity, QueuedDemand, SchedulerSnapshot, WorkerState,
+};
+use gang_types::{
+    ActionResources, Bytes, FleetCatalog, FleetName, FleetSet, NonZeroBytes, Refusal, SourceId,
+    WorkerId, property,
+};
+use nativelink_error::{Code, Error, make_err};
 use nativelink_scheduler::worker_scheduler::WorkerSummary;
 use nativelink_util::action_messages::{ActionInfo as NativeActionInfo, ActionState, OperationId};
 use nativelink_util::operation_state_manager::{ClientStateManager, OperationStageFlags};
@@ -67,6 +72,69 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
     })
 }
 
+/// Matches the original admission intent, not memory-derived whole-worker CPU.
+pub(crate) fn candidates(
+    info: &NativeActionInfo,
+    fleets: &FleetCatalog,
+) -> Result<FleetSet, Refusal> {
+    let reservation = info.memory_reservation.as_ref();
+    let candidates = fleets.admit(
+        info.platform_properties
+            .iter()
+            .filter(|(key, _)| {
+                reservation.is_none()
+                    || !matches!(key.as_str(), property::MEMORY_KB | property::CPU_MILLICORES)
+            })
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )?;
+    let candidates = original_minima(info, fleets, candidates);
+    if candidates.is_empty() {
+        Err(Refusal::Combination)
+    } else {
+        Ok(candidates)
+    }
+}
+
+/// Matching for already admitted actions, without allocating another validation request.
+pub(crate) fn accepting(info: &NativeActionInfo, fleets: &FleetCatalog) -> FleetSet {
+    let candidates = fleets.accepting(|key| {
+        if info.memory_reservation.is_some()
+            && matches!(key, property::MEMORY_KB | property::CPU_MILLICORES)
+        {
+            None
+        } else {
+            info.platform_properties.get(key).map(String::as_str)
+        }
+    });
+    original_minima(info, fleets, candidates)
+}
+
+fn original_minima(
+    info: &NativeActionInfo,
+    fleets: &FleetCatalog,
+    mut candidates: FleetSet,
+) -> FleetSet {
+    if let Some(reservation) = &info.memory_reservation {
+        for index in candidates {
+            let Some(fleet) = fleets.fleets().get(index) else {
+                candidates.remove(index);
+                continue;
+            };
+            if [
+                (property::MEMORY_KB, reservation.minimum_kb),
+                (property::CPU_MILLICORES, reservation.cpu_before_memory_fit),
+            ]
+            .into_iter()
+            .any(|(key, minimum)| {
+                minimum.is_some_and(|minimum| fleet.limit(key).is_none_or(|limit| minimum > limit))
+            }) {
+                candidates.remove(index);
+            }
+        }
+    }
+    candidates
+}
+
 /// Converts a queued operation into a scheduler demand.
 ///
 /// Candidates reflect fleet selectors and resource policy; old client environment labels
@@ -79,13 +147,7 @@ fn queued_demand(
 ) -> QueuedDemand {
     QueuedDemand {
         source,
-        candidates: fleets
-            .admit(
-                info.platform_properties
-                    .iter()
-                    .map(|(key, value)| (key.as_str(), value.as_str())),
-            )
-            .unwrap_or_default(),
+        candidates: candidates(info, fleets).unwrap_or_default(),
         resources: resources(&info.platform_properties),
         queued_since: Timestamp::from(info.insert_timestamp),
         priority: info.priority,
@@ -193,6 +255,22 @@ pub(crate) async fn fill(
     into.workers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
     into.queued.clear();
     into.executing.clear();
+    into.fleet_memory.clear();
+    for (fleet, properties) in fleets.fleets().iter().enumerate() {
+        let capacity = properties
+            .capacity(property::MEMORY_KB)
+            .and_then(|kb| kb.checked_mul(1024))
+            .and_then(|bytes| NonZeroBytes::new(Bytes::new(bytes)))
+            .ok_or_else(|| {
+                make_err!(
+                    Code::Internal,
+                    "invalid physical memory for fleet {}",
+                    properties.name()
+                )
+            })?;
+        into.fleet_memory
+            .push(FleetMemoryCapacity { fleet, capacity });
+    }
 
     let mut listing = scheduler
         .filter_operations(actions::queued_filter())
@@ -238,13 +316,7 @@ pub(crate) async fn fill(
             let row = ExecutingDemand {
                 worker,
                 source,
-                candidates: fleets.accepting(|key| {
-                    operation
-                        .info
-                        .platform_properties
-                        .get(key)
-                        .map(String::as_str)
-                }),
+                candidates: accepting(&operation.info, fleets),
                 resources: resources(&operation.info.platform_properties),
                 started: Timestamp::from(operation.state.last_transition_timestamp),
                 expected: expected(operation.origin.as_ref(), durations, now),
@@ -315,6 +387,7 @@ pub(crate) mod tests {
             ]),
             available_platform_properties: HashMap::new(),
             free_memory_kb: None,
+            latest_attempt_deadline: None,
         }
     }
 
@@ -1450,5 +1523,149 @@ pub(crate) mod tests {
             scratch.rows.clear();
         });
         assert_eq!(measured.count_total, 0);
+    }
+    #[test]
+    fn candidates_use_original_floor_and_cpu_before_memory_promotion() {
+        let fleets = FleetCatalog::try_new(
+            [("small", 16, 32), ("large", 8, 64)]
+                .into_iter()
+                .map(|(name, vcpus, memory)| {
+                    FleetProperties::new(
+                        &FleetName::try_new(name).unwrap(),
+                        Isa::X86_64,
+                        &"docker",
+                        &"host:test".parse().unwrap(),
+                        Resources {
+                            vcpus,
+                            memory: Bytes::gib(memory),
+                            disk: Bytes::gib(100),
+                        },
+                        &gang_types::FleetActionPolicy::default(),
+                        [],
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut action = demand(
+            0,
+            &[
+                (property::MEMORY_KB, "33554432"),
+                (property::CPU_MILLICORES, "16000"),
+            ],
+        );
+        assert_eq!(
+            queued_demand(&action, &fleets)
+                .candidates
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        Arc::make_mut(&mut action).memory_reservation =
+            Some(nativelink_util::action_messages::MemoryReservation {
+                minimum_kb: Some(40 * 1024 * 1024),
+                desired_kb: Some(70 * 1024 * 1024),
+                cpu_before_memory_fit: Some(1000),
+                fitted_revision: None,
+            });
+        assert_eq!(
+            queued_demand(&action, &fleets)
+                .candidates
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        Arc::make_mut(&mut action)
+            .memory_reservation
+            .as_mut()
+            .unwrap()
+            .cpu_before_memory_fit = Some(12000);
+        assert!(queued_demand(&action, &fleets).candidates.is_empty());
+        let reservation = Arc::make_mut(&mut action)
+            .memory_reservation
+            .as_mut()
+            .unwrap();
+        reservation.minimum_kb = None;
+        reservation.cpu_before_memory_fit = None;
+        assert_eq!(
+            queued_demand(&action, &fleets).candidates,
+            FleetSet::prefix(2).unwrap()
+        );
+        Arc::make_mut(&mut action)
+            .memory_reservation
+            .as_mut()
+            .unwrap()
+            .minimum_kb = Some(0);
+        assert_eq!(
+            queued_demand(&action, &fleets).candidates,
+            FleetSet::prefix(2).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_current_physical_memory_not_action_ceiling_and_reuses_buffer() {
+        let mut policy = gang_types::FleetActionPolicy::default();
+        policy.resources.memory = Some(NonZeroBytes::gib(4));
+        let fleets = FleetCatalog::try_new(vec![FleetProperties::new(
+            &FleetName::try_new("measured").unwrap(),
+            Isa::X86_64,
+            &"docker",
+            &"host:test".parse().unwrap(),
+            Resources {
+                vcpus: 16,
+                memory: Bytes::gib(63),
+                disk: Bytes::gib(100),
+            },
+            &policy,
+            [],
+        )])
+        .unwrap();
+        let (sender, receiver) = tokio::sync::watch::channel(Arc::new(
+            nativelink_scheduler::worker_scheduler::ResourceCapacitySnapshot::new(Vec::new()),
+        ));
+        let runtime = crate::capacity::RuntimeCatalog::new(fleets, receiver);
+        let mut snapshot = SchedulerSnapshot::default();
+        let mut buffer = None;
+        for memory_kb in [62_229 * 1024, 61 * 1024 * 1024] {
+            let mut row = nativelink_config::schedulers::ResourceCapacity::default();
+            row.exact
+                .insert(property::FLEET.to_owned(), "measured".to_owned());
+            row.minimum
+                .insert(property::MEMORY_KB.to_owned(), memory_kb);
+            sender
+                .send(Arc::new(
+                    nativelink_scheduler::worker_scheduler::ResourceCapacitySnapshot::new(vec![
+                        row,
+                    ]),
+                ))
+                .unwrap();
+            let current = runtime.current().unwrap();
+            fill(
+                &Fake::default(),
+                &[],
+                &current,
+                &history(),
+                Timestamp::from_unix_millis(0),
+                0,
+                &mut snapshot,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                snapshot.fleet_memory,
+                vec![FleetMemoryCapacity {
+                    fleet: 0,
+                    capacity: NonZeroBytes::new(Bytes::kib(memory_kb)).unwrap(),
+                }]
+            );
+            assert_eq!(
+                current.fleets()[0].limit(property::MEMORY_KB),
+                Some(4 * 1024 * 1024)
+            );
+            if let Some(pointer) = buffer {
+                assert_eq!(snapshot.fleet_memory.as_ptr(), pointer);
+            }
+            buffer = Some(snapshot.fleet_memory.as_ptr());
+        }
     }
 }

@@ -1,6 +1,12 @@
 data "aws_partition" "this" {}
 data "aws_caller_identity" "this" {}
 
+# Keep config generation independent of the worker module's teardown ordering.
+data "aws_ec2_instance_type" "worker" {
+  for_each      = toset(flatten(var.fleets[*].instance_types))
+  instance_type = each.key
+}
+
 resource "terraform_data" "input_checks" {
   lifecycle {
     precondition {
@@ -129,9 +135,12 @@ locals {
   }
 
   gang_toml = templatefile("${path.module}/gang.toml.tftpl", {
-    default_isa                       = var.default_isa
-    gang_settings                     = var.gang_settings
-    fleets                            = [for fleet in var.fleets : merge(fleet, { action_environment = local.node_action_environments[fleet.name] })]
+    default_isa   = var.default_isa
+    gang_settings = var.gang_settings
+    fleets = [for fleet in var.fleets : merge(fleet, {
+      action_environment  = local.node_action_environments[fleet.name]
+      memory_per_instance = "${min([for type in fleet.instance_types : data.aws_ec2_instance_type.worker[type].memory_size]...)}MiB"
+    })]
     network_granted                   = local.network_granted && var.execution_egress != null
     execution_egress                  = var.execution_egress
     protected_networks                = local.protected_networks

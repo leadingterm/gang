@@ -44,7 +44,7 @@ expect success 'release validation graph excludes macOS' jq -e "
   ancestors(\"release-validation\") | index(\"macos\") == null
 " <<<"$jobs"
 
-for job in required nix-vm lint linux-x86_64-shards linux-x86_64 linux-x86_64-bundle cache-x86_64 linux-arm64 linux-arm64-bundle linux-arm64-checks cross macos release-validation e2e-gate-1-shards e2e-gate-1 e2e-gate-2-shards e2e-gate-2; do
+for job in required nativelink-deadline-tests nix-vm lint linux-x86_64-shards linux-x86_64 linux-x86_64-bundle cache-x86_64 linux-arm64 linux-arm64-bundle linux-arm64-checks cross macos release-validation e2e-gate-1-shards e2e-gate-1 e2e-gate-2-shards e2e-gate-2; do
   while IFS= read -r dependency; do
     cp "$workflow" "$fixture"
     job="$job" dependency="$dependency" yq -i '.jobs[strenv(job)].needs |= ([.] | flatten) | del(.jobs[strenv(job)].needs[] | select(. == strenv(dependency)))' "$fixture"
@@ -69,11 +69,17 @@ for job in linux-arm64-bundle linux-arm64-checks linux-arm64 cross macos release
   job="$job" yq -i '.jobs[strenv(job)].if = "always()"' "$fixture"
   expect failure "$job cannot run on PRs" "$guard" "$fixture"
 done
-for job in required changes; do
+for job in required changes nativelink-deadline-tests; do
   cp "$workflow" "$fixture"
   job="$job" yq -i 'del(.jobs[strenv(job)])' "$fixture"
   expect failure "missing $job job" "$guard" "$fixture"
 done
+cp "$workflow" "$fixture"
+yq -i '.jobs.nativelink-deadline-tests.if = "needs.changes.outputs.heavy == '\''true'\'' && false"' "$fixture"
+expect failure 'native tests cannot skip heavy changes' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '(.jobs.required.steps[] | select(.env.NEEDS_RESULTS != null) | .env.NEEDS_RESULTS) |= sub("needs[.]nativelink-deadline-tests[.]result", "success")' "$fixture"
+expect failure 'required result cannot omit native tests' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i '.jobs.linux-x86_64.steps += [{"uses": "actions/checkout@fixture"}]' "$fixture"
 expect failure 'x86 aggregator cannot run extra steps' "$guard" "$fixture"
@@ -95,7 +101,7 @@ expect failure 'release results cannot omit ARM validation' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i '.jobs.linux-x86_64-shards.needs = ["changes", "linux-arm64"]' "$fixture"
 expect failure 'x86 shards cannot transitively require optional ARM jobs' "$guard" "$fixture"
-for job in lint linux-x86_64-bundle e2e-gate-1-shards e2e-gate-2-shards; do
+for job in nativelink-deadline-tests lint linux-x86_64-bundle e2e-gate-1-shards e2e-gate-2-shards; do
   cp "$workflow" "$fixture"
   job="$job" yq -i '.jobs[strenv(job)]."runs-on" = "ubuntu-24.04-arm"' "$fixture"
   expect failure "$job must run on x86" "$guard" "$fixture"

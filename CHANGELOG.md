@@ -7,6 +7,15 @@
 - Public egress now uses a per-action pasta network namespace and one host nftables policy scoped to the action cgroup subtree. NixOS prepares the policy and cgroup before worker startup; missing or mismatched prerequisites deny granted actions.
 - **Server configuration migration:** Remove `slirp4netns`, `nft`, `nsenter` and `ip` from `[sandbox.bwrap.egress]`; these old helper keys are rejected as unknown. The table now accepts only `program`, defaulting to `pasta`, resolved and pinned like `[sandbox.bwrap].program`. Keep the existing `[execution.egress]` policy and fleet grants.
 
+### Fixed
+
+- Fix startup on nominal 64 GiB workers whose measured memory, less reserve, is smaller than the fleet estimate; workers advertise their actual available action-pool capacity.
+- Use the same current memory guarantees for learned reservations, queued work, OOM retries and scaling, while preserving explicit client minimums and per-action ceilings.
+
+### Upgrade notes
+
+- `memory_per_instance` is now the machine's nominal RAM; Gang subtracts `actions.memory.reserve` to obtain the prelaunch usable-memory estimate. AWS deployments derive nominal RAM automatically from the smallest EC2 instance memory in each fleet. Remove `memory_per_instance` from every AWS deployment-module `fleets` entry; the generated internal `gang.toml` field is not an operator input to the AWS module.
+
 ## 0.3.4
 
 ### Added

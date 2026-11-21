@@ -71,7 +71,12 @@ async fn plain_mode_records_the_identity_fleet_and_layout() {
         Some("host:test")
     );
     assert_eq!(spec.properties.get(property::CPU_COUNT), Some("4"));
-    assert_eq!(spec.properties.get(property::MEMORY_KB), Some("8388608"));
+    let physical = gang_os::physical_memory().expect("physical memory is readable");
+    let expected_memory = physical.saturating_sub(NonZeroBytes::gib(2).get()).get() / 1024;
+    assert_eq!(
+        spec.properties.get(property::MEMORY_KB),
+        Some(expected_memory.to_string().as_str())
+    );
     assert_eq!(spec.slots.count().get(), 4);
     assert!(!spec.slots.is_single_use());
     assert_eq!(spec.work_directory, layout.work_directory());
@@ -350,7 +355,7 @@ async fn memory_pool_and_actions_reach_the_scheduler() {
         future::pending(),
     )
     .await
-    .expect("a pool equal to the declared memory is accepted");
+    .expect("prepared pool reaches scheduler");
     assert_eq!(
         harness.limits.prepared_reserve(),
         Some(NonZeroBytes::gib(2).get())
@@ -361,35 +366,172 @@ async fn memory_pool_and_actions_reach_the_scheduler() {
 }
 
 #[tokio::test]
-async fn insufficient_memory_pool_fails_before_enrollment() {
+async fn measured_pool_smaller_than_estimate_enrolls_and_preserves_action_ceiling() {
     let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
-    let limits = harness.limits.clone().with_memory_pool(ActionMemoryPool {
+    harness.scheduler.set_behaviour(Behaviour::Finish);
+    let mut settings = harness.settings();
+    let fleet_name = FleetName::try_new("example-fleet").expect("valid fleet");
+    let fleet = settings.fleets.by_name(&fleet_name).expect("fleet exists");
+    let mut policy = fleet.policy.clone();
+    policy.memory_per_instance = NonZeroBytes::gib(64);
+    policy.actions.resources.memory = Some(NonZeroBytes::gib(4));
+    settings.fleets = Fleets::try_new(vec![FleetMember {
+        policy,
+        sandbox: fleet.sandbox,
+        options: fleet.options.clone(),
+    }])
+    .expect("valid fleet");
+    std::sync::Arc::make_mut(&mut settings.actions)
+        .memory
+        .reserve = NonZeroBytes::gib(1);
+    // 63,253 MiB measured RAM minus the 1 GiB reserve.
+    let pool = ActionMemoryPool {
         cgroup: PathBuf::from("/test/action-pool"),
-        capacity: NonZeroBytes::gib(7),
-    });
-    let error = gang_worker::run(
+        capacity: NonZeroBytes::mib(62_229),
+    };
+    let limits = harness.limits.clone().with_memory_pool(pool.clone());
+    gang_worker::run(
         harness.parts(true),
-        harness.settings(),
+        settings,
         move |_| Ok(limits),
         harness.build_sandbox(),
         future::pending(),
     )
     .await
-    .expect_err("a smaller action pool is rejected");
-    match error {
-        WorkerError::FleetMemoryUnavailable {
-            fleet,
-            declared,
-            capacity,
-            reserve,
-        } => {
-            assert_eq!(fleet.as_str(), "example-fleet");
-            assert_eq!(declared, NonZeroBytes::gib(8).get());
-            assert_eq!(capacity, NonZeroBytes::gib(7).get());
-            assert_eq!(reserve, NonZeroBytes::gib(2).get());
-        }
-        other => panic!("unexpected worker error: {other:?}"),
-    }
+    .expect("measured memory below the nominal estimate can enroll");
+    assert_eq!(harness.enroller.calls(), 1);
+    assert_eq!(
+        harness.limits.prepared_reserve(),
+        Some(NonZeroBytes::gib(1).get())
+    );
+    let spec = only_spec(&harness);
+    assert_eq!(spec.memory_pool, Some(pool));
+    assert_eq!(spec.properties.get(property::MEMORY_KB), Some("63722496"));
+    assert_eq!(
+        spec.properties.capacity(property::MEMORY_KB),
+        Some(62_229 * 1024)
+    );
+    assert_eq!(
+        spec.properties.limit(property::MEMORY_KB),
+        Some(4 * 1024 * 1024)
+    );
+}
+
+#[tokio::test]
+async fn pool_below_configured_minimum_prevents_enrollment_and_registration() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    let mut settings = harness.settings();
+    let minimum = gang_config::MinReservation::from_units(8 * 1024);
+    std::sync::Arc::make_mut(&mut settings.actions)
+        .memory
+        .min_reservation = minimum;
+    let pool = ActionMemoryPool {
+        cgroup: PathBuf::from("/test/action-pool"),
+        capacity: NonZeroBytes::mib(4),
+    };
+    let limits = harness.limits.clone().with_memory_pool(pool);
+    let error = gang_worker::run(
+        harness.parts(true),
+        settings,
+        move |_| Ok(limits),
+        harness.build_sandbox(),
+        future::pending(),
+    )
+    .await
+    .expect_err("capacity below the minimum cannot enroll");
+    assert!(matches!(
+        error,
+        WorkerError::MemoryBelowMinimum { capacity, minimum: actual }
+            if capacity == Bytes::mib(4) && actual == minimum.get()
+    ));
+    assert_eq!(harness.enroller.calls(), 0);
+    assert!(harness.scheduler.specs().is_empty());
+}
+
+#[tokio::test]
+async fn pool_at_configured_minimum_enrolls_and_advertises_capacity() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    harness.scheduler.set_behaviour(Behaviour::Finish);
+    let mut settings = harness.settings();
+    let minimum = gang_config::MinReservation::from_units(8 * 1024);
+    std::sync::Arc::make_mut(&mut settings.actions)
+        .memory
+        .min_reservation = minimum;
+    let pool = ActionMemoryPool {
+        cgroup: PathBuf::from("/test/action-pool"),
+        capacity: NonZeroBytes::mib(8),
+    };
+    let limits = harness.limits.clone().with_memory_pool(pool);
+    gang_worker::run(
+        harness.parts(true),
+        settings,
+        move |_| Ok(limits),
+        harness.build_sandbox(),
+        future::pending(),
+    )
+    .await
+    .expect("capacity at the minimum can enroll");
+    assert_eq!(harness.enroller.calls(), 1);
+    assert_eq!(
+        only_spec(&harness).properties.capacity(property::MEMORY_KB),
+        Some(8 * 1024)
+    );
+}
+
+#[tokio::test]
+async fn one_byte_pool_prevents_enrollment_and_registration() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    let settings = harness.settings();
+    let minimum = settings.actions.memory.min_reservation;
+    let pool = ActionMemoryPool {
+        cgroup: PathBuf::from("/test/action-pool"),
+        capacity: NonZeroBytes::new(Bytes::new(1)).expect("one byte is nonzero"),
+    };
+    let limits = harness.limits.clone().with_memory_pool(pool);
+    let error = gang_worker::run(
+        harness.parts(true),
+        settings,
+        move |_| Ok(limits),
+        harness.build_sandbox(),
+        future::pending(),
+    )
+    .await
+    .expect_err("one byte cannot satisfy the minimum");
+    assert!(matches!(
+        error,
+        WorkerError::MemoryBelowMinimum { capacity, minimum: actual }
+            if capacity == Bytes::new(1) && actual == minimum.get()
+    ));
+    assert_eq!(harness.enroller.calls(), 0);
+    assert!(harness.scheduler.specs().is_empty());
+}
+
+#[tokio::test]
+async fn fallback_capacity_below_minimum_prevents_enrollment_and_registration() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    let mut settings = harness.settings();
+    settings.limits = None;
+    let minimum = settings.actions.memory.min_reservation;
+    let physical = gang_os::physical_memory().expect("physical memory is readable");
+    let reserve = NonZeroBytes::new(physical.saturating_sub(Bytes::new(1)))
+        .expect("physical memory exceeds one byte");
+    std::sync::Arc::make_mut(&mut settings.actions)
+        .memory
+        .reserve = reserve;
+    let error = gang_worker::run(
+        harness.parts(true),
+        settings,
+        harness.build_limits(),
+        harness.build_sandbox(),
+        future::pending(),
+    )
+    .await
+    .expect_err("fallback capacity below the minimum cannot enroll");
+    assert!(matches!(
+        error,
+        WorkerError::MemoryBelowMinimum { capacity, minimum: actual }
+            if capacity == Bytes::new(1) && actual == minimum.get()
+    ));
     assert_eq!(harness.enroller.calls(), 0);
     assert!(harness.scheduler.specs().is_empty());
 }
@@ -410,7 +552,48 @@ async fn no_limits_plugin_passes_no_pool() {
     .await
     .expect("a worker without limits starts");
     assert_eq!(harness.limits.prepared_reserve(), None);
-    assert_eq!(only_spec(&harness).memory_pool, None);
+    let spec = only_spec(&harness);
+    assert_eq!(spec.memory_pool, None);
+    let physical = gang_os::physical_memory().expect("physical memory is readable");
+    let expected = physical.saturating_sub(NonZeroBytes::gib(2).get()).get() / 1024;
+    assert_eq!(
+        spec.properties.capacity(property::MEMORY_KB),
+        Some(expected)
+    );
+    assert_eq!(
+        spec.properties.get(property::MEMORY_KB),
+        Some(expected.to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn reserve_exhausting_physical_memory_prevents_enrollment() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    let mut settings = harness.settings();
+    settings.limits = None;
+    let physical = gang_os::physical_memory().expect("physical memory is readable");
+    let reserve = NonZeroBytes::new(physical).expect("physical memory is nonzero");
+    std::sync::Arc::make_mut(&mut settings.actions)
+        .memory
+        .reserve = reserve;
+    let error = gang_worker::run(
+        harness.parts(true),
+        settings,
+        harness.build_limits(),
+        harness.build_sandbox(),
+        future::pending(),
+    )
+    .await
+    .expect_err("the reserve leaves no action memory");
+    assert!(matches!(
+        error,
+        WorkerError::MemoryReserveExhausted {
+            physical: actual,
+            reserve: actual_reserve,
+        } if actual == physical && actual_reserve == reserve.get()
+    ));
+    assert_eq!(harness.enroller.calls(), 0);
+    assert!(harness.scheduler.specs().is_empty());
 }
 
 #[tokio::test]

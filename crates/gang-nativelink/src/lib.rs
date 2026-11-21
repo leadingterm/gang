@@ -28,6 +28,7 @@
 #![recursion_limit = "256"]
 
 mod actions;
+mod capacity;
 mod config;
 mod controller;
 mod cordons;

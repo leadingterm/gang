@@ -44,7 +44,8 @@ use crate::server::{
 use crate::settings::ActionTools;
 use crate::system::{
     ActionLimits, FleetLayout, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, NOOP_FLEET,
-    PermitNetwork, SMALL_FLEET, Sandbox, SoftMemory, Variant,
+    PLACEMENT_LARGE_MEMORY, PLACEMENT_SMALL_MEMORY, PermitNetwork, SMALL_FLEET, Sandbox,
+    SoftMemory, Variant,
 };
 
 /// The `max_instances` of [`SMALL_FLEET`] and [`NOOP_FLEET`].
@@ -413,6 +414,8 @@ impl ConfigTemplate {
                 return Err(template_error("missing [sandbox.noop]"));
             }
             placement_fleets(&mut document.fleets)?;
+            document.actions.cold_start.memory =
+                gang_config::WholeKib::from_units(PLACEMENT_SMALL_MEMORY.as_u64() / 1024);
         }
         document.execution.input_links = variant.input_links;
         Self::project_limits(document, variant, worker_launcher)?;
@@ -516,19 +519,6 @@ impl ConfigTemplate {
     pub fn default_isa(&self) -> Result<Isa> {
         Ok(self.document.default_isa)
     }
-
-    /// Returns the large fleet's memory in KiB.
-    ///
-    /// # Errors
-    /// Returns a template error if the first fleet is absent or doubling its size overflows.
-    pub fn large_memory_kb(&self) -> Result<u64> {
-        let fleet = self
-            .document
-            .fleets
-            .first()
-            .ok_or_else(|| template_error("missing the first [[fleets]] entry"))?;
-        Ok(enlarged(fleet)?.1.as_u64() / 1024)
-    }
 }
 
 /// Maps a template failure to its public error.
@@ -592,13 +582,16 @@ fn placement_fleets(fleets: &mut Vec<RawFleet<SandboxKey>>) -> Result<()> {
         .first()
         .ok_or_else(|| template_error("missing the first [[fleets]] entry"))?;
     let (vcpus, memory) = enlarged(base)?;
-    let small = placement_fleet(base, SMALL_FLEET, SMALL_MAX_INSTANCES)?;
+    let mut small = placement_fleet(base, SMALL_FLEET, SMALL_MAX_INSTANCES)?;
+    small.actions.resources.memory = Some(PLACEMENT_SMALL_MEMORY);
     let max = NonZeroU32::new(LARGE_MAX_INSTANCES)
         .ok_or_else(|| template_error("large fleet maximum must be nonzero"))?;
     let mut large = placement_fleet(base, LARGE_FLEET, max)?;
     large.vcpus_per_instance = vcpus;
     large.memory_per_instance = memory;
+    large.actions.resources.memory = Some(PLACEMENT_LARGE_MEMORY);
     let mut noop = placement_fleet(base, NOOP_FLEET, SMALL_MAX_INSTANCES)?;
+    noop.actions.resources.memory = Some(PLACEMENT_SMALL_MEMORY);
     noop.sandbox = SandboxKey::Noop;
     noop.action_environment = "host:e2e".parse().map_err(template_error)?;
     noop.actions.grants.remove(&Capability::Network);

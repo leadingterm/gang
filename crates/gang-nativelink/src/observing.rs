@@ -21,7 +21,9 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 };
 use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
 use nativelink_scheduler::worker::{Worker, WorkerTimestamp};
-use nativelink_scheduler::worker_scheduler::{WorkerScheduler, WorkerSummary};
+use nativelink_scheduler::worker_scheduler::{
+    ResourceCapacitySnapshot, WorkerScheduler, WorkerSummary,
+};
 use nativelink_util::action_messages::{
     ActionInfo as NativeActionInfo, ActionResult, ActionStage, ExecutionMetadata, OperationId,
     WorkerId,
@@ -33,9 +35,10 @@ use nativelink_util::operation_state_manager::{
 use nativelink_util::origin_event::OriginMetadata;
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use parking_lot::Mutex;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 
 use crate::actions::digest_text;
+use crate::capacity::RuntimeCatalog;
 use crate::cordons::InstanceCordons;
 use crate::durations::ActionDurations;
 use crate::handoff::HandOff;
@@ -54,7 +57,7 @@ pub(crate) struct ObservingWorkerScheduler {
     handoff: HandOff,
     durations: Arc<Mutex<ActionDurations>>,
     clock: Arc<dyn Clock>,
-    fleets: Arc<FleetCatalog>,
+    fleets: Arc<RuntimeCatalog>,
     rates: Arc<SourceRates>,
     cordons: InstanceCordons,
     retiring: RwLock<bool>,
@@ -72,6 +75,7 @@ impl ObservingWorkerScheduler {
         durations: Arc<Mutex<ActionDurations>>,
         clock: Arc<dyn Clock>,
         fleets: Arc<FleetCatalog>,
+        runtime: Arc<RuntimeCatalog>,
         rates: Arc<SourceRates>,
     ) -> Self {
         Self {
@@ -83,7 +87,7 @@ impl ObservingWorkerScheduler {
             durations,
             clock,
             cordons: InstanceCordons::new(Arc::clone(&fleets)),
-            fleets,
+            fleets: runtime,
             rates,
             retiring: RwLock::new(false),
         }
@@ -258,6 +262,10 @@ impl WorkerScheduler for ObservingWorkerScheduler {
         self.inner.get_platform_property_manager()
     }
 
+    fn resource_capacity_updates(&self) -> Option<watch::Receiver<Arc<ResourceCapacitySnapshot>>> {
+        self.inner.resource_capacity_updates()
+    }
+
     async fn add_worker(&self, mut worker: Worker) -> Result<(), Error> {
         let retiring = self.retiring.read().await;
         if *retiring {
@@ -347,12 +355,9 @@ impl WorkerScheduler for ObservingWorkerScheduler {
         {
             self.completed.fetch_add(1, Ordering::Relaxed);
             let action = operation.as_action_info().await.ok();
+            let fleets = self.fleets.current()?;
             if let Some((info, _)) = &action
-                && let Some(preferred) = self
-                    .fleets
-                    .accepting(|key| info.platform_properties.get(key).map(String::as_str))
-                    .iter()
-                    .next()
+                && let Some(preferred) = crate::snapshot::accepting(info, &fleets).iter().next()
             {
                 let source = self.rates.source(origin.as_ref());
                 self.rates.record(
@@ -464,6 +469,10 @@ impl WorkerScheduler for ObservingWorkerScheduler {
         let result = self.inner.remove_timedout_workers(now_timestamp).await;
         self.signal_if_released().await;
         result
+    }
+
+    async fn expire_attempts(&self, now: std::time::SystemTime) -> Result<(), Error> {
+        self.inner.expire_attempts(now).await
     }
 
     async fn set_drain_worker(&self, worker_id: &WorkerId, is_draining: bool) -> Result<(), Error> {
@@ -650,6 +659,7 @@ mod tests {
     fn test_action_info() -> Arc<ActionInfo> {
         let digest = DigestInfo::new([3; 32], 30);
         Arc::new(ActionInfo {
+            memory_reservation: None,
             command_digest: digest,
             input_root_digest: digest,
             timeout: Duration::from_mins(1),
@@ -729,6 +739,7 @@ mod tests {
                 test_durations(),
                 test_clock(),
                 test_fleets(),
+                crate::capacity::test_catalog((*test_fleets()).clone()),
                 test_rates(),
             );
             let forwarded = scheduler
@@ -854,6 +865,7 @@ mod tests {
                 test_durations(),
                 test_clock(),
                 test_fleets(),
+                crate::capacity::test_catalog((*test_fleets()).clone()),
                 test_rates(),
             );
             scheduler
@@ -966,6 +978,7 @@ mod tests {
                 Arc::clone(&durations),
                 clock.clone(),
                 test_fleets(),
+                crate::capacity::test_catalog((*test_fleets()).clone()),
                 Arc::clone(&rates),
             );
             let duplicate = result.clone();
@@ -1110,6 +1123,12 @@ mod tests {
             &self.manager
         }
 
+        fn resource_capacity_updates(
+            &self,
+        ) -> Option<watch::Receiver<Arc<ResourceCapacitySnapshot>>> {
+            None
+        }
+
         async fn add_worker(&self, worker: Worker) -> Result<(), Error> {
             self.admitted_flags.lock().push(worker.is_draining);
             Ok(())
@@ -1236,6 +1255,11 @@ mod tests {
             Ok(())
         }
 
+        async fn expire_attempts(&self, _: SystemTime) -> Result<(), Error> {
+            // This fixture records worker updates but owns no attempt deadlines.
+            Ok(())
+        }
+
         async fn set_drain_worker(
             &self,
             worker_id: &WorkerId,
@@ -1266,6 +1290,7 @@ mod tests {
                 platform_properties: HashMap::new(),
                 available_platform_properties: HashMap::new(),
                 free_memory_kb: None,
+                latest_attempt_deadline: None,
             }]
         }
 
@@ -1296,6 +1321,7 @@ mod tests {
             test_durations(),
             test_clock(),
             test_fleets(),
+            crate::capacity::test_catalog((*test_fleets()).clone()),
             test_rates(),
         );
         (inner, counting, completed)

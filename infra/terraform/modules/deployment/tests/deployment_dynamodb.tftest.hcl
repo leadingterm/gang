@@ -37,6 +37,7 @@ mock_provider "aws" {
   mock_data "aws_ec2_instance_type" {
     defaults = {
       boot_modes              = ["legacy-bios", "uefi"]
+      memory_size             = 65536
       supported_architectures = ["x86_64"]
     }
   }
@@ -169,7 +170,6 @@ variables {
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
     },
@@ -180,7 +180,6 @@ variables {
       instance_types              = ["c7gd.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
     },
@@ -246,7 +245,6 @@ run "rejects_boot_grace_at_shutdown_grace" {
       instance_types              = ["c6id.4xlarge"]
       max_instances               = 4
       vcpus_per_instance          = 15
-      memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
       target_actions_per_instance = 16
       boot_grace                  = "5m"
