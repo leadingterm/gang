@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Show worker FastSlowStore cache reads, evictions and capacity in live state and the dashboard, with fleet reporting coverage.
+
 ## 0.3.5 — 2026-11-21
 
 ### Added

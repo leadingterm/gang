@@ -267,6 +267,8 @@ mod tests {
     use gang_spi::{ControllerSpec, ObservationSink, RenderedStoreSpec};
     use gang_testkit::TestResult;
     use gang_types::FleetCatalog;
+    use nativelink_store::fast_slow_store::FastSlowStore;
+    use nativelink_store::filesystem_store::FilesystemStore;
     use nativelink_util::common::DigestInfo;
     use nativelink_util::store_trait::StoreLike;
     use serde_json::{Value, json};
@@ -320,6 +322,146 @@ mod tests {
                 .update_oneshot(DigestInfo::new([index; 32], size), blob)
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn filesystem_cache_store(
+        path: &std::path::Path,
+    ) -> Result<nativelink_util::store_trait::Store, Box<dyn Error>> {
+        let content_path = path.join("content");
+        let temp_path = path.join("tmp");
+        let content = json!({"fast_slow": {
+            "fast": {"filesystem": {
+                "content_path": content_path.to_str().ok_or("content path is UTF-8")?,
+                "temp_path": temp_path.to_str().ok_or("temporary path is UTF-8")?,
+                "block_size": 1,
+                "eviction_policy": {"max_bytes": 5},
+            }},
+            "slow": {"memory": {}},
+        }});
+        let stores = controller_stores(content, json!({"memory": {}})).await?;
+        Ok(stores
+            .get_store(CONTENT_STORE)
+            .ok_or("content store is registered")?)
+    }
+
+    #[tokio::test]
+    async fn fast_slow_cache_counts_reads_and_materialization() -> TestResult {
+        let scratch = tempfile::tempdir()?;
+        let store = filesystem_cache_store(scratch.path()).await?;
+        let cache = store
+            .downcast_ref::<FastSlowStore>(None)
+            .ok_or("fast-slow store")?;
+        let first = DigestInfo::new([1; 32], 3);
+        let second = DigestInfo::new([2; 32], 4);
+        cache
+            .slow_store()
+            .update_oneshot(first, Bytes::from_static(b"abc"))
+            .await?;
+        cache
+            .slow_store()
+            .update_oneshot(second, Bytes::from_static(b"defg"))
+            .await?;
+
+        let initial = cache.cache_stats().ok_or("filesystem cache stats")?;
+        assert_eq!((initial.size_bytes, initial.budget_bytes), (0, 5));
+        assert_eq!(
+            (initial.local_read_requests, initial.slow_read_requests),
+            (0, 0)
+        );
+        assert_eq!(
+            store.get_part_unchunked(first, 0, None).await?,
+            Bytes::from_static(b"abc")
+        );
+        let cold = cache.cache_stats().ok_or("filesystem cache stats")?;
+        assert_eq!((cold.slow_read_requests, cold.slow_read_bytes), (1, 3));
+        assert_eq!((cold.local_read_requests, cold.local_read_bytes), (0, 0));
+        assert_eq!(
+            (cold.size_bytes, cold.evictions, cold.evicted_bytes),
+            (3, 0, 0)
+        );
+
+        assert_eq!(
+            store.get_part_unchunked(first, 0, None).await?,
+            Bytes::from_static(b"abc")
+        );
+        let hit = cache.cache_stats().ok_or("filesystem cache stats")?;
+        assert_eq!((hit.local_read_requests, hit.local_read_bytes), (1, 3));
+        assert_eq!((hit.slow_read_requests, hit.slow_read_bytes), (1, 3));
+
+        cache.populate_fast_store(first.into()).await?;
+        cache.get_file_entry_for_digest(&first).await?;
+        assert!(cache.get_file_entry_for_digest(&second).await.is_err());
+        let materialized = cache.cache_stats().ok_or("filesystem cache stats")?;
+        assert_eq!(
+            (
+                materialized.local_read_requests,
+                materialized.local_read_bytes
+            ),
+            (3, 9)
+        );
+        assert_eq!(
+            (
+                materialized.slow_read_requests,
+                materialized.slow_read_bytes
+            ),
+            (1, 3)
+        );
+
+        cache
+            .fast_store()
+            .downcast_ref::<FilesystemStore>(None)
+            .ok_or("filesystem fast store")?
+            .get_executable_hardlink_source(&first)
+            .await?;
+        let sources = cache
+            .get_executable_hardlink_sources(&[first, second])
+            .await;
+        assert_eq!(sources.len(), 2);
+        assert!(sources[0].is_ok());
+        assert!(sources[1].is_err());
+        let batch = cache.cache_stats().ok_or("filesystem cache stats")?;
+        assert_eq!((batch.local_read_requests, batch.local_read_bytes), (4, 12));
+        assert_eq!((batch.slow_read_requests, batch.slow_read_bytes), (1, 3));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fast_slow_cache_reports_evictions_and_occupancy() -> TestResult {
+        let scratch = tempfile::tempdir()?;
+        let store = filesystem_cache_store(scratch.path()).await?;
+        let cache = store
+            .downcast_ref::<FastSlowStore>(None)
+            .ok_or("fast-slow store")?;
+        let first = DigestInfo::new([1; 32], 3);
+        let second = DigestInfo::new([2; 32], 4);
+        cache
+            .slow_store()
+            .update_oneshot(first, Bytes::from_static(b"abc"))
+            .await?;
+        cache
+            .slow_store()
+            .update_oneshot(second, Bytes::from_static(b"defg"))
+            .await?;
+        assert_eq!(
+            store.get_part_unchunked(first, 0, None).await?,
+            Bytes::from_static(b"abc")
+        );
+        assert_eq!(
+            store.get_part_unchunked(second, 0, None).await?,
+            Bytes::from_static(b"defg")
+        );
+        let evicted = cache.cache_stats().ok_or("filesystem cache stats")?;
+        assert_eq!(
+            (evicted.slow_read_requests, evicted.slow_read_bytes),
+            (2, 7)
+        );
+        assert_eq!(
+            (evicted.local_read_requests, evicted.local_read_bytes),
+            (0, 0)
+        );
+        assert_eq!((evicted.evictions, evicted.evicted_bytes), (1, 3));
+        assert_eq!((evicted.size_bytes, evicted.budget_bytes), (4, 5));
         Ok(())
     }
 

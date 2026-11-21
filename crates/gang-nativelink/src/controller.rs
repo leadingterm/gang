@@ -1643,7 +1643,7 @@ mod tests {
                 if arm_worker {
                     stack
                         .workers
-                        .worker_keep_alive_received(&worker_id, NOW.get().as_secs(), None)
+                        .worker_keep_alive_received(&worker_id, NOW.get().as_secs(), None, None)
                         .await?;
                 }
                 stack.simple.do_try_match_for_test().await?;
@@ -1662,7 +1662,7 @@ mod tests {
                 if arm_worker {
                     stack
                         .workers
-                        .worker_keep_alive_received(&worker_id, NOW.get().as_secs(), None)
+                        .worker_keep_alive_received(&worker_id, NOW.get().as_secs(), None, None)
                         .await?;
                 }
                 stack.simple.do_try_match_for_test().await?;

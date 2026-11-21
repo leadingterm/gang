@@ -389,6 +389,15 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
         "draining": 0,
         "unconnected": 0
       },
+      "workerCache": {
+        "reporting": 1,
+        "workers": 1,
+        "totals": {
+          "local": {"requests": 120, "bytes": 10485760},
+          "remote": {"requests": 20, "bytes": 4194304},
+          "evictions": 3, "evicted": 1048576, "used": 8388608, "budget": 1073741824
+        }
+      },
       "demand": {
         "running": 1,
         "queued": 1,
@@ -410,6 +419,11 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
       "running": 1,
       "reserved": {"cpuMillicores": 2000, "memory": 4294967296},
       "capacity": {"cpuMillicores": 16000, "memory": 16106127360},
+      "cache": {
+        "local": {"requests": 120, "bytes": 10485760},
+        "remote": {"requests": 20, "bytes": 4194304},
+        "evictions": 3, "evicted": 1048576, "used": 8388608, "budget": 1073741824
+      },
       "paused": false,
       "launchTime": "2026-01-14T09:18:30.000Z",
       "phases": [
@@ -537,6 +551,14 @@ event: closed
 data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 ```
 
+Worker cache changes are carried in the same keyed, full-row upserts. In another stream at sequence 4813, a delta can replace both rows from the state example above:
+
+```sse
+event: delta
+id: 4814
+data: {"seq":4814,"base":4813,"updateTime":"2026-01-14T09:20:14.000Z","fleets":{"upsert":[{"name":"fleets/x86-64-spot","isa":"x86-64","sandbox":"bwrap","properties":{"capacity":"spot"},"instanceSize":{"vcpus":8,"memory":17179869184},"policy":{"min":2,"max":20,"idleTimeout":"600s","maxDrainWait":"1800s","bootGrace":"300s"},"desired":3,"launchFailure":{"reason":"capacity unavailable"},"instances":{"pending":1,"inService":1,"terminating":0,"warm":0},"workers":{"busy":0,"idle":1,"draining":0,"unconnected":0},"workerCache":{"reporting":1,"workers":1,"totals":{"local":{"requests":121,"bytes":10489856},"remote":{"requests":20,"bytes":4194304},"evictions":3,"evicted":1048576,"used":8388608,"budget":1073741824}},"demand":{"running":0,"queued":1,"candidates":1,"needed":2,"vcpus":2,"memory":4294967296,"readiness":"42.500s"}}]},"workers":{"upsert":[{"name":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b","fleet":"fleets/x86-64-spot","instance":"instances/i-0e1000000000000a","phase":"IDLE","phaseTime":"2026-01-14T09:20:04.000Z","running":0,"reserved":{"cpuMillicores":0,"memory":0},"capacity":{"cpuMillicores":16000,"memory":16106127360},"cache":{"local":{"requests":121,"bytes":10489856},"remote":{"requests":20,"bytes":4194304},"evictions":3,"evicted":1048576,"used":8388608,"budget":1073741824},"paused":false,"launchTime":"2026-01-14T09:18:30.000Z","phases":[{"phase":"BUSY","start":"2026-01-14T09:19:58.000Z"},{"phase":"IDLE","start":"2026-01-14T09:20:04.000Z"}]}]}}
+```
+
 ### Errors
 
 | Reason | When |
@@ -557,6 +579,8 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 - **Worker concurrency observation.** `workers[].slots` is optional observed worker metadata, not a scaling or admission input. It is omitted for an unlimited long-lived worker and is `1` for a single-use worker; older workers can report other values during rollout.
 - **Reservations.** A `Reservation` is `{cpuMillicores, memory}`: CPU is in millicores and memory is in bytes. Running and queued actions may carry `reservation`, their current fitted scheduler reservation; CPU is the debited `cpu_millicores`, not the ignored `cpu_count`, and memory is the current fitted property. They may also carry `learnedReservation` when either dimension of the initial pre-fit reservation exceeds the corresponding current reservation. Both dimensions come from the same initial snapshot of historical, cold-start or request sizing captured by the fitter, not raw p95 or peak values. The snapshot stays with the canonical action across retries.
 - **Worker reservations.** `reserved` and `capacity` are optional `Reservation` objects from the scheduler's worker ledger, not sums computed from the bounded action list. CPU capacity is the scheduler's aggregate vCPUs × 1000 × oversubscription; memory capacity is the registered physical ledger amount and can be below the advertised fleet nominal. Missing objects mean unknown or legacy data, not zero; present zero values are real zeros. Worker and action views have separate sampling times and need not agree at an instant. The same optional fields appear in stream snapshots, worker and running-action upserts, and queued-list replacements; no separate endpoint or stream protocol is needed.
+- **Worker cache.** A worker's optional `cache` is a NativeLink FastSlowStore snapshot: `local` and `remote` each contain cumulative `requests` and `bytes`; `evictions` and `evicted` are cumulative eviction count and bytes; `used` and `budget` are the fast filesystem store's current size and budget in bytes. These are store-layer observations, not network-derived metrics. Local reads include direct local file materialization and `get_part`. Remote reads are physical slow-store fetches: S3 in direct mode, or the controller in Local Mode. Concurrent deduplicated fetches count as one slow fetch; follower reads from the fast store count separately as local reads. NativeLink counts data-bearing partial reads and successful empty reads; bytes are those actually transferred at the store layer, including a full read-through fill rather than merely the requested range. Eviction counters are the raw native eviction-map counts and bytes for removals classified as evicted, including explicit removals; replacements are excluded.
+- **Fleet worker cache.** `fleets[].workerCache` has `reporting`, `workers`, and `totals`, the same shape as a worker `cache`. Totals sum only currently connected workers reporting cache data; `reporting` and `workers` expose coverage. An absent worker `cache`, including from an older worker, means unknown, not zero; present zeros are measurements. Counters live for the worker store's lifetime, without interval baselines. Fleet totals can fall on a worker restart or disconnect and are not durable cumulative farm totals. The same fields appear in state snapshots and keyed full-row fleet and worker upserts on the watch stream. They are distinct from the leader cache and client traffic below and do not attribute worker transfers to builds.
 - **Frames.** `Frame` is the type of each stream message, defined once in `gang-wire`:
 
   | Event | Data | Sent |
@@ -724,7 +748,7 @@ Pass the returned `nextPageToken` as `pageToken` with the same filter to request
 - **Transferred bytes.** `usage.cache.uploadedBytes` and `downloadedBytes` are client-sent and client-received cache-service message bytes attributed to the build; each mnemonic and `otherMnemonics` use the same shape. Calls lacking build metadata still count farm-wide but cannot be assigned to a build.
 - **Breakdowns.** Each `mnemonics` row holds the same usage shape; missing or excess mnemonics go into `otherMnemonics`. `missedTargets` uses Space-Saving: the true misses lie between `misses - overestimate` and `misses`. `slowest` is ordered by largest `span`, from `queueTime` to worker completion; its phase durations are action times.
 - **Timeline.** Buckets hold hit and miss counts and queued and executing action-time durations. Divide a duration by `step` for mean concurrency. As the timeline grows, adjacent buckets merge and `step` doubles, preserving totals.
-- **What the server cannot see.** Local and disk-cache hits and transfers, worker transfers, local-only actions except uploaded results, analysis time, Bazel job throttling, critical path and build success are not visible. A remote lookup hit whose outputs were evicted can be followed by an execution, so both may be counted; actions for which Bazel skips a remote lookup can execute without a lookup.
+- **What the build view cannot see.** Local and disk-cache hits and transfers, worker transfers per build, local-only actions except uploaded results, analysis time, Bazel job throttling, critical path and build success are not visible. State exposes worker store totals but does not attribute those transfers to individual builds. A remote lookup hit whose outputs were evicted can be followed by an execution, so both may be counted; actions for which Bazel skips a remote lookup can execute without a lookup.
 - Both GET routes accept the session cookie.
 
 ## principals

@@ -1014,6 +1014,7 @@ mod tests {
             max_inflight_actions: Some(nonzero_u32(16)),
             capacity: None,
             reserved: None,
+            cache: None,
             draining,
             paused: false,
             last_seen: Timestamp::default(),
