@@ -3507,7 +3507,9 @@ async fn post_supply_leadership_lapse_does_not_publish_observation_warning() -> 
         fail_supply: AtomicBool::new(false),
         observation_error: AtomicBool::new(true),
     };
-    fleet.inner.advance_on_supply(Arc::clone(&clock), Duration::from_secs(11));
+    fleet
+        .inner
+        .advance_on_supply(Arc::clone(&clock), Duration::from_secs(11));
     let scheduler = FakeScheduler::new()?;
     let repository = FakeRepository::default();
     let hub = hub();
@@ -3597,7 +3599,10 @@ async fn post_supply_scheduler_unavailable_does_not_publish_observation_warning(
     );
     let state = served(&hub);
     assert_eq!(state.pass.state, PassState::Skipped);
-    assert_eq!(state.pass.skip_reason, Some(SkipReason::SchedulerUnavailable));
+    assert_eq!(
+        state.pass.skip_reason,
+        Some(SkipReason::SchedulerUnavailable)
+    );
     assert_eq!(state.pass.error, None);
     assert!(scheduler.retain_drains_calls().is_empty());
     drop(guard);

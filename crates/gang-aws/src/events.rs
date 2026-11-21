@@ -1915,13 +1915,17 @@ mod tests {
                 .build()
         };
         let calls = || {
-            fake.state().requests.iter()
+            fake.state()
+                .requests
+                .iter()
                 .filter(|request| request.operation == "DescribeScalingActivities")
                 .count()
         };
         let mut out = Vec::new();
         events.observe_groups(&snapshot(1)).await;
-        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        events
+            .supply(FLEET, std::iter::once(FLEET), &mut out)
+            .await?;
         assert_eq!(out[0].id, "old");
         assert_eq!(calls(), 1);
 
@@ -1933,34 +1937,44 @@ mod tests {
             "ordinary launch",
         );
         events.observe_groups(&snapshot(2)).await;
-        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        events
+            .supply(FLEET, std::iter::once(FLEET), &mut out)
+            .await?;
         assert_eq!(calls(), 1);
         clock.advance(Duration::from_mins(1));
-        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        events
+            .supply(FLEET, std::iter::once(FLEET), &mut out)
+            .await?;
         assert_eq!(calls(), 2);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "old");
         assert!(events.activity_poll.lock().await.groups[FLEET].dirty);
 
-        gang_testkit::fence::with_held(async |held| {
-            events.acknowledge(held, FLEET, "old").await
-        }).await?;
-        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        gang_testkit::fence::with_held(async |held| events.acknowledge(held, FLEET, "old").await)
+            .await?;
+        events
+            .supply(FLEET, std::iter::once(FLEET), &mut out)
+            .await?;
         assert!(out.is_empty());
         assert_eq!(calls(), 2);
         clock.advance(Duration::from_mins(1));
-        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        events
+            .supply(FLEET, std::iter::once(FLEET), &mut out)
+            .await?;
         assert_eq!(calls(), 3);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "new");
         assert!(!events.activity_poll.lock().await.groups[FLEET].dirty);
-        gang_testkit::fence::with_held(async |held| {
-            events.acknowledge(held, FLEET, "new").await
-        }).await?;
-        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        gang_testkit::fence::with_held(async |held| events.acknowledge(held, FLEET, "new").await)
+            .await?;
+        events
+            .supply(FLEET, std::iter::once(FLEET), &mut out)
+            .await?;
         assert!(out.is_empty());
         clock.advance(Duration::from_mins(1));
-        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        events
+            .supply(FLEET, std::iter::once(FLEET), &mut out)
+            .await?;
         assert!(out.is_empty());
         assert_eq!(calls(), 3);
         Ok(())
@@ -1971,11 +1985,14 @@ mod tests {
         let (_fake, _clock, fleets) = replay_setup().await?;
         let events = fleets.events();
         let mut out = Vec::new();
-        events.supply(FLEET, std::iter::once(FLEET), &mut out).await?;
+        events
+            .supply(FLEET, std::iter::once(FLEET), &mut out)
+            .await?;
         assert_eq!(out.len(), 1);
         gang_testkit::fence::with_held(async |held| {
             events.acknowledge(held, FLEET, &out[0].id).await
-        }).await?;
+        })
+        .await?;
         assert!(!events.finish_activity_history(FLEET, &mut out, 0, true));
         assert!(out.is_empty());
         Ok(())
