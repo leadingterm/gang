@@ -228,6 +228,11 @@ run "direct_endpoint_without_load_balancer" {
   command = plan
 
   assert {
+    condition     = can(regex("(?s)\\[server\\.http2\\][^\\[]*max_connections = 4096\n", output.gang_toml))
+    error_message = "The direct endpoint must default to 4096 public listener connections."
+  }
+
+  assert {
     condition     = length(module.load_balancer) == 0
     error_message = "The direct endpoint must not create a load balancer."
   }
@@ -729,6 +734,26 @@ run "rejects_default_isa_outside_fleets" {
   expect_failures = [
     terraform_data.input_checks,
   ]
+}
+
+run "rejects_zero_http2_max_connections" {
+  command = plan
+
+  variables {
+    http2_max_connections = 0
+  }
+
+  expect_failures = [var.http2_max_connections]
+}
+
+run "rejects_fractional_http2_max_connections" {
+  command = plan
+
+  variables {
+    http2_max_connections = 1.5
+  }
+
+  expect_failures = [var.http2_max_connections]
 }
 
 run "rejects_bare_top_level_extra_config" {
