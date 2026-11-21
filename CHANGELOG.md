@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Fix startup on nominal 64 GiB workers whose measured memory, less reserve, is smaller than the fleet estimate; workers advertise their actual available action-pool capacity.
+
+### Upgrade notes
+
+- Remove `memory_per_instance` from every AWS deployment-module `fleets` entry. Prelaunch values are derived from the smallest nominal EC2 instance memory in each fleet. The generated internal `gang.toml` field remains a scheduler estimate, not an operator input to the AWS module.
+
 ## 0.3.4
 
 ### Added
