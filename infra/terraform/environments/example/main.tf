@@ -32,24 +32,24 @@ module "gang" {
 
   fleets = [
     {
-      name                        = "gang-worker-x86-64"
-      isa                         = "x86-64"
-      capacity                    = "spot"
-      instance_types              = ["m8id.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "61GiB"
-      disk_per_instance           = "200GiB"
+      name                = "gang-worker-x86-64"
+      isa                 = "x86-64"
+      capacity            = "spot"
+      instance_types      = ["m8id.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "61GiB"
+      disk_per_instance   = "200GiB"
     },
     {
-      name                        = "gang-worker-aarch64"
-      isa                         = "aarch64"
-      capacity                    = "spot"
-      instance_types              = ["m7gd.4xlarge"]
-      max_instances               = 4
-      vcpus_per_instance          = 15
-      memory_per_instance         = "61GiB"
-      disk_per_instance           = "200GiB"
+      name                = "gang-worker-aarch64"
+      isa                 = "aarch64"
+      capacity            = "spot"
+      instance_types      = ["m7gd.4xlarge"]
+      max_instances       = 4
+      vcpus_per_instance  = 15
+      memory_per_instance = "61GiB"
+      disk_per_instance   = "200GiB"
     },
     # Optional: a spot fleet with an on-demand twin. `fallback` adds the group <name>-on-demand, which takes
     # capacity while Spot is unavailable. Presence opts in; the values shown are the defaults.

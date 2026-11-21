@@ -1273,16 +1273,242 @@ mod tests {
         Ok(())
     }
 
-    /// The rendered worker budget, not its physical CPU count, limits fractional reservations.
-    #[tokio::test]
-    async fn rendered_workers_pack_fractional_cpu_until_a_resource_is_exhausted() -> TestResult {
-        use std::num::NonZeroU32;
+    struct PackingGate {
+        _notify: Arc<tokio::sync::Notify>,
+        _ready_rx: mpsc::Receiver<()>,
+    }
+
+    async fn packing_stack(
+        factor: u32,
+        memory: u64,
+        disk: u64,
+    ) -> TestResult<(
+        TestStack,
+        FleetProperties,
+        Arc<gang_config::ActionsConfig>,
+        PackingGate,
+    )> {
+        NOW.set(Duration::from_secs(1_000_000));
+        let properties = FleetProperties::new(
+            &FleetName::try_new("arm")?,
+            Isa::Aarch64,
+            &"docker",
+            &"host:test".parse()?,
+            Resources {
+                vcpus: 2,
+                memory: Bytes::new(memory),
+                disk: Bytes::new(disk),
+            },
+            &gang_types::FleetActionPolicy::default(),
+            Vec::<(&'static str, String)>::new(),
+        );
+        let fleets = FleetCatalog::try_new(vec![properties.clone()])?;
+        let mut actions = gang_config::ActionsConfig::default();
+        assert_eq!(actions.cold_start.cpu_millicores.get(), 250);
+        actions.cpu_oversubscription = std::num::NonZeroU32::new(factor).expect("nonzero factor");
+        actions.cold_start.memory = gang_config::WholeKib::from_units(64 * 1024);
+        actions.cold_start.disk = gang_config::WholeKib::from_units(1024 * 1024);
+        let actions = Arc::new(actions);
+        let (ready_tx, mut ready_rx) = mpsc::channel(1);
+        let (stack, notify) =
+            stack_with_actions(&fleets, &default_config(), Some(ready_tx), &actions)?;
+        notify.notify_one();
+        ready_rx
+            .recv()
+            .await
+            .expect("background matcher reached the gate");
+        Ok((
+            stack,
+            properties,
+            actions,
+            PackingGate {
+                _notify: notify,
+                _ready_rx: ready_rx,
+            },
+        ))
+    }
+
+    async fn register_packing_worker(
+        stack: &TestStack,
+        properties: FleetProperties,
+        actions: Arc<gang_config::ActionsConfig>,
+    ) -> TestResult<(WorkerId, mpsc::Receiver<UpdateForWorker>)> {
         use std::path::PathBuf;
 
         use gang_spi::{StoreAccess, WorkerSpec, WorkerTls};
         use gang_types::{InstanceId, WorkerLifetime};
         use nativelink_config::cas_server::WorkerProperty;
 
+        let store = RenderedStoreSpec(json!({ "memory": {} }));
+        let spec = WorkerSpec {
+            actions,
+            memory_pool: None,
+            instance: InstanceId::try_new("local-1")?,
+            properties,
+            lifetime: WorkerLifetime::LongLived,
+            work_directory: PathBuf::from("/var/gang/work"),
+            fast_cas_directory: PathBuf::from("/var/gang/cas"),
+            fast_cas_budget: Bytes::new(1024),
+            content_store: store.clone(),
+            action_store: store,
+            store_access: StoreAccess::Direct,
+            entrypoint: PathBuf::from("/usr/bin/gang"),
+        };
+        let rendered = settings::worker(
+            &default_config(),
+            &"grpc://127.0.0.1:9100".parse()?,
+            &spec,
+            WorkerTls::Plain,
+        )?
+        .worker;
+        assert_eq!(rendered.max_inflight_tasks, 0);
+        let pairs = rendered
+            .platform_properties
+            .iter()
+            .map(|(key, value)| match value {
+                WorkerProperty::Values(values) => {
+                    let [value] = values.as_slice() else {
+                        panic!("expected one static value for {key}");
+                    };
+                    (key.clone(), value.clone())
+                }
+                WorkerProperty::QueryCmd(_) => panic!("unexpected query property {key}"),
+            })
+            .collect();
+        let native_properties = stack
+            .workers
+            .get_platform_property_manager()
+            .make_platform_properties(pairs)?;
+        let worker_id = WorkerId("rendered-worker".to_owned());
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut worker = Worker::new(
+            worker_id.clone(),
+            native_properties,
+            tx,
+            NOW.get().as_secs(),
+            rendered.max_inflight_tasks,
+        );
+        worker.set_action_ceilings(&rendered.action_ceilings);
+        stack.workers.add_worker(worker).await?;
+        assert!(matches!(
+            rx.try_recv()
+                .expect("worker connection acknowledgement")
+                .update,
+            Some(update_for_worker::Update::ConnectionResult(_))
+        ));
+        Ok((worker_id, rx))
+    }
+
+    fn packing_action(index: u8) -> Arc<ActionInfo> {
+        let mut info = action(Isa::Aarch64, None);
+        let info_mut = Arc::get_mut(&mut info).expect("action is uniquely owned");
+        let digest = DigestInfo::new([index + 1; 32], 1);
+        info_mut.command_digest = digest;
+        info_mut.input_root_digest = digest;
+        info_mut.unique_qualifier = ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+            execution_scope: None,
+            instance_name: String::new(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest,
+        });
+        info
+    }
+
+    fn packing_start(rx: &mut mpsc::Receiver<UpdateForWorker>) -> StartExecute {
+        let start = match rx.try_recv().expect("action dispatch").update {
+            Some(update_for_worker::Update::StartAction(start)) => start,
+            update => panic!("expected StartAction, got {update:?}"),
+        };
+        assert!(
+            start
+                .platform
+                .as_ref()
+                .expect("dispatch platform")
+                .properties
+                .iter()
+                .any(|p| p.name == property::CPU_MILLICORES && p.value == "250")
+        );
+        start
+    }
+
+    async fn packing_case(factor: u32, memory: u64, disk: u64, dispatched: u8) -> TestResult {
+        let (stack, properties, actions, _gate) = packing_stack(factor, memory, disk).await?;
+        let (worker_id, mut rx) = register_packing_worker(&stack, properties, actions).await?;
+        let mut subscriptions = Vec::new();
+        let mut starts = Vec::new();
+        for index in 0..=dispatched {
+            let client = OperationId::from(format!("packing-client-{index}").as_str());
+            subscriptions.push(
+                stack
+                    .actions
+                    .add_action(client.clone(), packing_action(index))
+                    .await?,
+            );
+            stack.simple.do_try_match_for_test().await?;
+            if index == dispatched {
+                assert_eq!(
+                    stage_of(stack.actions.as_ref(), &client).await?,
+                    Some(ActionStage::Queued)
+                );
+                assert!(matches!(
+                    rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+            } else {
+                starts.push(packing_start(&mut rx));
+            }
+        }
+        let snapshot = stack.workers.worker_snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].running_actions, u32::from(dispatched));
+        assert_eq!(snapshot[0].max_inflight_tasks, 0);
+        let remaining = snapshot[0]
+            .available_platform_properties
+            .get(property::CPU_MILLICORES)
+            .expect("CPU ledger")
+            .parse::<u64>()?;
+        if dispatched > 1 {
+            assert!(snapshot[0].running_actions > 2);
+            assert_eq!(remaining, 0);
+        } else {
+            assert!(remaining > 0);
+            let (limited, expected) = if memory == 96 << 20 {
+                (property::MEMORY_KB, "32768")
+            } else {
+                (property::DISK_KB, "0")
+            };
+            assert_eq!(
+                snapshot[0]
+                    .available_platform_properties
+                    .get(limited)
+                    .map(String::as_str),
+                Some(expected)
+            );
+        }
+        let operation_id = OperationId::from(starts[0].operation_id.as_str());
+        stack
+            .workers
+            .update_action(
+                &worker_id,
+                &operation_id,
+                UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                    ActionResult::default(),
+                )),
+            )
+            .await?;
+        stack.simple.do_try_match_for_test().await?;
+        packing_start(&mut rx);
+        let queued_client = OperationId::from(format!("packing-client-{dispatched}").as_str());
+        assert_eq!(
+            stage_of(stack.actions.as_ref(), &queued_client).await?,
+            Some(ActionStage::Executing)
+        );
+        Ok(())
+    }
+
+    /// The rendered worker budget, not its physical CPU count, limits fractional reservations.
+    #[tokio::test]
+    async fn rendered_workers_pack_fractional_cpu_until_a_resource_is_exhausted() -> TestResult {
         // The last two cases cannot fit another memory or disk reservation, despite spare CPU.
         for (factor, memory, disk, dispatched) in [
             (1, 8 << 30, 100 << 30, 8_u8),
@@ -1290,197 +1516,7 @@ mod tests {
             (2, 96 << 20, 100 << 30, 1),
             (2, 8 << 30, 1 << 30, 1),
         ] {
-            NOW.set(Duration::from_secs(1_000_000));
-            let properties = FleetProperties::new(
-                &FleetName::try_new("arm")?,
-                Isa::Aarch64,
-                &"docker",
-                &"host:test".parse()?,
-                Resources {
-                    vcpus: 2,
-                    memory: Bytes::new(memory),
-                    disk: Bytes::new(disk),
-                },
-                &gang_types::FleetActionPolicy::default(),
-                Vec::<(&'static str, String)>::new(),
-            );
-            let fleets = FleetCatalog::try_new(vec![properties.clone()])?;
-            let mut actions = gang_config::ActionsConfig::default();
-            assert_eq!(actions.cold_start.cpu_millicores.get(), 250);
-            actions.cpu_oversubscription = NonZeroU32::new(factor).expect("nonzero factor");
-            actions.cold_start.memory = gang_config::WholeKib::from_units(64 * 1024);
-            actions.cold_start.disk = gang_config::WholeKib::from_units(1024 * 1024);
-            let actions = Arc::new(actions);
-            let (ready_tx, mut ready_rx) = mpsc::channel(1);
-            let (stack, notify) =
-                stack_with_actions(&fleets, &default_config(), Some(ready_tx), &actions)?;
-            notify.notify_one();
-            ready_rx
-                .recv()
-                .await
-                .expect("background matcher reached the gate");
-
-            let store = RenderedStoreSpec(json!({ "memory": {} }));
-            let spec = WorkerSpec {
-                actions: Arc::clone(&actions),
-                memory_pool: None,
-                instance: InstanceId::try_new("local-1")?,
-                properties,
-                lifetime: WorkerLifetime::LongLived,
-                work_directory: PathBuf::from("/var/gang/work"),
-                fast_cas_directory: PathBuf::from("/var/gang/cas"),
-                fast_cas_budget: Bytes::new(1024),
-                content_store: store.clone(),
-                action_store: store,
-                store_access: StoreAccess::Direct,
-                entrypoint: PathBuf::from("/usr/bin/gang"),
-            };
-            let rendered = settings::worker(
-                &default_config(),
-                &"grpc://127.0.0.1:9100".parse()?,
-                &spec,
-                WorkerTls::Plain,
-            )?
-            .worker;
-            assert_eq!(rendered.max_inflight_tasks, 0);
-            let pairs = rendered
-                .platform_properties
-                .iter()
-                .map(|(key, value)| match value {
-                    WorkerProperty::Values(values) => {
-                        let [value] = values.as_slice() else {
-                            panic!("expected one static value for {key}");
-                        };
-                        (key.clone(), value.clone())
-                    }
-                    WorkerProperty::QueryCmd(_) => panic!("unexpected query property {key}"),
-                })
-                .collect();
-            let native_properties = stack
-                .workers
-                .get_platform_property_manager()
-                .make_platform_properties(pairs)?;
-            let worker_id = WorkerId("rendered-worker".to_owned());
-            let (tx, mut rx) = mpsc::channel(64);
-            let mut worker = Worker::new(
-                worker_id.clone(),
-                native_properties,
-                tx,
-                NOW.get().as_secs(),
-                rendered.max_inflight_tasks,
-            );
-            worker.set_action_ceilings(&rendered.action_ceilings);
-            stack.workers.add_worker(worker).await?;
-            assert!(matches!(
-                rx.try_recv()
-                    .expect("worker connection acknowledgement")
-                    .update,
-                Some(update_for_worker::Update::ConnectionResult(_))
-            ));
-
-            let mut subscriptions = Vec::new();
-            let mut starts = Vec::new();
-            for index in 0..=dispatched {
-                let mut info = action(Isa::Aarch64, None);
-                {
-                    let info = Arc::get_mut(&mut info).expect("action is uniquely owned");
-                    let digest = DigestInfo::new([index + 1; 32], 1);
-                    info.command_digest = digest;
-                    info.input_root_digest = digest;
-                    info.unique_qualifier = ActionUniqueQualifier::Cacheable(ActionUniqueKey {
-                        execution_scope: None,
-                        instance_name: String::new(),
-                        digest_function: DigestHasherFunc::Sha256,
-                        digest,
-                    });
-                }
-                let client = OperationId::from(format!("packing-client-{index}").as_str());
-                subscriptions.push(stack.actions.add_action(client.clone(), info).await?);
-                stack.simple.do_try_match_for_test().await?;
-                if index == dispatched {
-                    assert_eq!(
-                        stage_of(stack.actions.as_ref(), &client).await?,
-                        Some(ActionStage::Queued)
-                    );
-                    assert!(matches!(
-                        rx.try_recv(),
-                        Err(mpsc::error::TryRecvError::Empty)
-                    ));
-                } else {
-                    let start = match rx.try_recv().expect("action dispatch").update {
-                        Some(update_for_worker::Update::StartAction(start)) => start,
-                        update => panic!("expected StartAction, got {update:?}"),
-                    };
-                    assert!(
-                        start
-                            .platform
-                            .as_ref()
-                            .expect("dispatch platform")
-                            .properties
-                            .iter()
-                            .any(|p| p.name == property::CPU_MILLICORES && p.value == "250")
-                    );
-                    starts.push(start);
-                }
-            }
-            let snapshot = stack.workers.worker_snapshot().await;
-            assert_eq!(snapshot.len(), 1);
-            assert_eq!(snapshot[0].running_actions, u32::from(dispatched));
-            assert_eq!(snapshot[0].max_inflight_tasks, 0);
-            let remaining = snapshot[0]
-                .available_platform_properties
-                .get(property::CPU_MILLICORES)
-                .expect("CPU ledger")
-                .parse::<u64>()?;
-            if dispatched > 1 {
-                assert!(snapshot[0].running_actions > 2);
-                assert_eq!(remaining, 0);
-            } else {
-                assert!(remaining > 0);
-                let (limited, expected) = if memory == 96 << 20 {
-                    (property::MEMORY_KB, "32768")
-                } else {
-                    (property::DISK_KB, "0")
-                };
-                assert_eq!(
-                    snapshot[0]
-                        .available_platform_properties
-                        .get(limited)
-                        .map(String::as_str),
-                    Some(expected)
-                );
-            }
-
-            let operation_id = OperationId::from(starts[0].operation_id.as_str());
-            stack
-                .workers
-                .update_action(
-                    &worker_id,
-                    &operation_id,
-                    UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
-                        ActionResult::default(),
-                    )),
-                )
-                .await?;
-            stack.simple.do_try_match_for_test().await?;
-            let queued_start = match rx.try_recv().expect("queued action dispatch").update {
-                Some(update_for_worker::Update::StartAction(start)) => start,
-                update => panic!("expected StartAction, got {update:?}"),
-            };
-            assert!(
-                queued_start
-                    .platform
-                    .as_ref()
-                    .expect("dispatch platform")
-                    .properties
-                    .iter()
-                    .any(|p| p.name == property::CPU_MILLICORES && p.value == "250")
-            );
-            let queued_client = OperationId::from(format!("packing-client-{dispatched}").as_str());
-            assert_eq!(
-                stage_of(stack.actions.as_ref(), &queued_client).await?,
-                Some(ActionStage::Executing)
-            );
+            packing_case(factor, memory, disk, dispatched).await?;
         }
         Ok(())
     }

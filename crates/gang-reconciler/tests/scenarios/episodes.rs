@@ -159,10 +159,13 @@ fn dispatch(
                 let running = jobs.iter().filter(|job| job.instance == name).count();
                 let count = running as u128 + 1;
                 let policy = &h.passes[X86].policy;
-                (count * u128::from(resources.cpu_millicores) <= u128::from(policy.vcpus_per_instance.get()) * 1000
-                    && count * u128::from(resources.memory.get()) <= u128::from(policy.memory_per_instance.get().get())
-                    && count * u128::from(resources.disk.get()) <= u128::from(policy.disk_per_instance.get().get()))
-                    .then_some((running, worker.id.as_str(), name))
+                (count * u128::from(resources.cpu_millicores)
+                    <= u128::from(policy.vcpus_per_instance.get()) * 1000
+                    && count * u128::from(resources.memory.get())
+                        <= u128::from(policy.memory_per_instance.get().get())
+                    && count * u128::from(resources.disk.get())
+                        <= u128::from(policy.disk_per_instance.get().get()))
+                .then_some((running, worker.id.as_str(), name))
             })
             .min_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         let Some((_, _, name)) = candidate else {
@@ -380,8 +383,12 @@ fn modeled_episode(name: &str) -> TestResult {
             assert_eq!(after.completed, u64::from(episode.modeled.concurrency));
         }
         "spread" => {
-            let cpu = f64::from(episode.modeled.concurrency) * episode.modeled.cpu_millicores as f64 / 1000.0;
-            let memory = f64::from(episode.modeled.concurrency) * episode.modeled.memory_bytes as f64 / (32.0 * 1024.0 * 1024.0 * 1024.0);
+            let cpu = f64::from(episode.modeled.concurrency)
+                * episode.modeled.cpu_millicores as f64
+                / 1000.0;
+            let memory = f64::from(episode.modeled.concurrency)
+                * episode.modeled.memory_bytes as f64
+                / (32.0 * 1024.0 * 1024.0 * 1024.0);
             let kept = (cpu.max(memory * 16.0) / (16.0 * 0.7)).ceil() as u32;
             assert!(
                 after.utilization_cordons > 0,
@@ -395,8 +402,14 @@ fn modeled_episode(name: &str) -> TestResult {
         "sustained" => {
             assert_eq!(episode.modeled.concurrency, 96);
             assert_eq!(episode.modeled.duration_ms, 30_000);
-            assert_eq!(after.peak, 6, "queued CPU reservations reach the fleet maximum");
-            assert_eq!(after.late_instances, 6, "sustained resource demand keeps capacity");
+            assert_eq!(
+                after.peak, 6,
+                "queued CPU reservations reach the fleet maximum"
+            );
+            assert_eq!(
+                after.late_instances, 6,
+                "sustained resource demand keeps capacity"
+            );
             assert!(
                 after.completed > u64::from(episode.modeled.concurrency),
                 "multiple closed-loop waves must finish"

@@ -757,9 +757,6 @@ fn render_identity(document: &mut Document<Plugins>, knobs: IdentityKnobs) -> Re
 
 /// Applies control-loop tuning to the configuration.
 fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Result<()> {
-    if let Some(factor) = knobs.cpu_oversubscription {
-        document.actions.cpu_oversubscription = factor;
-    }
     if let Some(interval) = knobs.poll_interval {
         document.poll_interval = NonZeroDuration::try_new(interval).map_err(template_error)?;
     }
@@ -844,22 +841,7 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
             ];
         }
     }
-    if knobs.cold_start_full_fleet_cpu {
-        let vcpus = document
-            .fleets
-            .first()
-            .ok_or_else(|| template_error("missing the first [[fleets]] entry"))?
-            .vcpus_per_instance
-            .get();
-        let millicores = u64::from(vcpus)
-            .saturating_mul(gang_types::property::MILLICORES_PER_CORE);
-        let millicores = u32::try_from(millicores)
-            .ok()
-            .and_then(NonZeroU32::new)
-            .ok_or_else(|| template_error("first fleet CPU reservation overflows millicores"))?;
-        document.actions.cold_start.enabled = true;
-        document.actions.cold_start.cpu_millicores = millicores;
-    }
+    render_control_cpu(document, knobs)?;
     if let Some(grace) = knobs.terminate_grace {
         let ProvisionerConfig::Local(local) = &mut document.provisioner else {
             return Err(template_error("missing [provisioner.local]"));
@@ -869,6 +851,28 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
     if let Some(interval) = knobs.detail_interval {
         document.dashboard.detail_interval =
             NonZeroDuration::try_new(interval).map_err(template_error)?;
+    }
+    Ok(())
+}
+
+fn render_control_cpu(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Result<()> {
+    if let Some(factor) = knobs.cpu_oversubscription {
+        document.actions.cpu_oversubscription = factor;
+    }
+    if knobs.cold_start_full_fleet_cpu {
+        let vcpus = document
+            .fleets
+            .first()
+            .ok_or_else(|| template_error("missing the first [[fleets]] entry"))?
+            .vcpus_per_instance
+            .get();
+        let millicores = u64::from(vcpus).saturating_mul(gang_types::property::MILLICORES_PER_CORE);
+        let millicores = u32::try_from(millicores)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| template_error("first fleet CPU reservation overflows millicores"))?;
+        document.actions.cold_start.enabled = true;
+        document.actions.cold_start.cpu_millicores = millicores;
     }
     Ok(())
 }

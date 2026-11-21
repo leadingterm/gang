@@ -45,8 +45,7 @@ fn accessors_report_queued_resources_and_running_actions() {
 }
 
 #[test]
-fn zero_resource_actions_share_one_instance()
--> Result<(), Box<dyn std::error::Error>> {
+fn zero_resource_actions_share_one_instance() -> Result<(), Box<dyn std::error::Error>> {
     let mut demand = Demand::default();
     for _ in 0..17 {
         demand.add_queued(ActionResources::default());
@@ -88,8 +87,7 @@ fn vcpus_dominate_other_resources() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn memory_dominates_vcpus()
--> Result<(), Box<dyn std::error::Error>> {
+fn memory_dominates_vcpus() -> Result<(), Box<dyn std::error::Error>> {
     let mut demand = Demand::default();
     demand.add_queued(resources(1000, Bytes::gib(30)));
 
