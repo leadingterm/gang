@@ -27,6 +27,7 @@
 - **v0.3.4:** Fund the held leader-failover fixture's additional worker with a scenario-local unknown-action duration, without changing its jobs or production defaults.
 - **v0.3.4:** Give the cold-burst fixture a payback horizon that accounts for its minimum disk reservation while retaining the default unknown-action prior.
 - **v0.3.4:** Restore the declared action-environment-probe input and controlled action-local IPC for fresh database-partition probes.
+- **v0.3.4:** Report both held and returning-wave build outcomes in utilization scenario failures instead of discarding their captured output.
 - **v0.3.4:** Declare rate probes explicitly so the checked-in sample passes harness validation.
 - **v0.3.4:** Credit pending and reliable requested capacity without repeatedly raising desired size; keep transient credential-refresh gaps separate from serving surplus and preserve failed-request withdrawal.
 - **v0.3.4:** Keep controller cordons across reconnects and overlapping worker generations within the live engine; do not adopt worker self-drain flags as controller intent. Reset N−1 dwell after skipped passes and keep repeated cordon reinforcement out of audit history.

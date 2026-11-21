@@ -431,6 +431,20 @@ pub fn utilization_checks(events: &[Event], max_cordons: usize, success: bool) -
     ]
 }
 
+fn utilization_build_check(outcome: &crate::BuildOutcome, second: &crate::BuildOutcome) -> Check {
+    Check::expect(
+        names::UTILIZATION_BUILD,
+        outcome.succeeded() && second.succeeded(),
+        || {
+            format!(
+                "held build: {}; returning build: {}",
+                outcome.exit_summary(),
+                second.exit_summary()
+            )
+        },
+    )
+}
+
 /// Distributed light load drains three workers to one; held and returning-wave builds finish.
 ///
 /// # Errors
@@ -524,7 +538,9 @@ pub fn utilization_scale_in(system: &Secured<'_>) -> Result<Vec<Check>> {
         let second = joined(second);
         hold.disarm();
         observed?;
-        let success = outcome?.succeeded() && second?.succeeded();
+        let outcome = outcome?;
+        let second = second?;
+        let success = outcome.succeeded() && second.succeeded();
         wait(stack, "builds finish on the surviving worker", |state| {
             Ok(running(state) == 0
                 && survivor
@@ -532,6 +548,7 @@ pub fn utilization_scale_in(system: &Secured<'_>) -> Result<Vec<Check>> {
                     .is_some_and(|instance| lone_survivor(state) == Some(instance)))
         })?;
         let mut checks = utilization_checks(&after(stack, since)?, max_cordons, success);
+        checks[2] = utilization_build_check(&outcome, &second);
         checks.push(Check::expect(
             names::LIGHT_LOAD_SPREAD,
             keep.len() == 3,
@@ -622,6 +639,24 @@ mod tests {
                 .iter()
                 .all(Check::is_failure)
         );
+    }
+
+    #[test]
+    fn utilization_build_failure_reports_both_outcomes() {
+        for (held_code, returning_code) in [(1, 0), (0, 2)] {
+            let held = crate::BuildOutcome::new(Some(held_code), "held output".to_owned());
+            let returning =
+                crate::BuildOutcome::new(Some(returning_code), "returning output".to_owned());
+            let check = utilization_build_check(&held, &returning);
+            assert_eq!(
+                check.outcome,
+                crate::check::Outcome::Failed(format!(
+                    "held build: the build exited with Some({held_code}): held output; returning build: the build exited with Some({returning_code}): returning output"
+                ))
+            );
+        }
+        let success = crate::BuildOutcome::new(Some(0), String::new());
+        assert!(utilization_build_check(&success, &success).is_passed());
     }
 
     #[test]
