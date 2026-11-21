@@ -149,12 +149,12 @@ const Readouts = ({ state }: { state: State }) => {
             {known && queue.unplaceable > 0 && <span class="caution">{queue.unplaceable} unplaceable</span>}
           </>
         }
-        chart={<ChartFrame size="spark"><Spark values={queuedSeries(state.recent)} label="Queued" recent={state.recent} scheduler /></ChartFrame>}
+        chart={<ChartFrame size="spark"><Spark values={queuedSeries(state.recent, known ? queue.total : null)} label="Queued" recent={state.recent} scheduler /></ChartFrame>}
       />
       <Tile
         label="Executing"
         value={known ? <Num value={running} /> : "unknown"}
-        chart={<ChartFrame size="spark"><Spark values={runningSeries(state.recent)} label="Executing" recent={state.recent} scheduler /></ChartFrame>}
+        chart={<ChartFrame size="spark"><Spark values={runningSeries(state.recent, known ? running : null)} label="Executing" recent={state.recent} scheduler /></ChartFrame>}
       />
       <Tile
         label="Instances"
@@ -172,8 +172,8 @@ const Readouts = ({ state }: { state: State }) => {
         label="Action cache"
         value={cache.rate === null ? <span class="cache-rate__empty">no lookups</span> : <span class="cache-rate">{Math.round(cache.rate * 100)}%{" "}<span class="cache-rate__of">of {cache.lookups} lookups</span></span>}
         meter={known && cas && <Meter g={cas.budgetBytes > 0 ? cas.usedBytes / cas.budgetBytes : 0} label={`CAS ${percent(cas.usedBytes, cas.budgetBytes)} of budget`} />}
-        caption={<><span>hit rate · <Duration ms={windowMs(state.recent)} /></span><span>{traffic ? `↓ ${bytes(traffic.downloaded)} · ↑ ${bytes(traffic.uploaded)}` : "—"}</span></>}
-        chart={<ChartFrame size="spark"><Spark values={cache.hitsPerStep} areaValues={cache.lookupsPerStep} label="Action-cache lookups as area and hits as line per step" recent={state.recent} /></ChartFrame>}
+        caption={<><span>hit rate · <Duration ms={windowMs(state.recent)} /> · chart: complete steps</span><span>{traffic ? `↓ ${bytes(traffic.downloaded)} · ↑ ${bytes(traffic.uploaded)}` : "—"}</span></>}
+        chart={<ChartFrame size="spark"><Spark values={cache.hitsPerStep} areaValues={cache.lookupsPerStep} label="Action-cache lookups as area and hits as line per complete step" recent={state.recent} /></ChartFrame>}
       />
       </Tiles>
     </section>
@@ -206,11 +206,11 @@ const Cache = ({ state }: { state: State }) => {
       )}
       {!stores.length && !bucket && <p>Bucket size not measured yet; S3 reports once a day.</p>}
       <Columns>
-        <ChartFrame size="spark" title="Transferred per step" legend={<p class="cache-sparks__legend"><span>↓ Downloaded</span><span>↑ Uploaded</span></p>}>
-          <Spark values={bytesSeries(state.recent, "downloadedBytes")} secondary={bytesSeries(state.recent, "uploadedBytes")} label="Transferred per step" recent={state.recent} />
+        <ChartFrame size="spark" title="Transferred per complete step" legend={<p class="cache-sparks__legend"><span>↓ Downloaded</span><span>↑ Uploaded</span></p>}>
+          <Spark values={bytesSeries(state.recent, "downloadedBytes")} secondary={bytesSeries(state.recent, "uploadedBytes")} label="Transferred per complete step" recent={state.recent} />
         </ChartFrame>
-        <ChartFrame size="spark" title="Evicted per step">
-          <Spark values={evictedSeries(state.recent)} label="Evicted per step" recent={state.recent} scheduler />
+        <ChartFrame size="spark" title="Evicted per complete step">
+          <Spark values={evictedSeries(state.recent)} label="Evicted per complete step" recent={state.recent} scheduler />
         </ChartFrame>
       </Columns>
     </Section>
@@ -287,9 +287,11 @@ const FleetRow = ({ f, ordinal, events, census, known, recent }: { f: Fleet; ord
 const PassBar = ({ state }: { state: State }) => {
   const bars = passBars(state.recent);
   const skipped = bars.filter((b) => b === "skipped").length;
+  const complete = bars.filter((b) => b !== "unrecorded" && b !== "partial").length;
+  const current = bars.includes("partial") ? "current step in progress" : "no current step recorded";
   return (
     <>
-      <div class="passbar" role="img" aria-label={`${skipped} of the last ${bars.length} steps had a skipped pass`}>
+      <div class="passbar" role="img" aria-label={`${skipped} of ${complete} recorded complete steps had a skipped pass; ${current}`}>
         {bars.map((b, i) => (
           <i key={i} class={b === "ok" ? undefined : `is-${b}`} />
         ))}

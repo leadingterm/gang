@@ -109,7 +109,7 @@ const probe = async (scenario) => {
     if (chart && chartSvgs.length !== (name === "Instances" ? 0 : 1)) add(`${name}: expected ${name === "Instances" ? 0 : 1} chart SVGs, got ${chartSvgs.length}`);
     if (name === "Action cache" && chartSvgs.length === 1) {
       const svg = chartSvgs[0];
-      if (svg.getAttribute("aria-label") !== "Action-cache lookups as area and hits as line per step") add("Action cache: incorrect chart label");
+      if (svg.getAttribute("aria-label") !== "Action-cache lookups as area and hits as line per complete step") add("Action cache: incorrect chart label");
       if (scenario === "isolated") {
         const runs = [...svg.querySelectorAll("path.spark__run")];
         const areas = [...svg.querySelectorAll("path.spark__area")];
@@ -126,7 +126,7 @@ const probe = async (scenario) => {
           };
           const hits = vertices(run);
           const lookups = vertices(area);
-          if (hits.length < 2 || lookups.length < hits.length + 2) add("Action cache: missing hit or lookup vertices");
+          if (hits.length !== 2 || lookups.length !== 4) add(`Action cache: expected two complete hit vertices and four area vertices, got ${hits.length} and ${lookups.length}`);
           for (let i = 0; i < Math.min(hits.length, lookups.length); i++) {
             if (!equal(hits[i].x, lookups[i].x) || hits[i].y < lookups[i].y - EPS) add(`Action cache: hit vertex ${i} is not aligned below its lookup vertex`);
           }
@@ -261,7 +261,7 @@ const probe = async (scenario) => {
     const svgs = row.flatMap((tile) => tile.svgs.map((svg) => ({ name: tile.name, top: svg.top })));
     if (svgs.length && svgs.some((svg) => !equal(svg.top, svgs[0].top))) add(`row SVG tops differ: ${svgs.map((svg) => `${svg.name}=${svg.top}`).join(", ")}`);
   }
-  const charts = ["Transferred per step", "Evicted per step"].map((label) => {
+  const charts = ["Transferred per complete step", "Evicted per complete step"].map((label) => {
     const svg = document.querySelector(`svg[aria-label="${label}"]`);
     if (!svg) { add(`Cache: missing ${label} SVG`); return null; }
     const frame = svg.closest(".chart-frame");
@@ -381,6 +381,179 @@ test("overview tile geometry", { timeout: 120000 }, async () => {
       }
     }
     assert.deepEqual(violations, []);
+  } finally {
+    if (browser) await browser.close();
+    server.closeAllConnections();
+    if (server.listening) await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    rmSync(profile, { recursive: true, force: true });
+  }
+});
+
+// Drive the real EventSource one frame at a time: no replay clock or synthetic DOM updates.
+test("overview charts slide only completed counter steps", { timeout: 120000 }, async (t) => {
+  const server = previewServer({ dist: "dist", replay: "instant" });
+  const handler = server.listeners("request")[0];
+  server.removeListener("request", handler);
+  let acceptStream;
+  server.on("request", (req, res) => {
+    if (new URL(req.url, "http://preview").pathname !== "/v1/state:watch") return handler(req, res);
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+    res.flushHeaders();
+    acceptStream(res);
+  });
+  const profile = mkdtempSync(join(process.env.TEST_TMPDIR ?? tmpdir(), "overview-slide-chromium-"));
+  let browser;
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    browser = await launch(join(process.env.JS_BINARY__RUNFILES, process.env.CHROMIUM), { profile });
+    const page = await browser.newPage();
+    const wait = async (operation) => {
+      let onAbort;
+      const aborted = new Promise((_, reject) => {
+        onAbort = () => reject(t.signal.reason ?? new Error("slide test aborted"));
+        if (t.signal.aborted) onAbort();
+        else t.signal.addEventListener("abort", onAbort, { once: true });
+      });
+      try { return await Promise.race([operation, browser.closed, aborted]); }
+      finally { t.signal.removeEventListener("abort", onAbort); }
+    };
+    const errors = [];
+    page.on("Runtime.exceptionThrown", (event) => errors.push(event.exceptionDetails.text));
+    page.on("Runtime.consoleAPICalled", (event) => {
+      if (event.type === "error") errors.push(event.args.map((arg) => arg.value ?? arg.description).join(" "));
+    });
+    await page.send("Page.enable");
+    await page.send("Network.enable");
+    await page.send("Runtime.enable");
+    await page.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
+    const fixtureNow = load("live").at(-1).at;
+    await page.send("Page.addScriptToEvaluateOnNewDocument", { source: `{ const offset = ${fixtureNow} - Date.now(); const now = Date.now.bind(Date); Date.now = () => now() + offset; }` });
+    const snapshot = structuredClone(load("isolated")[0].event.data);
+    snapshot.schedulerKnown = true;
+    snapshot.queue.total = 7;
+    snapshot.fleets[0].demand.running = 7;
+    const fleet = snapshot.fleets[0];
+    const baseTime = Date.parse(snapshot.recent.samples[0].start);
+    const sample = (index, values = {}) => ({
+      start: new Date(baseTime + index * 10000).toISOString(),
+      completed: 0, running: 0, queued: 0, passes: 1, skipped: 0,
+      lookups: 0, hits: 0, uploadedBytes: 0, downloadedBytes: 0, evictedBytes: 0,
+      ...values,
+    });
+    const observedFleet = { name: fleet.name, instances: { pending: 1, inService: 2, terminating: 0, warm: 0 }, desired: 3, max: 24 };
+    const first = sample(0, { completed: 2, running: 2, queued: 2, lookups: 10, hits: 5, uploadedBytes: 20, downloadedBytes: 30, evictedBytes: 10 });
+    const zero = sample(1);
+    const newZero = sample(2, { schedulerKnown: false });
+    const filled = sample(2, { completed: 4, lookups: 12, hits: 6, uploadedBytes: 40, downloadedBytes: 60, evictedBytes: 20, skipped: 1, schedulerKnown: true, fleets: [observedFleet] });
+    const next = sample(3);
+    snapshot.recent = { window: "40s", step: "10s", samples: [first, zero] };
+    const labels = ["Action-cache lookups as area and hits as line per complete step", "Transferred per complete step", "Evicted per complete step", "Done per minute"];
+    const inspect = async (expected) => {
+      const result = await wait(page.send("Runtime.evaluate", {
+        expression: `(async () => {
+          const expected = ${JSON.stringify(expected)};
+          const ready = () => document.querySelector(".passbar")?.getAttribute("aria-label")?.includes(expected.pass) &&
+            document.querySelector(".cache-rate__of")?.textContent.includes(expected.lookups);
+          if (!ready()) await new Promise(resolve => {
+            const observer = new MutationObserver(() => { if (ready()) { observer.disconnect(); resolve(); } });
+            observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true });
+            if (ready()) { observer.disconnect(); resolve(); }
+          });
+          await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+          const labels = ${JSON.stringify(labels)};
+          const vertices = (path) => [...(path?.getAttribute("d") ?? "").matchAll(/[ML]\\s*(-?(?:\\d+\\.?\\d*|\\.\\d+))[\\s,]+(-?(?:\\d+\\.?\\d*|\\.\\d+))/g)].map(m => [Number(m[1]), Number(m[2])]);
+          const charts = labels.map(label => {
+            const svg = document.querySelector('svg[aria-label="' + label + '"]');
+            if (!svg) throw new Error("missing chart " + label);
+            return [...svg.querySelectorAll("path.spark__run, path.spark__area")].map(vertices);
+          });
+          const gauge = (label) => {
+            const svg = document.querySelector('svg[aria-label="' + label + '"]');
+            if (!svg) throw new Error("missing gauge " + label);
+            return [...vertices(svg.querySelector("path.spark__run")), ...[...svg.querySelectorAll("circle.spark__point")].map(c => [Number(c.getAttribute("cx")), Number(c.getAttribute("cy"))])];
+          };
+          const fleet = [...document.querySelectorAll("svg[aria-label^='Instance history for ']")].find(svg => svg.getAttribute("aria-label").includes(${JSON.stringify(fleet.name)}));
+          if (!fleet) throw new Error("missing fleet history");
+          return { charts, queued: gauge("Queued"), executing: gauge("Executing"),
+            partial: document.querySelector(".passbar > i:last-child")?.className,
+            passLabel: document.querySelector(".passbar")?.getAttribute("aria-label"),
+            fleetLabel: fleet.getAttribute("aria-label"),
+            fleetPoints: vertices(fleet.querySelector('[data-series="inService"]')),
+            fleetUnknown: fleet.querySelectorAll(".spark__unknown").length,
+            overflow: document.documentElement.scrollWidth > innerWidth };
+        })()`, awaitPromise: true, returnByValue: true,
+      }));
+      if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+      return result.result.value;
+    };
+    const assertCharts = (state, expectedMax) => {
+      for (const [index, paths] of state.charts.entries()) {
+        assert.ok(paths.length > 0, labels[index]);
+        for (const vertices of paths) {
+          assert.ok(vertices.length > 0, `${labels[index]} has vertices`);
+          assert.ok(Math.max(...vertices.map(([x]) => x)) < 298, `${labels[index]} excludes current slot`);
+          assert.ok(Math.abs(Math.max(...vertices.map(([x]) => x)) - expectedMax) < 0.1, `${labels[index]} keeps slot positions`);
+        }
+      }
+      for (const [name, points] of [["Queued", state.queued], ["Executing", state.executing]]) {
+        assert.ok(points.some(([x, y]) => x === 298 && y < 42), `${name} shows the nonzero live value`);
+      }
+      assert.equal(state.partial, "is-partial");
+      assert.equal(state.overflow, false);
+    };
+    for (const width of [390, 1516]) {
+      await page.send("Network.clearBrowserCookies");
+      await page.send("Emulation.setDeviceMetricsOverride", { width, height: 1000, deviceScaleFactor: 1, mobile: false });
+      const connected = new Promise((resolve) => { acceptStream = resolve; });
+      const loaded = page.once("Page.loadEventFired");
+      await wait(page.send("Page.navigate", { url: `http://127.0.0.1:${server.address().port}/ui/` }));
+      await wait(loaded);
+      const stream = await wait(connected);
+      const send = async (event, data, expected) => {
+        const received = page.once("Network.eventSourceMessageReceived", (message) => message.eventName === event && message.data === JSON.stringify(data));
+        stream.write(`event: ${event}\nid: ${data.seq}\ndata: ${JSON.stringify(data)}\n\n`);
+        await wait(received);
+        return inspect(expected);
+      };
+      const delta = (seq, current) => ({ base: seq - 1, seq, updateTime: current.start, recent: { window: "40s", step: "10s", samples: [current] } });
+      const initial = await send("snapshot", snapshot, { pass: "0 of 1 recorded complete steps", lookups: "10 lookups" });
+      assertCharts(initial, 199.3);
+      assert.match(initial.passLabel, /0 of 1 recorded complete steps/);
+      const appended = await send("delta", delta(snapshot.seq + 1, newZero), { pass: "0 of 2 recorded complete steps", lookups: "10 lookups" });
+      assertCharts(appended, 199.3);
+      for (const paths of appended.charts) for (const points of paths) assert.ok(points.some(([x, y]) => Math.abs(x - 199.3) < 0.1 && y === 42), "completed zero is visible");
+      const populated = await send("delta", delta(snapshot.seq + 2, filled), { pass: "0 of 2 recorded complete steps", lookups: "22 lookups" });
+      assertCharts(populated, 199.3);
+      assert.deepEqual(populated.charts, appended.charts, "partial counters do not change plots");
+      assert.match(populated.passLabel, /0 of 2 recorded complete steps/);
+      assert.match(populated.fleetLabel, /In service 2/);
+      assert.ok(populated.fleetPoints.some(([x, y]) => x === 298 && y < 42), "independently observed current fleet is plotted");
+      if (process.env.GANG_LAYOUT_SCREENSHOTS && process.env.TEST_UNDECLARED_OUTPUTS_DIR) {
+        const size = await page.send("Runtime.evaluate", { expression: `({ x: 0, y: 0, width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight, scale: 1 })`, returnByValue: true });
+        const shot = await page.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, clip: size.result.value });
+        writeFileSync(join(process.env.TEST_UNDECLARED_OUTPUTS_DIR, `overview-slide-${width}-before.png`), Buffer.from(shot.data, "base64"));
+      }
+      const completed = await send("delta", delta(snapshot.seq + 3, next), { pass: "1 of 3 recorded complete steps", lookups: "22 lookups" });
+      assertCharts(completed, 199.3);
+      assert.ok(completed.charts.every((paths) => paths.every((points) => points.some(([x, y]) => Math.abs(x - 199.3) < 0.1 && y < 42))), "filled bucket becomes visible when complete");
+      assert.match(completed.passLabel, /1 of 3 recorded complete steps/);
+      assert.match(completed.fleetLabel, /latest sample: not recorded/);
+      assert.ok(completed.fleetUnknown > 0, "missing current fleet observation is a gap");
+      assert.ok(!completed.fleetPoints.some(([x]) => x === 298), "missing fleet is not forward-filled");
+      if (process.env.GANG_LAYOUT_SCREENSHOTS && process.env.TEST_UNDECLARED_OUTPUTS_DIR) {
+        const size = await page.send("Runtime.evaluate", { expression: `({ x: 0, y: 0, width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight, scale: 1 })`, returnByValue: true });
+        const shot = await page.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, clip: size.result.value });
+        writeFileSync(join(process.env.TEST_UNDECLARED_OUTPUTS_DIR, `overview-slide-${width}-after.png`), Buffer.from(shot.data, "base64"));
+      }
+      const unloaded = page.once("Page.loadEventFired");
+      await wait(page.send("Page.navigate", { url: "about:blank" }));
+      await wait(unloaded);
+      stream.end();
+    }
+    assert.deepEqual(errors, []);
   } finally {
     if (browser) await browser.close();
     server.closeAllConnections();
