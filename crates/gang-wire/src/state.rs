@@ -1368,7 +1368,10 @@ mod tests {
     #[test]
     fn fleet_without_worker_cache_defaults_and_reserializes_it() {
         let mut legacy = fleet_value();
-        legacy.as_object_mut().expect("fleet is an object").remove("workerCache");
+        legacy
+            .as_object_mut()
+            .expect("fleet is an object")
+            .remove("workerCache");
 
         let fleet: Fleet = serde_json::from_value(legacy).expect("legacy fleet parses");
         assert_eq!(fleet.worker_cache.reporting, 0);

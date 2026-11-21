@@ -819,12 +819,13 @@ fn input_integrity_checks(ctx: &RunContext<'_>) -> Vec<Check> {
 /// The verdicts of the input root scenario, on the baseline deployment.
 fn input_root_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     attempt(Scenario::InputRoot, || {
+        const OBSERVED: &str = "input root worker cache reports remote bytes";
+
         let stack = Stack::create(ctx.inputs, &ctx.baseline, Transport::Tls, ctx.issuer)?;
         let mut checks = input_root(&stack, &ctx.baseline)?;
         if checks.iter().any(Check::is_failure) {
             return Ok(checks);
         }
-        const OBSERVED: &str = "input root worker cache reports remote bytes";
         let observed = stack.wait_live_state(stack.settings().history_timeout, |state| {
             state.workers.iter().any(|worker| {
                 worker.cache.is_some_and(|cache| cache.remote.bytes > 0)
