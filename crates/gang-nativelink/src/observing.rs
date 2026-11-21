@@ -735,7 +735,7 @@ mod tests {
                 test_durations(),
                 test_clock(),
                 test_fleets(),
-                crate::test_catalog((*test_fleets()).clone()),
+                crate::capacity::test_catalog((*test_fleets()).clone()),
                 test_rates(),
             );
             let forwarded = scheduler
@@ -861,7 +861,7 @@ mod tests {
                 test_durations(),
                 test_clock(),
                 test_fleets(),
-                crate::test_catalog((*test_fleets()).clone()),
+                crate::capacity::test_catalog((*test_fleets()).clone()),
                 test_rates(),
             );
             scheduler
@@ -974,7 +974,7 @@ mod tests {
                 Arc::clone(&durations),
                 clock.clone(),
                 test_fleets(),
-                crate::test_catalog((*test_fleets()).clone()),
+                crate::capacity::test_catalog((*test_fleets()).clone()),
                 Arc::clone(&rates),
             );
             let duplicate = result.clone();
@@ -1312,7 +1312,7 @@ mod tests {
             test_durations(),
             test_clock(),
             test_fleets(),
-            crate::test_catalog((*test_fleets()).clone()),
+            crate::capacity::test_catalog((*test_fleets()).clone()),
             test_rates(),
         );
         (inner, counting, completed)

@@ -367,7 +367,7 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let wrapper = PlaceableActions::new(
             fake.clone(),
-            crate::test_catalog(catalog()),
+            crate::capacity::test_catalog(catalog()),
             AdmittedFleets::default(),
         );
         let Err(error) = wrapper
@@ -389,7 +389,7 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let wrapper = PlaceableActions::new(
             fake.clone(),
-            crate::test_catalog(catalog()),
+            crate::capacity::test_catalog(catalog()),
             AdmittedFleets::default(),
         );
         for label in [None, Some(""), Some("legacy"), Some("host:old")] {
@@ -414,7 +414,7 @@ mod tests {
         let admitted = AdmittedFleets::default();
         let fitted = FittedActions::new(
             fake.clone(),
-            crate::test_catalog(fleets.clone()),
+            crate::capacity::test_catalog(fleets.clone()),
             admitted.clone(),
             MinReservation::from_units(8192),
             DiskMinReservation::from_units(2048),
@@ -451,7 +451,11 @@ mod tests {
                 Some(expected.parse::<u64>().unwrap()),
             );
         }
-        let outer = PlaceableActions::new(Arc::new(fitted), crate::test_catalog(fleets), admitted);
+        let outer = PlaceableActions::new(
+            Arc::new(fitted),
+            crate::capacity::test_catalog(fleets),
+            admitted,
+        );
         outer
             .add_action(operation(), info(property::CPU_MILLICORES, "14000"))
             .await
@@ -493,7 +497,7 @@ mod tests {
         let admitted = AdmittedFleets::default();
         let fitted = FittedActions::new(
             fake.clone(),
-            crate::test_catalog(fleets.clone()),
+            crate::capacity::test_catalog(fleets.clone()),
             admitted.clone(),
             MinReservation::from_units(8192),
             DiskMinReservation::from_units(2048),
@@ -708,7 +712,7 @@ mod tests {
         let admitted = AdmittedFleets::default();
         let fitted = FittedActions::new(
             fake.clone(),
-            crate::test_catalog(fleets.clone()),
+            crate::capacity::test_catalog(fleets.clone()),
             admitted.clone(),
             MinReservation::from_units(8192),
             gang_config::DiskMinReservation::from_units(2048),
@@ -761,7 +765,7 @@ mod tests {
         let admitted = AdmittedFleets::default();
         let fitted = FittedActions::new(
             fake.clone(),
-            crate::test_catalog(fleets.clone()),
+            crate::capacity::test_catalog(fleets.clone()),
             admitted.clone(),
             MinReservation::from_units(8192),
             DiskMinReservation::from_units(2048),
@@ -788,7 +792,7 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let outer = PlaceableActions::new(
             fake.clone(),
-            crate::test_catalog(catalog()),
+            crate::capacity::test_catalog(catalog()),
             AdmittedFleets::default(),
         );
         assert!(
@@ -824,7 +828,7 @@ mod tests {
         let admitted = AdmittedFleets::default();
         let fitted = FittedActions::new(
             fake.clone(),
-            crate::test_catalog(fleets.clone()),
+            crate::capacity::test_catalog(fleets.clone()),
             admitted.clone(),
             MinReservation::from_units(8192),
             gang_config::DiskMinReservation::from_units(2048),
@@ -873,7 +877,7 @@ mod tests {
         let admitted = AdmittedFleets::default();
         let fitted = FittedActions::new(
             fake.clone(),
-            crate::test_catalog(fleets.clone()),
+            crate::capacity::test_catalog(fleets.clone()),
             admitted.clone(),
             MinReservation::from_units(8192),
             DiskMinReservation::from_units(2048),
@@ -906,7 +910,7 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let fitted = FittedActions::new(
             fake.clone(),
-            crate::test_catalog(large_memory_catalog()),
+            crate::capacity::test_catalog(large_memory_catalog()),
             AdmittedFleets::default(),
             MinReservation::from_units(8192),
             DiskMinReservation::from_units(2048),
@@ -926,7 +930,7 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let fitted = FittedActions::new(
             fake.clone(),
-            crate::test_catalog(large_memory_catalog()),
+            crate::capacity::test_catalog(large_memory_catalog()),
             AdmittedFleets::default(),
             MinReservation::from_units(4096),
             DiskMinReservation::from_units(2048),
@@ -952,7 +956,7 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let fitted = FittedActions::new(
             fake.clone(),
-            crate::test_catalog(large_memory_catalog()),
+            crate::capacity::test_catalog(large_memory_catalog()),
             AdmittedFleets::default(),
             MinReservation::from_units(8192),
             DiskMinReservation::from_units(2048),
@@ -972,7 +976,7 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let fitted = FittedActions::new(
             fake.clone(),
-            crate::test_catalog(large_memory_catalog()),
+            crate::capacity::test_catalog(large_memory_catalog()),
             AdmittedFleets::default(),
             MinReservation::from_units(8192),
             DiskMinReservation::from_units(2048),
@@ -993,7 +997,7 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let fitted = FittedActions::new(
             fake.clone(),
-            crate::test_catalog(large_memory_catalog()),
+            crate::capacity::test_catalog(large_memory_catalog()),
             AdmittedFleets::default(),
             MinReservation::from_units(8192),
             DiskMinReservation::from_units(2048),
@@ -1014,7 +1018,7 @@ mod tests {
         let fleets = large_memory_catalog();
         let fitted = FittedActions::new(
             fake.clone(),
-            crate::test_catalog(fleets),
+            crate::capacity::test_catalog(fleets),
             AdmittedFleets::default(),
             MinReservation::from_units(8192),
             DiskMinReservation::from_units(2048),
@@ -1042,7 +1046,7 @@ mod tests {
         *fake.observed_admitted.lock() = Some(admitted.clone());
         let outer = PlaceableActions::new(
             fake.clone(),
-            crate::test_catalog(catalog()),
+            crate::capacity::test_catalog(catalog()),
             admitted.clone(),
         );
         for fail in [false, true] {

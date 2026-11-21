@@ -110,6 +110,12 @@ impl RuntimeCatalog {
 }
 
 #[cfg(test)]
+pub(crate) fn test_catalog(fleets: FleetCatalog) -> Arc<RuntimeCatalog> {
+    let (_sender, receiver) = watch::channel(Arc::new(ResourceCapacitySnapshot::new(Vec::new())));
+    Arc::new(RuntimeCatalog::new(fleets, receiver))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use gang_types::{FleetActionPolicy, FleetName, FleetProperties, Isa, Resources};
