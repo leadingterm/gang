@@ -277,8 +277,7 @@ mod tests {
         let policy: PublicEgressPolicy =
             toml::from_str("protected_networks = [\"8.8.4.0/24\"]\ndns_servers = [\"1.1.1.1\"]")
                 .unwrap();
-        let protected = ["127.0.0.1", "::1", "8.8.4.4"]
-            .map(|address| address.parse::<IpAddr>().unwrap());
+        let protected = ["127.0.0.1", "::1", "8.8.4.4"].map(|address| address.parse::<IpAddr>().unwrap());
         assert!(addresses_protected(&policy, protected.into_iter()).is_ok());
         let mixed = ["8.8.4.4", "8.8.8.8"].map(|address| address.parse::<IpAddr>().unwrap());
         assert!(addresses_protected(&policy, mixed.into_iter()).is_err());

@@ -267,9 +267,13 @@ impl ActionIsolationPort for Bwrap {
                                 "public egress requires an action memory cgroup",
                             ))
                         })?;
-                        crate::host_egress::verify_host_egress(policy, controller_endpoints, cgroup)
-                            .await
-                            .map_err(BwrapError::NetworkSetup)?;
+                        crate::host_egress::verify_host_egress(
+                            policy,
+                            controller_endpoints,
+                            cgroup,
+                        )
+                        .await
+                        .map_err(BwrapError::NetworkSetup)?;
                         Some(resolver_file(policy).map_err(BwrapError::NetworkSetup)?)
                     }
                     #[cfg(not(target_os = "linux"))]
