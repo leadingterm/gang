@@ -11,8 +11,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::state::{
-    Cache, Fleet, Instance, Pass, Queue, QueuedAction, Recent, RunningAction, State, Truncated,
-    Worker,
+    Cache, Connections, Fleet, Instance, Pass, Queue, QueuedAction, Recent, RunningAction, State,
+    Truncated, Worker,
 };
 use crate::{Build, Event, FrameError};
 
@@ -113,6 +113,9 @@ pub struct Delta {
     /// A whole replacement of cache occupancy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<Cache>,
+    /// A whole replacement of public listener connection counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections: Option<Connections>,
     /// Changes to the fleets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleets: Option<Keyed<Fleet>>,
@@ -159,6 +162,7 @@ impl Delta {
         self.pass.is_none()
             && self.queue.is_none()
             && self.cache.is_none()
+            && self.connections.is_none()
             && keyed_is_empty(self.fleets.as_ref())
             && keyed_is_empty(self.workers.as_ref())
             && keyed_is_empty(self.instances.as_ref())
@@ -362,6 +366,7 @@ mod tests {
             "provisioner": "aws",
             "pass": {"state": "OK", "interval": "2s", "applied": 0, "failed": 0},
             "queue": {"total": 0, "unplaceable": 0},
+            "connections": {"active": 0, "limit": 0, "refused": 0},
             "fleets": [],
             "workers": [],
             "instances": [],

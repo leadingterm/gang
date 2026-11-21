@@ -275,6 +275,20 @@ retryDelay?: Duration, };
 
 export type ClosedReason = "REVOKED" | "EXPIRED" | "VIEWER_CAP" | "SHUTDOWN";
 
+export type Connections = { 
+/**
+ * Currently served public connections.
+ */
+active: number, 
+/**
+ * Configured public listener limit.
+ */
+limit: number, 
+/**
+ * Public connections refused since process start.
+ */
+refused: number, };
+
 export type Delta = { 
 /**
  * The sequence number this delta moves the state to.
@@ -300,6 +314,10 @@ queue?: Queue,
  * A whole replacement of cache occupancy.
  */
 cache?: Cache, 
+/**
+ * A whole replacement of public listener connection counts.
+ */
+connections?: Connections, 
 /**
  * Changes to the fleets.
  */
@@ -1212,6 +1230,10 @@ recent: Recent,
  * The leader's bounded stores and latest external bucket measurement.
  */
 cache: Cache, 
+/**
+ * Public listener connections and cumulative refusals.
+ */
+connections: Connections, 
 /**
  * Builds with an observation within the recent window, basic view, ordered by name; at most `max_live`.
  */

@@ -5,6 +5,7 @@
 ### Changed
 
 - Scale out to the greater of the fleet minimum and the CPU, memory, or disk reservation need, capped by the fleet maximum. CPU capacity includes `[actions] cpu_oversubscription` (default `2`); rate and payback estimates no longer hold scale-out below resource demand. Expected wait and N−1 scale-in use resource capacity, not nominal action slots.
+- The public listener defaults to 4096 connections, with dashboard diagnostics showing current saturation and cumulative refusals since server start.
 - Public egress now uses a per-action pasta network namespace and one host nftables policy scoped to the action cgroup subtree. NixOS prepares the policy and cgroup before worker startup; missing or mismatched prerequisites deny granted actions.
 - **Server configuration migration:** Remove `slirp4netns`, `nft`, `nsenter` and `ip` from `[sandbox.bwrap.egress]`; these old helper keys are rejected as unknown. The table now accepts only `program`, defaulting to `pasta`, resolved and pinned like `[sandbox.bwrap].program`. Keep the existing `[execution.egress]` policy and fleet grants.
 
@@ -15,6 +16,7 @@
 
 ### Fixed
 
+- Cache DNS locally on controller and worker images, including for static binaries.
 - Expose the public listener connection limit in the deployment module, defaulting to 4096. The module now owns `[server.http2]` for all backends; SQLite callers must remove any appended `[server.http2]` table and move their `max_connections` override to `http2_max_connections`.
 - Exclude concurrent child spawns while testing owned pipe-reader cancellation, so fork-inherited readers cannot make the close assertion nondeterministic.
 

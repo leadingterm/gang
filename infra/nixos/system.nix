@@ -8,6 +8,7 @@
   # The EC2 disk image, `system.build.ec2Image`, is defined in ./ec2-image.nix, which the image build (not this module) imports.
   imports = [
     (modulesPath + "/virtualisation/amazon-image.nix")
+    ./dns.nix
     ./gang-config.nix
     ./controller.nix
     ./worker.nix

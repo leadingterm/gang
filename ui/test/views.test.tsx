@@ -106,6 +106,37 @@ for (const [name, rendered] of SCREENS) {
   });
 }
 
+test("public connection saturation and recovered refusals are visible", (t) => {
+  const saturated = { ...live, connections: { active: 10, limit: 10, refused: 3 } };
+  const full = screen("overview", { state: saturated }, <Overview />);
+  t.assert.match(full, /Public connection limit reached/);
+  t.assert.match(visibleText(full), /10 \/ 10 open · 3 refused since server start/);
+  const recovered = { ...saturated, connections: { active: 2, limit: 10, refused: 3 } };
+  const history = screen("overview", { state: recovered }, <Overview />);
+  t.assert.match(visibleText(history), /3 connections refused since server start/);
+  t.assert.match(visibleText(history), /2 \/ 10 open/);
+  t.assert.doesNotMatch(history, /Public connection limit reached/);
+});
+
+test("zero and missing public connection metrics do not warn", (t) => {
+  const { connections: _connections, ...oldState } = live;
+  for (const state of [oldState, { ...live, connections: { active: 0, limit: 0, refused: 0 } }]) {
+    const markup = screen("overview", { state: state as typeof live }, <Overview />);
+    t.assert.doesNotMatch(markup, /Public connection limit reached|connections refused since server start/);
+  }
+});
+
+test("stream loss, revocation and skipped passes precede public saturation", (t) => {
+  const state = { ...live, connections: { active: 10, limit: 10, refused: 3 } };
+  const lost = screen("overview", { state, link: { kind: "lost", frozenAt: null, retryAt: ms(live.updateTime) + 4000 } }, <Overview />);
+  const revoked = screen("overview", { state, link: { kind: "revoked" } }, <Overview />);
+  const skipped = screen("overview", { state: { ...state, pass: { ...state.pass, state: "SKIPPED" } } }, <Overview />);
+  for (const [markup, expected] of [[lost, /Stream lost/], [revoked, /Access revoked/], [skipped, /Pass skipped/]] as const) {
+    t.assert.match(markup, expected);
+    t.assert.doesNotMatch(markup, /Public connection limit reached/);
+  }
+});
+
 test("build list shows the live build, hit rate and link", (t) => {
   const markup = html({}, <Builds />);
   t.assert.match(markup, /ops@example.org/);

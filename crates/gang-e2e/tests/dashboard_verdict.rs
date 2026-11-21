@@ -128,6 +128,7 @@ fn state(seq: u64, in_service: u32, workers: Vec<Worker>, completed: u64) -> Sta
         completed,
         recent: Recent::default(),
         cache: gang_wire::Cache::default(),
+        connections: gang_wire::Connections::default(),
         builds: Vec::new(),
         principals_epoch: 0,
     }
@@ -195,6 +196,7 @@ fn delta(base: u64, seq: u64, events: Vec<Event>) -> Delta {
         completed: None,
         recent: None,
         cache: None,
+        connections: None,
         builds: None,
         principals_epoch: None,
     }
