@@ -274,7 +274,7 @@ const FleetRow = ({ f, ordinal, events, census, known, recent }: { f: Fleet; ord
       </dl>
       <div class="fleet__history">
         <ChartFrame size="spark" title="Instance history" legend={<div class="legend" aria-label="Instance history legend">
-          {fields.map((field) => <span key={field.name} class={`legend__item spark__series--${field.name}${field.reference ? " spark__series--reference" : ""}`}><i class="fleet__history-swatch" aria-hidden="true" />{field.label}</span>)}
+          {fields.map((field) => <span key={field.name} class="legend__item"><i class={`fleet__history-swatch spark__series--${field.name}${field.reference ? " spark__series--reference" : ""}`} aria-hidden="true" />{field.label}</span>)}
         </div>}>
           <Spark values={series[0]!.values} series={series} unknown={samples.map((sample) => !sample)} label={historyLabel} recent={recent} />
         </ChartFrame>

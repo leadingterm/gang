@@ -182,6 +182,36 @@ const probe = async (scenario) => {
       for (const label of ["Pending", "In service", "Terminating", "Warm", "Desired", "Max"]) {
         if (!labels.includes(label)) add(`fleet ${index}: missing ${label} legend item`);
       }
+      const tokenProbe = document.createElement("span");
+      legend.append(tokenProbe);
+      const tokenColor = (token) => {
+        tokenProbe.style.color = `var(${token})`;
+        return getComputedStyle(tokenProbe).color;
+      };
+      const muted = tokenColor("--color-muted");
+      for (const [name, label, token] of [
+        ["pending", "Pending", "--color-amber"],
+        ["inService", "In service", "--color-accent"],
+        ["terminating", "Terminating", "--color-bark"],
+        ["warm", "Warm", "--color-accent-deep"],
+        ["desired", "Desired", "--color-ink-2"],
+        ["max", "Max", "--color-muted"],
+      ]) {
+        const item = [...legend.children].find((child) => child.textContent.trim() === label);
+        const swatch = item?.querySelector(".fleet__history-swatch");
+        if (!item || item.className !== "legend__item" || getComputedStyle(item).color !== muted) add(`fleet ${index}: ${label} legend text does not inherit muted color`);
+        if (!swatch || !swatch.classList.contains(`spark__series--${name}`)) {
+          add(`fleet ${index}: missing ${name} swatch`);
+          continue;
+        }
+        const style = getComputedStyle(swatch);
+        const reference = ["desired", "max"].includes(name);
+        if (style.color !== tokenColor(token) || style.borderBlockStartColor !== tokenColor(token)) add(`fleet ${index}: ${name} swatch does not use ${token}`);
+        if (style.borderBlockStartStyle !== (reference ? "dashed" : "solid") || parseFloat(style.borderBlockStartWidth) <= 0 || swatch.getBoundingClientRect().width <= EPS) add(`fleet ${index}: ${name} swatch has incorrect or invisible border`);
+        if (swatch.classList.contains("spark__series--reference") !== reference) add(`fleet ${index}: incorrect reference class for ${name} swatch`);
+      }
+      tokenProbe.remove();
+      if (legend.querySelectorAll(".fleet__history-swatch").length !== 6) add(`fleet ${index}: expected exactly six legend swatches`);
       for (const [name, node] of [["chart", svg], ["legend", legend], ...[...legend.children].map((item) => ["legend item", item])]) {
         const box = rect(node);
         const style = getComputedStyle(node);
@@ -195,6 +225,8 @@ const probe = async (scenario) => {
         else {
           const reference = paths[0].classList.contains("spark__run--reference");
           if (reference !== ["desired", "max"].includes(name)) add(`fleet ${index}: incorrect reference class for ${name}`);
+          const pathStyle = getComputedStyle(paths[0]);
+          if (reference && (pathStyle.strokeDasharray === "none" || parseFloat(pathStyle.strokeWidth) <= 0)) add(`fleet ${index}: ${name} reference line is not visibly dashed`);
           if (!(paths[0].getAttribute("d") ?? "").trim()) add(`fleet ${index}: ${name} path is empty`);
           if (index === 0 && name === "pending" && (paths[0].getAttribute("d")?.match(/M/g) ?? []).length !== 2) add("fleet 0: missing-entry gap or scheduler-independent sample not preserved");
         }

@@ -162,6 +162,7 @@ fn fill_into(
         pass: PassStatus::Observed {
             hosted: Some(&hosted),
             supplies: &fresh,
+            fresh_supplies: &fresh,
         },
         fleets: &observer_passes,
         catalog: &catalog,
@@ -189,6 +190,7 @@ fn fill_into(
         } => PassStatus::Observed {
             hosted: known.then_some(&hosted),
             supplies,
+            fresh_supplies: supplies,
         },
     };
     let projection_passes = if matches!(&pass, PassStatus::Observed { .. }) {

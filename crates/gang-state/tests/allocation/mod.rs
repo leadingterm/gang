@@ -344,6 +344,7 @@ fn steady_completed_pass_allocates_nothing() -> TestResult {
         pass: PassStatus::Observed {
             hosted: Some(&world.hosted),
             supplies: &supplies,
+            fresh_supplies: &supplies,
         },
         ..inputs(&world)
     };
@@ -395,6 +396,7 @@ fn steady_skipped_pass_allocates_nothing() -> TestResult {
         pass: PassStatus::Observed {
             hosted: Some(&world.hosted),
             supplies: &supplies,
+            fresh_supplies: &supplies,
         },
         ..inputs(&world)
     };
@@ -462,6 +464,7 @@ fn steady_replacement_projection_allocates_nothing() -> TestResult {
         pass: PassStatus::Observed {
             hosted: Some(&world.hosted),
             supplies: &supplies,
+            fresh_supplies: &supplies,
         },
         ..inputs(&world)
     };
@@ -498,6 +501,7 @@ fn steady_partial_observation_allocates_nothing() -> TestResult {
         pass: PassStatus::Observed {
             hosted: None,
             supplies: &supplies,
+            fresh_supplies: &supplies,
         },
         ..inputs(&world)
     };
@@ -531,6 +535,7 @@ fn steady_hosted_inventory_observation_allocates_nothing() -> TestResult {
         pass: PassStatus::Observed {
             hosted: Some(&world.hosted),
             supplies: &supplies,
+            fresh_supplies: &supplies,
         },
         actions: None,
         ..inputs(&world)
@@ -571,6 +576,7 @@ fn observation_reuses_instance_buffers_across_identity_churn() -> TestResult {
         pass: PassStatus::Observed {
             hosted: Some(&world.hosted),
             supplies: &supplies,
+            fresh_supplies: &supplies,
         },
         fleets: &observer_passes,
         actions: None,
@@ -588,6 +594,7 @@ fn observation_reuses_instance_buffers_across_identity_churn() -> TestResult {
         pass: PassStatus::Observed {
             hosted: Some(&world.hosted),
             supplies: &supplies,
+            fresh_supplies: &supplies,
         },
         fleets: &replacement,
         actions: None,
@@ -632,6 +639,7 @@ fn observation_reuses_worker_buffers_across_generation_churn() -> TestResult {
         pass: PassStatus::Observed {
             hosted: Some(&world.hosted),
             supplies: &supplies,
+            fresh_supplies: &supplies,
         },
         actions: None,
         ..inputs(&world)
@@ -640,6 +648,7 @@ fn observation_reuses_worker_buffers_across_generation_churn() -> TestResult {
         pass: PassStatus::Observed {
             hosted: Some(&changed_hosted),
             supplies: &supplies,
+            fresh_supplies: &supplies,
         },
         actions: None,
         ..inputs(&world)

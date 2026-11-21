@@ -142,7 +142,9 @@ impl Builder {
                 skipped = true;
                 // Only the independent observer establishes scheduler availability.
             }
-            PassStatus::Observed { hosted, supplies } => {
+            PassStatus::Observed {
+                hosted, supplies, ..
+            } => {
                 let (observed_completed, observed_evicted, known) =
                     self.observe(cur, prev, inputs, *hosted, supplies);
                 completed = observed_completed;
@@ -159,7 +161,7 @@ impl Builder {
         let cur_scheduler_available = cur.scheduler_known == Some(true);
         let fleets = &cur.fleets;
         let supplies = match &inputs.pass {
-            PassStatus::Observed { supplies, .. } => Some(*supplies),
+            PassStatus::Observed { fresh_supplies, .. } => Some(*fresh_supplies),
             _ => None,
         };
         cur.recent.sample_at(inputs.wall, |sample| {

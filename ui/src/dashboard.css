@@ -462,7 +462,7 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .fleet__nums dd { font-family: var(--font-mono); font-size: var(--text-2xl); line-height: 1.1; }
 .fleet__history { grid-area: history; min-width: 0; }
 .fleet__history-swatch { width: var(--chart-swatch-width); border-block-start: 2px solid currentColor; }
-.spark__series--reference .fleet__history-swatch { border-block-start-style: dashed; }
+.spark__series--reference.fleet__history-swatch { border-block-start-style: dashed; }
 
 .tag {
   display: inline-block;
