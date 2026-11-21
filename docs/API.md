@@ -315,7 +315,9 @@ curl -X POST https://gang.example.com/v1/deviceAuthorizations/BCDF-GHJK:redeem \
 
 ### Name
 
-The singleton `state`: the fleet as the control loop last saw it, with the workers, instances, queue, running and queued actions, and the most recent scaling events. It is derived from the control loop and never authoritative: nothing reads it back to decide.
+The singleton `state`: the latest independently observed fleet, workers, instances, queue and actions, together with control-pass metadata and the most recent scaling events. Scheduler and provisioner observations continue while a control pass is blocked. The view is read-only and never authoritative: nothing reads it back to decide.
+
+`State.schedulerKnown` is an optional current point status: it is absent before the first scheduler observation, true after a successful observation and false after an unavailable observation. It is independent of historical sample completeness, so point readouts recover immediately on success even if the current sample remains incomplete. Older responses omit it; clients may fall back to the latest sample's availability. Global queue totals and oldest time reflect the latest scheduler observation; each fleet's `demand.queued` is attributed by the latest completed control pass and can therefore be older.
 
 ### Methods
 
@@ -348,7 +350,7 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
   },
   "queue": {
     "total": 1,
-    "unplaceable": 1,
+    "unplaceable": 0,
     "oldestQueueTime": "2026-01-14T09:19:51.250Z"
   },
   "connections": { "active": 24, "limit": 4096, "refused": 3 },
@@ -367,7 +369,6 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
       "policy": {
         "min": 2,
         "max": 20,
-        "targetActions": 4,
         "idleTimeout": "600s",
         "maxDrainWait": "1800s",
         "bootGrace": "300s"
@@ -390,8 +391,8 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
       },
       "demand": {
         "running": 1,
-        "queued": 0,
-        "candidates": 0,
+        "queued": 1,
+        "candidates": 1,
         "needed": 2,
         "vcpus": 2,
         "readiness": "42.500s",
@@ -407,7 +408,8 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
       "phase": "BUSY",
       "phaseTime": "2026-01-14T09:19:58.000Z",
       "running": 1,
-      "slots": 4,
+      "reserved": {"cpuMillicores": 2000, "memory": 4294967296},
+      "capacity": {"cpuMillicores": 16000, "memory": 16106127360},
       "paused": false,
       "launchTime": "2026-01-14T09:18:30.000Z",
       "phases": [
@@ -438,7 +440,8 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
         "mnemonic": "TestRunner",
         "build": "builds/k3q9w2m7x1c4v8bz",
         "startTime": "2026-01-14T09:19:58.000Z",
-        "priority": 0
+        "priority": 0,
+        "reservation": {"cpuMillicores": 2000, "memory": 4294967296}
       }
     ],
     "queued": [
@@ -450,8 +453,9 @@ curl -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state
         "build": "builds/k3q9w2m7x1c4v8bz",
         "queueTime": "2026-01-14T09:19:51.250Z",
         "priority": 0,
-        "candidates": [],
-        "refusal": "cpu_millicores 871000 is above the largest fleet's 15000"
+        "candidates": ["fleets/x86-64-spot"],
+        "reservation": {"cpuMillicores": 4000, "memory": 4294967296},
+        "learnedReservation": {"cpuMillicores": 6000, "memory": 8589934592}
       }
     ],
     "truncated": {
@@ -522,7 +526,7 @@ data: {"name":"state","seq":4812,"updateTime":"2026-01-14T09:20:02.000Z","provis
 
 event: delta
 id: 4813
-data: {"seq":4813,"base":4812,"updateTime":"2026-01-14T09:20:04.000Z","queue":{"total":0,"unplaceable":0},"workers":{"upsert":[{"name":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b","fleet":"fleets/x86-64-spot","instance":"instances/i-0e1000000000000a","phase":"IDLE","phaseTime":"2026-01-14T09:20:04.000Z","running":0,"slots":4,"paused":false,"launchTime":"2026-01-14T09:18:30.000Z","phases":[{"phase":"BUSY","start":"2026-01-14T09:19:58.000Z"},{"phase":"IDLE","start":"2026-01-14T09:20:04.000Z"}]}]},"actions":{"sampleTime":"2026-01-14T09:20:04.000Z","running":{"remove":["actions/ac9b1c52-3d0e-4f61-9a27-51c6d7e8f901"]},"queued":[]},"events":[{"name":"events/997","createTime":"2026-01-14T09:20:04.000Z","fleet":"fleets/x86-64-spot","cause":"IDLE_TIMEOUT","drainStarted":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"completed":981,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":2,"skipped":0,"lookups":0,"hits":0,"uploadedBytes":0,"downloadedBytes":0,"evictedBytes":0}]}}
+data: {"seq":4813,"base":4812,"updateTime":"2026-01-14T09:20:04.000Z","queue":{"total":0,"unplaceable":0},"workers":{"upsert":[{"name":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b","fleet":"fleets/x86-64-spot","instance":"instances/i-0e1000000000000a","phase":"IDLE","phaseTime":"2026-01-14T09:20:04.000Z","running":0,"paused":false,"launchTime":"2026-01-14T09:18:30.000Z","phases":[{"phase":"BUSY","start":"2026-01-14T09:19:58.000Z"},{"phase":"IDLE","start":"2026-01-14T09:20:04.000Z"}]}]},"actions":{"sampleTime":"2026-01-14T09:20:04.000Z","running":{"remove":["actions/ac9b1c52-3d0e-4f61-9a27-51c6d7e8f901"]},"queued":[]},"events":[{"name":"events/997","createTime":"2026-01-14T09:20:04.000Z","fleet":"fleets/x86-64-spot","cause":"IDLE_TIMEOUT","drainStarted":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"completed":981,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":2,"skipped":0,"lookups":0,"hits":0,"uploadedBytes":0,"downloadedBytes":0,"evictedBytes":0}]}}
 
 event: tick
 id: 4813
@@ -549,21 +553,24 @@ data: {"reason":"VIEWER_CAP","retryDelay":"5s"}
 - **Admission.** State operations require leader admission. A nonadmitting controller returns HTTP 503 before the handler with `gang-request-not-started: true`; it does not forward requests or streaming responses. Leader-only gRPC requests similarly return `UNAVAILABLE` (code 14) with the marker. Leadership refusal gracefully retires HTTP/2 connections with GOAWAY, even after an earlier shared request; admitted streams and concurrent accepted shared requests are not blanket-refused. After promotion leader admission remains enabled through a lease lapse, even when `/ready` returns 503. Prepared controllers serve shared authentication, API, browser and cache services independently of promotion; see [listener admission](SPECIFICATION.md#61-gang-server-listeners).
 - **Public connections.** `connections.active` and `connections.limit` are current gauges for the public listener's open connections and admission limit. `connections.refused` is the cumulative number of connections refused at that limit since this server process started; it resets on process restart. Older snapshots without `connections` decode to zero for all three fields. Dashboard and REAPI traffic share this listener and its admission limit; worker connections are excluded. Refusal counting is never throttled with logs.
 - **Fleet demand estimates.** `demand.readiness` and `demand.expectedWait` are independently optional Google Duration strings, for example `"42.5s"` and `"0s"`. `readiness` is the measured launch-to-first-worker latency; it is omitted until measured, while the planner uses the configured `scaling.readiness_prior`, clamped to the fleet's `boot_grace`, as its cold prior. `expectedWait` is the latest simulated start delay among the fleet's attributed queued actions at the final planned capacity; it is omitted when there is no attributed queue. Zero is a valid estimate, not an absent value.
-- **Fleet rate diagnostics.** `demand.load` is persistent load in integer deci-slots (`125` means 12.5 slots). `demand.backlog` is transient queued slot-time before readiness subtraction, rounded to whole seconds and encoded as a Google Duration string (`"42s"`). `demand.utilization` is instantaneous serving resource occupancy in integer permille (`735` means 73.5%): the maximum occupancy fraction across resource dimensions, excluding draining workers. The fields are independently optional; unmeasured values are omitted, and `utilization` is omitted without serving capacity. Measured zero is present as `0` or `"0s"`, never treated as absence.
+- **Fleet rate diagnostics.** `demand.load` is the maximum normalized persistent resource load in tenths of a worker equivalent (`125` means 12.5 workers). `demand.backlog` is the maximum normalized transient queued resource-work in worker-equivalent seconds, rounded to whole seconds and encoded as a Google Duration string (`"42s"`). `demand.utilization` is instantaneous serving resource occupancy in integer permille (`735` means 73.5%): the maximum occupancy fraction across resource dimensions, excluding draining workers. The fields are independently optional; unmeasured values are omitted, and `utilization` is omitted without serving capacity. Measured zero is present as `0` or `"0s"`, never treated as absence.
+- **Worker concurrency observation.** `workers[].slots` is optional observed worker metadata, not a scaling or admission input. It is omitted for an unlimited long-lived worker and is `1` for a single-use worker; older workers can report other values during rollout.
+- **Reservations.** A `Reservation` is `{cpuMillicores, memory}`: CPU is in millicores and memory is in bytes. Running and queued actions may carry `reservation`, their current fitted scheduler reservation; CPU is the debited `cpu_millicores`, not the ignored `cpu_count`, and memory is the current fitted property. They may also carry `learnedReservation` when either dimension of the initial pre-fit reservation exceeds the corresponding current reservation. Both dimensions come from the same initial snapshot of historical, cold-start or request sizing captured by the fitter, not raw p95 or peak values. The snapshot stays with the canonical action across retries.
+- **Worker reservations.** `reserved` and `capacity` are optional `Reservation` objects from the scheduler's worker ledger, not sums computed from the bounded action list. CPU capacity is the scheduler's aggregate vCPUs × 1000 × oversubscription; memory capacity is the registered physical ledger amount and can be below the advertised fleet nominal. Missing objects mean unknown or legacy data, not zero; present zero values are real zeros. Worker and action views have separate sampling times and need not agree at an instant. The same optional fields appear in stream snapshots, worker and running-action upserts, and queued-list replacements; no separate endpoint or stream protocol is needed.
 - **Frames.** `Frame` is the type of each stream message, defined once in `gang-wire`:
 
   | Event | Data | Sent |
   |---|---|---|
   | `snapshot` | `State` | first on every connect, and again when a viewer fell behind the broadcast |
-  | `delta` | `{seq, base, updateTime, pass?, queue?, cache?, connections?, fleets?, workers?, instances?, actions?, events?, statusEvents?, completed?, recent?, builds?, principalsEpoch?}` | when a pass changed something and a viewer is connected |
+  | `delta` | `{seq, base, updateTime, schedulerKnown?, pass?, queue?, cache?, connections?, fleets?, workers?, instances?, actions?, events?, statusEvents?, completed?, recent?, builds?, principalsEpoch?}` | when an observation or pass outcome changed something and a viewer is connected |
   | `tick` | `{seq, time}` | every heartbeat interval, with the current `seq` |
   | `closed` | `{reason, retryDelay?}` | last, when the server ends the stream deliberately |
 
   The SSE event names `snapshot`, `delta`, `tick` and `closed` are protocol identifiers and stay lowercase. `id:` is the frame's `seq`. The server may also write comment lines starting with `:` between frames; a reader ignores them.
-- **Applying a delta.** A delta moves the state from `base` to `seq`. A part that is present replaces the whole part (`pass`, `queue`, `cache`, `connections`, `completed`, `principalsEpoch`); `fleets`, `workers` and `instances` are `{upsert[], remove[]}` keyed by `name`, and a name is in at most one of the two lists (empty lists are omitted); `events` are appended, newest last; `statusEvents` replaces the whole status list when present, including an empty list to remove expired statuses. `recent` carries `window`, `step` and the samples from the first one that changed: drop your samples from that sample's `start` on, append these, then drop samples that start a whole `window` or more before the last. The `actions` patch is `{sampleTime?, staleAfter?, running?, queued?, truncated?}`: `running` is keyed by `name`, `queued` replaces the whole list. When `actions` first appears, the patch carries every field and all rows in `running.upsert`.
+- **Applying a delta.** A delta moves the state from `base` to `seq`. A part that is present replaces the whole part (`schedulerKnown`, including false, `pass`, `queue`, `cache`, `connections`, `completed`, `principalsEpoch`); `fleets`, `workers` and `instances` are `{upsert[], remove[]}` keyed by `name`, and a name is in at most one of the two lists (empty lists are omitted); `events` are appended, newest last; `statusEvents` replaces the whole status list when present, including an empty list to remove expired statuses. `recent` carries `window`, `step` and the samples from the first one that changed: drop your samples from that sample's `start` on, append these, then drop samples that start a whole `window` or more before the last. The `actions` patch is `{sampleTime?, staleAfter?, running?, queued?, truncated?}`: `running` is keyed by `name`, `queued` replaces the whole list. When `actions` first appears, the patch carries every field and all rows in `running.upsert`.
 - **Resynchronizing.** `seq` advances only when a delta is sent, and only while a viewer is connected. A client reconnects when a delta's `base` differs from its own `seq`, or when a tick's `seq` is behind its own state. A tick whose `seq` equals or runs ahead of the client's is normal (a delta may still be queued for that viewer). There is no replay and no `Last-Event-ID` handling: every connect begins with a snapshot, and a second `snapshot` on an open stream replaces the client's state.
-- **Recent window.** `recent` is what the server observed over its last `window` (`[dashboard] history_window`), one sample per `step` (`history_step`), oldest first and without holes; the last sample is the step in progress. A sample counts `completed` actions in its step, the `running` and `queued` actions at its latest completed pass, and its completed and `skipped` passes. A worker's `phases` are its phase spans within the window, the last being its current phase. The window lives in the server's memory: after a restart the steps before the first sample were not recorded and must not be read as zero.
-- **Cache.** `cache.stores` lists the leader engine's bounded stores, read at the latest completed pass. `store` is `CAS` or `AC`; readers tolerate future values. `usedBytes` is on-disk occupancy rounded to filesystem blocks, and `budgetBytes` is the eviction budget. `cache.bucket` is the provider's latest whole-bucket measurement, irrespective of key prefix; `measureTime` is when it was measured, not read, and can be more than a day old. S3 objects expire by bucket lifecycle, which Gang does not observe. Empty `stores` and absent `bucket` are omitted; the `cache` object is always present. For example: `{"bucket":{"bytes":912680550400,"objects":4210336,"measureTime":"2026-01-14T00:00:00.000Z"}}`.
+- **Recent window.** `recent` is what the server observed over its last `window` (`[dashboard] history_window`), one sample per `step` (`history_step`), oldest first and without holes; the last sample is the step in progress. A sample counts `completed` actions in its step, the `running` and `queued` actions at its latest scheduler observation, and actual completed (`passes`) and `skipped` control-pass outcomes. Observation does not itself count as a pass. Sample `schedulerKnown` describes cumulative completeness: an unobserved sample starts false and can become true on a known observation; an actual unknown or counter-unbaselined observation makes it false for the rest of that step. If omitted, infer known as `passes > 0` for compatibility with legacy samples. Scheduler-dependent counts in an unknown step are not a complete measurement; dashboard scheduler charts and worker lanes hatch unknown gaps. A failed scheduler read does not reset the window, and the first successful read after a gap establishes fresh completion and eviction baselines without assigning the missing counts to any step. Local traffic and build observation, and provider-cache measurement, continue independently. A worker's `phases` are its observed phase spans within the window. The window lives in the server's memory: after a restart the steps before the first sample were not recorded and must not be read as zero.
+- **Cache.** `cache.stores` lists the leader engine's bounded stores, read at the latest successful scheduler observation. `store` is `CAS` or `AC`; readers tolerate future values. `usedBytes` is on-disk occupancy rounded to filesystem blocks, and `budgetBytes` is the eviction budget. `cache.bucket` is the provider's latest whole-bucket measurement, irrespective of key prefix; `measureTime` is when it was measured, not read, and can be more than a day old. S3 objects expire by bucket lifecycle, which Gang does not observe. Empty `stores` and absent `bucket` are omitted; the `cache` object is always present. For example: `{"bucket":{"bytes":912680550400,"objects":4210336,"measureTime":"2026-01-14T00:00:00.000Z"}}`.
 - **Cache traffic.** Each sample's `lookups`, `hits`, `uploadedBytes` and `downloadedBytes` count calls served by the leader, including calls without attributable metadata. Traffic snapshots are coherent: hits never exceed lookups. Counts can be lost on restart or leadership change. Bytes are gRPC message bytes on ActionCache, ContentAddressableStorage and ByteStream calls between clients and Gang, including partial streams, compressed when sent compressed and counting every attempt, without HTTP/2 or TLS framing. Worker-to-store traffic is excluded. `evictedBytes` counts bounded-store evictions in the step.
 - **Builds in the state.** `State.builds` contains the basic build view for records observed within the recent window, ordered by name and bounded by `max_live`; `Delta.builds` applies `{upsert[], remove[]}` keyed by name. RunningAction and QueuedAction `build` references the first submitter's build, and is absent when unattributable. See [builds](#builds) for the build view.
 - **Events in the state.** `State.events` holds the newest `eventsLimit` scaling events, newest last (ascending). The same events are on `GET /v1/events`, which pages the whole history newest first.

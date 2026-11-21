@@ -20,7 +20,7 @@ use gang_spi::{
     LoginPort, LoginRequest, LoginSupport, NetworkAccess, NodeLifecyclePort, Peer, Plugin,
     PluginContext, PortError, PreemptionNotice, ProofVerifierPort, ProvisionerPort, RecordId,
     RecordKey, RecordKind, RecordVersion, Rejection, RenderedStoreSpec, RequestGate, RequestScope,
-    SchedulerPort, SchedulerSnapshot, Scheme, ScratchVolumePort, SignatureAlgorithm, Slots,
+    SchedulerPort, SchedulerSnapshot, Scheme, ScratchVolumePort, SignatureAlgorithm,
     StateRepositoryPort, StoreAccess, Subject, WorkerSpec, WorkerTls, WorkloadCredentialPort,
     full_body,
 };
@@ -165,7 +165,6 @@ max_instances = 4
 vcpus_per_instance = 4
 memory_per_instance = "8GiB"
 disk_per_instance = "100GiB"
-target_actions_per_instance = 4
 idle_timeout = "15s"
 max_drain_wait = "1m"
 boot_grace = "30s"
@@ -581,6 +580,7 @@ fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
     let controller = ControllerSpec {
         actions: Arc::new(gang_config::ActionsConfig::default()),
         scaling: Arc::new(gang_config::ScalingConfig::default()),
+        control_acquire_timeout: gang_types::NonZeroDuration::from_secs(1),
         clock: Arc::new(gang_clock::TestClock::new(
             gang_clock::Timestamp::UNIX_EPOCH,
         )),
@@ -615,7 +615,7 @@ fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
         memory_pool: None,
         instance: worker_instance,
         properties,
-        slots: Slots::LongLived(NonZeroU32::MIN.saturating_add(3)),
+        lifetime: WorkerLifetime::LongLived,
         work_directory: PathBuf::from("/work"),
         fast_cas_directory: PathBuf::from("/work/cas"),
         fast_cas_budget: Bytes::new(1024),

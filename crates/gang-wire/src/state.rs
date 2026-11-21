@@ -124,6 +124,10 @@ pub struct State {
     pub provisioner: String,
     /// The outcome of the last scheduling pass.
     pub pass: Pass,
+    /// Whether the latest scheduler observation succeeded; absent before the first observation
+    /// and on legacy frames. This is independent of recent-step counter completeness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_known: Option<bool>,
     /// The action queue.
     pub queue: Queue,
     /// Fleets in declaration order, which is preference order.
@@ -279,6 +283,7 @@ pub struct Recent {
     ts_rs::TS,
 )]
 #[serde(rename_all = "camelCase")]
+#[ts(optional_fields)]
 pub struct Sample {
     /// Start of the step: a whole multiple of the step since the Unix epoch.
     #[serde(with = "crate::time")]
@@ -286,14 +291,19 @@ pub struct Sample {
     pub start: Timestamp,
     /// Actions that reached a terminal result during the step.
     pub completed: u32,
-    /// Actions executing at the step's latest completed pass; 0 when `passes` is 0.
+    /// Actions executing at the step's latest known scheduler observation.
     pub running: u32,
-    /// Actions queued at the step's latest completed pass; 0 when `passes` is 0.
+    /// Actions queued at the step's latest known scheduler observation.
     pub queued: u32,
     /// Control passes that completed during the step.
     pub passes: u32,
     /// Control passes skipped during the step.
     pub skipped: u32,
+    /// Whether scheduler history for this step is complete. An actual unavailable or
+    /// counter-unbaselined observation makes false sticky within the step; an unobserved
+    /// step is false until its first complete observation. Absent only on legacy samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_known: Option<bool>,
     /// `GetActionResult` calls answered during the step.
     pub lookups: u32,
     /// Of `lookups`, remote cache hits.
@@ -356,6 +366,7 @@ impl Recent {
         match self.samples.last() {
             None => self.samples.push(Sample {
                 start: Timestamp::from_unix_millis(start),
+                scheduler_known: Some(false),
                 ..Sample::default()
             }),
             Some(last) => {
@@ -366,12 +377,14 @@ impl Recent {
                         self.samples.clear();
                         self.samples.push(Sample {
                             start: Timestamp::from_unix_millis(start),
+                            scheduler_known: Some(false),
                             ..Sample::default()
                         });
                     } else {
                         for offset in 1..=steps {
                             self.samples.push(Sample {
                                 start: Timestamp::from_unix_millis(last + offset * step),
+                                scheduler_known: Some(false),
                                 ..Sample::default()
                             });
                         }
@@ -506,7 +519,7 @@ impl Pass {
 #[serde(rename_all = "camelCase")]
 #[ts(optional_fields)]
 pub struct Queue {
-    /// The sum of every fleet's queued demand plus `unplaceable`.
+    /// Total queued actions in the latest scheduler observation.
     pub total: u32,
     /// Queued actions that no fleet accepts.
     pub unplaceable: u32,
@@ -604,8 +617,6 @@ pub struct Policy {
     pub min: u32,
     /// The most instances the fleet runs.
     pub max: u32,
-    /// The number of actions one instance is expected to take.
-    pub target_actions: u32,
     /// How long a worker may stay idle before it drains.
     #[serde(with = "crate::duration")]
     #[ts(type = "Duration")]
@@ -688,7 +699,7 @@ pub struct WorkerCounts {
 pub struct Demand {
     /// Actions running on the fleet.
     pub running: u32,
-    /// Queued actions charged to this fleet only.
+    /// Queued actions attributed to this fleet by the latest completed control pass.
     pub queued: u32,
     /// Queued actions this fleet could run; overlaps across fleets.
     pub candidates: u32,
@@ -715,10 +726,10 @@ pub struct Demand {
     )]
     #[ts(type = "Duration")]
     pub expected_wait: Option<Duration>,
-    /// Persistent load in integer deci-slots, absent until measured; zero is a measurement.
+    /// Persistent load in tenths of a worker-equivalent, absent until measured; zero is a measurement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load: Option<u32>,
-    /// Transient queued slot-time before readiness subtraction, rounded to whole seconds.
+    /// Transient queued worker-equivalent-seconds, rounded to whole seconds.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -729,6 +740,29 @@ pub struct Demand {
     /// Instantaneous serving resource occupancy in permille, absent without serving capacity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub utilization: Option<u16>,
+}
+
+/// CPU and memory resources from the scheduler's reservation ledger.
+#[derive(
+    gang_macros::Known,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct Reservation {
+    /// CPU in millicores.
+    #[ts(type = "number")]
+    pub cpu_millicores: u64,
+    /// Memory in bytes.
+    #[ts(type = "number")]
+    pub memory: u64,
 }
 
 /// A connected worker, named `workers/{worker}`.
@@ -755,9 +789,15 @@ pub struct Worker {
     pub phase_time: Timestamp,
     /// Actions the worker is running.
     pub running: u32,
-    /// How many actions the worker may run at once; absent when unknown.
+    /// Optional observed action cap; absent for unlimited long-lived workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots: Option<u32>,
+    /// Resources currently reserved on this worker, when reported by the scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved: Option<Reservation>,
+    /// Worker's resource capacity, when reported by the scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<Reservation>,
     /// Whether the worker is paused.
     pub paused: bool,
     /// When the instance launched.
@@ -846,6 +886,7 @@ pub struct Truncated {
     gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS,
 )]
 #[serde(rename_all = "camelCase")]
+#[ts(optional_fields)]
 pub struct RunningAction {
     /// Resource name, `actions/{op}`.
     pub name: String,
@@ -869,6 +910,12 @@ pub struct RunningAction {
     pub start_time: Timestamp,
     /// The action's priority.
     pub priority: i32,
+    /// Resources reserved for this action, when reported by the scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation: Option<Reservation>,
+    /// Learned pre-fit resources, when CPU or memory exceeded the fitted reservation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_reservation: Option<Reservation>,
 }
 
 /// An action that waits for a worker, named `actions/{op}`.
@@ -902,6 +949,12 @@ pub struct QueuedAction {
     /// Why no fleet accepts this action; absent when a fleet accepts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+    /// Resources reserved for this action, when reported by the scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation: Option<Reservation>,
+    /// Learned pre-fit resources, when CPU or memory exceeded the fitted reservation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_reservation: Option<Reservation>,
 }
 
 /// A resource that carries its resource name.
@@ -1067,6 +1120,7 @@ mod tests {
             recent.samples[1],
             Sample {
                 start: Timestamp::from_unix_millis(20_000),
+                scheduler_known: Some(false),
                 ..Sample::default()
             }
         );
@@ -1101,6 +1155,29 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_availability_is_optional_on_the_wire() {
+        let sample = Sample::default();
+        let legacy = serde_json::to_value(sample).expect("sample serializes");
+        assert!(legacy.get("schedulerKnown").is_none());
+        assert_eq!(
+            serde_json::from_value::<Sample>(legacy)
+                .expect("legacy sample")
+                .scheduler_known,
+            None
+        );
+        let unknown = Sample {
+            scheduler_known: Some(false),
+            ..sample
+        };
+        let value = serde_json::to_value(unknown).expect("sample serializes");
+        assert_eq!(value["schedulerKnown"], false);
+        assert_eq!(
+            serde_json::from_value::<Sample>(value).expect("sample deserializes"),
+            unknown
+        );
+    }
+
+    #[test]
     fn recent_and_worker_phases_have_wire_json() {
         let start = Timestamp::from_unix_millis(0);
         let mut recent = Recent::new(Duration::from_mins(15), Duration::from_secs(10));
@@ -1117,6 +1194,7 @@ mod tests {
                 uploaded_bytes: 8,
                 downloaded_bytes: 9,
                 evicted_bytes: 10,
+                scheduler_known: None,
             };
         });
         let state = State {
@@ -1173,7 +1251,6 @@ mod tests {
             "policy": {
                 "min": 0,
                 "max": 20,
-                "targetActions": 4,
                 "idleTimeout": "300s",
                 "maxDrainWait": "1800s",
                 "bootGrace": "0.250s",

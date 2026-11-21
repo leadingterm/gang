@@ -44,6 +44,7 @@ use gang_spi::{
 };
 use gang_types::{FleetCatalog, SaturatingInto};
 
+use crate::capacity::RuntimeCatalog;
 use crate::config::NativeLinkConfig;
 use crate::durations::ActionDurations;
 use crate::errors::NativeLinkEmbedError;
@@ -67,14 +68,15 @@ pub(crate) struct Handles {
     pub worker_scheduler: Arc<ObservingWorkerScheduler>,
     /// Queued actions and the platform properties they require.
     pub action_scheduler: Arc<dyn KnownPlatformPropertyProvider>,
-    /// Every fleet's properties, to match queued actions against.
-    pub fleets: Arc<FleetCatalog>,
+    /// Current conservative fleet properties, shared with admission and fitting.
+    pub fleets: Arc<RuntimeCatalog>,
     /// Actions that reached a terminal result on a worker since the controller started.
     pub completed: Arc<AtomicU64>,
     /// Learned worker slot durations.
     pub durations: Arc<Mutex<ActionDurations>>,
     /// Server clock shared by completion receipts, duration writers and snapshot readers.
     pub clock: Arc<dyn Clock>,
+    pub control_acquire_timeout: gang_types::NonZeroDuration,
     pub rates: Arc<SourceRates>,
     pub scratch: tokio::sync::Mutex<crate::snapshot::Scratch>,
     /// The controller stores' usage, read through one reused metrics collector.
@@ -208,6 +210,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         actions: action_scheduler,
         workers: worker_scheduler,
         resource,
+        fleets,
     } = scheduler_stack(&scheduler, spec.fleets, &spec.actions, resources)?;
     let handoff = HandOff::new();
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
@@ -215,9 +218,8 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
     let completed = Arc::new(AtomicU64::new(0));
     let durations = retained_durations(histories, resource, &spec.actions);
     let clock = Arc::clone(&spec.clock);
-    let fleets = Arc::new(spec.fleets.clone());
     let rates = Arc::new(
-        SourceRates::new(&spec.scaling, fleets.len(), Arc::clone(&clock))
+        SourceRates::new(&spec.scaling, spec.fleets.len(), Arc::clone(&clock))
             .map_err(NativeLinkEmbedError::native("source rates"))?,
     );
     let draining = Arc::new(ObservingWorkerScheduler::new(
@@ -229,6 +231,9 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         handoff.clone(),
         Arc::clone(&durations),
         Arc::clone(&clock),
+        &fleets
+            .current()
+            .map_err(NativeLinkEmbedError::native("fleet capacity"))?,
         Arc::clone(&fleets),
         Arc::clone(&rates),
     ));
@@ -261,6 +266,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         completed,
         durations,
         clock,
+        control_acquire_timeout: spec.control_acquire_timeout,
         rates,
         scratch: tokio::sync::Mutex::new(crate::snapshot::Scratch::default()),
         stores: StoreUsage::new(Arc::clone(store_manager)),
@@ -436,12 +442,14 @@ fn connection_limits(tuning: &Http2Config, max_workers: u64) -> ConnectionLimits
 type SchedulerHandles = (
     Arc<dyn KnownPlatformPropertyProvider>,
     Arc<dyn WorkerScheduler>,
+    Arc<RuntimeCatalog>,
 );
 
 struct SchedulerStack {
     actions: Arc<dyn KnownPlatformPropertyProvider>,
     workers: Arc<dyn WorkerScheduler>,
     resource: Arc<ResourceSketch>,
+    fleets: Arc<RuntimeCatalog>,
 }
 
 /// The action stack over `NativeLink`'s simple scheduler.
@@ -452,7 +460,7 @@ fn scheduler_stack(
     resources: &OnceLock<Arc<ResourceSketch>>,
 ) -> Result<SchedulerStack, NativeLinkEmbedError> {
     let mut resource = None;
-    let (actions, workers) = action_stack(
+    let (actions, workers, fleets) = action_stack(
         scheduler,
         fleets,
         actions,
@@ -477,6 +485,7 @@ fn scheduler_stack(
         actions,
         workers,
         resource,
+        fleets,
     })
 }
 
@@ -532,10 +541,22 @@ fn action_stack(
     });
     let notify = Arc::new(Notify::new());
     let (simple_actions, worker_scheduler) = simple_scheduler(simple, notify, Arc::clone(sketch));
+    let receiver = worker_scheduler
+        .resource_capacity_updates()
+        .ok_or_else(|| {
+            NativeLinkEmbedError::native("scheduler configuration failed")(make_err!(
+                Code::InvalidArgument,
+                "NativeLink worker scheduler must publish resource capacity updates"
+            ))
+        })?;
+    let fleets = Arc::new(RuntimeCatalog::new(fleets.clone(), receiver));
+    fleets
+        .current()
+        .map_err(NativeLinkEmbedError::native("fleet capacity"))?;
     let admitted = AdmittedFleets::default();
     let fitted = Arc::new(FittedActions::new(
         simple_actions,
-        fleets.clone(),
+        Arc::clone(&fleets),
         admitted.clone(),
         actions.memory.min_reservation,
         actions.disk.min_reservation,
@@ -545,9 +566,12 @@ fn action_stack(
         fitted,
         Arc::clone(sketch),
     ));
-    let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
-        Arc::new(PlaceableActions::new(historical, fleets.clone(), admitted));
-    Ok((action_scheduler, worker_scheduler))
+    let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> = Arc::new(PlaceableActions::new(
+        historical,
+        Arc::clone(&fleets),
+        admitted,
+    ));
+    Ok((action_scheduler, worker_scheduler, fleets))
 }
 
 /// Observes the router's calls into `sink`, and decodes Bazel's `RequestMetadata` header into the
@@ -923,6 +947,7 @@ mod tests {
                 actions: Arc::clone(actions),
                 scaling: Arc::new(gang_config::ScalingConfig::default()),
                 clock: Arc::new(SystemClock::new()),
+                control_acquire_timeout: gang_types::NonZeroDuration::from_secs(1),
                 content_store: &memory,
                 action_store: &memory,
                 fleets,
@@ -934,7 +959,7 @@ mod tests {
         let mut simple_slot = None;
         let mut sketch_slot = None;
         let mut notify_slot = None;
-        let (actions, workers) = action_stack(
+        let (actions, workers, _) = action_stack(
             &rendered,
             fleets,
             actions,
@@ -1065,10 +1090,12 @@ mod tests {
             platform_properties.insert(property::MEMORY_KB.to_owned(), memory_kb.to_owned());
         }
         Arc::new(ActionInfo {
+            memory_reservation: None,
             command_digest: digest,
             input_root_digest: digest,
             timeout: Duration::from_mins(1),
             platform_properties,
+            pre_fit_reservation: None,
             priority: 0,
             load_timestamp: test_now().now(),
             insert_timestamp: test_now().now(),
@@ -1146,6 +1173,55 @@ mod tests {
                 .map(String::as_str),
             Some(expected)
         );
+    }
+
+    #[tokio::test]
+    async fn historical_stack_preserves_original_memory_intent_before_native_persistence()
+    -> TestResult {
+        let policies = Arc::new(serde_json::from_value(json!({
+            "cold_start": { "memory": "30GiB" }
+        }))?);
+        for original in [None, Some("0"), Some("2097152")] {
+            let fleets = x86_and_arm_fleets();
+            let (stack, _) = stack_with_actions(&fleets, &default_config(), None, &policies)?;
+            let mut request = action(Isa::Aarch64, original);
+            let info = Arc::make_mut(&mut request);
+            info.platform_properties
+                .insert(property::CPU_MILLICORES.to_owned(), "2000".to_owned());
+            info.memory_reservation = Some(nativelink_util::action_messages::MemoryReservation {
+                minimum_kb: Some(u64::MAX),
+                desired_kb: Some(u64::MAX),
+                cpu_before_memory_fit: Some(u64::MAX),
+                fitted_revision: None,
+            });
+            let subscription = stack
+                .actions
+                .add_action(OperationId::from("original-intent"), request)
+                .await?;
+            let (persisted, _) = subscription.as_action_info().await?;
+            let reservation = persisted
+                .memory_reservation
+                .as_ref()
+                .expect("Gang-owned intent");
+            let minimum = original.map(|value| value.parse::<u64>().unwrap());
+            assert_eq!(reservation.minimum_kb, minimum);
+            assert_eq!(
+                reservation.desired_kb,
+                Some(minimum.unwrap_or(30 * 1024 * 1024))
+            );
+            assert_eq!(reservation.cpu_before_memory_fit, Some(2000));
+            assert!(reservation.fitted_revision.is_some());
+            let physical = 8 * 1024 * 1024;
+            assert_eq!(
+                persisted.platform_properties[property::MEMORY_KB],
+                minimum.unwrap_or(physical).to_string(),
+            );
+            assert_eq!(
+                persisted.platform_properties[property::CPU_MILLICORES],
+                if original.is_none() { "4000" } else { "2000" },
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1279,6 +1355,254 @@ mod tests {
                 .any(|p| p.name == property::CPU_MILLICORES && p.value == "4000"),
             "a whole-CPU request dispatches with its canonical millicore reservation"
         );
+        Ok(())
+    }
+
+    struct PackingGate {
+        _notify: Arc<tokio::sync::Notify>,
+        _ready_rx: mpsc::Receiver<()>,
+    }
+
+    async fn packing_stack(
+        factor: u32,
+        memory: u64,
+        disk: u64,
+    ) -> TestResult<(
+        TestStack,
+        FleetProperties,
+        Arc<gang_config::ActionsConfig>,
+        PackingGate,
+    )> {
+        NOW.set(Duration::from_secs(1_000_000));
+        let properties = FleetProperties::new(
+            &FleetName::try_new("arm")?,
+            Isa::Aarch64,
+            &"docker",
+            &"host:test".parse()?,
+            Resources {
+                vcpus: 2,
+                memory: Bytes::new(memory),
+                disk: Bytes::new(disk),
+            },
+            &gang_types::FleetActionPolicy::default(),
+            Vec::<(&'static str, String)>::new(),
+        );
+        let fleets = FleetCatalog::try_new(vec![properties.clone()])?;
+        let mut actions = gang_config::ActionsConfig::default();
+        assert_eq!(actions.cold_start.cpu_millicores.get(), 250);
+        actions.cpu_oversubscription = std::num::NonZeroU32::new(factor).expect("nonzero factor");
+        actions.cold_start.memory = gang_config::WholeKib::from_units(64 * 1024);
+        actions.cold_start.disk = gang_config::WholeKib::from_units(1024 * 1024);
+        let actions = Arc::new(actions);
+        let (ready_tx, mut ready_rx) = mpsc::channel(1);
+        let (stack, notify) =
+            stack_with_actions(&fleets, &default_config(), Some(ready_tx), &actions)?;
+        notify.notify_one();
+        ready_rx
+            .recv()
+            .await
+            .expect("background matcher reached the gate");
+        Ok((
+            stack,
+            properties,
+            actions,
+            PackingGate {
+                _notify: notify,
+                _ready_rx: ready_rx,
+            },
+        ))
+    }
+
+    async fn register_packing_worker(
+        stack: &TestStack,
+        properties: FleetProperties,
+        actions: Arc<gang_config::ActionsConfig>,
+    ) -> TestResult<(WorkerId, mpsc::Receiver<UpdateForWorker>)> {
+        use std::path::PathBuf;
+
+        use gang_spi::{StoreAccess, WorkerSpec, WorkerTls};
+        use gang_types::{InstanceId, WorkerLifetime};
+        use nativelink_config::cas_server::WorkerProperty;
+
+        let store = RenderedStoreSpec(json!({ "memory": {} }));
+        let spec = WorkerSpec {
+            actions,
+            memory_pool: None,
+            instance: InstanceId::try_new("local-1")?,
+            properties,
+            lifetime: WorkerLifetime::LongLived,
+            work_directory: PathBuf::from("/var/gang/work"),
+            fast_cas_directory: PathBuf::from("/var/gang/cas"),
+            fast_cas_budget: Bytes::new(1024),
+            content_store: store.clone(),
+            action_store: store,
+            store_access: StoreAccess::Direct,
+            entrypoint: PathBuf::from("/usr/bin/gang"),
+        };
+        let rendered = settings::worker(
+            &default_config(),
+            &"grpc://127.0.0.1:9100".parse()?,
+            &spec,
+            WorkerTls::Plain,
+        )?
+        .worker;
+        assert_eq!(rendered.max_inflight_tasks, 0);
+        let pairs = rendered
+            .platform_properties
+            .iter()
+            .map(|(key, value)| match value {
+                WorkerProperty::Values(values) => {
+                    let [value] = values.as_slice() else {
+                        panic!("expected one static value for {key}");
+                    };
+                    (key.clone(), value.clone())
+                }
+                WorkerProperty::QueryCmd(_) => panic!("unexpected query property {key}"),
+            })
+            .collect();
+        let native_properties = stack
+            .workers
+            .get_platform_property_manager()
+            .make_platform_properties(pairs)?;
+        let worker_id = WorkerId("rendered-worker".to_owned());
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut worker = Worker::new(
+            worker_id.clone(),
+            native_properties,
+            tx,
+            NOW.get().as_secs(),
+            rendered.max_inflight_tasks,
+        );
+        worker.set_action_ceilings(&rendered.action_ceilings);
+        stack.workers.add_worker(worker).await?;
+        assert!(matches!(
+            rx.try_recv()
+                .expect("worker connection acknowledgement")
+                .update,
+            Some(update_for_worker::Update::ConnectionResult(_))
+        ));
+        Ok((worker_id, rx))
+    }
+
+    fn packing_action(index: u8) -> Arc<ActionInfo> {
+        let mut info = action(Isa::Aarch64, None);
+        let info_mut = Arc::get_mut(&mut info).expect("action is uniquely owned");
+        let digest = DigestInfo::new([index + 1; 32], 1);
+        info_mut.command_digest = digest;
+        info_mut.input_root_digest = digest;
+        info_mut.unique_qualifier = ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+            execution_scope: None,
+            instance_name: String::new(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest,
+        });
+        info
+    }
+
+    fn packing_start(rx: &mut mpsc::Receiver<UpdateForWorker>) -> StartExecute {
+        let start = match rx.try_recv().expect("action dispatch").update {
+            Some(update_for_worker::Update::StartAction(start)) => start,
+            update => panic!("expected StartAction, got {update:?}"),
+        };
+        assert!(
+            start
+                .platform
+                .as_ref()
+                .expect("dispatch platform")
+                .properties
+                .iter()
+                .any(|p| p.name == property::CPU_MILLICORES && p.value == "250")
+        );
+        start
+    }
+
+    async fn packing_case(factor: u32, memory: u64, disk: u64, dispatched: u8) -> TestResult {
+        let (stack, properties, actions, _gate) = packing_stack(factor, memory, disk).await?;
+        let (worker_id, mut rx) = register_packing_worker(&stack, properties, actions).await?;
+        let mut subscriptions = Vec::new();
+        let mut starts = Vec::new();
+        for index in 0..=dispatched {
+            let client = OperationId::from(format!("packing-client-{index}").as_str());
+            subscriptions.push(
+                stack
+                    .actions
+                    .add_action(client.clone(), packing_action(index))
+                    .await?,
+            );
+            stack.simple.do_try_match_for_test().await?;
+            if index == dispatched {
+                assert_eq!(
+                    stage_of(stack.actions.as_ref(), &client).await?,
+                    Some(ActionStage::Queued)
+                );
+                assert!(matches!(
+                    rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+            } else {
+                starts.push(packing_start(&mut rx));
+            }
+        }
+        let snapshot = stack.workers.worker_snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].running_actions, u32::from(dispatched));
+        assert_eq!(snapshot[0].max_inflight_tasks, 0);
+        let remaining = snapshot[0]
+            .available_platform_properties
+            .get(property::CPU_MILLICORES)
+            .expect("CPU ledger")
+            .parse::<u64>()?;
+        if dispatched > 1 {
+            assert!(snapshot[0].running_actions > 2);
+            assert_eq!(remaining, 0);
+        } else {
+            assert!(remaining > 0);
+            let (limited, expected) = if memory == 96 << 20 {
+                (property::MEMORY_KB, "32768")
+            } else {
+                (property::DISK_KB, "0")
+            };
+            assert_eq!(
+                snapshot[0]
+                    .available_platform_properties
+                    .get(limited)
+                    .map(String::as_str),
+                Some(expected)
+            );
+        }
+        let operation_id = OperationId::from(starts[0].operation_id.as_str());
+        stack
+            .workers
+            .update_action(
+                &worker_id,
+                &operation_id,
+                UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                    ActionResult::default(),
+                )),
+            )
+            .await?;
+        stack.simple.do_try_match_for_test().await?;
+        packing_start(&mut rx);
+        let queued_client = OperationId::from(format!("packing-client-{dispatched}").as_str());
+        assert_eq!(
+            stage_of(stack.actions.as_ref(), &queued_client).await?,
+            Some(ActionStage::Executing)
+        );
+        Ok(())
+    }
+
+    /// The rendered worker budget, not its physical CPU count, limits fractional reservations.
+    #[tokio::test]
+    async fn rendered_workers_pack_fractional_cpu_until_a_resource_is_exhausted() -> TestResult {
+        // The last two cases cannot fit another memory or disk reservation, despite spare CPU.
+        for (factor, memory, disk, dispatched) in [
+            (1, 8 << 30, 100 << 30, 8_u8),
+            (2, 8 << 30, 100 << 30, 16),
+            (2, 96 << 20, 100 << 30, 1),
+            (2, 8 << 30, 1 << 30, 1),
+        ] {
+            packing_case(factor, memory, disk, dispatched).await?;
+        }
         Ok(())
     }
 
@@ -1542,6 +1866,7 @@ mod tests {
             actions: Arc::new(gang_config::ActionsConfig::default()),
             scaling: Arc::new(gang_config::ScalingConfig::default()),
             clock: Arc::new(SystemClock::new()),
+            control_acquire_timeout: gang_types::NonZeroDuration::from_secs(1),
             content_store: &store,
             action_store: &store,
             fleets: &fleets,
@@ -1828,6 +2153,7 @@ mod tests {
             actions: Arc::clone(&actions),
             scaling: Arc::new(gang_config::ScalingConfig::default()),
             clock: Arc::new(SystemClock::new()),
+            control_acquire_timeout: gang_types::NonZeroDuration::from_secs(1),
             content_store: &store,
             action_store: &store,
             fleets: &fleets,
@@ -1846,6 +2172,7 @@ mod tests {
         let operation = OperationId::String("stack-wiring".to_owned());
         let digest = DigestInfo::new([1; 32], 1);
         let info = Arc::new(ActionInfo {
+            memory_reservation: None,
             command_digest: digest,
             input_root_digest: digest,
             timeout: Duration::from_mins(1),
@@ -1858,6 +2185,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            pre_fit_reservation: None,
             priority: 0,
             load_timestamp: UNIX_EPOCH,
             insert_timestamp: UNIX_EPOCH,
@@ -1897,6 +2225,7 @@ mod tests {
     fn origin_test_action() -> Arc<ActionInfo> {
         let digest = DigestInfo::new([2; 32], 2);
         Arc::new(ActionInfo {
+            memory_reservation: None,
             command_digest: digest,
             input_root_digest: digest,
             timeout: Duration::from_mins(1),
@@ -1904,6 +2233,7 @@ mod tests {
                 property::ACTION_ENVIRONMENT.to_owned(),
                 "host:test".to_owned(),
             )]),
+            pre_fit_reservation: None,
             priority: 0,
             load_timestamp: UNIX_EPOCH,
             insert_timestamp: UNIX_EPOCH,
@@ -1930,6 +2260,7 @@ mod tests {
             actions: Arc::new(gang_config::ActionsConfig::default()),
             scaling: Arc::new(gang_config::ScalingConfig::default()),
             clock: Arc::new(SystemClock::new()),
+            control_acquire_timeout: gang_types::NonZeroDuration::from_secs(1),
             content_store: &store,
             action_store: &store,
             fleets: &fleets,

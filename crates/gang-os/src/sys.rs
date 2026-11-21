@@ -1,6 +1,6 @@
 #![expect(
     unsafe_code,
-    reason = "signal masks, mkfifo and kqueue require unsafe calls"
+    reason = "signal masks, mkfifo, kqueue and physical memory queries require unsafe calls"
 )]
 
 use std::ffi::CStr;
@@ -8,6 +8,56 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
 use std::ptr;
+
+/// Returns the operating system's reported physical memory in bytes.
+///
+/// # Errors
+/// Returns an I/O error if the operating system query fails or its result is invalid.
+#[cfg(target_os = "linux")]
+pub fn physical_memory() -> io::Result<gang_types::Bytes> {
+    let mut info = MaybeUninit::<libc::sysinfo>::uninit();
+    // SAFETY: info points to writable storage for a sysinfo struct, initialized on success.
+    if unsafe { libc::sysinfo(info.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful sysinfo call initialized the entire struct.
+    let info = unsafe { info.assume_init() };
+    let total = u64::try_from(u128::from(info.totalram))
+        .ok()
+        .and_then(|ram| ram.checked_mul(u64::from(info.mem_unit)))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "physical memory overflow"))?;
+    Ok(gang_types::Bytes::new(total))
+}
+
+/// Returns the operating system's reported physical memory in bytes.
+///
+/// # Errors
+/// Returns an I/O error if the operating system query fails or its result is invalid.
+#[cfg(target_os = "macos")]
+pub fn physical_memory() -> io::Result<gang_types::Bytes> {
+    let mut total = 0_u64;
+    let mut len = std::mem::size_of_val(&total);
+    // SAFETY: the name is NUL-terminated, and total and len are valid writable buffers.
+    if unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&raw mut total).cast(),
+            &raw mut len,
+            ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if len != std::mem::size_of_val(&total) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid physical memory size",
+        ));
+    }
+    Ok(gang_types::Bytes::new(total))
+}
 
 /// An asynchronously readable owned pipe. Dropping the reader closes its descriptor.
 pub struct PipeReader {

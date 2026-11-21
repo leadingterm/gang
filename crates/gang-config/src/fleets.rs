@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use gang_types::{
-    ActionEnvironment, Fleet, FleetActionPolicy, FleetCatalog, FleetCountError, FleetName,
+    ActionEnvironment, Bytes, Fleet, FleetActionPolicy, FleetCatalog, FleetCountError, FleetName,
     FleetProperties, Isa, MAX_FLEETS, NonZeroBytes,
 };
 use serde::{Deserialize, Serialize};
@@ -33,12 +33,10 @@ pub struct RawFleet<K> {
     pub max_instances: NonZeroU32,
     /// Virtual CPUs per instance.
     pub vcpus_per_instance: NonZeroU32,
-    /// Memory per instance.
+    /// Nominal physical memory estimate per instance, before the action memory reserve.
     pub memory_per_instance: NonZeroBytes,
     /// Disk space per instance.
     pub disk_per_instance: NonZeroBytes,
-    /// Target concurrent actions per instance.
-    pub target_actions_per_instance: NonZeroU32,
     /// Idle time before an instance can be removed.
     #[serde(with = "gang_types::duration")]
     pub idle_timeout: Duration,
@@ -63,7 +61,10 @@ pub struct RawFleet<K> {
 
 impl<K> RawFleet<K> {
     /// Splits the entry into its validated policy, sandbox key and options table.
-    fn into_parts(self) -> Result<(FleetPolicy, K, FleetOptionsTable), ConfigError> {
+    fn into_parts(
+        self,
+        reserve: Bytes,
+    ) -> Result<(FleetPolicy, K, FleetOptionsTable), ConfigError> {
         let RawFleet {
             name,
             isa,
@@ -73,7 +74,6 @@ impl<K> RawFleet<K> {
             vcpus_per_instance,
             memory_per_instance,
             disk_per_instance,
-            target_actions_per_instance,
             idle_timeout,
             max_drain_wait,
             boot_grace,
@@ -82,6 +82,17 @@ impl<K> RawFleet<K> {
             options,
             scheduled_minimum,
         } = self;
+        let Some(usable_memory) =
+            NonZeroBytes::new(memory_per_instance.get().saturating_sub(reserve))
+        else {
+            return Err(ConfigError::ActionResourceDoesNotFit {
+                key: "actions.memory.reserve",
+                value: reserve.get(),
+                capacity: memory_per_instance.as_u64(),
+                fleet: name,
+                relation: "less than",
+            });
+        };
         let instances = InstanceBounds::try_new(min_instances, max_instances)
             .map_err(|_| ConfigError::FleetBounds {
                 fleet: name.clone(),
@@ -101,9 +112,8 @@ impl<K> RawFleet<K> {
             action_environment,
             instances,
             vcpus_per_instance,
-            memory_per_instance,
+            memory_per_instance: usable_memory,
             disk_per_instance,
-            target_actions_per_instance,
             idle_timeout,
             max_drain_wait,
             boot_grace,
@@ -147,13 +157,14 @@ impl<P: PluginSet> Fleets<P> {
         raw: Vec<RawFleet<P::SandboxKey>>,
         provisioner: &P::Provisioner,
         sandbox: &P::Sandbox,
+        reserve: Bytes,
     ) -> Result<Self, ConfigError> {
         if raw.len() > MAX_FLEETS {
             return Err(ConfigError::TooManyFleets { count: raw.len() });
         }
         let mut members = Vec::with_capacity(raw.len());
         for raw in raw {
-            let (policy, key, options_table) = raw.into_parts()?;
+            let (policy, key, options_table) = raw.into_parts(reserve)?;
 
             if members
                 .iter()
@@ -350,7 +361,6 @@ max_instances = 4
 vcpus_per_instance = 8
 memory_per_instance = "29GiB"
 disk_per_instance = "100GiB"
-target_actions_per_instance = 2
 idle_timeout = "5m"
 max_drain_wait = "1h"
 boot_grace = "10m"
@@ -360,7 +370,7 @@ sandbox = "bwrap"
     #[test]
     fn parses_isa_and_instance_size() -> Result<(), Box<dyn Error>> {
         let raw: RawFleet<String> = toml::from_str(FLEET)?;
-        let (policy, sandbox, options) = raw.into_parts()?;
+        let (policy, sandbox, options) = raw.into_parts(NonZeroBytes::gib(1).get())?;
 
         assert_eq!(policy.name, "gang-arm64".parse::<FleetName>()?);
         assert_eq!(policy.isa, "aarch64".parse::<Isa>()?);
@@ -370,7 +380,7 @@ sandbox = "bwrap"
             policy.instance(),
             Resources {
                 vcpus: 8,
-                memory: NonZeroBytes::gib(29).get(),
+                memory: NonZeroBytes::gib(28).get(),
                 disk: NonZeroBytes::gib(100).get(),
             }
         );
@@ -393,7 +403,7 @@ sandbox = "bwrap"
             "{FLEET}\n[actions]\ngrants = [\"network\"]\n[actions.resources]\ncpu_count = 4\n"
         );
         let raw: RawFleet<String> = toml::from_str(&config)?;
-        let (policy, _, _) = raw.into_parts()?;
+        let (policy, _, _) = raw.into_parts(NonZeroBytes::gib(1).get())?;
         assert_eq!(policy.action_environment.as_str(), "host:test");
         assert!(
             policy

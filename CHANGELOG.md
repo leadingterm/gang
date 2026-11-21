@@ -2,18 +2,41 @@
 
 ## Unreleased
 
+### Fixed
+
+- Fix OpenTofu retained-generation cleanup racing AMI-data removal by patching forget-node references. Bazel and the deployment shell share the same pinned, source-built runtime; strict fixture diagnostics remain unchanged.
+
+## 0.3.5 — 2026-11-21
+
+### Added
+
+- Expose scheduler-owned action reservations and worker reserved capacity in live state and the dashboard, including pre-fit sizing when clamped.
+- Preserve learned scheduler history across transitions when a scheduler is temporarily unknown.
+- Prioritize Spot capacity in fleet allocation and verify deployments automatically.
+
 ### Changed
 
+- Scale out to the greater of the fleet minimum and the CPU, memory, or disk reservation need, capped by the fleet maximum. CPU capacity includes `[actions] cpu_oversubscription` (default `2`); rate and payback estimates no longer hold scale-out below resource demand. Expected wait and N−1 scale-in use resource capacity, not nominal action slots.
 - The public listener defaults to 4096 connections, with dashboard diagnostics showing current saturation and cumulative refusals since server start.
 - Public egress now uses a per-action pasta network namespace and one host nftables policy scoped to the action cgroup subtree. NixOS prepares the policy and cgroup before worker startup; missing or mismatched prerequisites deny granted actions.
 - **Server configuration migration:** Remove `slirp4netns`, `nft`, `nsenter` and `ip` from `[sandbox.bwrap.egress]`; these old helper keys are rejected as unknown. The table now accepts only `program`, defaulting to `pasta`, resolved and pinned like `[sandbox.bwrap].program`. Keep the existing `[execution.egress]` policy and fleet grants.
 
+### Removed
+
+- Remove `target_actions_per_instance` from fleet configuration and Terraform fleet inputs, and remove `targetActions` from the fleet policy state API. Operators must delete the setting from existing configuration and Terraform inputs before upgrading; dashboard/API clients must stop reading `targetActions`. There is no replacement action-count limit. Long-lived workers have no fixed in-flight limit; single-use workers retain their lifecycle.
+- Replace `[actions.cold_start] cpu_count`, expressed in whole cores, with the integer `cpu_millicores` setting. The new default is 250 millicores; migrate an explicit old value by multiplying it by 1000. The old key is rejected.
+
 ### Fixed
 
 - Cache DNS locally on controller and worker images, including for static binaries.
+- Fix startup on nominal 64 GiB workers whose measured memory, less reserve, is smaller than the fleet estimate; workers advertise their actual available action-pool capacity.
+- Use the same current memory guarantees for learned reservations, queued work, OOM retries and scaling, while preserving explicit client minimums and per-action ceilings.
 - Expose the public listener connection limit in the deployment module, defaulting to 4096. The module now owns `[server.http2]` for all backends; SQLite callers must remove any appended `[server.http2]` table and move their `max_connections` override to `http2_max_connections`.
 - Exclude concurrent child spawns while testing owned pipe-reader cancellation, so fork-inherited readers cannot make the close assertion nondeterministic.
-- Fix OpenTofu retained-generation cleanup racing AMI-data removal by patching forget-node references. Bazel and the deployment shell now share the same pinned, source-built runtime; strict fixture diagnostics remain unchanged.
+
+### Upgrade notes
+
+- `memory_per_instance` is now the machine's nominal RAM; Gang subtracts `actions.memory.reserve` to obtain the prelaunch usable-memory estimate. AWS deployments derive nominal RAM automatically from the smallest EC2 instance memory in each fleet. Remove `memory_per_instance` from every AWS deployment-module `fleets` entry; the generated internal `gang.toml` field is not an operator input to the AWS module.
 
 ## 0.3.4
 

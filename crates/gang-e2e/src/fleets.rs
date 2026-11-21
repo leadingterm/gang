@@ -22,9 +22,8 @@ use crate::verdict;
 enum Arrival {
     /// As the build sends them.
     AsSent,
-    /// With initially empty history and the fixture's cost-justified unknown durations,
-    /// all at once: every pass is skipped until both actions are queued, so the first
-    /// placing pass sees both before either can execute.
+    /// With initially empty history, all at once: every pass is skipped until both
+    /// actions are queued, so the first placing pass sees both before either can execute.
     Together,
 }
 
@@ -102,11 +101,10 @@ const DRAINED_STARTS: [Step; 4] = [
     },
 ];
 
-// The placement fixture's ten-minute unknown-duration prior justifies another worker:
-// with cold B=60s and idle=2s, H=50%*(B+idle)=31s, so 600/H>19 slots/action.
+// Each cold action reserves the small fleet's full physical CPU at factor one.
 // One pass sees both queued; the small fleet's one-instance limit forces the second
-// cost-justified purchase onto the next declared fleet. Short/default-prior bursts
-// correctly need not overflow, and arriving after dispatch could reuse the small worker.
+// action to overflow onto the next declared fleet. A second arrival after the first
+// completed could reuse the small worker.
 const COLD_PAIR: Step = Step {
     request: names::fleets::OVERFLOW,
     probes: &[Probe::OverflowFirst, Probe::OverflowSecond],
@@ -151,9 +149,9 @@ pub fn run_drained_starts<S: Control>(system: &S, variant: &Variant) -> Result<V
 /// Runs only the cold overflow pair and its drain checks on a fresh deployment.
 ///
 /// The caller must supply a separate, never-used controller and history namespace with
-/// [`ControlKnobs::FLEETS`](crate::ControlKnobs::FLEETS), whose ten-minute unknown-action
-/// prior makes the second worker cost-justified. Supply is held until both actions are
-/// queued together. This function starts its server and leaves it running for caller cleanup.
+/// [`ControlKnobs::FLEETS`](crate::ControlKnobs::FLEETS), whose cold CPU reservation
+/// saturates the first worker. Supply is held until both actions are queued together.
+/// This function starts its server and leaves it running for caller cleanup.
 ///
 /// # Errors
 ///

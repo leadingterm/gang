@@ -220,6 +220,7 @@ mod tests {
             recent: None,
             builds: None,
             principals_epoch: None,
+            scheduler_known: None,
         })
     }
 

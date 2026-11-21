@@ -2150,6 +2150,13 @@ impl System for Cluster<'_> {
     fn build(&self, probes: &[Probe]) -> Result<BuildOutcome> {
         self.stack.build(probes)
     }
+    fn build_until_stopped(
+        &self,
+        probes: &[Probe],
+        stop: tokio::sync::oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        self.stack.build_until_stopped(probes, stop)
+    }
     fn build_run(&self, probes: &[Probe], run: &Run) -> Result<BuildOutcome> {
         self.stack.build_run(probes, run)
     }
@@ -2611,7 +2618,7 @@ providers = ["local-workers"]
             }
             let source = "worker_endpoint = 'grpcs://old:1'\n[server]\n[server.http2]\n";
             let mut doc: toml::Value = toml::from_str(&format!(
-                "{source}\n[[fleets]]\nname = 'production'\nvcpus_per_instance = 2\ntarget_actions_per_instance = 2\n[fleets.options]\ncapacity = 'spot'\n[limits.cgroup]\n"
+                "{source}\n[[fleets]]\nname = 'production'\nvcpus_per_instance = 2\n[fleets.options]\ncapacity = 'spot'\n[limits.cgroup]\n"
             ))?;
             super::adapt_release_config(
                 &mut doc,
@@ -2631,7 +2638,6 @@ providers = ["local-workers"]
             )?;
             let fleet = &doc["fleets"][0];
             assert_eq!(fleet["vcpus_per_instance"].as_integer(), Some(2));
-            assert_eq!(fleet["target_actions_per_instance"].as_integer(), Some(2));
             assert_environment_schema(&doc, modern);
             assert!(fleet.get("options").is_none());
             assert!(doc.get("limits").is_none());

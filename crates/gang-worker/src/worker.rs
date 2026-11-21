@@ -9,9 +9,9 @@ use gang_clock::{Clock, Timestamp};
 use gang_config::{PluginSet, SandboxFile, SandboxSelection, WorkerConfig};
 use gang_spi::{
     ActionLimitsPort, CacheStorePort, ClientTls, NodeLifecyclePort, PortError, ProvisionerPort,
-    SchedulerPort, ScratchVolumePort, Slots, WorkerSpec, WorkerTls, WorkloadCredentialPort,
+    SchedulerPort, ScratchVolumePort, WorkerSpec, WorkerTls, WorkloadCredentialPort,
 };
-use gang_types::{ActionEnvironment, WorkerLifetime};
+use gang_types::ActionEnvironment;
 
 use crate::credentials::Enroller;
 use crate::deployment::{WorkerDeployment, WorkerParts, WorkerSettings};
@@ -40,6 +40,8 @@ use crate::transport::{ServerCaSource, Transport};
 /// [`WorkerError::IsaMismatch`] when that fleet is configured for another instruction set;
 /// [`WorkerError::FleetDiskUnavailable`] when the scratch volume leaves the actions less disk
 /// than the fleet declares;
+/// [`WorkerError::MemoryReserveExhausted`] when the memory reserve leaves no physical memory;
+/// [`WorkerError::MemoryBelowMinimum`] when action memory is below the minimum reservation;
 /// [`WorkerError::Config`] when the sandbox file cannot be rendered;
 /// [`WorkerError::SandboxProgram`] when a sandbox program does not resolve to an executable
 /// file;
@@ -211,10 +213,7 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         .by_name(&identity.fleet)
         .ok_or_else(|| WorkerError::NoFleet(identity.fleet.clone()))?;
     check_isa(&identity, fleet.policy.isa)?;
-    let slots = match provisioner.worker_lifetime() {
-        WorkerLifetime::SingleUse => Slots::SingleUse,
-        WorkerLifetime::LongLived => Slots::LongLived(fleet.policy.target_actions_per_instance),
-    };
+    let lifetime = provisioner.worker_lifetime();
     let volume = provisioner.mount(&identity.instance).await?;
     let layout = Layout::new(&volume.path);
     let mut sandbox = sandbox;
@@ -263,22 +262,18 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
     )?;
     let limits = file.limits.map(build_limits).transpose()?;
     let reserve = actions.memory.reserve.get();
-    let memory_pool = prepare_memory_pool(
-        limits.as_ref(),
-        reserve,
-        fleet.policy.memory_per_instance.get(),
-        &identity.fleet,
-    )
-    .await?;
+    let (memory_pool, capacity) =
+        prepare_memory_pool(limits.as_ref(), reserve, actions.memory.min_reservation).await?;
     let mut properties = fleet.properties.clone();
     properties.set_action_environment(&environment);
+    properties.set_memory_capacity(capacity);
     let action_store = cache.action_store(&actions.environment)?;
     let spec = WorkerSpec {
         actions,
         memory_pool,
         instance: identity.instance,
         properties,
-        slots,
+        lifetime,
         work_directory: layout.work_directory(),
         fast_cas_directory: layout.fast_cas_directory(),
         fast_cas_budget,
@@ -365,25 +360,26 @@ fn fast_cas_budget(
 async fn prepare_memory_pool<L: ActionLimitsPort>(
     limits: Option<&L>,
     reserve: gang_types::Bytes,
-    declared: gang_types::Bytes,
-    fleet: &gang_types::FleetName,
-) -> Result<Option<gang_spi::ActionMemoryPool>, WorkerError> {
+    minimum: gang_config::MinReservation,
+) -> Result<(Option<gang_spi::ActionMemoryPool>, gang_types::NonZeroBytes), WorkerError> {
     let memory_pool = match limits {
         Some(limits) => limits.prepare(reserve).await?,
         None => None,
     };
-    if let Some(pool) = &memory_pool {
-        let capacity = pool.capacity.get();
-        if declared > capacity {
-            return Err(WorkerError::FleetMemoryUnavailable {
-                fleet: fleet.clone(),
-                declared,
-                capacity,
-                reserve,
-            });
-        }
+    let capacity = if let Some(pool) = &memory_pool {
+        pool.capacity
+    } else {
+        let physical = gang_os::physical_memory().map_err(PortError::backend)?;
+        gang_types::NonZeroBytes::new(physical.saturating_sub(reserve))
+            .ok_or(WorkerError::MemoryReserveExhausted { physical, reserve })?
+    };
+    if capacity.get() < minimum.get() {
+        return Err(WorkerError::MemoryBelowMinimum {
+            capacity: capacity.get(),
+            minimum: minimum.get(),
+        });
     }
-    Ok(memory_pool)
+    Ok((memory_pool, capacity))
 }
 
 /// The TLS material of one generation: the files the worker reads, when to refresh them, and

@@ -98,6 +98,7 @@ fn snapshot(seq: u64, held: &[u64], limit: u32) -> Result<Frame, Box<dyn Error>>
         connections: gang_wire::Connections::default(),
         builds: Vec::new(),
         principals_epoch: 0,
+        scheduler_known: None,
     }))
 }
 
@@ -121,6 +122,7 @@ fn delta(base: u64, seq: u64, carried: &[u64]) -> Result<Frame, Box<dyn Error>> 
         connections: None,
         builds: None,
         principals_epoch: None,
+        scheduler_known: None,
     }))
 }
 

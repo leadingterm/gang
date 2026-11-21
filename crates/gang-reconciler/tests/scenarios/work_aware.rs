@@ -20,10 +20,17 @@ pub(super) fn source(n: u64) -> TestResult<SourceId> {
     Ok(format!("{n:016x}").parse()?)
 }
 
-pub(super) fn fleet(name: &str, max: u32, target: u32) -> TestResult<FleetPolicy> {
+fn cpu_reservation() -> ActionResources {
+    ActionResources {
+        cpu_millicores: 1000,
+        ..ActionResources::default()
+    }
+}
+
+pub(super) fn fleet(name: &str, max: u32, vcpus: u32) -> TestResult<FleetPolicy> {
     let mut p = policy_named(name, Isa::X86_64)?;
     p.instances = InstanceBounds::try_new(0, NonZeroU32::new(max).ok_or("zero maximum")?)?;
-    p.target_actions_per_instance = NonZeroU32::new(target).ok_or("zero target")?;
+    p.vcpus_per_instance = NonZeroU32::new(vcpus).ok_or("zero vcpus")?;
     p.boot_grace = secs(600);
     p.idle_timeout = secs(600);
     p.max_drain_wait = secs(3600);
@@ -43,9 +50,9 @@ pub(super) struct Workload {
 }
 
 impl Workload {
-    pub fn new(max: u32, target: u32, payback: u16) -> TestResult<Self> {
+    pub fn new(max: u32, vcpus: u32, payback: u16) -> TestResult<Self> {
         Ok(Self {
-            h: Harness::with_scaling(vec![fleet("gang-x86", max, target)?], settings(payback)?),
+            h: Harness::with_scaling(vec![fleet("gang-x86", max, vcpus)?], settings(payback)?),
         })
     }
 
@@ -57,7 +64,14 @@ impl Workload {
         expected: Option<Duration>,
     ) -> TestResult {
         let start = self.h.snapshot.queued.len();
-        self.h.queue(fleet, count)?;
+        self.h.queue_sized(
+            fleet,
+            count,
+            ActionResources {
+                cpu_millicores: 1000,
+                ..ActionResources::default()
+            },
+        )?;
         for row in &mut self.h.snapshot.queued[start..] {
             row.source = source;
             row.expected = expected;
@@ -71,12 +85,6 @@ impl Workload {
             .launch(fleet, name, InstanceLifecycle::InService, secs(3600))?;
         self.h.set_desired_capacity(fleet, desired + 1);
         self.h.connect(fleet, name)?;
-        self.h
-            .snapshot
-            .workers
-            .last_mut()
-            .ok_or("missing worker")?
-            .max_inflight_actions = NonZeroU32::new(16);
         Ok(())
     }
 
@@ -104,6 +112,7 @@ impl Workload {
             .iter_mut()
             .filter(|row| row.worker == index)
         {
+            row.resources.cpu_millicores = 1000;
             row.source = source;
             row.started = self.h.clock.wall() - elapsed;
             row.expected = expected;
@@ -241,41 +250,46 @@ pub(super) fn summary(steps: &[PlanStep]) -> TestResult<ScaleDecision> {
 }
 
 #[test]
-fn cold_burst_buys_one() -> TestResult {
+fn cold_burst_scales_to_resource_bound() -> TestResult {
     let mut w = Workload::new(6, 16, 50)?;
     w.queue(Some(source(1)?), X86, 16, None)?;
     let mut steps = w.run();
-    let decision = summary(&steps)?;
-    assert_eq!(decision.readiness, secs(45));
-    assert_eq!(decision.horizon, Duration::from_millis(322_500));
+    assert_eq!(summary(&steps)?.needed, 1);
     w.h.launch(X86, "local-1", InstanceLifecycle::Pending, Duration::ZERO)?;
-    for (delay, additional) in [(8, 32), (1, 112)] {
+    for (delay, additional, needed) in [(8, 32, 3), (1, 112, 6)] {
         w.h.advance(secs(delay));
         w.queue(Some(source(1)?), X86, additional, None)?;
         steps.extend(w.run());
         assert_eq!(
             w.h.outlook(X86)?.needed,
-            1,
-            "pending capacity remains in the work baseline"
+            needed,
+            "queued CPU reservations determine capacity"
         );
     }
-    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
-    assert_eq!(w.h.supply(X86)?.desired, 1);
+    assert_eq!(
+        purchases(&steps),
+        vec![
+            (X86, 0, 1, NeedCause::Demand),
+            (X86, 1, 3, NeedCause::Demand),
+            (X86, 3, 6, NeedCause::Demand),
+        ]
+    );
+    assert_eq!(w.h.supply(X86)?.desired, 6);
     Ok(())
 }
 
 #[test]
-fn burst_payback_uses_idle_tail() -> TestResult {
-    for (percent, expected) in [
-        (100, vec![]),
-        (50, vec![]),
-        (25, vec![(X86, 1, 3, NeedCause::Demand)]),
-    ] {
+fn burst_resource_bound_is_independent_of_payback() -> TestResult {
+    for percent in [100, 50, 25] {
         let mut w = Workload::new(6, 16, percent)?;
         w.h.set_desired_capacity(X86, 1);
         w.h.launch(X86, "local-1", InstanceLifecycle::Pending, Duration::ZERO)?;
         w.queue(Some(source(1)?), X86, 160, Some(secs(60)))?;
-        assert_eq!(purchases(&w.pass()), expected, "payback={percent}");
+        assert_eq!(
+            purchases(&w.pass()),
+            vec![(X86, 1, 6, NeedCause::Demand)],
+            "payback={percent}"
+        );
     }
     Ok(())
 }
@@ -287,7 +301,8 @@ fn young_dump_is_transient_and_static_batch_never_fabricates_refill() -> TestRes
         w.serve(X86, "local-1")?;
         w.running("local-1", 16, Some(source(1)?), Duration::ZERO, known)?;
         w.queue(Some(source(1)?), X86, 144, known)?;
-        assert!(purchases(&w.pass()).is_empty());
+        w.pass();
+        assert_eq!(w.h.outlook(X86)?.needed, 6);
         for _ in 0..10 {
             w.h.advance(secs(30));
             let completed = w.h.snapshot.executing.len().min(16);
@@ -296,7 +311,7 @@ fn young_dump_is_transient_and_static_batch_never_fabricates_refill() -> TestRes
                 X86,
                 u32::try_from(completed)?,
                 Some(secs(30)),
-                ActionResources::default(),
+                cpu_reservation(),
             );
             let start = w.h.snapshot.queued.len().min(16);
             w.h.snapshot.queued.drain(..start);
@@ -308,10 +323,11 @@ fn young_dump_is_transient_and_static_batch_never_fabricates_refill() -> TestRes
                 known,
             )?;
             let steps = w.pass();
-            assert!(
-                purchases(&steps).is_empty(),
-                "static dump bought: {steps:?}"
+            assert_eq!(
+                w.h.outlook(X86)?.needed,
+                u32::try_from((start + w.h.snapshot.queued.len()).div_ceil(16))?.min(6)
             );
+            let _ = steps;
             assert_eq!(
                 w.h.outlook(X86)?.load,
                 Some(0),
@@ -326,17 +342,17 @@ fn young_dump_is_transient_and_static_batch_never_fabricates_refill() -> TestRes
 fn seventeen_action_static_build_does_not_ratchet() -> TestResult {
     let mut w = Workload::new(6, 16, 50)?;
     w.queue(Some(source(1)?), X86, 17, None)?;
-    assert_eq!(purchases(&w.run()), vec![(X86, 0, 1, NeedCause::Demand)]);
+    assert_eq!(purchases(&w.run()), vec![(X86, 0, 2, NeedCause::Demand)]);
     w.h.launch(X86, "local-1", InstanceLifecycle::Pending, Duration::ZERO)?;
     w.h.advance(secs(8));
     assert!(purchases(&w.pass()).is_empty());
-    assert_eq!(w.h.outlook(X86)?.needed, 1);
+    assert_eq!(w.h.outlook(X86)?.needed, 2);
     Ok(())
 }
 
 #[test]
 fn persistent_queue_nets_booting_and_unborn_capacity_once() -> TestResult {
-    for (serving, queue, booting, needed) in [(1, 40, 2, 3), (0, 32, 1, 1)] {
+    for (serving, queue, booting, needed) in [(1, 40, 2, 3), (0, 32, 1, 2)] {
         let mut w = Workload::new(6, 16, 50)?;
         w.learn_profile(source(1)?, secs(1800))?;
         if serving == 1 {
@@ -359,18 +375,17 @@ fn persistent_queue_nets_booting_and_unborn_capacity_once() -> TestResult {
 }
 
 #[test]
-fn known_source_profile_admits_without_bypassing_payback() -> TestResult {
+fn known_source_profile_does_not_change_resource_bound() -> TestResult {
     let mut w = Workload::new(6, 16, 50)?;
     w.learn_profile(source(1)?, secs(1800))?;
     w.queue(Some(source(1)?), X86, 48, None)?;
     let steps = w.pass();
-    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
-    assert_eq!(summary(&steps)?.persistent_streams, 1);
+    assert_eq!(purchases(&steps), vec![(X86, 0, 3, NeedCause::Demand)]);
     Ok(())
 }
 
 #[test]
-fn closed_loop_aged_source_does_not_buy_unpaid_backlog() -> TestResult {
+fn closed_loop_aged_source_keeps_resource_bound() -> TestResult {
     let mut w = Workload::new(6, 16, 50)?;
     w.serve(X86, "local-1")?;
     w.queue(Some(source(1)?), X86, 40, None)?;
@@ -384,13 +399,7 @@ fn closed_loop_aged_source_does_not_buy_unpaid_backlog() -> TestResult {
     w.pass();
     for _ in 0..13 {
         w.h.advance(secs(30));
-        w.complete(
-            Some(source(1)?),
-            X86,
-            16,
-            Some(secs(30)),
-            ActionResources::default(),
-        );
+        w.complete(Some(source(1)?), X86, 16, Some(secs(30)), cpu_reservation());
         w.running(
             "local-1",
             16,
@@ -398,14 +407,8 @@ fn closed_loop_aged_source_does_not_buy_unpaid_backlog() -> TestResult {
             Duration::ZERO,
             Some(secs(30)),
         )?;
-        let steps = w.pass();
-        // Constant inflight count means arrivals equal completions: 16/30 actions/s,
-        // or 16 offered slots, exactly the worker's capacity. The 1200 slot-second
-        // backlog does not repay another worker's 16 * 322.5 = 5160 slot-seconds.
-        assert!(
-            purchases(&steps).is_empty(),
-            "unpaid backlog bought: {steps:?}"
-        );
+        w.pass();
+        assert_eq!(w.h.outlook(X86)?.needed, 4);
     }
     Ok(())
 }
@@ -423,27 +426,12 @@ fn steady_ci_stream_scales_stepwise_and_bounded() -> TestResult {
         Some(secs(20)),
     )?;
     w.pass();
-    let kappa = std::f64::consts::LN_2 / Duration::from(w.h.scaling.load_half_life).as_secs_f64();
-    let decay = (-kappa * 20.0).exp();
-    let readiness = Duration::from(w.h.scaling.readiness_prior).as_secs_f64();
-    let horizon = (readiness + w.h.passes[X86].policy.idle_timeout.as_secs_f64()) * 0.5;
-    let pre_ready = 16.0 * (readiness - 20.0);
-    let mut offered = 0.0;
-    let mut completed = 0.0;
-    let mut previous = 0;
     let mut all_steps = Vec::new();
-    let mut pending_since = Vec::new();
     for queued in [
         4, 8, 12, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240,
     ] {
         w.h.advance(secs(20));
-        w.complete(
-            Some(source(1)?),
-            X86,
-            16,
-            Some(secs(20)),
-            ActionResources::default(),
-        );
+        w.complete(Some(source(1)?), X86, 16, Some(secs(20)), cpu_reservation());
         w.running(
             "local-1",
             16,
@@ -454,35 +442,8 @@ fn steady_ci_stream_scales_stepwise_and_bounded() -> TestResult {
         w.h.snapshot.queued.clear();
         // Preserve the original cohorts, then sustain the last cohort's 16 net arrivals/window.
         w.queue(Some(source(1)?), X86, queued, Some(secs(20)))?;
-        // Independent event-kernel arithmetic: timed mean 20s, 16 completions and
-        // the observed increase in inflight count each 20-second window.
-        offered = offered * decay + 20.0 * kappa * (16 + queued - previous) as f64;
-        completed = completed * decay + 20.0 * kappa * 16.0;
-        // Service-wave spikes cannot fabricate excess arrival work above physical capacity.
-        let future = offered.min(completed.min(16.0) + (offered - completed).max(0.0));
-        previous = queued;
-        let pending_credit = pending_since
-            .iter()
-            .map(|launched| {
-                16.0 * w
-                    .h
-                    .clock
-                    .monotonic()
-                    .saturating_duration_since(*launched)
-                    .as_secs_f64()
-                    .min(readiness)
-            })
-            .sum::<f64>();
-        let payable = ((queued as f64 * 20.0 + future * readiness - pre_ready - pending_credit)
-            .max(0.0)
-            / horizon
-            + (future - 16.0).max(0.0)
-            - (16.0 - future).max(0.0))
-        .max(0.0);
         let from = w.h.supply(X86)?.desired;
-        let extra = (payable - f64::from(from - 1) * 16.0).max(0.0);
-        assert!(extra < 32.0, "the trace buys at most one worker per pass");
-        let needed = from + u32::from(extra >= 16.0);
+        let needed = u32::try_from((16_usize + queued).div_ceil(16))?.min(6);
         let steps = w.run();
         assert_eq!(w.h.outlook(X86)?.needed, needed);
         if needed > from {
@@ -496,7 +457,6 @@ fn steady_ci_stream_scales_stepwise_and_bounded() -> TestResult {
                 InstanceLifecycle::Pending,
                 Duration::ZERO,
             )?;
-            pending_since.push(w.h.clock.monotonic());
         } else {
             assert!(
                 purchases(&steps).is_empty(),
@@ -506,13 +466,10 @@ fn steady_ci_stream_scales_stepwise_and_bounded() -> TestResult {
         all_steps.extend(steps);
     }
     assert_eq!(
-        purchases(&all_steps),
-        vec![
-            (X86, 1, 2, NeedCause::Demand),
-            (X86, 2, 3, NeedCause::Demand)
-        ]
+        purchases(&all_steps).last(),
+        Some(&(X86, 5, 6, NeedCause::Demand))
     );
-    assert_eq!(w.h.supply(X86)?.desired, 3);
+    assert_eq!(w.h.supply(X86)?.desired, 6);
     Ok(())
 }
 
@@ -531,51 +488,27 @@ fn two_sources_share_capacity_without_cross_attribution() -> TestResult {
     w.pass();
     for _ in 0..120 {
         w.h.advance(secs(5));
-        w.complete(
-            Some(source(1)?),
-            X86,
-            3,
-            Some(secs(20)),
-            ActionResources::default(),
-        );
+        w.complete(Some(source(1)?), X86, 3, Some(secs(20)), cpu_reservation());
         w.pass();
     }
     w.queue(Some(source(2)?), X86, 200, Some(secs(30)))?;
     let first = w.pass();
-    assert!(
-        purchases(&first).is_empty(),
-        "source A's profile must not make B persistent"
-    );
+    assert_eq!(purchases(&first), vec![(X86, 1, 6, NeedCause::Demand)]);
     assert!(
         w.h.outlook(X86)?
             .load
-            .is_some_and(|load| (110..=130).contains(&load))
+            .is_some_and(|load| (7..=8).contains(&load))
     );
     for tick in 1..=78 {
         w.h.advance(secs(5));
-        w.complete(
-            Some(source(1)?),
-            X86,
-            3,
-            Some(secs(20)),
-            ActionResources::default(),
-        );
+        w.complete(Some(source(1)?), X86, 3, Some(secs(20)), cpu_reservation());
         if tick % 6 == 0 {
-            w.complete(
-                Some(source(2)?),
-                X86,
-                4,
-                Some(secs(30)),
-                ActionResources::default(),
-            );
+            w.complete(Some(source(2)?), X86, 4, Some(secs(30)), cpu_reservation());
         }
         w.pass();
     }
     let aged = w.h.plan.steps.clone();
-    // A offers 3/5 * 20 = 12 slots and B offers 4/30 * 30 = 4: no net excess.
-    // B's 200 * 30 = 6000 slot-seconds repay one extra worker, not five.
-    assert_eq!(purchases(&aged), vec![(X86, 1, 2, NeedCause::Demand)]);
-    assert_eq!(summary(&aged)?.persistent_streams, 2);
+    assert_eq!(purchases(&aged), vec![(X86, 1, 6, NeedCause::Demand)]);
     Ok(())
 }
 
@@ -604,7 +537,7 @@ fn long_tail_never_buys_and_idle_surplus_leaves() -> TestResult {
 }
 
 #[test]
-fn final_dispatch_has_two_free_slots_and_never_changes_purchase() -> TestResult {
+fn final_dispatch_fits_two_cpu_reservations_without_scaling() -> TestResult {
     let mut plans = Vec::new();
     for durations in [[100, 1], [1, 100]] {
         let mut w = Workload::new(6, 2, 50)?;
@@ -621,24 +554,44 @@ fn final_dispatch_has_two_free_slots_and_never_changes_purchase() -> TestResult 
 
 #[test]
 fn reachability_floor_respects_other_candidates_pending_and_failure() -> TestResult {
-    for failed in [false, true] {
+    for state in [
+        "pending",
+        "unborn",
+        "failed",
+        "serving-failed",
+        "pending-failed",
+    ] {
         let mut w = Workload {
             h: Harness::with_scaling(
                 vec![fleet("gang-first", 1, 16)?, fleet("gang-second", 2, 16)?],
                 settings(50)?,
             ),
         };
+        match state {
+            "serving-failed" => w.serve(0, "local-1")?,
+            "pending" | "pending-failed" => {
+                w.h.launch(0, "local-1", InstanceLifecycle::Pending, Duration::ZERO)?;
+            }
+            _ => {}
+        }
         w.h.set_desired_capacity(0, 1);
-        if failed {
+        if state.ends_with("failed") {
             w.h.supply_mut(0)?.launch_failure = Some(gang_spi::LaunchFailure {
                 reason: "capacity unavailable".into(),
             });
-        } else {
-            w.h.launch(0, "local-1", InstanceLifecycle::Pending, Duration::ZERO)?;
         }
+        // A physical pending/serving instance or reliable unborn request covers every
+        // unreserved action. A failed request with no physical capacity must fall back.
         w.h.queue_candidates(FleetSet::prefix(2)?, 32);
         let steps = w.pass();
-        assert_eq!(purchases(&steps).iter().any(|step| step.0 == 1), failed);
+        let fallback = state == "failed";
+        assert_eq!(
+            purchases(&steps).iter().any(|step| step.0 == 1),
+            fallback,
+            "{state}"
+        );
+        assert_eq!(w.h.outlook(0)?.needed, u32::from(!fallback), "{state}");
+        assert_eq!(w.h.outlook(1)?.needed, u32::from(fallback), "{state}");
     }
     Ok(())
 }
@@ -652,11 +605,7 @@ fn unknown_duration_prefers_authenticated_source_mean_not_readiness() -> TestRes
         w.running("local-1", 1, src, Duration::ZERO, Some(secs(600)))?;
         w.queue(src, X86, 160, None)?;
         let steps = w.pass();
-        if authenticated {
-            assert!(!purchases(&steps).is_empty());
-        } else {
-            assert!(purchases(&steps).is_empty());
-        }
+        assert_eq!(purchases(&steps), vec![(X86, 1, 6, NeedCause::Demand)]);
     }
     Ok(())
 }
@@ -683,7 +632,7 @@ fn complementary_resources_are_summed_before_the_maximum() -> TestResult {
 }
 
 #[test]
-fn zero_free_action_slots_do_not_invent_resource_capacity() -> TestResult {
+fn occupied_cpu_does_not_hide_memory_demand() -> TestResult {
     let mut w = Workload::new(6, 16, 50)?;
     w.serve(X86, "local-1")?;
     w.running(
@@ -699,10 +648,7 @@ fn zero_free_action_slots_do_not_invent_resource_capacity() -> TestResult {
         row.resources.memory = memory;
     }
     let steps = w.pass();
-    assert!(
-        !purchases(&steps).is_empty(),
-        "occupied action slots must gate spare memory"
-    );
+    assert_eq!(purchases(&steps), vec![(X86, 1, 6, NeedCause::Demand)]);
     Ok(())
 }
 
@@ -717,10 +663,7 @@ fn measured_readiness_zero_and_idle_zero_use_analytic_limit() -> TestResult {
     w.queue(Some(source(1)?), X86, 48, None)?;
     let steps = w.pass();
     assert_eq!(purchases(&steps), vec![(X86, 0, 3, NeedCause::Demand)]);
-    let decision = summary(&steps)?;
-    assert!(decision.zero_overhead);
-    assert_eq!(decision.horizon, Duration::ZERO);
-    assert!(decision.transient_extra.get().is_finite());
+    assert_eq!(summary(&steps)?.needed, 3);
     w.h.snapshot.queued.clear();
     assert!(purchases(&w.pass()).is_empty());
     Ok(())
@@ -735,10 +678,8 @@ fn huge_payback_duration_is_finite_and_does_not_overflow() -> TestResult {
     };
     w.queue(Some(source(1)?), X86, 160, None)?;
     let steps = w.pass();
-    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
-    let decision = summary(&steps)?;
-    assert!(decision.horizon >= secs(45));
-    assert!(decision.transient_extra.get().is_finite());
+    assert_eq!(purchases(&steps), vec![(X86, 0, 6, NeedCause::Demand)]);
+    assert_eq!(summary(&steps)?.needed, 6);
     Ok(())
 }
 
@@ -748,13 +689,7 @@ fn source_rates_use_the_already_advanced_shared_clock() -> TestResult {
     w.h.advance(secs(4 * 3600));
     w.pass();
     w.h.advance(secs(1));
-    w.complete(
-        Some(source(1)?),
-        X86,
-        16,
-        Some(secs(30)),
-        ActionResources::default(),
-    );
+    w.complete(Some(source(1)?), X86, 16, Some(secs(30)), cpu_reservation());
     w.pass();
     assert!(w.h.snapshot.source_rates[0].created_at >= Tick::from_elapsed(secs(4 * 3600)));
     assert!(w.h.outlook(X86)?.backlog.unwrap_or_default().is_zero());
@@ -763,7 +698,7 @@ fn source_rates_use_the_already_advanced_shared_clock() -> TestResult {
 }
 
 #[test]
-fn open_loop_excess_accumulates_until_one_whole_instance_repays() -> TestResult {
+fn open_loop_backlog_scales_with_resource_demand() -> TestResult {
     let mut w = Workload::new(6, 16, 50)?;
     w.learn_profile(source(1)?, secs(1800))?;
     w.serve(X86, "local-1")?;
@@ -775,27 +710,13 @@ fn open_loop_excess_accumulates_until_one_whole_instance_repays() -> TestResult 
         Some(secs(20)),
     )?;
     w.pass();
-    let kappa = std::f64::consts::LN_2 / Duration::from(w.h.scaling.load_half_life).as_secs_f64();
-    let decay = (-kappa * 20.0).exp();
-    let readiness = Duration::from(w.h.scaling.readiness_prior).as_secs_f64();
-    let horizon = (readiness + w.h.passes[X86].policy.idle_timeout.as_secs_f64()) * 0.5;
-    let pre_ready = 16.0 * (readiness - 20.0);
-    let mut offered = 0.0;
-    let mut completed = 0.0;
     let mut all_steps = Vec::new();
     for batch in 1..=44 {
         let queue = batch * 4;
         w.h.advance(secs(20));
-        w.complete(
-            Some(source(1)?),
-            X86,
-            16,
-            Some(secs(20)),
-            ActionResources::default(),
-        );
+        w.complete(Some(source(1)?), X86, 16, Some(secs(20)), cpu_reservation());
         w.h.snapshot.queued.clear();
-        // Arrival rate is (16 + 4)/20 = 1/s versus service 16/20 = 0.8/s:
-        // 20 offered slots exceed the serving worker's 16 slots by four.
+        // Each running and queued reservation consumes one vCPU.
         w.running(
             "local-1",
             16,
@@ -804,32 +725,34 @@ fn open_loop_excess_accumulates_until_one_whole_instance_repays() -> TestResult 
             Some(secs(20)),
         )?;
         w.queue(Some(source(1)?), X86, queue, Some(secs(20)))?;
-        // A_k = 20*kappa*20*(1-decay^k)/(1-decay); M_k uses 16 completions, not 20 arrivals.
-        offered = offered * decay + 20.0 * kappa * 20.0;
-        completed = completed * decay + 20.0 * kappa * 16.0;
-        let future = offered.min(completed.min(16.0) + (offered - completed).max(0.0));
-        let payable = ((queue as f64 * 20.0 + future * readiness - pre_ready).max(0.0) / horizon
-            + (future - 16.0).max(0.0)
-            - (16.0 - future).max(0.0))
-        .max(0.0);
-        assert!(payable < 32.0, "this trace funds only one extra worker");
-        let needed = if payable >= 16.0 { 2 } else { 1 };
+        let needed = u32::try_from((16_usize + queue).div_ceil(16))?.min(6);
         let from = w.h.supply(X86)?.desired;
         let steps = w.run();
         assert_eq!(w.h.outlook(X86)?.needed, needed);
         if needed > from {
-            assert_eq!(purchases(&steps), vec![(X86, 1, 2, NeedCause::Demand)]);
-            w.h.launch(X86, "pending-2", InstanceLifecycle::Pending, Duration::ZERO)?;
+            assert_eq!(
+                purchases(&steps),
+                vec![(X86, from, needed, NeedCause::Demand)]
+            );
+            w.h.launch(
+                X86,
+                &format!("pending-{needed}"),
+                InstanceLifecycle::Pending,
+                Duration::ZERO,
+            )?;
         } else {
             assert!(
                 purchases(&steps).is_empty(),
-                "purchase before payback or pending ratchet"
+                "already requested capacity must not ratchet"
             );
         }
         all_steps.extend(steps);
     }
-    assert_eq!(purchases(&all_steps), vec![(X86, 1, 2, NeedCause::Demand)]);
-    assert_eq!(w.h.supply(X86)?.desired, 2);
+    assert_eq!(
+        purchases(&all_steps).last(),
+        Some(&(X86, 5, 6, NeedCause::Demand))
+    );
+    assert_eq!(w.h.supply(X86)?.desired, 6);
     Ok(())
 }
 
@@ -858,33 +781,26 @@ fn readiness_median_keeps_latest_samples_and_excludes_reconnects() -> TestResult
 }
 
 #[test]
-fn unknown_running_overrun_keeps_slot_occupied_without_buying_for_wait() -> TestResult {
+fn unknown_running_overrun_keeps_cpu_occupied() -> TestResult {
     let mut w = Workload::new(6, 16, 50)?;
     w.serve(X86, "local-1")?;
     w.running("local-1", 16, Some(source(1)?), secs(300), None)?;
     w.queue(Some(source(1)?), X86, 16, None)?;
-    assert!(
-        purchases(&w.pass()).is_empty(),
-        "display wait must not be a purchase trigger"
-    );
-    assert!(
-        w.h.outlook(X86)?
-            .expected_wait
-            .is_some_and(|wait| wait >= secs(300))
-    );
+    assert_eq!(purchases(&w.pass()), vec![(X86, 1, 2, NeedCause::Demand)]);
+    assert_eq!(w.h.outlook(X86)?.expected_wait, Some(secs(45)));
     Ok(())
 }
 
 #[test]
-fn booting_capacity_reduces_transient_backlog_after_early_readiness() -> TestResult {
+fn booting_capacity_prevents_duplicate_scale_out_at_resource_bound() -> TestResult {
     let mut w = Workload::new(6, 16, 50)?;
     w.h.set_desired_capacity(X86, 1);
     w.h.launch(X86, "local-1", InstanceLifecycle::Pending, secs(44))?;
     w.queue(Some(source(1)?), X86, 160, Some(secs(30)))?;
-    assert!(purchases(&w.pass()).is_empty());
+    assert_eq!(purchases(&w.run()), vec![(X86, 1, 6, NeedCause::Demand)]);
     w.h.advance(secs(1));
     assert!(purchases(&w.pass()).is_empty());
-    assert_eq!(w.h.outlook(X86)?.needed, 1);
+    assert_eq!(w.h.outlook(X86)?.needed, 6);
     Ok(())
 }
 
@@ -902,7 +818,6 @@ fn measured_zero_readiness_and_zero_idle_use_concurrency_limit() -> TestResult {
     w.queue(Some(source(1)?), X86, 48, None)?;
     let steps = w.pass();
     assert_eq!(purchases(&steps), vec![(X86, 1, 3, NeedCause::Demand)]);
-    assert!(summary(&steps)?.zero_overhead);
     Ok(())
 }
 
@@ -919,7 +834,55 @@ fn final_dispatch_queue_order_changes_wait_but_not_scale_decisions() -> TestResu
         decisions.push(purchases(&w.pass()));
         waits.push(w.h.outlook(X86)?.expected_wait);
     }
-    assert_eq!(decisions, vec![vec![], vec![]]);
-    assert_eq!(waits, vec![Some(secs(100)), Some(secs(1))]);
+    assert_eq!(
+        decisions,
+        vec![
+            vec![(X86, 1, 2, NeedCause::Demand)],
+            vec![(X86, 1, 2, NeedCause::Demand)]
+        ]
+    );
+    assert_eq!(waits, vec![Some(secs(45)), Some(secs(1))]);
+    Ok(())
+}
+
+#[test]
+fn oversubscribed_serving_fleet_scales_to_live_max_regardless_of_payback() -> TestResult {
+    for (payback, running_cpu, queued_cpu) in [
+        (25, 10_000, 8_000),
+        (1000, 10_000, 8_000),
+        (25, 12_000, 12_000),
+        (1000, 12_000, 12_000),
+    ] {
+        let mut w = Workload::new(10, 15, payback)?;
+        w.h.set_cpu_oversubscription(NonZeroU32::new(2).ok_or("nonzero factor")?);
+        for index in 0..6 {
+            let name = format!("local-{index}");
+            w.serve(X86, &name)?;
+            w.running(&name, 2, Some(source(1)?), Duration::ZERO, Some(secs(60)))?;
+        }
+        for row in &mut w.h.snapshot.executing {
+            row.resources.cpu_millicores = running_cpu;
+        }
+        w.queue(Some(source(1)?), X86, 23, Some(secs(1)))?;
+        for row in &mut w.h.snapshot.queued {
+            row.resources.cpu_millicores = queued_cpu;
+        }
+        let steps = w.pass();
+        assert_eq!(w.h.outlook(X86)?.needed, 10);
+        assert_eq!(purchases(&steps), vec![(X86, 6, 10, NeedCause::Demand)]);
+    }
+    Ok(())
+}
+
+#[test]
+fn cpu_oversubscription_survives_reconciler_restart() -> TestResult {
+    let mut w = Workload::new(10, 15, 50)?;
+    w.h.set_cpu_oversubscription(NonZeroU32::new(2).ok_or("nonzero factor")?);
+    w.queue(None, X86, 20, None)?;
+    w.pass();
+    assert_eq!(w.h.outlook(X86)?.needed, 1);
+    w.h.restart();
+    w.pass();
+    assert_eq!(w.h.outlook(X86)?.needed, 1);
     Ok(())
 }

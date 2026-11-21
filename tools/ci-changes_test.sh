@@ -25,12 +25,23 @@ failures=0
 cases=0
 
 expect() {
-  local expected=$1 description=$2 base_rev=$3 head_rev=$4
+  local expected=$1 description=$2
+  shift 2
   cases=$((cases + 1))
   printf 'heavy=%s\n' "$expected" >"$scratch/expected"
-  if ! "$detector" "$base_rev" "$head_rev" >"$scratch/output" ||
+  if ! "$detector" "$@" >"$scratch/output" ||
     ! cmp -s "$scratch/expected" "$scratch/output"; then
     echo "FAIL: $description" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+expect_failure() {
+  local description=$1
+  shift
+  cases=$((cases + 1))
+  if "$detector" "$@" >"$scratch/output" 2>"$scratch/error"; then
+    echo "FAIL: $description unexpectedly succeeded" >&2
     failures=$((failures + 1))
   fi
 }
@@ -88,16 +99,49 @@ git add . && git commit -qm newline
 newline=$(git rev-parse HEAD)
 expect true 'newline in filename' "$deleted" "$newline"
 expect true 'initial zero base' 0000000000000000000000000000000000000000 "$newline"
-cases=$((cases + 1))
-if "$detector" invalid-revision "$newline" >"$scratch/output" 2>"$scratch/error"; then
-  echo 'FAIL: invalid revision unexpectedly succeeded' >&2
-  failures=$((failures + 1))
-fi
-cases=$((cases + 1))
-if "$detector" >"$scratch/output" 2>"$scratch/error"; then
-  echo 'FAIL: missing arguments unexpectedly succeeded' >&2
-  failures=$((failures + 1))
-fi
+expect_failure 'invalid revision' invalid-revision "$newline"
+expect_failure 'missing arguments'
+
+# Model two speculative queue groups while origin still points at the real base.
+git checkout -q --detach "$base"
+git update-ref refs/remotes/origin/main "$base"
+git update-ref refs/remotes/origin/release/stable "$base"
+printf 'queue source\n' >>src/main.rs
+git add . && git commit -qm queue-source
+group_source=$(git rev-parse HEAD)
+printf 'queue documentation\n' >docs/queue.md
+git add . && git commit -qm queue-docs
+group_source_docs=$(git rev-parse HEAD)
+expect true 'stacked source then docs against main' --merge-group refs/heads/gh-readonly-queue/main/group-2 "$group_source_docs"
+expect true 'stacked source then docs against slash target' --merge-group refs/heads/gh-readonly-queue/release/stable/group-2 "$group_source_docs"
+
+# Once the real target contains the source group, only the docs remain.
+git update-ref refs/remotes/origin/main "$group_source"
+git update-ref refs/remotes/origin/release/stable "$group_source"
+expect false 'main advanced past source' --merge-group refs/heads/gh-readonly-queue/main/group-2 "$group_source_docs"
+expect false 'slash target advanced past source' --merge-group refs/heads/gh-readonly-queue/release/stable/group-2 "$group_source_docs"
+
+git checkout -q --detach "$base"
+git update-ref refs/remotes/origin/main "$base"
+git update-ref refs/remotes/origin/release/stable "$base"
+printf 'first docs\n' >docs/first.md
+git add . && git commit -qm first-docs
+printf 'second docs\n' >docs/second.md
+git add . && git commit -qm second-docs
+group_docs=$(git rev-parse HEAD)
+expect false 'stacked docs against main' --merge-group refs/heads/gh-readonly-queue/main/group-2 "$group_docs"
+expect false 'stacked docs against slash target' --merge-group refs/heads/gh-readonly-queue/release/stable/group-2 "$group_docs"
+
+expect_failure 'wrong queue prefix' --merge-group refs/heads/main/group-1 "$group_docs"
+expect_failure 'missing target' --merge-group refs/heads/gh-readonly-queue//group-1 "$group_docs"
+expect_failure 'missing group leaf' --merge-group refs/heads/gh-readonly-queue/main/ "$group_docs"
+expect_failure 'missing target and group leaf' --merge-group refs/heads/gh-readonly-queue/ "$group_docs"
+expect_failure 'invalid target' --merge-group refs/heads/gh-readonly-queue/bad..branch/group-1 "$group_docs"
+expect_failure 'invalid group leaf' --merge-group 'refs/heads/gh-readonly-queue/main/bad leaf' "$group_docs"
+expect_failure 'missing origin target' --merge-group refs/heads/gh-readonly-queue/missing/group-1 "$group_docs"
+expect_failure 'invalid group head' --merge-group refs/heads/gh-readonly-queue/main/group-1 invalid-revision
+expect_failure 'zero group head' --merge-group refs/heads/gh-readonly-queue/main/group-1 0000000000000000000000000000000000000000
+expect_failure 'missing group head' --merge-group refs/heads/gh-readonly-queue/main/group-1
 
 printf '%d cases, %d failures\n' "$cases" "$failures"
 exit "$((failures > 0))"

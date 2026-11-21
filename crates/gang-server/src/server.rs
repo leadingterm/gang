@@ -829,6 +829,7 @@ async fn lead_work<D: Deployment>(
         context.control_settings,
         Arc::clone(context.scaling),
         profiles.clone(),
+        context.actions.cpu_oversubscription,
         &crate::control::ControlPorts {
             provisioner: context.provisioner,
             scheduler: context.scheduler,
@@ -1451,6 +1452,7 @@ impl<D: Deployment> Server<D> {
             fleets: self.fleets.catalog(),
             max_workers: self.fleets.max_instances(),
             client_action_timeout: self.client_action_timeout.get(),
+            control_acquire_timeout: self.control_settings.poll_interval,
             actions: Arc::clone(&self.actions),
             scaling: Arc::clone(&self.scaling),
             clock: core.host.clock.clone(),
@@ -2796,6 +2798,7 @@ mod tests {
             policies,
             std::sync::Arc::clone(&settings.scaling),
             profiles.clone(),
+            settings.actions.cpu_oversubscription,
         );
         let mut fleets: Vec<_> = policies.iter().cloned().map(FleetPass::new).collect();
         let mut queued = crate::test_support::queued_demand(gang_types::FleetSet::prefix(1)?);

@@ -159,7 +159,6 @@ max_instances = 4
 vcpus_per_instance = 4
 memory_per_instance = "8GiB"
 disk_per_instance = "100GiB"
-target_actions_per_instance = 4
 idle_timeout = "15s"
 max_drain_wait = "1m"
 boot_grace = "1m"

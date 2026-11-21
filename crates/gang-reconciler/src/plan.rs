@@ -78,8 +78,7 @@ impl fmt::Display for DurationText {
 impl PlanStep {
     /// Records a successfully applied decision. Physical cordon repairs are silent.
     ///
-    /// Scale-out detail is at most 420 bytes. Its bound is `214 + 7 + 2*25 + 6*14 + 6*10 + 5`:
-    /// literal text, dimension, durations, metrics, u32 values and a boolean, respectively.
+    /// Scale-out detail is at most 200 bytes, including dimensions, metrics and instance counts.
     /// Drain detail is at most 315 bytes, bounded by `148 + 7 + 4*25 + 3*14 + 10 + 3 + 5`;
     /// its last numeric values are one u32 and one u8. Both fit storage for every summary.
     #[must_use]
@@ -88,23 +87,14 @@ impl PlanStep {
         match (&self.action, &mut kind) {
             (Action::ScaleOut { summary, .. }, ScalingEventKind::ScaledOut { detail, .. }) => {
                 *detail = Some(format!(
-                    "dimension={} readiness={} horizon={} slots={} reliable={} capacity={} pre_ready={} persistent_load={} transient_backlog={} transient_extra={} persistent_queue={} extra_instances={} reachability={} persistent_streams={} streams={} zero_overhead={}",
+                    "dimension={} demand={} capacity={} reliable={} booting={} needed={} extra_instances={}",
                     summary.dimension.as_str(),
-                    DurationText(summary.readiness),
-                    DurationText(summary.horizon),
-                    summary.slots,
-                    summary.reliable,
+                    MetricText(summary.demand),
                     MetricText(summary.capacity),
-                    MetricText(summary.pre_ready),
-                    MetricText(summary.persistent_load),
-                    MetricText(summary.transient_backlog),
-                    MetricText(summary.transient_extra),
-                    MetricText(summary.persistent_queue),
+                    summary.reliable,
+                    summary.booting,
+                    summary.needed,
                     summary.extra_instances,
-                    summary.reachability,
-                    summary.persistent_streams,
-                    summary.streams,
-                    summary.zero_overhead,
                 ));
             }
             (
@@ -208,7 +198,7 @@ pub enum Action {
         to: u32,
         /// What sets the capacity need.
         need: NeedCause,
-        /// Captured purchase inputs.
+        /// Captured resource scaling inputs.
         summary: ScaleDecision,
     },
     /// Withdraws requests whose launches have not started.
@@ -344,22 +334,13 @@ mod tests {
                 to: u32::MAX,
                 need: NeedCause::Demand,
                 summary: ScaleDecision {
-                    readiness: Duration::MAX,
-                    horizon: Duration::MAX,
-                    slots: u32::MAX,
-                    reliable: u32::MAX,
                     dimension: ScalingDimension::Cpu,
+                    demand: value,
                     capacity: value,
-                    pre_ready: value,
-                    persistent_load: value,
-                    transient_backlog: value,
-                    transient_extra: value,
-                    persistent_queue: value,
+                    reliable: u32::MAX,
+                    booting: u32::MAX,
+                    needed: u32::MAX,
                     extra_instances: u32::MAX,
-                    reachability: u32::MAX,
-                    persistent_streams: u32::MAX,
-                    streams: u32::MAX,
-                    zero_overhead: true,
                 },
             })?;
             assert!(audit.kind.validate().is_ok());
@@ -370,7 +351,7 @@ mod tests {
             else {
                 return Err("missing scale summary".into());
             };
-            assert!(detail.len() <= 420);
+            assert!(detail.len() <= 200);
             assert!(detail.len() <= ScalingEventKind::MAX_DECISION_DETAIL_BYTES);
         }
         Ok(())
@@ -420,8 +401,8 @@ mod tests {
     fn scale_out_audits_as_scaled_out() -> TestResult {
         let summary = ScaleDecision {
             dimension: ScalingDimension::Memory,
-            persistent_queue: metric(17.0),
-            zero_overhead: true,
+            demand: metric(17.0),
+            needed: 5,
             ..ScaleDecision::default()
         };
         let audit = event(Action::ScaleOut {
@@ -441,8 +422,8 @@ mod tests {
         };
         assert_eq!((from, to), (2, 5));
         assert!(detail.contains("dimension=memory"));
-        assert!(detail.contains("persistent_queue=17"));
-        assert!(detail.contains("zero_overhead=true"));
+        assert!(detail.contains("demand=17"));
+        assert!(detail.contains("needed=5"));
         Ok(())
     }
 

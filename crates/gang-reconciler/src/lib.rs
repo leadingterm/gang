@@ -23,7 +23,6 @@
 //!     vcpus_per_instance: nonzero_u32(4),
 //!     memory_per_instance: NonZeroBytes::gib(8),
 //!     disk_per_instance: NonZeroBytes::gib(100),
-//!     target_actions_per_instance: nonzero_u32(4),
 //!     idle_timeout: Duration::from_secs(15),
 //!     max_drain_wait: Duration::from_mins(1),
 //!     boot_grace: Duration::from_secs(30),
@@ -48,7 +47,7 @@
 //!
 //! let scaling = Arc::new(ScalingConfig::default());
 //! let profiles = SourceProfiles::new(&scaling, HistoryWindow::from_units(1));
-//! let mut reconciler = Reconciler::new(std::slice::from_ref(&policy), scaling, profiles);
+//! let mut reconciler = Reconciler::new(std::slice::from_ref(&policy), scaling, profiles, nonzero_u32(2));
 //! let mut plan = Plan::new();
 //! reconciler.reconcile(&mut fleets, &hosted, PassTime::read(&clock), &mut plan);
 //! assert!(matches!(

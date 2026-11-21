@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-use gang_types::{AuthenticationSettings, CaPin, Isa, NonZeroDuration, ProviderName, Url};
+use gang_types::{
+    AuthenticationSettings, CaPin, Isa, NonZeroDuration, ProviderName, Url, property,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::actions::ActionsConfig;
@@ -159,7 +161,7 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
         } = self;
         Self::check_listener_collisions(listen, worker_listen, health_listen)?;
         Self::check_leadership(&server)?;
-        let fleets = Fleets::resolve(fleets, &provisioner, &sandbox)?;
+        let fleets = Fleets::resolve(fleets, &provisioner, &sandbox, actions.memory.reserve.get())?;
         Self::check_fleet_settings(&fleets, &server, default_isa)?;
         if let Some(policy) = &execution.egress {
             policy.validate().map_err(ConfigError::InvalidEgress)?;
@@ -230,33 +232,25 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
     fn check_actions(fleets: &Fleets<P>, actions: &ActionsConfig) -> Result<(), ConfigError> {
         for fleet in fleets.policies() {
             let effective = fleet.actions.resources.effective(fleet.instance());
-            for (key, value, capacity, strict) in [
+            for (key, value, capacity) in [
                 (
                     "actions.memory.min_reservation",
                     actions.memory.min_reservation.as_units() * 1024,
                     effective.memory.get(),
-                    false,
-                ),
-                (
-                    "actions.memory.reserve",
-                    actions.memory.reserve.as_u64(),
-                    fleet.memory_per_instance.as_u64(),
-                    true,
                 ),
                 (
                     "actions.disk.min_reservation",
                     actions.disk.min_reservation.as_units() * 1024,
                     effective.disk.get(),
-                    false,
                 ),
             ] {
-                if value > capacity || (strict && value == capacity) {
+                if value > capacity {
                     return Err(ConfigError::ActionResourceDoesNotFit {
                         key,
                         value,
                         capacity,
                         fleet: fleet.name.clone(),
-                        relation: if strict { "less than" } else { "at most" },
+                        relation: "at most",
                     });
                 }
             }
@@ -264,13 +258,14 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
         let cold = &actions.cold_start;
         let fits = fleets.policies().iter().any(|fleet| {
             let effective = fleet.actions.resources.effective(fleet.instance());
-            effective.vcpus >= cold.cpu_count.get()
+            u64::from(effective.vcpus) * property::MILLICORES_PER_CORE
+                >= u64::from(cold.cpu_millicores.get())
                 && effective.memory.get() >= cold.memory.as_units() * 1024
                 && effective.disk.get() >= cold.disk.as_units() * 1024
         });
         if cold.enabled && !fits {
             return Err(ConfigError::ColdStartFitsNoFleet {
-                cpu_count: cold.cpu_count.get(),
+                cpu_millicores: cold.cpu_millicores.get(),
                 memory_kb: cold.memory.as_units(),
                 disk_kb: cold.disk.as_units(),
             });

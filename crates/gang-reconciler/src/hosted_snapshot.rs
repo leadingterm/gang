@@ -97,6 +97,8 @@ mod tests {
             environment: Some("host:test".parse()?),
             running_actions: 0,
             max_inflight_actions: NonZeroU32::new(4),
+            capacity: None,
+            reserved: None,
             draining: false,
             paused: false,
             last_seen: Timestamp::default(),

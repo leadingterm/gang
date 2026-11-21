@@ -109,7 +109,7 @@ pub struct FleetPolicy {
     pub instances: InstanceBounds,
     /// CPU cores of one worker.
     pub vcpus_per_instance: NonZeroU32,
-    /// Memory of one worker. Non-zero.
+    /// Estimated action memory available per worker after the configured reserve. Non-zero.
     pub memory_per_instance: NonZeroBytes,
     /// A lower bound of the disk the actions of one worker may hold in total, valid for every
     /// instance type the fleet may launch: scratch capacity less the fast content store's budget
@@ -119,8 +119,6 @@ pub struct FleetPolicy {
     /// enrolls.
     /// Non-zero.
     pub disk_per_instance: NonZeroBytes,
-    /// Concurrent actions one worker is sized for.
-    pub target_actions_per_instance: NonZeroU32,
     /// How long a worker may sit idle before it is drained.
     pub idle_timeout: Duration,
     /// How long a draining worker may keep running actions before it is terminated.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Guard the x86 PR critical path and the push-only release validation graph.
+# Guard the x86 PR path and trusted release validation graph.
 set -euo pipefail
 
 if (( $# > 1 )); then
@@ -10,8 +10,8 @@ fi
 script_dir=$(cd "$(dirname "$0")" && pwd)
 workflow=${1-"$script_dir/../.github/workflows/ci.yml"}
 
-yq -o=json '.jobs' "$workflow" | jq -e '
-  . as $jobs
+yq -o=json '.' "$workflow" | jq -e '
+  .jobs as $jobs
   | def needs($id; $expected):
       if ($jobs[$id].needs | if type == "string" then [.] else . end | sort)
          == ($expected | sort) then .
@@ -34,13 +34,35 @@ yq -o=json '.jobs' "$workflow" | jq -e '
            and ($condition | contains("refs/heads/master"))
            and ($condition | contains("refs/tags/v")) then .
         else error($id + " must run only for main/master pushes and v* tags") end;
-  if type != "object" or (.required | type) != "object" then
+    def release_scope:
+      "(github.event_name == '\''merge_group'\'' || github.event_name == '\''push'\'' && (github.ref == '\''refs/heads/main'\'' || github.ref == '\''refs/heads/master'\'' || startsWith(github.ref, '\''refs/tags/v'\'')) || github.event_name == '\''pull_request'\'' && startsWith(github.event.pull_request.head.ref, '\''release/'\'') && github.event.pull_request.head.repo.full_name == github.repository)";
+    def release_checkout:
+      "${{ github.event_name == '\''pull_request'\'' && startsWith(github.event.pull_request.head.ref, '\''release/'\'') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}";
+  if .on.merge_group.types != ["checks_requested"] then
+    error("merge_group must trigger exactly on checks_requested")
+  elif ($jobs | type) != "object" or ($jobs.required | type) != "object" then
     error("workflow must contain a required job")
-  elif (.changes | type) != "object" then
+  elif ($jobs.changes | type) != "object" then
     error("workflow must contain a changes job")
   else . end
-  | needs("required"; ["changes", "nix-vm", "lint", "linux-x86_64-shards", "linux-x86_64", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-1", "e2e-gate-2-shards", "e2e-gate-2"])
+  | if ([$jobs.changes.steps[]? | select(.id == "filter") | .env.BASE]
+        == ["${{ github.event_name == '\''pull_request'\'' && github.event.pull_request.base.sha || '\''0000000000000000000000000000000000000000'\'' }}"]) then .
+    else error("change classification must use the PR base or zero fallback") end
+  | if ([$jobs.changes.steps[]? | select(.id == "filter") | .env.EVENT] == ["${{ github.event_name }}"])
+       and ([$jobs.changes.steps[]? | select(.id == "filter") | .env.REF] == ["${{ github.ref }}"]) then .
+    else error("change classification must use the event name and queue ref") end
+  | if ([$jobs.changes.steps[]? | select(.id == "filter") | .run]
+        == ["if [[ \"$EVENT\" == merge_group ]]; then\n  tools/ci-changes.sh --merge-group \"$REF\" \"$HEAD\"\nelse\n  tools/ci-changes.sh \"$BASE\" \"$HEAD\"\nfi >> \"$GITHUB_OUTPUT\"\n"]) then .
+    else error("change classification must dispatch merge groups and ordinary events correctly") end
+  | if ([$jobs[].steps[]? | select((.uses // "") | startswith("actions/checkout@"))
+         | select(.with.ref != release_checkout)] | length) == 0
+       and ([$jobs.changes.steps[]? | select(.id == "filter") | .env.HEAD] == [release_checkout]) then .
+    else error("all CI checkouts and change classification must use the release PR head") end
+  | needs("required"; ["changes", "nativelink-memory-tests", "nix-vm", "lint", "linux-x86_64-shards", "linux-x86_64", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-1", "e2e-gate-2-shards", "e2e-gate-2"])
   | results("required")
+  | needs("nativelink-memory-tests"; ["changes"])
+  | if $jobs["nativelink-memory-tests"].if == "needs.changes.outputs.heavy == '\''true'\''" then .
+    else error("nativelink-memory-tests must run whenever heavy is true") end
   | needs("nix-vm"; ["changes"])
   | needs("linux-x86_64-shards"; ["changes"])
   | needs("lint"; ["changes"])
@@ -95,6 +117,9 @@ yq -o=json '.jobs' "$workflow" | jq -e '
   | needs("linux-arm64-checks"; ["changes", "linux-arm64-bundle"])
   | needs("release-validation"; ["changes", "required", "linux-arm64", "cross"])
   | results("release-validation")
+  | if ([$jobs["release-validation"].steps[]? | select(.env.REQUIRED_RESULT != null) | .env.HEAVY]
+        == ["${{ needs.changes.outputs.heavy }}"]) then .
+    else error("release-validation must use the changes heavy output") end
   | reduce ["e2e-gate-1", "e2e-gate-2"][] as $id (.;
       needs($id + "-shards"; ["changes", "linux-x86_64-bundle"])
       | needs($id; ["changes", $id + "-shards"])
@@ -108,15 +133,17 @@ yq -o=json '.jobs' "$workflow" | jq -e '
       results($id)
       | if $jobs[$id].if == "always()" then .
       else error("unsafe aggregator " + $id + ": if must be always()") end)
-  | reduce ["linux-arm64-bundle", "linux-arm64-checks", "linux-arm64", "cross", "macos", "release-validation"][] as $id (.;
-      push_only($id))
-  | if ($jobs["linux-arm64"].if | contains("always()"))
-       and ($jobs["release-validation"].if | contains("always()")) then .
-    else error("push aggregators must always run after their dependencies") end
+  | push_only("macos")
+  | reduce ["linux-arm64-bundle", "linux-arm64-checks", "cross"][] as $id (.;
+      if $jobs[$id].if == (release_scope + " && needs.changes.outputs.heavy == '\''true'\''") then .
+      else error($id + " must run only on heavy merge groups, main/master/tag pushes and trusted release PRs") end)
+  | reduce ["linux-arm64", "release-validation"][] as $id (.;
+      if $jobs[$id].if == ("always() && " + release_scope) then .
+      else error($id + " must always aggregate on trusted release events") end)
   | reduce ["nix-vm", "lint", "linux-x86_64-shards", "linux-x86_64-bundle", "cache-x86_64", "e2e-gate-1-shards", "e2e-gate-2-shards", "linux-arm64-bundle", "linux-arm64-checks", "cross", "macos"][] as $id (.;
       if ($jobs[$id].if | contains("needs.changes.outputs.heavy == '\''true'\''")) then .
       else error($id + " must skip intentionally when heavy is false") end)
-  | reduce ["nix-vm", "lint", "linux-x86_64-shards", "linux-x86_64", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-1", "e2e-gate-2-shards", "e2e-gate-2", "required"][] as $id (.;
+  | reduce ["nativelink-memory-tests", "nix-vm", "lint", "linux-x86_64-shards", "linux-x86_64", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-1", "e2e-gate-2-shards", "e2e-gate-2", "required"][] as $id (.;
       ($jobs[$id]."runs-on" // "") as $runner
       | if ($runner | type) == "string" and ($runner | contains("ubuntu-24.04"))
            and ($runner | contains("linux-x64")) and ($runner | contains("arm64") | not) then .

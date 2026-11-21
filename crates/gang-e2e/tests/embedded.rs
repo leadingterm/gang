@@ -18,8 +18,8 @@ use gang_spi::{
     Accepted, Admitted, ApiRequestBody, ApiResponseBody, ApiService, Authenticated, ClientTls,
     ControllerConnections, ControllerReady, ControllerSpec, GateDecision, Listening,
     ObservationSink, Peer, PortError, Rejection, RenderedStoreSpec, RequestGate, RequestScope,
-    SchedulerPort, SchedulerSnapshot, Slots, StoreAccess, StoreKind, WorkerSpec, WorkerState,
-    WorkerTls, full_body,
+    SchedulerPort, SchedulerSnapshot, StoreAccess, StoreKind, WorkerSpec, WorkerState, WorkerTls,
+    full_body,
 };
 use gang_testkit::{ChildTest, ExtendedKeyUsagePurpose, TestAuthority, TestResult};
 use gang_tls::{
@@ -28,7 +28,7 @@ use gang_tls::{
 };
 use gang_types::{
     Bytes, CertSerial, FleetCatalog, FleetName, FleetProperties, FleetSet, Identity, InstanceId,
-    Isa, NonZeroDuration, Principal, ProviderName, Resources,
+    Isa, NonZeroDuration, Principal, ProviderName, Resources, WorkerLifetime,
 };
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -68,8 +68,6 @@ use tonic::transport::{Channel, Endpoint};
 const CLIENT_ACTION_TIMEOUT: Duration = Duration::from_mins(1);
 /// The instance the test worker runs on.
 const WORKER_INSTANCE: &str = "local-1";
-/// Actions the test worker accepts at once.
-const MAX_INFLIGHT: NonZeroU32 = NonZeroU32::new(2).expect("two is not zero");
 /// Virtual CPUs the test worker registers.
 const WORKER_VCPUS: u32 = 4;
 /// Bytes in one gibibyte.
@@ -351,6 +349,7 @@ fn spawn_controller(
         let spec = ControllerSpec {
             actions,
             scaling: Arc::new(gang_config::ScalingConfig::default()),
+            control_acquire_timeout: NonZeroDuration::from_secs(1),
             clock: Arc::new(gang_clock::SystemClock::new()),
             content_store: &content,
             action_store: &action,
@@ -427,7 +426,7 @@ fn spawn_worker(
             memory_pool: None,
             instance,
             properties,
-            slots: Slots::LongLived(MAX_INFLIGHT),
+            lifetime: WorkerLifetime::LongLived,
             work_directory: paths.work,
             fast_cas_directory: paths.fast,
             fast_cas_budget: Bytes::new(FAST_CAS_BUDGET),
@@ -698,7 +697,7 @@ async fn a_worker_whose_certificate_is_revoked_ends_instead_of_reconnecting() ->
         memory_pool: None,
         instance: InstanceId::try_new(WORKER_INSTANCE)?,
         properties: default_fleet()?,
-        slots: Slots::LongLived(MAX_INFLIGHT),
+        lifetime: WorkerLifetime::LongLived,
         work_directory: paths.work,
         fast_cas_directory: paths.fast,
         fast_cas_budget: Bytes::new(FAST_CAS_BUDGET),
@@ -748,7 +747,7 @@ async fn snapshot_is_empty_then_shows_a_registered_worker() -> TestResult {
     let instance = InstanceId::try_new(WORKER_INSTANCE)?;
     assert!(worker.id.as_str().starts_with(&instance.worker_name()));
     assert_eq!(worker.fleet, FleetName::try_new(DEFAULT_FLEET)?);
-    assert_eq!(worker.max_inflight_actions, Some(MAX_INFLIGHT));
+    assert_eq!(worker.max_inflight_actions, None);
     assert!(!worker.draining);
     Ok(())
 }
@@ -823,6 +822,7 @@ async fn a_second_controller_is_refused() -> TestResult {
     let spec = ControllerSpec {
         actions: Arc::new(gang_config::ActionsConfig::default()),
         scaling: Arc::new(gang_config::ScalingConfig::default()),
+        control_acquire_timeout: NonZeroDuration::from_secs(1),
         clock: Arc::new(gang_clock::SystemClock::new()),
         content_store: &content,
         action_store: &action,
@@ -851,6 +851,7 @@ async fn sequential_controller_terms_drain_and_republish() -> TestResult {
     let spec = ControllerSpec {
         actions: Arc::new(gang_config::ActionsConfig::default()),
         scaling: Arc::new(gang_config::ScalingConfig::default()),
+        control_acquire_timeout: NonZeroDuration::from_secs(1),
         clock: Arc::new(gang_clock::SystemClock::new()),
         content_store: &content,
         action_store: &action,
@@ -2471,7 +2472,6 @@ fn worker_fleets() -> Result<gang_config::Fleets<gang_testkit::TestPlugins>, Box
                 vcpus_per_instance: NonZeroU32::new(4).ok_or("nonzero vCPU count")?,
                 memory_per_instance: gang_types::NonZeroBytes::gib(8),
                 disk_per_instance: gang_types::NonZeroBytes::gib(100),
-                target_actions_per_instance: NonZeroU32::new(4).ok_or("nonzero action target")?,
                 idle_timeout: Duration::from_secs(15),
                 max_drain_wait: Duration::from_mins(1),
                 boot_grace: Duration::from_secs(30),

@@ -11,8 +11,8 @@ use gang_config::{
 use gang_e2e::{
     AUDIENCE, ActionLimits, ActionTools, ConfigTemplate, ControlKnobs, E2eError, ExecutionKnobs,
     FleetLayout, IdentityKnobs, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, NOOP_FLEET,
-    ORGANIZATION, ORGANIZATION_CLAIM, PermitNetwork, Placement, SMALL_FLEET, Sandbox, ServerKnobs,
-    SoftMemory, Transport, Variant,
+    ORGANIZATION, ORGANIZATION_CLAIM, PLACEMENT_LARGE_MEMORY, PLACEMENT_SMALL_MEMORY,
+    PermitNetwork, Placement, SMALL_FLEET, Sandbox, ServerKnobs, SoftMemory, Transport, Variant,
 };
 use gang_main::plugins::{
     CacheConfig, ClientAuthenticationConfig, DatabaseConfig, IdentityProviderConfig, LimitsConfig,
@@ -420,10 +420,7 @@ fn leader_failover_preset_renders_only_the_service_prior() -> gang_e2e::Result<(
     for (fleet, before) in leader.fleets.iter().zip(&baseline.fleets) {
         assert_eq!(fleet.min_instances, before.min_instances);
         assert_eq!(fleet.max_instances, before.max_instances);
-        assert_eq!(
-            fleet.target_actions_per_instance,
-            before.target_actions_per_instance
-        );
+        assert_eq!(fleet.vcpus_per_instance, before.vcpus_per_instance);
         assert_eq!(fleet.idle_timeout, before.idle_timeout);
         assert_eq!(fleet.boot_grace, before.boot_grace);
         assert_eq!(fleet.max_drain_wait, before.max_drain_wait);
@@ -441,6 +438,15 @@ fn rate_scaling_presets_render_typed_knobs() -> gang_e2e::Result<()> {
         backlog.scaling.unknown_action_duration.get(),
         std::time::Duration::from_mins(10),
     );
+    let fleet = &backlog.fleets[0];
+    assert_eq!(fleet.vcpus_per_instance.get(), 1);
+    assert_eq!(backlog.actions.cpu_oversubscription.get(), 1);
+    assert_eq!(fleet.max_instances.get(), 3);
+    let millicores_per_core = gang_types::property::MILLICORES_PER_CORE;
+    let held_cpu = 3 * u64::from(gang_e2e::HOLD_CPU_COUNT) * millicores_per_core;
+    let physical_cpu = u64::from(fleet.vcpus_per_instance.get()) * millicores_per_core;
+    let worker_cpu = physical_cpu * u64::from(backlog.actions.cpu_oversubscription.get());
+    assert_eq!(held_cpu.div_ceil(worker_cpu), 3);
     for (control, idle) in [
         (
             ControlKnobs::BURST_FROM_ZERO,
@@ -496,8 +502,8 @@ fn rate_scaling_presets_render_typed_knobs() -> gang_e2e::Result<()> {
             control.idle_timeout.expect("preset idle timeout")
         );
         assert_eq!(
-            document.fleets[0].target_actions_per_instance.get(),
-            control.target_actions_per_instance.expect("preset target")
+            document.fleets[0].vcpus_per_instance.get(),
+            control.vcpus_per_instance.expect("preset vcpus")
         );
     }
     Ok(())
@@ -518,16 +524,6 @@ fn database_outage_preset_justifies_follower_work_before_partition_heals() -> ga
         document.dashboard.detail_interval.get(),
         std::time::Duration::from_secs(1),
     );
-    for fleet in &document.fleets {
-        assert_eq!(fleet.target_actions_per_instance.get(), 2);
-        let boot = document.scaling.readiness_prior.get().min(fleet.boot_grace);
-        let horizon = (boot + fleet.idle_timeout) / 2;
-        // Conservatively credit two two-slot instances throughout B and H.
-        // Four unknown queued actions must still pay for another two-slot worker.
-        let work = 4 * document.scaling.unknown_action_duration.get().as_nanos();
-        let credited = 4 * (boot + horizon).as_nanos();
-        assert!(work > credited + 2 * horizon.as_nanos());
-    }
     Ok(())
 }
 
@@ -1109,8 +1105,7 @@ fn launch_failure_preset_sets_missing_launcher_and_short_timeout() -> gang_e2e::
 }
 
 #[test]
-fn fleets_preset_justifies_overflow_without_changing_placement_or_polling() -> gang_e2e::Result<()>
-{
+fn fleets_preset_saturates_first_fleet() -> gang_e2e::Result<()> {
     let base = base_config()?;
     for sandbox in [Sandbox::Noop, Sandbox::Bwrap] {
         let variant = placement_variant(sandbox);
@@ -1134,10 +1129,23 @@ fn fleets_preset_justifies_overflow_without_changing_placement_or_polling() -> g
         );
         assert_eq!(tuned.client_action_timeout, untuned.client_action_timeout);
         assert_eq!(tuned.fleets.len(), 3);
+        assert!(tuned.actions.cold_start.enabled);
+        assert_eq!(tuned.actions.cpu_oversubscription.get(), 1);
+        assert_eq!(tuned.fleets[0].vcpus_per_instance.get(), 4);
+        assert_eq!(tuned.actions.cold_start.cpu_millicores.get(), 4000);
+        assert_eq!(
+            u64::from(tuned.actions.cold_start.cpu_millicores.get()),
+            u64::from(tuned.fleets[0].vcpus_per_instance.get())
+                * gang_types::property::MILLICORES_PER_CORE
+        );
         assert_eq!(tuned.scaling.payback_percent.get(), 50);
         assert_eq!(
+            tuned.scaling.unknown_action_duration,
+            untuned.scaling.unknown_action_duration
+        );
+        assert_eq!(
             tuned.scaling.unknown_action_duration.get(),
-            std::time::Duration::from_mins(10),
+            std::time::Duration::from_secs(10)
         );
         for (fleet, before) in tuned.fleets.iter().zip(&untuned.fleets) {
             assert_eq!(fleet.name, before.name);
@@ -1147,13 +1155,6 @@ fn fleets_preset_justifies_overflow_without_changing_placement_or_polling() -> g
             assert_eq!(fleet.idle_timeout, std::time::Duration::from_secs(2));
             assert_eq!(fleet.max_drain_wait, before.max_drain_wait);
             assert_eq!(fleet.boot_grace, before.boot_grace);
-            assert_eq!(fleet.target_actions_per_instance.get(), 1);
-            let boot = tuned.scaling.readiness_prior.get().min(fleet.boot_grace);
-            let horizon = (boot + fleet.idle_timeout) / 2;
-            assert!(
-                tuned.scaling.unknown_action_duration.get().as_nanos() >= 2 * horizon.as_nanos(),
-                "one queued action must justify another whole slot after crediting the planned slot",
-            );
         }
         let ProvisionerConfig::Local(local) = tuned.provisioner else {
             panic!("local provisioner expected");
@@ -1163,6 +1164,32 @@ fn fleets_preset_justifies_overflow_without_changing_placement_or_polling() -> g
             std::time::Duration::from_secs(1)
         );
     }
+    Ok(())
+}
+
+#[test]
+fn pressure_preset_keeps_the_memory_ledger_on_one_worker() -> gang_e2e::Result<()> {
+    let variant = Variant {
+        limits: ActionLimits::Cgroup,
+        soft_memory: SoftMemory::Off,
+        control: ControlKnobs::PRESSURE,
+        execution: ExecutionKnobs {
+            resource_policy: Some(gang_e2e::ResourcePolicy::pressure_scenario()?),
+            ..ExecutionKnobs::NONE
+        },
+        ..Variant::baseline(Sandbox::Noop)
+    };
+    let tuned = typed_rendered(&ConfigTemplate::parse(&base_config()?)?.vary(
+        &variant,
+        &launcher(),
+        &*(tools()?),
+    )?)?;
+    assert_eq!(tuned.fleets.len(), 1);
+    assert_eq!(tuned.fleets[0].max_instances.get(), 1);
+    assert_eq!(
+        tuned.fleets[0].memory_per_instance,
+        gang_types::NonZeroBytes::mib(512)
+    );
     Ok(())
 }
 
@@ -1341,7 +1368,6 @@ fn placement_small_fleet_keeps_the_base_sizing_and_holds_one_instance() -> gang_
     assert_eq!(small.disk_per_instance, gang_types::NonZeroBytes::gib(20));
     assert_eq!(small.min_instances, 0);
     assert_eq!(small.max_instances.get(), 1);
-    assert_eq!(small.target_actions_per_instance.get(), 1);
     Ok(())
 }
 
@@ -1356,7 +1382,6 @@ fn placement_large_fleet_doubles_the_size_under_the_same_sandbox() -> gang_e2e::
     assert_eq!(large.disk_per_instance, gang_types::NonZeroBytes::gib(20));
     assert_eq!(large.min_instances, 0);
     assert_eq!(large.max_instances.get(), 2);
-    assert_eq!(large.target_actions_per_instance.get(), 1);
     Ok(())
 }
 
@@ -1370,7 +1395,6 @@ fn placement_noop_fleet_has_the_small_size_under_the_noop_sandbox() -> gang_e2e:
     assert_eq!(noop.memory_per_instance, gang_types::NonZeroBytes::gib(8));
     assert_eq!(noop.disk_per_instance, gang_types::NonZeroBytes::gib(20));
     assert_eq!(noop.max_instances.get(), 1);
-    assert_eq!(noop.target_actions_per_instance.get(), 1);
     Ok(())
 }
 
@@ -1455,33 +1479,38 @@ fn placement_layout_needs_exactly_one_base_fleet() -> gang_e2e::Result<()> {
 }
 
 #[test]
-fn large_memory_is_what_the_large_fleet_registers_in_kib() -> gang_e2e::Result<()> {
-    let template = ConfigTemplate::parse(&base_config()?)?;
-    let fleets = placement_fleets(Sandbox::Bwrap)?;
-    assert_eq!(
-        template.large_memory_kb()?,
-        fleets[1].memory_per_instance.as_u64() / 1024
-    );
-    Ok(())
-}
-
-#[test]
-fn large_memory_exceeds_the_small_fleet() -> gang_e2e::Result<()> {
-    let template = ConfigTemplate::parse(&base_config()?)?;
-    let fleets = placement_fleets(Sandbox::Bwrap)?;
-    assert!(template.large_memory_kb()? > fleets[0].memory_per_instance.as_u64() / 1024);
-    Ok(())
-}
-
-#[test]
-fn large_memory_is_the_same_for_the_base_and_its_placement_layout() -> gang_e2e::Result<()> {
-    let template = ConfigTemplate::parse(&base_config()?)?;
-    let placed = ConfigTemplate::parse(&base_config()?)?.vary(
+fn placement_memory_probe_fits_only_the_large_action_ceiling() -> gang_e2e::Result<()> {
+    let template = ConfigTemplate::parse(&base_config()?)?.vary(
         &placement_variant(Sandbox::Bwrap),
         &launcher(),
         &*(tools()?),
     )?;
-    assert_eq!(template.large_memory_kb()?, placed.large_memory_kb()?);
+    let doc = typed_rendered(&template)?;
+    let small = doc.fleets[0]
+        .actions
+        .resources
+        .memory
+        .expect("small ceiling");
+    let large = doc.fleets[1]
+        .actions
+        .resources
+        .memory
+        .expect("large ceiling");
+    let noop = doc.fleets[2]
+        .actions
+        .resources
+        .memory
+        .expect("noop ceiling");
+    let probe_kib = PLACEMENT_LARGE_MEMORY.as_u64() / 1024;
+    assert_eq!(small, PLACEMENT_SMALL_MEMORY);
+    assert_eq!(noop, PLACEMENT_SMALL_MEMORY);
+    assert_eq!(probe_kib, large.as_u64() / 1024);
+    assert!(probe_kib > small.as_u64() / 1024);
+    let cold_memory = doc.actions.cold_start.memory.get().get();
+    assert_eq!(cold_memory, PLACEMENT_SMALL_MEMORY.as_u64());
+    assert!(cold_memory <= small.as_u64());
+    assert!(cold_memory <= large.as_u64());
+    assert!(cold_memory <= noop.as_u64());
     Ok(())
 }
 

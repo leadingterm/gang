@@ -1,7 +1,7 @@
 //! Deterministic pressure observations exercise each independently failing verdict.
 
-use gang_e2e::AttemptRecord;
 use gang_e2e::pressure::{self, Evidence};
+use gang_e2e::{AttemptRecord, ResourcePolicy};
 
 const KIB: u64 = 1024;
 const PEAK: u64 = 193 * KIB;
@@ -43,7 +43,7 @@ impl Simulation {
         let victim = 64 * KIB;
         let neighbour = 320 * KIB;
         let learned = (PEAK * 125).div_ceil(100);
-        let retry = learned.max((victim * 250).div_ceil(100)).max(victim + 1);
+        let retry = learned.max((victim * 700).div_ceil(100)).max(victim + 1);
         Self::record(&mut self.attempts, "pressure_victim", victim);
         Self::record(&mut self.attempts, "pressure_neighbour", neighbour);
         let wrong_victim = matches!(self.behaviour, Behaviour::WrongVictim);
@@ -89,6 +89,22 @@ fn fails(checks: &[gang_e2e::Check], name: &str) -> bool {
     checks
         .iter()
         .any(|check| check.name == name && check.is_failure())
+}
+
+#[test]
+fn pressure_policy_retry_waits_for_neighbour_capacity() {
+    let policy = ResourcePolicy::pressure_scenario().expect("valid pressure policy");
+    let capacity = policy
+        .worker_memory_max
+        .expect("pressure policy bounds worker memory")
+        .get()
+        - policy.memory.reserve.get().get();
+    let victim = 64 * 1024 * 1024_u64;
+    let neighbour = 320 * 1024 * 1024_u64;
+    let retry_floor = (victim * u64::from(policy.memory.escalation_percent.get())).div_ceil(100);
+
+    assert!(victim + neighbour <= capacity);
+    assert!(retry_floor + neighbour > capacity);
 }
 
 #[test]

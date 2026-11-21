@@ -44,7 +44,8 @@ use crate::server::{
 use crate::settings::ActionTools;
 use crate::system::{
     ActionLimits, FleetLayout, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, NOOP_FLEET,
-    PermitNetwork, SMALL_FLEET, Sandbox, SoftMemory, Variant,
+    PLACEMENT_LARGE_MEMORY, PLACEMENT_SMALL_MEMORY, PermitNetwork, SMALL_FLEET, Sandbox,
+    SoftMemory, Variant,
 };
 
 /// The `max_instances` of [`SMALL_FLEET`] and [`NOOP_FLEET`].
@@ -216,9 +217,6 @@ fn render_resource_policy(
     if let Some(vcpus) = policy.fleet_vcpus {
         for fleet in &mut document.fleets {
             fleet.vcpus_per_instance = vcpus;
-            fleet.target_actions_per_instance = fleet
-                .target_actions_per_instance
-                .max(NonZeroU32::MIN.saturating_add(1));
         }
     }
     if let Some(cold_start) = policy.cold_start {
@@ -413,6 +411,8 @@ impl ConfigTemplate {
                 return Err(template_error("missing [sandbox.noop]"));
             }
             placement_fleets(&mut document.fleets)?;
+            document.actions.cold_start.memory =
+                gang_config::WholeKib::from_units(PLACEMENT_SMALL_MEMORY.as_u64() / 1024);
         }
         document.execution.input_links = variant.input_links;
         Self::project_limits(document, variant, worker_launcher)?;
@@ -516,19 +516,6 @@ impl ConfigTemplate {
     pub fn default_isa(&self) -> Result<Isa> {
         Ok(self.document.default_isa)
     }
-
-    /// Returns the large fleet's memory in KiB.
-    ///
-    /// # Errors
-    /// Returns a template error if the first fleet is absent or doubling its size overflows.
-    pub fn large_memory_kb(&self) -> Result<u64> {
-        let fleet = self
-            .document
-            .fleets
-            .first()
-            .ok_or_else(|| template_error("missing the first [[fleets]] entry"))?;
-        Ok(enlarged(fleet)?.1.as_u64() / 1024)
-    }
 }
 
 /// Maps a template failure to its public error.
@@ -569,7 +556,6 @@ fn placement_fleet(
         vcpus_per_instance: base.vcpus_per_instance,
         memory_per_instance: base.memory_per_instance,
         disk_per_instance: base.disk_per_instance,
-        target_actions_per_instance: NonZeroU32::MIN,
         idle_timeout: base.idle_timeout,
         max_drain_wait: base.max_drain_wait,
         boot_grace: base.boot_grace,
@@ -592,13 +578,16 @@ fn placement_fleets(fleets: &mut Vec<RawFleet<SandboxKey>>) -> Result<()> {
         .first()
         .ok_or_else(|| template_error("missing the first [[fleets]] entry"))?;
     let (vcpus, memory) = enlarged(base)?;
-    let small = placement_fleet(base, SMALL_FLEET, SMALL_MAX_INSTANCES)?;
+    let mut small = placement_fleet(base, SMALL_FLEET, SMALL_MAX_INSTANCES)?;
+    small.actions.resources.memory = Some(PLACEMENT_SMALL_MEMORY);
     let max = NonZeroU32::new(LARGE_MAX_INSTANCES)
         .ok_or_else(|| template_error("large fleet maximum must be nonzero"))?;
     let mut large = placement_fleet(base, LARGE_FLEET, max)?;
     large.vcpus_per_instance = vcpus;
     large.memory_per_instance = memory;
+    large.actions.resources.memory = Some(PLACEMENT_LARGE_MEMORY);
     let mut noop = placement_fleet(base, NOOP_FLEET, SMALL_MAX_INSTANCES)?;
+    noop.actions.resources.memory = Some(PLACEMENT_SMALL_MEMORY);
     noop.sandbox = SandboxKey::Noop;
     noop.action_environment = "host:e2e".parse().map_err(template_error)?;
     noop.actions.grants.remove(&Capability::Network);
@@ -783,10 +772,6 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
             fleet.max_instances = NonZeroU32::new(max)
                 .ok_or_else(|| template_error("max instances must be nonzero"))?;
         }
-        if let Some(target) = knobs.target_actions_per_instance {
-            fleet.target_actions_per_instance = NonZeroU32::new(target)
-                .ok_or_else(|| template_error("target actions per instance must be nonzero"))?;
-        }
         if let Some(vcpus) = knobs.vcpus_per_instance {
             fleet.vcpus_per_instance = NonZeroU32::new(vcpus)
                 .ok_or_else(|| template_error("vcpus per instance must be nonzero"))?;
@@ -808,6 +793,7 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
             ];
         }
     }
+    render_control_cpu(document, knobs)?;
     if let Some(grace) = knobs.terminate_grace {
         let ProvisionerConfig::Local(local) = &mut document.provisioner else {
             return Err(template_error("missing [provisioner.local]"));
@@ -817,6 +803,28 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
     if let Some(interval) = knobs.detail_interval {
         document.dashboard.detail_interval =
             NonZeroDuration::try_new(interval).map_err(template_error)?;
+    }
+    Ok(())
+}
+
+fn render_control_cpu(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Result<()> {
+    if let Some(factor) = knobs.cpu_oversubscription {
+        document.actions.cpu_oversubscription = factor;
+    }
+    if knobs.cold_start_full_fleet_cpu {
+        let vcpus = document
+            .fleets
+            .first()
+            .ok_or_else(|| template_error("missing the first [[fleets]] entry"))?
+            .vcpus_per_instance
+            .get();
+        let millicores = u64::from(vcpus).saturating_mul(gang_types::property::MILLICORES_PER_CORE);
+        let millicores = u32::try_from(millicores)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| template_error("first fleet CPU reservation overflows millicores"))?;
+        document.actions.cold_start.enabled = true;
+        document.actions.cold_start.cpu_millicores = millicores;
     }
     Ok(())
 }
@@ -858,4 +866,31 @@ fn render_server(document: &mut Document<Plugins>, knobs: ServerKnobs) -> Result
         document.server.certificate_backdate = CERTIFICATE_BACKDATE;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_cpu_reservation_factor_renders_without_changing_other_action_policy() {
+        let path = std::env::var("GANG_E2E_BASE_CONFIG").expect("base config runfile");
+        let config = std::fs::read_to_string(path).expect("base config");
+        for (knobs, expected) in [
+            (ControlKnobs::NONE, 3),
+            (ControlKnobs::LEADER_FAILOVER, 3),
+            (ControlKnobs::QUEUED_BEHIND_SHORT_WORK, 1),
+            (ControlKnobs::UTILIZATION_SCALE_IN, 1),
+        ] {
+            let mut document = Document::<Plugins>::parse(&config).expect("base config parses");
+            document.actions.cpu_oversubscription = NonZeroU32::new(3).expect("3 is nonzero");
+            let mut expected_actions = document.actions.clone();
+            expected_actions.cpu_oversubscription =
+                NonZeroU32::new(expected).expect("expected factor is nonzero");
+            render_control(&mut document, &knobs).expect("control renders");
+            let rendered = document.to_toml().expect("document serializes");
+            let parsed = Document::<Plugins>::parse(&rendered).expect("rendered config parses");
+            assert_eq!(parsed.actions, expected_actions);
+        }
+    }
 }

@@ -14,7 +14,8 @@ use tokio::sync::oneshot;
 use gang_clock::{Clock, Tick, Timestamp};
 use gang_types::{
     ActionEnvironment, ActionResources, BuildId, Bytes, FleetCatalog, FleetName, FleetProperties,
-    FleetSet, InstanceId, Refusal, SourceId, Url, WorkerId,
+    FleetSet, InstanceId, NonZeroBytes, NonZeroDuration, Refusal, SourceId, Url, WorkerId,
+    WorkerLifetime,
 };
 
 use crate::{
@@ -60,8 +61,8 @@ pub trait SchedulerPort: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] while the controller is not serving; [`PortError`] when the
-    /// scheduler cannot be queried.
+    /// [`PortError::Unavailable`] while the controller is not serving or acquisition times out;
+    /// [`PortError`] when the scheduler cannot be queried.
     async fn snapshot(&self, into: &mut SchedulerSnapshot) -> Result<(), PortError>;
 
     /// Overwrites `into` with the actions the scheduler holds: the executing ones, ordered by
@@ -81,8 +82,9 @@ pub trait SchedulerPort: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] while the controller is not serving, or a backend error when
-    /// a connected worker could not be updated. A failed update retains the controller intent.
+    /// [`PortError::Unavailable`] while the controller is not serving or acquisition times out.
+    /// An acquisition timeout occurs before any control mutation starts. A backend error may
+    /// occur when a connected worker could not be updated; a failed update retains the intent.
     async fn set_draining(
         &self,
         fleet: &FleetName,
@@ -98,7 +100,8 @@ pub trait SchedulerPort: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`PortError::Unavailable`] while the controller is not serving.
+    /// [`PortError::Unavailable`] while the controller is not serving or acquisition times out.
+    /// An acquisition timeout occurs before any control mutation starts.
     async fn retain_drains(
         &self,
         now: Tick,
@@ -156,8 +159,8 @@ pub trait SchedulerPort: Send + Sync {
     ) -> Result<(), PortError>;
 
     /// Builds one worker, connects it to the controller's worker listener, and runs it until
-    /// `stop` completes, the worker fails, or a [`Slots::SingleUse`] worker has finished its one
-    /// action and uploaded the result.
+    /// `stop` completes, the worker fails, or a [`WorkerLifetime::SingleUse`] worker has
+    /// finished its one action and uploaded the result.
     ///
     /// Once `stop` completes the worker takes no new action, ends every action it runs (the
     /// action's whole process group) and removes their directories, then returns `Ok(())`, so
@@ -192,6 +195,15 @@ pub struct LearnedHistory {
     pub expires_at: Timestamp,
 }
 
+/// Conservative usable memory for one configured fleet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetMemoryCapacity {
+    /// Index in the configured fleet catalog, matching queued demand candidates.
+    pub fleet: usize,
+    /// Usable memory, initially estimated and lowered by physical observations.
+    pub capacity: NonZeroBytes,
+}
+
 /// What the scheduler holds at one moment.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SchedulerSnapshot {
@@ -203,6 +215,9 @@ pub struct SchedulerSnapshot {
     pub source_rates_at: Tick,
     /// Controller-owned physical intents only, unique and sorted by `(fleet, instance)`.
     pub cordons: Vec<InstanceCordon>,
+    /// Current conservative usable memory per configured fleet, initially estimated until observed.
+    /// This buffer is reused across snapshots.
+    pub fleet_memory: Vec<FleetMemoryCapacity>,
     /// The connected workers, with unique ids sorted by `WorkerId` ascending.
     pub workers: Vec<WorkerState>,
     /// The queued actions, highest priority first, then oldest.
@@ -272,6 +287,10 @@ pub struct WorkerState {
     pub running_actions: u32,
     /// Actions it accepts at once; `None` when the worker accepts any number.
     pub max_inflight_actions: Option<NonZeroU32>,
+    /// Worker resource capacity from the scheduler ledger, absent when unavailable or malformed.
+    pub capacity: Option<ActionResources>,
+    /// Resources currently reserved in the scheduler ledger, absent when unavailable or malformed.
+    pub reserved: Option<ActionResources>,
     /// Whether the scheduler has stopped assigning it new actions.
     pub draining: bool,
     /// Whether the scheduler has paused the worker. Not the same as draining, which a drain
@@ -353,6 +372,10 @@ pub struct ActionInfo {
     pub priority: i32,
     /// The build the action's first submitter belongs to; `None` when unattributable.
     pub build: Option<BuildId>,
+    /// Resources reserved by the scheduler, including zero-valued dimensions.
+    pub reservation: ActionResources,
+    /// Pre-fit learned reservation when CPU or memory exceeded the fitted reservation.
+    pub learned_reservation: Option<ActionResources>,
 }
 
 /// A running action reported by the scheduler.
@@ -571,6 +594,9 @@ pub struct ControllerSpec<'a> {
     pub scaling: Arc<gang_config::ScalingConfig>,
     /// The server's existing clock, shared with completion producers and reconciliation.
     pub clock: Arc<dyn Clock>,
+    /// Bound on control lock acquisition and read preparation, derived from the server's poll
+    /// cadence. Once a control mutation begins it is not timed out or cancelled by this bound.
+    pub control_acquire_timeout: NonZeroDuration,
     /// The content-addressable store.
     pub content_store: &'a RenderedStoreSpec,
     /// The action store.
@@ -593,6 +619,7 @@ impl std::fmt::Debug for ControllerSpec<'_> {
             .debug_struct("ControllerSpec")
             .field("actions", &self.actions)
             .field("scaling", &self.scaling)
+            .field("control_acquire_timeout", &self.control_acquire_timeout)
             .field("content_store", &self.content_store)
             .field("action_store", &self.action_store)
             .field("fleets", &self.fleets)
@@ -624,32 +651,6 @@ pub enum StoreAccess {
     ViaController,
 }
 
-/// How many actions a worker takes at once, and whether it serves one action only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Slots {
-    /// The worker serves one action, then finishes.
-    SingleUse,
-    /// The worker serves this many actions at once.
-    LongLived(NonZeroU32),
-}
-
-impl Slots {
-    /// The number of actions the worker takes at once: one for [`Slots::SingleUse`].
-    #[must_use]
-    pub const fn count(self) -> NonZeroU32 {
-        match self {
-            Self::SingleUse => NonZeroU32::MIN,
-            Self::LongLived(count) => count,
-        }
-    }
-
-    /// Whether the worker serves one action and then finishes.
-    #[must_use]
-    pub const fn is_single_use(self) -> bool {
-        matches!(self, Self::SingleUse)
-    }
-}
-
 /// Inputs of one worker.
 #[derive(Debug, Clone)]
 pub struct WorkerSpec {
@@ -662,8 +663,8 @@ pub struct WorkerSpec {
     pub instance: InstanceId,
     /// The properties the worker registers: its fleet's.
     pub properties: FleetProperties,
-    /// Whether it serves many actions or exactly one, and how many at once.
-    pub slots: Slots,
+    /// Whether the worker serves one action or remains available for more.
+    pub lifetime: WorkerLifetime,
     /// Where actions are built: one directory per worker. The worker empties it at start.
     pub work_directory: PathBuf,
     /// The worker-local fast content-addressable cache directory, under the mounted scratch
@@ -687,13 +688,12 @@ pub struct WorkerSpec {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
     use std::pin::pin;
     use std::task::{Context, Poll, Waker};
 
     use http_body_util::BodyExt;
 
-    use super::{BoxedError, InstanceCordon, Slots, full_body};
+    use super::{BoxedError, InstanceCordon, full_body};
 
     #[test]
     fn instance_cordon_clone_from_shares_the_immutable_identity() -> Result<(), BoxedError> {
@@ -722,27 +722,6 @@ mod tests {
             return Err("a full body is ready on its first poll".into());
         };
         assert_eq!(collected?.to_bytes(), "answer");
-        Ok(())
-    }
-
-    #[test]
-    fn slots_count_is_one_for_single_use() {
-        assert_eq!(Slots::SingleUse.count(), NonZeroU32::MIN);
-    }
-
-    #[test]
-    fn slots_count_is_the_long_lived_slot_count() -> Result<(), BoxedError> {
-        let four = NonZeroU32::new(4).ok_or("four is non-zero")?;
-        assert_eq!(Slots::LongLived(four).count(), four);
-        Ok(())
-    }
-
-    #[test]
-    fn only_single_use_is_single_use() -> Result<(), BoxedError> {
-        let four = NonZeroU32::new(4).ok_or("four is non-zero")?;
-        assert!(Slots::SingleUse.is_single_use());
-        assert!(!Slots::LongLived(NonZeroU32::MIN).is_single_use());
-        assert!(!Slots::LongLived(four).is_single_use());
         Ok(())
     }
 }

@@ -307,6 +307,10 @@ updateTime: Timestamp,
  */
 pass?: Pass, 
 /**
+ * Current scheduler availability, when changed.
+ */
+schedulerKnown?: boolean, 
+/**
  * A new action queue.
  */
 queue?: Queue, 
@@ -366,7 +370,7 @@ export type Demand = {
  */
 running: number, 
 /**
- * Queued actions charged to this fleet only.
+ * Queued actions attributed to this fleet by the latest completed control pass.
  */
 queued: number, 
 /**
@@ -394,11 +398,11 @@ readiness?: Duration,
  */
 expectedWait?: Duration, 
 /**
- * Persistent load in integer deci-slots, absent until measured; zero is a measurement.
+ * Persistent load in tenths of a worker-equivalent, absent until measured; zero is a measurement.
  */
 load?: number, 
 /**
- * Transient queued slot-time before readiness subtraction, rounded to whole seconds.
+ * Transient queued worker-equivalent-seconds, rounded to whole seconds.
  */
 backlog?: Duration, 
 /**
@@ -796,10 +800,6 @@ min: number,
  */
 max: number, 
 /**
- * The number of actions one instance is expected to take.
- */
-targetActions: number, 
-/**
  * How long a worker may stay idle before it drains.
  */
 idleTimeout: Duration, 
@@ -840,7 +840,7 @@ revokeTime?: Timestamp, };
 
 export type Queue = { 
 /**
- * The sum of every fleet's queued demand plus `unplaceable`.
+ * Total queued actions in the latest scheduler observation.
  */
 total: number, 
 /**
@@ -889,7 +889,15 @@ candidates: Array<string>,
 /**
  * Why no fleet accepts this action; absent when a fleet accepts it.
  */
-refusal?: string, };
+refusal?: string, 
+/**
+ * Resources reserved for this action, when reported by the scheduler.
+ */
+reservation?: Reservation, 
+/**
+ * Learned pre-fit resources, when CPU or memory exceeded the fitted reservation.
+ */
+learnedReservation?: Reservation, };
 
 export type Recent = { 
 /**
@@ -905,6 +913,16 @@ step: Duration,
  * most `window / step` samples.
  */
 samples?: Array<Sample>, };
+
+export type Reservation = { 
+/**
+ * CPU in millicores.
+ */
+cpuMillicores: number, 
+/**
+ * Memory in bytes.
+ */
+memory: number, };
 
 export type Role = { 
 /**
@@ -956,7 +974,15 @@ startTime: Timestamp,
 /**
  * The action's priority.
  */
-priority: number, };
+priority: number, 
+/**
+ * Resources reserved for this action, when reported by the scheduler.
+ */
+reservation?: Reservation, 
+/**
+ * Learned pre-fit resources, when CPU or memory exceeded the fitted reservation.
+ */
+learnedReservation?: Reservation, };
 
 export type Sample = { 
 /**
@@ -968,11 +994,11 @@ start: Timestamp,
  */
 completed: number, 
 /**
- * Actions executing at the step's latest completed pass; 0 when `passes` is 0.
+ * Actions executing at the step's latest known scheduler observation.
  */
 running: number, 
 /**
- * Actions queued at the step's latest completed pass; 0 when `passes` is 0.
+ * Actions queued at the step's latest known scheduler observation.
  */
 queued: number, 
 /**
@@ -983,6 +1009,12 @@ passes: number,
  * Control passes skipped during the step.
  */
 skipped: number, 
+/**
+ * Whether scheduler history for this step is complete. An actual unavailable or
+ * counter-unbaselined observation makes false sticky within the step; an unobserved
+ * step is false until its first complete observation. Absent only on legacy samples.
+ */
+schedulerKnown?: boolean, 
 /**
  * `GetActionResult` calls answered during the step.
  */
@@ -1190,6 +1222,11 @@ provisioner: string,
  */
 pass: Pass, 
 /**
+ * Whether the latest scheduler observation succeeded; absent before the first observation
+ * and on legacy frames. This is independent of recent-step counter completeness.
+ */
+schedulerKnown?: boolean, 
+/**
  * The action queue.
  */
 queue: Queue, 
@@ -1357,9 +1394,17 @@ phaseTime: Timestamp,
  */
 running: number, 
 /**
- * How many actions the worker may run at once; absent when unknown.
+ * Optional observed action cap; absent for unlimited long-lived workers.
  */
 slots?: number, 
+/**
+ * Resources currently reserved on this worker, when reported by the scheduler.
+ */
+reserved?: Reservation, 
+/**
+ * Worker's resource capacity, when reported by the scheduler.
+ */
+capacity?: Reservation, 
 /**
  * Whether the worker is paused.
  */

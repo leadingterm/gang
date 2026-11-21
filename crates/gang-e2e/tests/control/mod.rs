@@ -2,6 +2,7 @@
 //! and each flaw fails exactly the checks it breaks.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gang_clock::Timestamp;
@@ -14,6 +15,7 @@ use gang_wire::{
     QueuedAction, Recent, SkipReason, State, Worker,
 };
 use parking_lot::Mutex;
+use tokio::sync::oneshot;
 
 use super::support::{self, Simulation};
 use super::{assert_compliant, failures};
@@ -540,6 +542,7 @@ impl World {
             connections: gang_wire::Connections::default(),
             builds: Vec::new(),
             principals_epoch: 0,
+            scheduler_known: None,
         }
     }
 }
@@ -592,8 +595,21 @@ impl ControlSim {
     /// Runs passes until `target` actions were served; the build fails if they are not within
     /// the wait.
     fn serve(&self, target: usize) -> Result<BuildOutcome> {
+        self.serve_until(target, &AtomicBool::new(false))
+    }
+
+    /// Serves this build's queued demand only while its owner keeps it active.
+    fn serve_until(&self, target: usize, cancelled: &AtomicBool) -> Result<BuildOutcome> {
         for _ in 0..MAX_PASSES {
-            let world = self.world.lock();
+            let mut world = self.world.lock();
+            if cancelled.load(Ordering::Acquire) {
+                if world.served < target {
+                    world.queued = world.queued.saturating_sub(1);
+                }
+                return Err(E2eError::system(
+                    "the simulated control build was cancelled",
+                ));
+            }
             if world.served >= target {
                 let code = i32::from(world.outcome == Served::Failed);
                 let stderr = if world.outcome == Served::Local {
@@ -706,6 +722,22 @@ impl System for ControlSim {
         self.observe()?;
         let target = self.enqueue();
         self.serve(target)
+    }
+
+    fn build_until_stopped(
+        &self,
+        _probes: &[Probe],
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        support::until_stopped(
+            stop,
+            |cancelled| {
+                self.observe()?;
+                let target = self.enqueue();
+                self.serve_until(target, cancelled)
+            },
+            || {},
+        )
     }
 
     // Models neither the action cache nor the journal, so a run changes nothing.

@@ -5,7 +5,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use gang_config::InputLinks;
+use gang_types::NonZeroBytes;
 use gang_wire::{Event, Frame, State};
+use tokio::sync::oneshot;
 
 use crate::access::IdentityKnobs;
 use crate::build_output::BuildOutcome;
@@ -97,6 +99,12 @@ pub const SMALL_FLEET: &str = "local-small";
 /// The second fleet of [`FleetLayout::Placement`]: twice the size of [`SMALL_FLEET`], the same
 /// sandbox, two instances at most.
 pub const LARGE_FLEET: &str = "local-large";
+
+/// The per-action memory ceiling of the small and noop placement fleets.
+pub const PLACEMENT_SMALL_MEMORY: NonZeroBytes = NonZeroBytes::gib(1);
+
+/// The per-action memory ceiling of the large placement fleet and its memory probe.
+pub const PLACEMENT_LARGE_MEMORY: NonZeroBytes = NonZeroBytes::gib(2);
 
 /// The third fleet of [`FleetLayout::Placement`]: the size of [`SMALL_FLEET`], the noop sandbox,
 /// one instance at most.
@@ -778,6 +786,18 @@ pub trait System: Sync {
     ///
     /// When Bazel cannot be run.
     fn build(&self, probes: &[Probe]) -> Result<BuildOutcome>;
+
+    /// Builds until completion or the caller sends an abort reason, without stopping on worker
+    /// early-exit events. Dropping the sender does not cancel the build.
+    ///
+    /// # Errors
+    ///
+    /// When Bazel cannot be run, or the caller aborts it (the supplied reason is the system error).
+    fn build_until_stopped(
+        &self,
+        probes: &[Probe],
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome>;
 
     /// Builds `probes` as `run`: their actions are distinct from those of every other build, so
     /// no earlier result or attempt stands in for them, and the journal lines their probes write

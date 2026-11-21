@@ -377,12 +377,12 @@ async fn clear_directory(directory: &Path, preserve_side_channels: bool) -> std:
 #[cfg(test)]
 mod tests {
     use std::future::{pending, ready};
-    use std::num::NonZeroU32;
     use std::path::PathBuf;
 
-    use gang_spi::{RenderedStoreSpec, Slots, StoreAccess, WorkerSpec, WorkerTls};
+    use gang_spi::{RenderedStoreSpec, StoreAccess, WorkerSpec, WorkerTls};
     use gang_types::{
         Bytes, FleetName, FleetProperties, InstanceId, Isa, NonZeroDuration, Resources,
+        WorkerLifetime,
     };
     use serde_json::json;
 
@@ -523,7 +523,7 @@ mod tests {
                 &gang_types::FleetActionPolicy::default(),
                 [("capacity", "2".to_owned())],
             ),
-            slots: Slots::LongLived(NonZeroU32::new(4).expect("non-zero slots")),
+            lifetime: WorkerLifetime::LongLived,
             work_directory: PathBuf::from("/var/gang/work"),
             fast_cas_directory: PathBuf::from("/var/gang/cas"),
             fast_cas_budget: Bytes::new(1024),

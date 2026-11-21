@@ -189,7 +189,7 @@ fn short_observation(frames: &[Frame], since: u64) -> Result<Option<bool>> {
     for state in states(frames)? {
         for event in &state.events {
             if matches!(event.change, EventChange::ScaledOut { .. }) && sequence(event)? > since {
-                return Ok(Some(false));
+                return Ok(Some(true));
             }
         }
     }
@@ -231,14 +231,12 @@ fn burst_purchase_checks(events: &[Event], outcome: &crate::BuildOutcome) -> Vec
     vec![
         Check::expect(
             names::BURST_SCALE_OUT,
-            !events.is_empty()
+            events
+                .iter()
+                .any(|e| matches!(e.change, EventChange::ScaledOut { to: 6, .. }))
                 && events
                     .iter()
-                    .filter(|e| matches!(e.change, EventChange::ScaledOut { .. }))
-                    .all(|e| matches!(e.change, EventChange::ScaledOut { to: 0..=1, .. }))
-                && events
-                    .iter()
-                    .any(|e| matches!(e.change, EventChange::ScaledOut { .. })),
+                    .all(|e| !matches!(e.change, EventChange::ScaledOut { to: 7.., .. })),
             || format!("burst scale-outs: {events:?}"),
         ),
         build_check(names::BURST_BUILD, outcome),
@@ -247,9 +245,11 @@ fn burst_purchase_checks(events: &[Event], outcome: &crate::BuildOutcome) -> Vec
 
 /// Judges the largest desired fleet capacity observed during the burst.
 pub fn burst_capacity_check(max_desired: u32) -> Check {
-    Check::expect("burst capacity never exceeds one", max_desired <= 1, || {
-        format!("the burst reached desired capacity {max_desired}")
-    })
+    Check::expect(
+        "burst reaches bounded resource capacity",
+        max_desired == 6,
+        || format!("the burst reached desired capacity {max_desired}, expected 6"),
+    )
 }
 
 /// Judges a held short-work build and its scaling history.
@@ -257,14 +257,13 @@ pub fn burst_capacity_check(max_desired: u32) -> Check {
 pub fn short_checks(events: &[Event], observed: bool, outcome: &crate::BuildOutcome) -> Vec<Check> {
     vec![
         Check::expect(names::QUEUED, observed, || {
-            "two executing actions and one queued action were not observed for three passes"
-                .to_owned()
+            "queued work or its resource-driven scale-out was not observed".to_owned()
         }),
         Check::expect(
             names::QUEUED_SCALE_OUT,
-            !events
+            events
                 .iter()
-                .any(|event| matches!(event.change, EventChange::ScaledOut { .. })),
+                .any(|event| matches!(event.change, EventChange::ScaledOut { to: 2.., .. })),
             || format!("scale-outs during build: {events:?}"),
         ),
         build_check(names::QUEUED_BUILD, outcome),
@@ -282,7 +281,7 @@ pub fn backlog_checks(reached: bool, outcome: &crate::BuildOutcome) -> Vec<Check
     ]
 }
 
-/// A trained short burst from zero buys only one worker and measures launch readiness.
+/// A trained burst scales to its resource bound and measures launch readiness.
 ///
 /// # Errors
 /// When the deployment or its observations cannot be driven.
@@ -418,7 +417,7 @@ fn run_burst<S: Control, E: Execution>(
     Ok(checks)
 }
 
-/// Short executing work absorbs a queued action without another worker.
+/// Queued work exceeding running CPU capacity requires another worker.
 ///
 /// # Errors
 /// When the deployment or its observations cannot be driven.
@@ -568,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_burst_verdict_requires_one_worker_and_success_without_training() {
+    fn cold_burst_verdict_requires_resource_bound_and_success_without_training() {
         let event = |to| Event {
             name: "events/1".to_owned(),
             create_time: gang_clock::Timestamp::from_unix_millis(0),
@@ -581,12 +580,12 @@ mod tests {
             },
         };
         let success = crate::BuildOutcome::new(Some(0), String::new());
-        let checks = burst_purchase_checks(&[event(1)], &success);
+        let checks = burst_purchase_checks(&[event(6)], &success);
         assert_eq!(checks.len(), 2);
         assert!(checks.iter().all(|check| !check.is_failure()));
-        assert!(burst_purchase_checks(&[event(2)], &success)[0].is_failure());
+        assert!(burst_purchase_checks(&[event(1)], &success)[0].is_failure());
         let failure = crate::BuildOutcome::new(Some(1), String::new());
-        assert!(burst_purchase_checks(&[event(1)], &failure)[1].is_failure());
+        assert!(burst_purchase_checks(&[event(6)], &failure)[1].is_failure());
     }
 
     #[test]

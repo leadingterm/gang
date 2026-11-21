@@ -47,8 +47,8 @@ use crate::signer_key;
 use crate::sse::{self, EventStream as _, STREAM_OK};
 use crate::state_api::StateApi;
 use crate::system::{
-    AttemptRecord, HOLD_CPU_COUNT, HOLD_MEMORY_KB, LARGE_FLEET, Limits, PressureObservation, Probe,
-    Sandbox, ScopeFacts, System, Variant,
+    AttemptRecord, HOLD_CPU_COUNT, HOLD_MEMORY_KB, LARGE_FLEET, Limits, PLACEMENT_LARGE_MEMORY,
+    PressureObservation, Probe, Sandbox, ScopeFacts, System, Variant,
 };
 use crate::template::{ConfigTemplate, Transport};
 
@@ -104,7 +104,6 @@ pub(crate) fn sample_parameters(
     salt: &str,
     signal_path: &Path,
     isa: gang_types::Isa,
-    large_memory_kb: u64,
 ) -> SampleParameters {
     SampleParameters {
         salt: salt.to_owned(),
@@ -127,7 +126,7 @@ pub(crate) fn sample_parameters(
         memory_kb: HOLD_MEMORY_KB,
         cpu_count: HOLD_CPU_COUNT,
         large_fleet: LARGE_FLEET.to_owned(),
-        large_memory_kb,
+        large_memory_kb: PLACEMENT_LARGE_MEMORY.as_u64() / 1024,
         requested_sandbox: Sandbox::Noop,
         glibc_tool: invocation.action_tools.glibc_tool.clone(),
     }
@@ -358,20 +357,12 @@ impl<'a> Stack<'a> {
 
         let isa = template.default_isa()?;
         let tmp_path = PathBuf::from("/tmp");
-        let large_memory_kb = template.large_memory_kb()?;
         let rendered = template.render()?;
         let config_file = placement.config_file();
         fs::write(&config_file, rendered)
             .map_err(E2eError::io(format!("writing {}", config_file.display())))?;
 
-        let parameters = sample_parameters(
-            invocation,
-            variant,
-            &salt,
-            &signal_path,
-            isa,
-            large_memory_kb,
-        );
+        let parameters = sample_parameters(invocation, variant, &salt, &signal_path, isa);
         sample::stage(&invocation.sample, &placement.workspace(), &parameters)?;
 
         prepare_admin_directories(&placement, transport)?;
@@ -1324,6 +1315,14 @@ impl System for Stack<'_> {
 
     fn build(&self, probes: &[Probe]) -> Result<BuildOutcome> {
         self.run_build(&self.remote()?, probes, None)
+    }
+
+    fn build_until_stopped(
+        &self,
+        probes: &[Probe],
+        stop: oneshot::Receiver<String>,
+    ) -> Result<BuildOutcome> {
+        Stack::build_until_stopped(self, probes, stop)
     }
 
     fn build_run(&self, probes: &[Probe], run: &Run) -> Result<BuildOutcome> {

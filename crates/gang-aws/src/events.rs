@@ -88,6 +88,7 @@ pub(crate) struct Events {
     clock: Arc<dyn Clock>,
     managed: Arc<Managed>,
     pending: Mutex<Vec<Pending>>,
+    activity_poll: Mutex<()>,
     history: RwLock<HashMap<String, ActivityHistory>>,
 }
 
@@ -110,6 +111,7 @@ impl Events {
             clock,
             managed,
             pending: Mutex::new(Vec::new()),
+            activity_poll: Mutex::new(()),
             history: RwLock::new(HashMap::new()),
         }
     }
@@ -361,6 +363,8 @@ impl Events {
                     .map(|item| item.event.clone()),
             );
         } else {
+            // Polls share seen markers, so reset, pagination, and sweep must not interleave.
+            let _poll = self.activity_poll.lock().await;
             {
                 let managed = self.managed.0.read();
                 let since = self.clock.wall() - self.window;
@@ -1053,6 +1057,54 @@ mod tests {
                 .await
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activity_polls_serialize_and_cancellation_preserves_acknowledgements()
+    -> Result<(), Box<dyn Error>> {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let (_fake, _, fleets) = replay_setup().await?;
+        let events = fleets.events();
+        let mut initial = Vec::new();
+        events
+            .supply(FLEET, std::iter::once(FLEET), &mut initial)
+            .await?;
+        assert_eq!(initial.len(), 1);
+        gang_testkit::fence::with_held(async |held| {
+            events.acknowledge(held, FLEET, &initial[0].id).await
+        })
+        .await?;
+
+        let mut first_out = Vec::new();
+        let mut second_out = Vec::new();
+        let mut first = Box::pin(events.supply(FLEET, std::iter::once(FLEET), &mut first_out));
+        let mut second = Box::pin(events.supply(FLEET, std::iter::once(FLEET), &mut second_out));
+        poll_fn(|cx| {
+            assert!(matches!(first.as_mut().poll(cx), Poll::Pending));
+            assert!(!events.history.read()[FLEET].deliveries[&initial[0].id].seen);
+            assert!(matches!(second.as_mut().poll(cx), Poll::Pending));
+            assert!(events.activity_poll.try_lock().is_err());
+            Poll::Ready(())
+        })
+        .await;
+        drop(first);
+        second.await?;
+        assert!(second_out.is_empty());
+
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        let (left_result, right_result) = tokio::join!(
+            events.supply(FLEET, std::iter::once(FLEET), &mut left),
+            events.supply(FLEET, std::iter::once(FLEET), &mut right),
+        );
+        left_result?;
+        right_result?;
+        assert!(left.is_empty());
+        assert!(right.is_empty());
+        assert!(events.history.read()[FLEET].deliveries[&initial[0].id].acknowledged);
         Ok(())
     }
 
