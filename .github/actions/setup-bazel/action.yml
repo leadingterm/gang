@@ -58,6 +58,7 @@ runs:
         mkdir -p "$zig_cache"
         cat > "$HOME/.bazelrc" <<EOF
         build --config=ci
+        build --config=local
         build --disk_cache=$BAZEL_DISK_CACHE
         build --repository_cache=$BAZEL_REPOSITORY_CACHE
         build --repo_env=HERMETIC_CC_TOOLCHAIN_CACHE_PREFIX=$zig_cache

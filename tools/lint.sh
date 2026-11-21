@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 portable() {
-  "${BAZEL:-bazel}" run -c opt --remote_executor= --remote_cache= //:gazelle.check
+  "${BAZEL:-bazel}" run --config=local -c opt --remote_executor= --remote_cache= //:gazelle.check
   tools/check-required-jobs_test.sh
   tools/check-opentofu-tests.sh
   tools/ci-changes_test.sh
@@ -42,10 +42,10 @@ nix_vm() (
   local names name staged
   staged=$(mktemp -d)
   trap 'rm -rf "$staged"' EXIT
-  "${BAZEL:-bazel}" build -c opt //:gang //crates/gang-e2e:action_network
+  "${BAZEL:-bazel}" build --config=local -c opt //:gang //crates/gang-e2e:action_network
   mkdir -p "$staged/x86_64-linux"
-  cp "$("${BAZEL:-bazel}" cquery -c opt --output=files //:gang)" "$staged/x86_64-linux/gang"
-  cp "$("${BAZEL:-bazel}" cquery -c opt --output=files //crates/gang-e2e:action_network)" "$staged/x86_64-linux/action_network"
+  cp "$("${BAZEL:-bazel}" cquery --config=local -c opt --output=files //:gang)" "$staged/x86_64-linux/gang"
+  cp "$("${BAZEL:-bazel}" cquery --config=local -c opt --output=files //crates/gang-e2e:action_network)" "$staged/x86_64-linux/action_network"
   local -a checks=() link_args=(--no-link)
   names=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames | jq -er '.[]')
   if [[ -z $names ]]; then

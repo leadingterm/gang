@@ -13,6 +13,10 @@
 - Expose optional `Pass.error` state diagnostics, retaining nonfatal activity-history poll errors until the next successful poll while reconciliation continues.
 - Retry throttled AWS deployment-verifier reads with bounded backoff within the existing verification deadlines; permanent errors still fail without retry.
 
+### Fixed
+
+- Keep remote action shells and paths FHS-compatible: the devShell's later-loaded Bazel rc previously replaced them with host-only Nix store paths. Use `--config=local` for pinned Nix tools and local-only execution.
+
 ## 0.3.5 — 2026-11-21
 
 ### Added

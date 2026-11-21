@@ -2,7 +2,7 @@ common --enable_bzlmod
 common --enable_platform_specific_config
 common --lockfile_mode=error
 common --repo_env=ASPECT_TOOLS_TELEMETRY=-all
-# Repository rules see the client environment; --action_env (the devShell's pinned PATH) is for actions only.
+# Repository rules see the client environment; the devShell's :local config pins only action PATH.
 common --incompatible_repo_env_ignores_action_env
 
 build --incompatible_strict_action_env
