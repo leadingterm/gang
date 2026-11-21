@@ -431,14 +431,14 @@ probe(name = "controller_loss_7", srcs = ["action-environment-probe"], script = 
 
 # The database partition follows a completed outage build. A distinct mnemonic and
 # targets keep its held work unknown even after E2eProbe target/mnemonic learning.
-probe(name = "partition_0", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
-probe(name = "partition_1", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
-probe(name = "partition_2", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
-probe(name = "partition_3", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
-probe(name = "partition_4", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
-probe(name = "partition_5", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
-probe(name = "partition_6", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
-probe(name = "partition_7", script = CONTROLLER_LOSS, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_0", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_1", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_2", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_3", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_4", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_5", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_6", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, mnemonic = "E2ePartition", exec_properties = LIMITS)
+probe(name = "partition_7", srcs = ["action-environment-probe"], script = CONTROLLER_LOSS, controlled = True, mnemonic = "E2ePartition", exec_properties = LIMITS)
 
 
 WORK_PROPERTIES = dict(EXEC_PROPERTIES, ISA = ISA, cpu_count = "1", memory_kb = "65536", disk_kb = "65536")

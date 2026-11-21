@@ -24,6 +24,7 @@
 
 - **v0.3.4:** Bound persistent-queue scale-out by payback on queued work and qualified genuine arrivals, avoiding overscaling cheap static batches and closed-loop completion waves.
 - **v0.3.4:** Give the cold-burst fixture a payback horizon that accounts for its minimum disk reservation while retaining the default unknown-action prior.
+- **v0.3.4:** Restore the declared action-environment-probe input and controlled action-local IPC for fresh database-partition probes.
 - **v0.3.4:** Declare rate probes explicitly so the checked-in sample passes harness validation.
 - **v0.3.4:** Credit pending and reliable requested capacity without repeatedly raising desired size; keep transient credential-refresh gaps separate from serving surplus and preserve failed-request withdrawal.
 - **v0.3.4:** Keep controller cordons across reconnects and overlapping worker generations within the live engine; do not adopt worker self-drain flags as controller intent. Reset N−1 dwell after skipped passes and keep repeated cordon reinforcement out of audit history.
