@@ -19,6 +19,7 @@ use nativelink_scheduler::resource_sketch::ResourceSketch;
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use tokio::sync::watch;
 
+use crate::acquisition::Acquisition;
 use crate::config::NativeLinkConfig;
 use crate::controller::{self, Handles, SharedServices};
 use crate::errors::NativeLinkConfigError;
@@ -142,28 +143,29 @@ impl SchedulerPort for NativeLink {
     /// when the scheduler cannot list its workers or queued operations.
     async fn snapshot(&self, into: &mut SchedulerSnapshot) -> Result<(), PortError> {
         let handles = self.current()?;
-        let mut scratch = handles.scratch.lock().await;
-        handles
-            .worker_scheduler
-            .cordons_into(&mut into.cordons)
-            .await;
-        let workers = handles.worker_scheduler.worker_snapshot().await;
-        let completed = handles.completed.load(Ordering::Relaxed);
-        snapshot::fill(
-            &*handles.action_scheduler,
-            &workers,
-            &handles.fleets,
-            &handles.durations,
-            handles.clock.wall(),
-            completed,
-            &handles.rates,
-            &mut scratch,
-            into,
-        )
-        .await
-        .map_err(PortError::backend)?;
-        handles.stores.fill(&mut into.stores);
-        Ok(())
+        let acquisition = Acquisition::new(&*handles.clock, handles.control_acquire_timeout);
+        acquisition.wait(async {
+            let mut scratch = handles.scratch.lock().await;
+            handles.worker_scheduler.cordons_into(&mut into.cordons).await;
+            let workers = handles.worker_scheduler.worker_snapshot().await;
+            let completed = handles.completed.load(Ordering::Relaxed);
+            let fleets = handles.fleets.current().map_err(PortError::backend)?;
+            snapshot::fill(
+                &*handles.action_scheduler,
+                &workers,
+                &fleets,
+                &handles.durations,
+                handles.clock.wall(),
+                completed,
+                &handles.rates,
+                &mut scratch,
+                into,
+            )
+            .await
+            .map_err(PortError::backend)?;
+            handles.stores.fill(&mut into.stores);
+            Ok(())
+        }).await?
     }
 
     /// Lists the running and queued actions of the serving controller, bounded by `limits`.
@@ -179,15 +181,10 @@ impl SchedulerPort for NativeLink {
     ) -> Result<(), PortError> {
         let handles = self.current()?;
         let workers = handles.worker_scheduler.worker_snapshot().await;
-        crate::actions::list(
-            &*handles.action_scheduler,
-            &workers,
-            &handles.fleets,
-            limits,
-            into,
-        )
-        .await
-        .map_err(PortError::backend)
+        let fleets = handles.fleets.current().map_err(PortError::backend)?;
+        crate::actions::list(&*handles.action_scheduler, &workers, &fleets, limits, into)
+            .await
+            .map_err(PortError::backend)
     }
 
     /// Stops or resumes every connection of a physical instance, including future connections.
@@ -197,10 +194,9 @@ impl SchedulerPort for NativeLink {
         instance: &InstanceId,
         draining: bool,
     ) -> Result<(), PortError> {
-        self.current()?
-            .worker_scheduler
-            .set_draining(fleet, instance, draining)
-            .await
+        let handles = self.current()?;
+        let acquisition = Acquisition::new(&*handles.clock, handles.control_acquire_timeout);
+        handles.worker_scheduler.set_draining(fleet, instance, draining, &acquisition).await
     }
 
     async fn retain_drains(
@@ -209,11 +205,9 @@ impl SchedulerPort for NativeLink {
         grace: Duration,
         live: &[(&FleetName, &FleetSupply)],
     ) -> Result<(), PortError> {
-        self.current()?
-            .worker_scheduler
-            .retain_drains(now, grace, live)
-            .await;
-        Ok(())
+        let handles = self.current()?;
+        let acquisition = Acquisition::new(&*handles.clock, handles.control_acquire_timeout);
+        handles.worker_scheduler.retain_drains(now, grace, live, &acquisition).await
     }
 
     fn endpoints(&self) -> ControllerEndpoints {

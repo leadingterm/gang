@@ -1452,6 +1452,7 @@ impl<D: Deployment> Server<D> {
             fleets: self.fleets.catalog(),
             max_workers: self.fleets.max_instances(),
             client_action_timeout: self.client_action_timeout.get(),
+            control_acquire_timeout: self.control_settings.poll_interval,
             actions: Arc::clone(&self.actions),
             scaling: Arc::clone(&self.scaling),
             clock: core.host.clock.clone(),

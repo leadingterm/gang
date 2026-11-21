@@ -54,12 +54,8 @@ struct World {
     builds: gang_insight::Builds,
 }
 
-fn ok(applied: u32, hosted: &HostedSnapshot) -> PassStatus<'_> {
-    PassStatus::Ok {
-        applied,
-        failed: 0,
-        hosted,
-    }
+fn ok(applied: u32) -> PassStatus<'static> {
+    PassStatus::Ok { applied, failed: 0 }
 }
 
 /// The fleet index an instance belongs to; instances rotate across the fleets.
@@ -99,7 +95,7 @@ fn outlook() -> FleetOutlook {
 fn inputs(world: &World) -> Inputs<'_> {
     Inputs {
         wall: ts(WALL_MILLIS),
-        pass: ok(0, &world.hosted),
+        pass: ok(0),
         fleets: &world.passes,
         catalog: &world.catalog,
         actions: world.actions.as_ref(),
@@ -225,6 +221,8 @@ fn actions_sample() -> Result<ActionsSample, Box<dyn Error>> {
                 mnemonic: "Javac".to_owned(),
                 priority: 0,
                 build: None,
+                reservation: Default::default(),
+                learned_reservation: None,
             },
             worker: worker_on(&instance_id(index)?)?,
             started: ts(5_000 + index),
@@ -240,6 +238,8 @@ fn actions_sample() -> Result<ActionsSample, Box<dyn Error>> {
                 mnemonic: "Genrule".to_owned(),
                 priority: 0,
                 build: None,
+                reservation: Default::default(),
+                learned_reservation: None,
             },
             queued_since: ts(4_000 + index),
             candidates: FleetSet::default(),
@@ -339,6 +339,16 @@ fn steady_completed_pass_allocates_nothing() -> TestResult {
     let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let mut cur = blank();
     let mut prev = blank();
+    let supplies = vec![true; world.passes.len()];
+    let observed = Inputs {
+        pass: PassStatus::Observed {
+            hosted: Some(&world.hosted),
+            supplies: &supplies,
+        },
+        ..inputs(&world)
+    };
+    builder.fill(&mut cur, &prev, 0, &observed);
+    std::mem::swap(&mut cur, &mut prev);
 
     let mut seq = 0;
     for _ in 0..WARM_UP_PASSES {
@@ -380,6 +390,16 @@ fn steady_skipped_pass_allocates_nothing() -> TestResult {
     let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let mut cur = blank();
     let mut prev = blank();
+    let supplies = vec![true; world.passes.len()];
+    let observed = Inputs {
+        pass: PassStatus::Observed {
+            hosted: Some(&world.hosted),
+            supplies: &supplies,
+        },
+        ..inputs(&world)
+    };
+    builder.fill(&mut cur, &prev, 0, &observed);
+    std::mem::swap(&mut cur, &mut prev);
 
     let mut seq = 0;
     for _ in 0..WARM_UP_PASSES {
@@ -437,6 +457,16 @@ fn steady_replacement_projection_allocates_nothing() -> TestResult {
     let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let mut cur = blank();
     let mut prev = blank();
+    let supplies = vec![true; world.passes.len()];
+    let observed = Inputs {
+        pass: PassStatus::Observed {
+            hosted: Some(&world.hosted),
+            supplies: &supplies,
+        },
+        ..inputs(&world)
+    };
+    builder.fill(&mut cur, &prev, 0, &observed);
+    std::mem::swap(&mut cur, &mut prev);
     for seq in 1..=WARM_UP_PASSES as u64 {
         builder.fill(&mut cur, &prev, seq, &view);
         std::mem::swap(&mut cur, &mut prev);
@@ -457,5 +487,81 @@ fn steady_replacement_projection_allocates_nothing() -> TestResult {
         info.bytes_total, 0,
         "steady replacement pass allocated bytes"
     );
+    Ok(())
+}
+
+#[test]
+fn steady_partial_observation_allocates_nothing() -> TestResult {
+    let world = world()?;
+    let supplies = vec![true; world.passes.len()];
+    let view = Inputs {
+        pass: PassStatus::Observed {
+            hosted: None,
+            supplies: &supplies,
+        },
+        ..inputs(&world)
+    };
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut cur = blank();
+    let mut prev = blank();
+    for seq in 1..=WARM_UP_PASSES as u64 {
+        builder.fill(&mut cur, &prev, seq, &view);
+        std::mem::swap(&mut cur, &mut prev);
+    }
+    let info = allocation_counter::measure(|| {
+        builder.fill(&mut cur, &prev, WARM_UP_PASSES as u64 + 1, &view);
+    });
+    assert_eq!(info.count_total, 0, "steady observation allocated");
+    assert_eq!(info.bytes_total, 0, "steady observation allocated bytes");
+    Ok(())
+}
+
+#[test]
+fn observation_reuses_instance_buffers_across_identity_churn() -> TestResult {
+    let world = world()?;
+    let supplies = vec![true; world.passes.len()];
+    let mut observer_passes = world.passes.clone();
+    for pass in &mut observer_passes {
+        pass.outlook = FleetOutlook::default();
+        pass.past_boot_grace.clear();
+    }
+    let view = Inputs {
+        pass: PassStatus::Observed {
+            hosted: Some(&world.hosted),
+            supplies: &supplies,
+        },
+        fleets: &observer_passes,
+        actions: None,
+        ..inputs(&world)
+    };
+    let mut replacement = observer_passes.clone();
+    let row = replacement[0]
+        .supply
+        .instances
+        .iter_mut()
+        .find(|instance| instance.id == instance_id(24).expect("fixture id"))
+        .ok_or("fixture instance")?;
+    row.id = instance_id(90)?;
+    let changed = Inputs {
+        pass: PassStatus::Observed {
+            hosted: Some(&world.hosted),
+            supplies: &supplies,
+        },
+        fleets: &replacement,
+        actions: None,
+        ..inputs(&world)
+    };
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut cur = blank();
+    let mut prev = blank();
+    for seq in 1..=WARM_UP_PASSES as u64 {
+        builder.fill(&mut cur, &prev, seq, &view);
+        std::mem::swap(&mut cur, &mut prev);
+    }
+    let info = allocation_counter::measure(|| {
+        builder.fill(&mut cur, &prev, WARM_UP_PASSES as u64 + 1, &changed);
+    });
+    assert_eq!(info.count_total, 0, "identity churn allocated");
+    assert_eq!(info.bytes_total, 0, "identity churn allocated bytes");
     Ok(())
 }

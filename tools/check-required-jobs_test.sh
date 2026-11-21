@@ -44,7 +44,7 @@ expect success 'release validation graph excludes macOS' jq -e "
   ancestors(\"release-validation\") | index(\"macos\") == null
 " <<<"$jobs"
 
-for job in required nix-vm lint linux-x86_64-shards linux-x86_64 linux-x86_64-bundle cache-x86_64 linux-arm64 linux-arm64-bundle linux-arm64-checks cross macos release-validation e2e-gate-1-shards e2e-gate-1 e2e-gate-2-shards e2e-gate-2; do
+for job in required nativelink-memory-tests nix-vm lint linux-x86_64-shards linux-x86_64 linux-x86_64-bundle cache-x86_64 linux-arm64 linux-arm64-bundle linux-arm64-checks cross macos release-validation e2e-gate-1-shards e2e-gate-1 e2e-gate-2-shards e2e-gate-2; do
   while IFS= read -r dependency; do
     cp "$workflow" "$fixture"
     job="$job" dependency="$dependency" yq -i '.jobs[strenv(job)].needs |= ([.] | flatten) | del(.jobs[strenv(job)].needs[] | select(. == strenv(dependency)))' "$fixture"
@@ -67,13 +67,33 @@ done
 for job in linux-arm64-bundle linux-arm64-checks linux-arm64 cross macos release-validation; do
   cp "$workflow" "$fixture"
   job="$job" yq -i '.jobs[strenv(job)].if = "always()"' "$fixture"
-  expect failure "$job cannot run on PRs" "$guard" "$fixture"
+  expect failure "$job cannot run on untrusted events" "$guard" "$fixture"
 done
-for job in required changes; do
+for job in linux-arm64-bundle linux-arm64-checks linux-arm64 cross release-validation; do
+  cp "$workflow" "$fixture"
+  job="$job" yq -i '.jobs[strenv(job)].if |= sub("github.event.pull_request.head.repo.full_name == github.repository", "true")' "$fixture"
+  expect failure "$job cannot accept fork release PRs" "$guard" "$fixture"
+  cp "$workflow" "$fixture"
+  job="$job" yq -i '.jobs[strenv(job)].if |= sub("startsWith[(]github.event.pull_request.head.ref, '\''release/'\''[)]", "true")' "$fixture"
+  expect failure "$job cannot accept ordinary same-repository PRs" "$guard" "$fixture"
+done
+cp "$workflow" "$fixture"
+yq -i 'del(.jobs.linux-x86_64-bundle.steps[] | select((.uses // "") | startswith("actions/checkout@")) | .with.ref)' "$fixture"
+expect failure 'release binary checkout must use the PR head' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '(.jobs.changes.steps[] | select(.id == "filter") | .env.HEAD) = "${{ github.sha }}"' "$fixture"
+expect failure 'release change classification must use the PR head' "$guard" "$fixture"
+for job in required changes nativelink-memory-tests; do
   cp "$workflow" "$fixture"
   job="$job" yq -i 'del(.jobs[strenv(job)])' "$fixture"
   expect failure "missing $job job" "$guard" "$fixture"
 done
+cp "$workflow" "$fixture"
+yq -i '.jobs.nativelink-memory-tests.if = "needs.changes.outputs.heavy == '\''true'\'' && false"' "$fixture"
+expect failure 'NativeLink memory tests cannot skip heavy changes' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '(.jobs.required.steps[] | select(.env.NEEDS_RESULTS != null) | .env.NEEDS_RESULTS) |= sub("needs[.]nativelink-memory-tests[.]result", "success")' "$fixture"
+expect failure 'required result cannot omit NativeLink memory tests' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i '.jobs.linux-x86_64.steps += [{"uses": "actions/checkout@fixture"}]' "$fixture"
 expect failure 'x86 aggregator cannot run extra steps' "$guard" "$fixture"
@@ -95,7 +115,7 @@ expect failure 'release results cannot omit ARM validation' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i '.jobs.linux-x86_64-shards.needs = ["changes", "linux-arm64"]' "$fixture"
 expect failure 'x86 shards cannot transitively require optional ARM jobs' "$guard" "$fixture"
-for job in lint linux-x86_64-bundle e2e-gate-1-shards e2e-gate-2-shards; do
+for job in nativelink-memory-tests lint linux-x86_64-bundle e2e-gate-1-shards e2e-gate-2-shards; do
   cp "$workflow" "$fixture"
   job="$job" yq -i '.jobs[strenv(job)]."runs-on" = "ubuntu-24.04-arm"' "$fixture"
   expect failure "$job must run on x86" "$guard" "$fixture"
@@ -277,6 +297,9 @@ expect_condition() {
   expr=${expr%'}}'}
   expr=${expr//"always()"/true}
   expr=${expr//"startsWith(github.ref, 'refs/tags/v')"/"\"\$REF\" == refs/tags/v*"}
+  expr=${expr//"startsWith(github.event.pull_request.head.ref, 'release/')"/"\"\$HEAD_REF\" == release/*"}
+  expr=${expr//github.event.pull_request.head.repo.full_name/"\"\$HEAD_REPO\""}
+  expr=${expr//github.repository/"\"\$REPO\""}
   expr=${expr//github.event_name/"\"\$EVENT\""}
   expr=${expr//github.ref/"\"\$REF\""}
   expr=${expr//'!github.event.repository.private'/"\"\$PRIVATE\" != true"}
@@ -294,14 +317,24 @@ expect_condition() {
   if bash --noprofile --norc -c "[[ $expr ]]"; then actual=success; fi
   expect success "$description" test "$actual" = "$expected"
 }
-export HEAVY=true PRIVATE=false
+export HEAVY=true PRIVATE=false REPO=example/gang HEAD_REPO=example/gang HEAD_REF=feature
 for job in linux-arm64-bundle linux-arm64-checks linux-arm64 cross macos release-validation; do
   condition=$(jq -er --arg job "$job" '.[$job].if' <<<"$jobs")
   export EVENT=pull_request REF=refs/pull/1/merge
-  expect_condition failure "$job intentionally skips a PR" "$condition"
-  # A PR targeting main must not bypass the event guard either.
+  expect_condition failure "$job skips ordinary PRs" "$condition"
   REF=refs/heads/main
-  expect_condition failure "$job rejects a PR even with a main ref" "$condition"
+  expect_condition failure "$job rejects an ordinary PR even with a main ref" "$condition"
+  REF=refs/pull/1/merge HEAD_REF=release/v0.3.5 HEAD_REPO=fork/gang
+  expect_condition failure "$job skips fork release PRs" "$condition"
+  HEAD_REPO=example/gang
+  if [[ $job == macos ]]; then expected=failure; else expected=success; fi
+  expect_condition "$expected" "$job scopes trusted release PRs" "$condition"
+  HEAD_REF=release-candidate/v0.3.5
+  expect_condition failure "$job rejects a non-release-prefix PR" "$condition"
+  HEAD_REF=release/v0.3.5 HEAVY=false
+  if [[ $job == linux-arm64 || $job == release-validation ]]; then expected=success; else expected=failure; fi
+  expect_condition "$expected" "$job docs-only release PR preserves intentional skips" "$condition"
+  HEAD_REF=feature HEAVY=true
   EVENT=push
   for REF in refs/heads/main refs/heads/master refs/tags/v0.3.2; do
     expect_condition success "$job runs on push $REF" "$condition"

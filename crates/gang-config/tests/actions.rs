@@ -272,10 +272,16 @@ fn fleet_resource_validation_names_the_fleet_setting_and_values() {
             6_u64 << 30,
         ),
         (
+            "[actions.memory]\nreserve = \"7GiB\"",
+            "actions.memory.reserve",
+            7_u64 << 30,
+            6_u64 << 30,
+        ),
+        (
             "[actions.memory]\nmin_reservation = \"7GiB\"",
             "actions.memory.min_reservation",
             7_u64 << 30,
-            6_u64 << 30,
+            5_u64 << 30,
         ),
         (
             "[actions.disk]\nmin_reservation = \"9GiB\"",
@@ -323,7 +329,7 @@ sandbox = "noop"
 min_instances = 0
 max_instances = 2
 vcpus_per_instance = 2
-memory_per_instance = "2GiB"
+memory_per_instance = "2112MiB"
 disk_per_instance = "3GiB"
 idle_timeout = "15s"
 max_drain_wait = "1m"
@@ -345,4 +351,70 @@ boot_grace = "1m"
     assert!(
         matches!(too_large.parse::<gang_config::GangConfig<Plugins>>(), Err(gang_config::ConfigError::ActionResourceDoesNotFit { ref fleet, .. }) if fleet.as_str() == "tiny")
     );
+}
+
+#[test]
+fn usable_memory_excludes_reserve_for_cold_start_and_minimum() {
+    let config = CONFIG.replace(
+        "memory_per_instance = \"6GiB\"",
+        "memory_per_instance = \"4GiB\"",
+    );
+    assert!(matches!(
+        config.parse::<gang_config::GangConfig<Plugins>>(),
+        Err(gang_config::ConfigError::ColdStartFitsNoFleet { .. })
+    ));
+
+    let minimum = format!("{config}\n[actions.memory]\nmin_reservation = \"4GiB\"\n");
+    assert!(matches!(
+        minimum.parse::<gang_config::GangConfig<Plugins>>(),
+        Err(gang_config::ConfigError::ActionResourceDoesNotFit {
+            key: "actions.memory.min_reservation",
+            value,
+            capacity,
+            relation: "at most",
+            ..
+        }) if value == 4_u64 << 30 && capacity == 3_u64 << 30
+    ));
+}
+
+#[test]
+fn reserve_is_subtracted_once_from_nominal_memory() {
+    let config = CONFIG.replace(
+        "memory_per_instance = \"6GiB\"",
+        "memory_per_instance = \"3GiB\"",
+    );
+    let config = format!(
+        "{config}\n[actions.memory]\nreserve = \"2GiB\"\nmin_reservation = \"1GiB\"\n[actions.cold_start]\nenabled = false\n"
+    );
+    let resolved = config
+        .parse::<gang_config::GangConfig<Plugins>>()
+        .expect("usable memory fits");
+    assert_eq!(
+        resolved.fleets.policies()[0].memory_per_instance,
+        gang_types::NonZeroBytes::gib(1)
+    );
+
+    let large = CONFIG.replace(
+        "memory_per_instance = \"6GiB\"",
+        "memory_per_instance = \"64GiB\"",
+    );
+    let resolved = large
+        .parse::<gang_config::GangConfig<Plugins>>()
+        .expect("large fleet fits");
+    assert_eq!(
+        resolved.fleets.policies()[0].memory_per_instance,
+        gang_types::NonZeroBytes::gib(63)
+    );
+}
+
+#[test]
+fn action_memory_ceiling_is_checked_against_usable_memory() {
+    let config = CONFIG.replace(
+        "sandbox = \"noop\"",
+        "sandbox = \"noop\"\nactions = { resources = { memory = \"6GiB\" } }",
+    );
+    assert!(matches!(
+        config.parse::<gang_config::GangConfig<Plugins>>(),
+        Err(gang_config::ConfigError::FleetActionPolicy { .. })
+    ));
 }

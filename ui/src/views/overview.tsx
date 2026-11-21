@@ -1,7 +1,7 @@
 // Overview: five readouts, the fleets in preference order, the control pass and recent scaling.
 import { eventKind, idOf, ms, scalingLog } from "../wire-parse.ts";
 import type { Cause, Fleet, Recent, ScalingEvent, State } from "../wire.ts";
-import { bytesSeries, cacheWindow, donePerMinute, doneSeries, evictedSeries, passBars, queuedSeries, runningSeries, transferred, unrecordedSlots, windowMs } from "../recent.ts";
+import { bytesSeries, cacheWindow, donePerMinute, doneSeries, evictedSeries, passBars, queuedSeries, runningSeries, schedulerCurrent, schedulerKnown, slots as recentSlots, transferred, unrecordedSlots, windowMs } from "../recent.ts";
 import { bytes, humanize, percent, sum } from "../format.ts";
 import { Cell, ChartFrame, Clock, Columns, Duration, Empty, EVENT_VIEW, EventWhat, Glyph, Ident, Num, Row, Section, Since, Table, Tile, Tiles, useClient, useEnter } from "../ui.tsx";
 import { Legend, Tape, type FleetCensus } from "./fleet.tsx";
@@ -13,12 +13,13 @@ const SPARK_W = 300;
 const SPARK_H = 44;
 const SPARK_POINT_RADIUS = 2;
 
-const Spark = ({ values, areaValues, secondary, label, recent }: {
+const Spark = ({ values, areaValues, secondary, label, recent, scheduler = false }: {
   values: readonly (number | null)[];
   areaValues?: readonly (number | null)[];
   secondary?: readonly (number | null)[];
   label: string;
   recent: Recent;
+  scheduler?: boolean;
 }) => {
   const missing = unrecordedSlots(recent);
   const hatch = `spark-hatch-${label.replaceAll(" ", "-")}`;
@@ -67,6 +68,13 @@ const Spark = ({ values, areaValues, secondary, label, recent }: {
           <title>not recorded</title>
         </rect>
       )}
+      {scheduler && recentSlots(recent).map((sample, i) => sample && !schedulerKnown(sample) && (
+        <rect key={i} class="spark__unknown" x={i === 0 ? 0 : (x(i - 1) + x(i)) / 2} y="0"
+          width={(i === values.length - 1 ? SPARK_W : (x(i) + x(i + 1)) / 2) - (i === 0 ? 0 : (x(i - 1) + x(i)) / 2)}
+          height={SPARK_H} fill={`url(#${hatch})`}>
+          <title>scheduler unknown</title>
+        </rect>
+      ))}
       {areaValues && <path class="spark__area" d={trace(areaValues, true)} />}
       <path class="spark__run" d={path} />
       {secondary && <path class="spark__run spark__run--secondary" d={trace(secondary)} />}
@@ -99,7 +107,12 @@ const Readouts = ({ state }: { state: State }) => {
     state.fleets.filter((f) => f.properties["capacity"] === "spot"),
     (f) => f.instances.inService,
   );
+  const known = schedulerCurrent(state);
   const done = donePerMinute(state.recent);
+  const samples = state.recent.samples ?? [];
+  const awaitingFirstStep = state.schedulerKnown === undefined && samples.every((s) => s.schedulerKnown === false) ||
+    samples.length < 2 && state.schedulerKnown !== false &&
+      (samples.length === 0 || schedulerKnown(samples[0]!));
   const cache = cacheWindow(state.recent);
   const { queue } = state;
   const traffic = transferred(state.recent);
@@ -109,22 +122,22 @@ const Readouts = ({ state }: { state: State }) => {
       <Tiles>
       <Tile
         label="Queue"
-        value={<Num value={queue.total} />}
+        value={known ? <Num value={queue.total} /> : "unknown"}
         caption={
           <>
-            {queue.oldestQueueTime !== undefined && (
+            {known && queue.oldestQueueTime !== undefined && (
               <span>oldest <Since t={ms(queue.oldestQueueTime)} /></span>
             )}
-            {queue.unplaceable > 0 && <span class="caution">{queue.unplaceable} unplaceable</span>}
+            {known && queue.unplaceable > 0 && <span class="caution">{queue.unplaceable} unplaceable</span>}
           </>
         }
-        chart={<ChartFrame size="spark"><Spark values={queuedSeries(state.recent)} label="Queued" recent={state.recent} /></ChartFrame>}
+        chart={<ChartFrame size="spark"><Spark values={queuedSeries(state.recent)} label="Queued" recent={state.recent} scheduler /></ChartFrame>}
       />
       <Tile
         label="Executing"
-        value={<><Num value={running} />{slots !== undefined && <span class="readout__of">/{slots}</span>}</>}
-        meter={slots !== undefined ? <Meter g={slots ? running / slots : 0} /> : undefined}
-        chart={<ChartFrame size="spark"><Spark values={runningSeries(state.recent)} label="Executing" recent={state.recent} /></ChartFrame>}
+        value={known ? <><Num value={running} />{slots !== undefined && <span class="readout__of">/{slots}</span>}</> : "unknown"}
+        meter={known && slots !== undefined ? <Meter g={slots ? running / slots : 0} /> : undefined}
+        chart={<ChartFrame size="spark"><Spark values={runningSeries(state.recent)} label="Executing" recent={state.recent} scheduler /></ChartFrame>}
       />
       <Tile
         label="Instances"
@@ -135,13 +148,13 @@ const Readouts = ({ state }: { state: State }) => {
       <Tile
         label="Done / min"
         value={done === null ? <span class="num live">–</span> : <Num value={done.perMinute} />}
-        caption={done === null ? "not recorded yet" : done.spanMs < 60 * 1000 && <>over <Duration ms={Math.round(done.spanMs / 1000) * 1000} /></>}
-        chart={<ChartFrame size="spark"><Spark values={doneSeries(state.recent)} label="Done per minute" recent={state.recent} /></ChartFrame>}
+        caption={done === null ? awaitingFirstStep ? "not recorded yet" : "not available" : done.spanMs < 60 * 1000 && <>over <Duration ms={Math.round(done.spanMs / 1000) * 1000} /></>}
+        chart={<ChartFrame size="spark"><Spark values={doneSeries(state.recent)} label="Done per minute" recent={state.recent} scheduler /></ChartFrame>}
       />
       <Tile
         label="Action cache"
         value={cache.rate === null ? <span class="cache-rate__empty">no lookups</span> : <span class="cache-rate">{Math.round(cache.rate * 100)}%{" "}<span class="cache-rate__of">of {cache.lookups} lookups</span></span>}
-        meter={cas && <Meter g={cas.budgetBytes > 0 ? cas.usedBytes / cas.budgetBytes : 0} label={`CAS ${percent(cas.usedBytes, cas.budgetBytes)} of budget`} />}
+        meter={known && cas && <Meter g={cas.budgetBytes > 0 ? cas.usedBytes / cas.budgetBytes : 0} label={`CAS ${percent(cas.usedBytes, cas.budgetBytes)} of budget`} />}
         caption={<><span>hit rate · <Duration ms={windowMs(state.recent)} /></span><span>{traffic ? `↓ ${bytes(traffic.downloaded)} · ↑ ${bytes(traffic.uploaded)}` : "—"}</span></>}
         chart={<ChartFrame size="spark"><Spark values={cache.hitsPerStep} areaValues={cache.lookupsPerStep} label="Action-cache lookups as area and hits as line per step" recent={state.recent} /></ChartFrame>}
       />
@@ -154,16 +167,17 @@ const Cache = ({ state }: { state: State }) => {
   const stores = state.cache.stores ?? [];
   const bucket = state.cache.bucket;
   const samples = state.recent.samples ?? [];
-  const evicted = sum(samples, (s) => s.evictedBytes);
+  const known = schedulerCurrent(state);
+  const evicted = samples.every(schedulerKnown) ? sum(samples, (s) => s.evictedBytes) : null;
   return (
     <Section id="cache-h" title="Cache">
       {stores.length > 0 && (
         <Table cls="cache-table" cols={[{ head: "Store", share: 1 }, { head: "Used" }, { head: "Budget" }, { head: "Usage" }, { head: "Evicted (window, all stores)" }]}>
           {stores.map((store, index) => (
             <Row key={store.store}>
-              <Cell><span class="build-label">Store </span>{store.store}</Cell><Cell><span class="build-label">Used </span>{bytes(store.usedBytes)}</Cell><Cell><span class="build-label">Budget </span>{bytes(store.budgetBytes)}</Cell>
-              <Cell><span class="build-label">Usage </span><Meter g={store.budgetBytes > 0 ? store.usedBytes / store.budgetBytes : 0} label={`${store.store} ${percent(store.usedBytes, store.budgetBytes)} of budget`} /></Cell>
-              <Cell><span class="build-label">Evicted (window, all stores) </span>{index === 0 ? bytes(evicted) : "—"}</Cell>
+              <Cell><span class="build-label">Store </span>{store.store}</Cell><Cell><span class="build-label">Used </span>{known ? bytes(store.usedBytes) : "unknown"}</Cell><Cell><span class="build-label">Budget </span>{known ? bytes(store.budgetBytes) : "unknown"}</Cell>
+              <Cell><span class="build-label">Usage </span>{known ? <Meter g={store.budgetBytes > 0 ? store.usedBytes / store.budgetBytes : 0} label={`${store.store} ${percent(store.usedBytes, store.budgetBytes)} of budget`} /> : "unknown"}</Cell>
+              <Cell><span class="build-label">Evicted (window, all stores) </span>{index === 0 ? evicted === null ? "unknown" : bytes(evicted) : "—"}</Cell>
             </Row>
           ))}
         </Table>
@@ -179,14 +193,14 @@ const Cache = ({ state }: { state: State }) => {
           <Spark values={bytesSeries(state.recent, "downloadedBytes")} secondary={bytesSeries(state.recent, "uploadedBytes")} label="Transferred per step" recent={state.recent} />
         </ChartFrame>
         <ChartFrame size="spark" title="Evicted per step">
-          <Spark values={evictedSeries(state.recent)} label="Evicted per step" recent={state.recent} />
+          <Spark values={evictedSeries(state.recent)} label="Evicted per step" recent={state.recent} scheduler />
         </ChartFrame>
       </Columns>
     </Section>
   );
 };
 
-const FleetRow = ({ f, ordinal, events, census }: { f: Fleet; ordinal: number; events: readonly ScalingEvent[]; census: FleetCensus }) => {
+const FleetRow = ({ f, ordinal, events, census, known }: { f: Fleet; ordinal: number; events: readonly ScalingEvent[]; census: FleetCensus; known: boolean }) => {
   const capacity = f.properties["capacity"];
   const idle = f.instances.inService === 0 && f.instances.pending === 0;
   const cold =
@@ -213,19 +227,19 @@ const FleetRow = ({ f, ordinal, events, census }: { f: Fleet; ordinal: number; e
         {f.launchFailure && <p class="fleet__failure caution">{f.instances.inService} of {f.desired} · {f.launchFailure.reason}</p>}
       </div>
       <div class="fleet__gauge">
-        <Tape f={f} census={census} />
+        {known ? <Tape f={f} census={census} /> : <span>Scheduler unknown</span>}
       </div>
       <dl class="fleet__nums">
         <div>
           <dt>running</dt>
           <dd>
-            <Num value={f.demand.running} />
+            {known ? <Num value={f.demand.running} /> : "unknown"}
           </dd>
         </div>
         <div>
           <dt>queued</dt>
           <dd>
-            <Num value={f.demand.queued} />
+            {known ? <Num value={f.demand.queued} /> : "unknown"}
           </dd>
         </div>
       </dl>
@@ -284,7 +298,8 @@ export const Overview = () => {
   const state = client.state.value;
   if (!state) return null;
   const recent = scalingLog(state.events, state.statusEvents ?? []).slice(-RECENT_EVENTS).reverse();
-  const idle = state.workers.length === 0 && state.queue.total === 0;
+  const known = schedulerCurrent(state);
+  const idle = known && state.workers.length === 0 && state.queue.total === 0;
   return (
     <>
       <Readouts state={state} />
@@ -296,7 +311,7 @@ export const Overview = () => {
       <Section id="fleets-h" title="Fleets" legend={<Legend />}>
         <ol class="fleets">
           {state.fleets.map((f, i) => (
-            <FleetRow key={f.name} f={f} ordinal={i + 1} events={state.events} census={state} />
+            <FleetRow key={f.name} f={f} ordinal={i + 1} events={state.events} census={state} known={known} />
           ))}
         </ol>
       </Section>

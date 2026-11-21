@@ -65,21 +65,21 @@ devshell_import_tools(name = "import_test_tools", dev_dependency = True)
 
 # Released Linux binaries and source trees used by the mixed-version upgrade gate.
 http_file(
-    name = "gang_v033_linux_x86_64",
+    name = "gang_v034_linux_x86_64",
     dev_dependency = True,
     downloaded_file_path = "gang",
     executable = True,
-    sha256 = "48d80604a7181f3d25c365c51001eabea741829671af87bda026ba770743c1d1",
-    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.3/gang-x86_64-unknown-linux-musl"],
+    sha256 = "e50df214c413116250a03982890035b9bce749131ed391663248b79d27b8c1e0",
+    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.4/gang-x86_64-unknown-linux-musl"],
 )
 
 http_file(
-    name = "gang_v033_linux_arm64",
+    name = "gang_v034_linux_arm64",
     dev_dependency = True,
     downloaded_file_path = "gang",
     executable = True,
-    sha256 = "c2fda1ddf62217a7c7757b21ac5adc064ad7144b1d2099b24941430d43f6feb1",
-    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.3/gang-aarch64-unknown-linux-musl"],
+    sha256 = "af7797ea984bc61d41d43b6bfb686b1b483efc25b39945f4b1ed7a1411d8eff7",
+    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.4/gang-aarch64-unknown-linux-musl"],
 )
 
 # Remove archive package boundaries so the generated root filegroup sees every source.
@@ -94,14 +94,14 @@ filegroup(
 UPGRADE_SOURCE_PATCH = "find infra configs -type f \\( -name BUILD -o -name BUILD.bazel \\) -delete"
 
 http_archive(
-    name = "gang_v033_source",
+    name = "gang_v034_source",
     build_file_content = UPGRADE_SOURCE_BUILD,
     dev_dependency = True,
     patch_cmds = [UPGRADE_SOURCE_PATCH],
-    sha256 = "c47892f7700e385a61a3cd4653f9846dc59cbdbd1e9f91eb3650a17a1fa379d0",
-    strip_prefix = "gang-0.3.3",
+    sha256 = "fe925581988cdbf17e85b6167684a974b716a73666184bae6e81dd590e9b9db0",
+    strip_prefix = "gang-0.3.4",
     type = "tar.gz",
-    urls = ["https://codeload.github.com/leadingterm/gang/tar.gz/refs/tags/v0.3.3"],
+    urls = ["https://codeload.github.com/leadingterm/gang/tar.gz/refs/tags/v0.3.4"],
 )
 
 # The Bazel the e2e harness drives in its sample workspace (crates/gang-e2e); each download below is pinned by checksum.

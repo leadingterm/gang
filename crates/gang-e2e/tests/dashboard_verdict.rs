@@ -90,6 +90,8 @@ fn worker(phase: Phase) -> Worker {
         phase_time: at(0),
         running: 0,
         slots: Some(4),
+        capacity: None,
+        reserved: None,
         paused: false,
         launch_time: at(0),
         phases: Vec::new(),
@@ -131,6 +133,7 @@ fn state(seq: u64, in_service: u32, workers: Vec<Worker>, completed: u64) -> Sta
         connections: gang_wire::Connections::default(),
         builds: Vec::new(),
         principals_epoch: 0,
+        scheduler_known: None,
     }
 }
 
@@ -199,6 +202,7 @@ fn delta(base: u64, seq: u64, events: Vec<Event>) -> Delta {
         connections: None,
         builds: None,
         principals_epoch: None,
+        scheduler_known: None,
     }
 }
 

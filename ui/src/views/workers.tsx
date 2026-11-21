@@ -2,11 +2,11 @@
 // instances without a worker sit under their fleet as counts.
 import { useState } from "preact/hooks";
 import { idOf, ms, type UnixMs } from "../wire-parse.ts";
-import type { Fleet, InfrastructureStatus, Instance, Phase, State, Worker } from "../wire.ts";
-import { windowMs } from "../recent.ts";
-import { sum, workerInstance } from "../format.ts";
+import type { Fleet, InfrastructureStatus, Instance, Phase, Recent, State, Worker } from "../wire.ts";
+import { schedulerCurrent, schedulerKnown, stepMs, windowMs } from "../recent.ts";
+import { bytes, sum, workerInstance } from "../format.ts";
 import { Cell, Clock, Disclosure, Duration, Empty, FleetFilter, Ident, Row, Section, Since, Table, Target, useClient, useNowStep } from "../ui.tsx";
-import { AsOf } from "./actions.tsx";
+import { AsOf, ReservationAmounts } from "./actions.tsx";
 import { fleetCounts, fleetTotals, STATE_NAME, StaticCell, Tally, unhostedInstances, type Counted, type FleetCensus } from "./fleet.tsx";
 
 /** The instances without a worker are listed under their fleet. */
@@ -42,11 +42,16 @@ export const laneSegments = (w: Worker, now: UnixMs, window: number): readonly L
     .filter((s) => s.to > s.from);
 };
 
-const Lane = ({ w, now, window }: { w: Worker; now: UnixMs; window: number }) => {
+const Lane = ({ w, now, recent }: { w: Worker; now: UnixMs; recent: Recent }) => {
+  const window = windowMs(recent);
   const start = now - window;
   const segments = laneSegments(w, now, window);
+  const unknown = (recent.samples ?? []).filter((s) => !schedulerKnown(s)).map((s) => ({
+    from: Math.max(start, ms(s.start), ms(w.launchTime)),
+    to: Math.min(now, ms(s.start) + stepMs(recent)),
+  })).filter((s) => s.to > s.from);
   return (
-    <div class="lane" role="img" aria-label={`Phase history: ${segments.map((s) => s.phase.toLowerCase()).join(", ")}`}>
+    <div class="lane" role="img" aria-label={`Phase history: ${segments.map((s) => s.phase.toLowerCase()).join(", ")}${unknown.length ? ", scheduler unknown" : ""}`}>
       {segments.map((s) => (
         <i
           key={`${s.phase}-${s.from}`}
@@ -56,6 +61,12 @@ const Lane = ({ w, now, window }: { w: Worker; now: UnixMs; window: number }) =>
             "--w": String(((s.to - s.from) / window).toFixed(4)),
           }}
         />
+      ))}
+      {unknown.map((s) => (
+        <i key={s.from} class="lane__seg lane__seg--unrecorded" title="scheduler unknown" style={{
+          "--x": String(((s.from - start) / window).toFixed(4)),
+          "--w": String(((s.to - s.from) / window).toFixed(4)),
+        }} />
       ))}
     </div>
   );
@@ -87,6 +98,9 @@ const Infrastructure = ({ status }: { status: InfrastructureStatus }) => (
   </span>
 );
 
+const ledger = (w: Worker): string =>
+  `CPU admission ${w.reserved ? `${w.reserved.cpuMillicores} millicores` : "—"} / ${w.capacity ? `${w.capacity.cpuMillicores} millicores` : "—"} · memory ${w.reserved ? bytes(w.reserved.memory) : "—"} / ${w.capacity ? bytes(w.capacity.memory) : "—"} reserved / capacity`;
+
 export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
   const client = useClient();
   const acts = state.actions?.running.filter((a) => a.worker === w.name) ?? [];
@@ -111,8 +125,10 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
         </dd>
         <dt>{w.slots === undefined ? "running" : "slots"}</dt>
         <dd class="mono">
-          {w.slots === undefined ? w.running : `${w.running}/${w.slots}`}
+          {schedulerCurrent(state) ? w.slots === undefined ? w.running : `${w.running}/${w.slots}` : "unknown"}
         </dd>
+        <dt>reservation</dt>
+        <dd class="mono">{schedulerCurrent(state) ? ledger(w) : "unknown"}</dd>
         {w.infrastructure && <><dt>infrastructure</dt><dd><Infrastructure status={w.infrastructure} /></dd></>}
       </dl>
       {segments.length > 0 && (
@@ -137,6 +153,7 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
               <Row key={a.name}>
                 <Cell cls="a-main">
                   {a.target ? <Target label={a.target} /> : <Ident text={a.digest.slice(0, 12)} title={a.digest} cls="quiet" />}
+                  <ReservationAmounts reservation={a.reservation} learned={a.learnedReservation} />
                 </Cell>
                 <Cell cls="a-kind">{a.mnemonic ? <Ident text={a.mnemonic} /> : "—"}</Cell>
                 <Cell cls="a-age r">
@@ -155,7 +172,8 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
 const WorkerRow = ({ w, state, now }: { w: Worker; state: State; now: UnixMs }) => {
   const id = idOf(w.name);
   const instance = workerInstance(id);
-  const phase = w.phase.toLowerCase();
+  const known = schedulerCurrent(state);
+  const phase = known ? w.phase.toLowerCase() : "unknown";
   return (
     <div class="wrow">
       <Disclosure
@@ -168,18 +186,24 @@ const WorkerRow = ({ w, state, now }: { w: Worker; state: State; now: UnixMs }) 
               <svg class="wrow__chev" viewBox="0 0 10 10" aria-hidden="true">
                 <path d="M3 1.5 6.5 5 3 8.5" />
               </svg>
-              <span class="wrow__inst"><Ident text={instance} /></span>
+              <span class="wrow__inst">
+                <Ident text={instance} />
+                <span class="dim" role="group" title="Reserved / admission capacity" aria-label={ledger(w)}>
+                  <span style={{ display: "block" }}>CPU {w.reserved?.cpuMillicores ?? "—"} / {w.capacity?.cpuMillicores ?? "—"} mCPU</span>
+                  <span style={{ display: "block" }}>Memory {w.reserved ? bytes(w.reserved.memory) : "—"} / {w.capacity ? bytes(w.capacity.memory) : "—"}</span>
+                </span>
+              </span>
             </span>
             <span class={`phase phase--${phase}`}>
               <span class="phase__name">{phase}</span>
-              <span class="phase__since">
+              {known && <span class="phase__since">
                 <Since t={ms(w.phaseTime)} />
-              </span>
+              </span>}
               {w.infrastructure && <> · <Infrastructure status={w.infrastructure} /></>}
               {w.paused && <span class="paused">paused</span>}
             </span>
-            <Pips w={w} />
-            <Lane w={w} now={now} window={windowMs(state.recent)} />
+            {known ? <Pips w={w} /> : <span>unknown</span>}
+            <Lane w={w} now={now} recent={state.recent} />
           </>
         }
       >
@@ -240,7 +264,7 @@ export const Workers = () => {
     <>
       <div class="toolbar">
         <FleetFilter id="wfleet" fleets={state.fleets} value={fleet} onChange={setFleet} count={(f) => ws.filter((w) => w.fleet === f.name).length} />
-        <Tally items={fleetTotals(state.fleets, state).filter(([s]) => TALLIED[s])} />
+        {schedulerCurrent(state) ? <Tally items={fleetTotals(state.fleets, state).filter(([s]) => TALLIED[s])} /> : <span>Scheduler unknown</span>}
       </div>
       <div class="wgrid">
         <div class="wgrid__axis" aria-hidden="true">

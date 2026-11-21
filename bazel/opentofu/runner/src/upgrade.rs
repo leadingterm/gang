@@ -6,6 +6,7 @@
 
 use std::error::Error;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -264,6 +265,12 @@ fn cleanup_failure_context(stdout: &[u8], mut message: String, failed_line: usiz
             if let Some(detail) = event["diagnostic"]["detail"].as_str() {
                 message.push('\n');
                 message.push_str(detail);
+            }
+            if let (Some(filename), Some(line)) = (
+                event["diagnostic"]["range"]["filename"].as_str(),
+                event["diagnostic"]["range"]["start"]["line"].as_u64(),
+            ) {
+                let _ = write!(message, "\ncleanup diagnostic location: {filename}:{line}");
             }
         }
     }
@@ -1677,7 +1684,9 @@ mod tests {
         events.push(json!({
             "type":"diagnostic", "@level":"error", "@testfile":TEST, "@testrun":"promote",
             "diagnostic":{"severity":"error", "summary":"destroy blocked",
-                "detail":"prevent_destroy retained state volume"}
+                "detail":"prevent_destroy retained state volume",
+                "range":{"filename":"main.tf", "start":{"line":42}},
+                "snippet":{"code":"snippet-secret-sentinel"}}
         }));
         let error = selected_evidence(&encode_events(&events))
             .err()
@@ -1690,11 +1699,13 @@ mod tests {
             "deadbeef",
             "destroy blocked",
             "prevent_destroy retained state volume",
+            "cleanup diagnostic location: main.tf:42",
         ] {
             assert!(message.contains(expected));
         }
         assert!(!message.contains("plan-secret-sentinel"));
         assert!(!message.contains("state-secret-sentinel"));
+        assert!(!message.contains("snippet-secret-sentinel"));
     }
 
     #[test]

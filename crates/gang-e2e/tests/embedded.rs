@@ -349,6 +349,7 @@ fn spawn_controller(
         let spec = ControllerSpec {
             actions,
             scaling: Arc::new(gang_config::ScalingConfig::default()),
+            control_acquire_timeout: NonZeroDuration::from_secs(1),
             clock: Arc::new(gang_clock::SystemClock::new()),
             content_store: &content,
             action_store: &action,
@@ -821,6 +822,7 @@ async fn a_second_controller_is_refused() -> TestResult {
     let spec = ControllerSpec {
         actions: Arc::new(gang_config::ActionsConfig::default()),
         scaling: Arc::new(gang_config::ScalingConfig::default()),
+        control_acquire_timeout: NonZeroDuration::from_secs(1),
         clock: Arc::new(gang_clock::SystemClock::new()),
         content_store: &content,
         action_store: &action,
@@ -849,6 +851,7 @@ async fn sequential_controller_terms_drain_and_republish() -> TestResult {
     let spec = ControllerSpec {
         actions: Arc::new(gang_config::ActionsConfig::default()),
         scaling: Arc::new(gang_config::ScalingConfig::default()),
+        control_acquire_timeout: NonZeroDuration::from_secs(1),
         clock: Arc::new(gang_clock::SystemClock::new()),
         content_store: &content,
         action_store: &action,

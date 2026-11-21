@@ -147,7 +147,8 @@ impl ResourcePolicy {
             pressure_poll_interval: NonZeroDuration::from_millis(50),
             pressure_kill_after: NonZeroDuration::from_millis(1000),
             sample_interval: NonZeroDuration::from_millis(20),
-            escalation_percent: EscalationPercent::try_new(250)
+            // The retry waits for its neighbour: together they exceed the 736 MiB kernel pool.
+            escalation_percent: EscalationPercent::try_new(700)
                 .map_err(E2eError::system_from("the pressure escalation percentage"))?,
             max_steps: NonZeroU32::MIN.saturating_add(2),
             ..MemoryTuning::default()
@@ -173,6 +174,8 @@ impl ResourcePolicy {
     /// Returns an error if the fixture's escalation percentage is invalid.
     pub fn pool_oom_scenario() -> Result<Self> {
         let mut policy = Self::pressure_scenario()?;
+        policy.memory.escalation_percent = EscalationPercent::try_new(250)
+            .map_err(E2eError::system_from("the pool OOM escalation percentage"))?;
         policy.memory.enforcement = gang_config::MemoryEnforcement::None;
         policy.worker_memory_max = Some(NonZeroBytes::mib(512).get());
         policy.fleet_memory = Some(NonZeroBytes::mib(448));

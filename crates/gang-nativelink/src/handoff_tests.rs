@@ -91,10 +91,12 @@ impl KnownPlatformPropertyProvider for Fake {
 fn info() -> Arc<ActionInfo> {
     let digest = DigestInfo::new([1; 32], 1);
     Arc::new(ActionInfo {
+        memory_reservation: None,
         command_digest: digest,
         input_root_digest: digest,
         timeout: Duration::from_secs(1),
         platform_properties: std::collections::HashMap::default(),
+        pre_fit_reservation: None,
         priority: 0,
         load_timestamp: UNIX_EPOCH,
         insert_timestamp: UNIX_EPOCH,

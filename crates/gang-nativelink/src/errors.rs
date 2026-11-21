@@ -2,6 +2,11 @@
 
 use std::path::PathBuf;
 
+/// Scheduler control could not acquire its read/lock prerequisites in time.
+#[derive(Debug, thiserror::Error)]
+#[error("scheduler control acquisition timed out")]
+pub(crate) struct SchedulerAcquireTimeout;
+
 /// Plugin configuration that cannot be used to run `NativeLink`.
 #[derive(Debug, thiserror::Error, gang_spi::PortFailure)]
 pub(crate) enum NativeLinkConfigError {

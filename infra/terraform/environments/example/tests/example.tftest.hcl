@@ -29,6 +29,7 @@ mock_provider "aws" {
   mock_data "aws_ec2_instance_type" {
     defaults = {
       boot_modes                 = ["legacy-bios", "uefi"]
+      memory_size                = 65536
       supported_architectures    = ["x86_64"]
       instance_storage_supported = true
       hypervisor                 = "nitro"

@@ -11,8 +11,8 @@ use gang_config::{
 use gang_e2e::{
     AUDIENCE, ActionLimits, ActionTools, ConfigTemplate, ControlKnobs, E2eError, ExecutionKnobs,
     FleetLayout, IdentityKnobs, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, NOOP_FLEET,
-    ORGANIZATION, ORGANIZATION_CLAIM, PermitNetwork, Placement, SMALL_FLEET, Sandbox, ServerKnobs,
-    SoftMemory, Transport, Variant,
+    ORGANIZATION, ORGANIZATION_CLAIM, PLACEMENT_LARGE_MEMORY, PLACEMENT_SMALL_MEMORY,
+    PermitNetwork, Placement, SMALL_FLEET, Sandbox, ServerKnobs, SoftMemory, Transport, Variant,
 };
 use gang_main::plugins::{
     CacheConfig, ClientAuthenticationConfig, DatabaseConfig, IdentityProviderConfig, LimitsConfig,
@@ -1479,33 +1479,38 @@ fn placement_layout_needs_exactly_one_base_fleet() -> gang_e2e::Result<()> {
 }
 
 #[test]
-fn large_memory_is_what_the_large_fleet_registers_in_kib() -> gang_e2e::Result<()> {
-    let template = ConfigTemplate::parse(&base_config()?)?;
-    let fleets = placement_fleets(Sandbox::Bwrap)?;
-    assert_eq!(
-        template.large_memory_kb()?,
-        fleets[1].memory_per_instance.as_u64() / 1024
-    );
-    Ok(())
-}
-
-#[test]
-fn large_memory_exceeds_the_small_fleet() -> gang_e2e::Result<()> {
-    let template = ConfigTemplate::parse(&base_config()?)?;
-    let fleets = placement_fleets(Sandbox::Bwrap)?;
-    assert!(template.large_memory_kb()? > fleets[0].memory_per_instance.as_u64() / 1024);
-    Ok(())
-}
-
-#[test]
-fn large_memory_is_the_same_for_the_base_and_its_placement_layout() -> gang_e2e::Result<()> {
-    let template = ConfigTemplate::parse(&base_config()?)?;
-    let placed = ConfigTemplate::parse(&base_config()?)?.vary(
+fn placement_memory_probe_fits_only_the_large_action_ceiling() -> gang_e2e::Result<()> {
+    let template = ConfigTemplate::parse(&base_config()?)?.vary(
         &placement_variant(Sandbox::Bwrap),
         &launcher(),
         &*(tools()?),
     )?;
-    assert_eq!(template.large_memory_kb()?, placed.large_memory_kb()?);
+    let doc = typed_rendered(&template)?;
+    let small = doc.fleets[0]
+        .actions
+        .resources
+        .memory
+        .expect("small ceiling");
+    let large = doc.fleets[1]
+        .actions
+        .resources
+        .memory
+        .expect("large ceiling");
+    let noop = doc.fleets[2]
+        .actions
+        .resources
+        .memory
+        .expect("noop ceiling");
+    let probe_kib = PLACEMENT_LARGE_MEMORY.as_u64() / 1024;
+    assert_eq!(small, PLACEMENT_SMALL_MEMORY);
+    assert_eq!(noop, PLACEMENT_SMALL_MEMORY);
+    assert_eq!(probe_kib, large.as_u64() / 1024);
+    assert!(probe_kib > small.as_u64() / 1024);
+    let cold_memory = doc.actions.cold_start.memory.get().get();
+    assert_eq!(cold_memory, PLACEMENT_SMALL_MEMORY.as_u64());
+    assert!(cold_memory <= small.as_u64());
+    assert!(cold_memory <= large.as_u64());
+    assert!(cold_memory <= noop.as_u64());
     Ok(())
 }
 

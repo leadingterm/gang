@@ -1,10 +1,11 @@
-//! Builds each live state frame from the outputs of one control pass.
+//! Builds live state frames from control passes and independent observations.
 //!
-//! A frame is filled into a caller-owned [`State`] so that its vectors and strings keep their
-//! capacity from one pass to the next: a completed pass rewrites the rows in place and allocates
-//! nothing once the frame is warm. Workers and instances are kept ordered by resource name, so
-//! the phase clock of a worker is carried over from the previous frame by a binary search of the
-//! previous frame's rows, which are sorted by name too.
+//! Control passes update pass metadata and reconciler outlook. Independent observations alone
+//! update scheduler and provisioner measurements and their cumulative baselines. Local traffic,
+//! builds, and cache measurements are sampled on every publication.
+//!
+//! Frames use caller-owned buffers. Workers and instances are ordered by resource name, so a
+//! worker's phase clock is carried over by binary search in the preceding frame.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -13,14 +14,12 @@ use std::time::Duration;
 
 use gang_clock::Timestamp;
 use gang_reconciler::{Activity, FleetPass, HostedSnapshot};
-use gang_spi::{
-    FleetInstance, FleetSupply, QueuedActionView, SchedulerSnapshot, StoreKind, Traffic,
-};
-use gang_types::{FleetCatalog, FleetProperties, InstanceLifecycle, SaturatingInto};
+use gang_spi::{FleetSupply, QueuedActionView, SchedulerSnapshot, StoreKind, Traffic};
+use gang_types::{ActionResources, FleetCatalog, FleetProperties, InstanceLifecycle, SaturatingInto};
 use gang_wire::{
-    Actions, BucketUsage, CacheStore, Demand, Event, Fleet, Instance, InstanceCounts, InstanceSize,
-    Isa, Lifecycle, Pass, Phase, PhaseSpan, Policy, Queue, QueuedAction, Recent, RunningAction,
-    SkipReason, State, StoreUsage, Truncated, Worker, WorkerCounts, name,
+    Actions, BucketUsage, CacheStore, Demand, Event, Fleet, InstanceCounts, InstanceSize, Isa,
+    Lifecycle, Pass, Phase, PhaseSpan, Policy, Queue, QueuedAction, Recent, Reservation,
+    RunningAction, SkipReason, State, StoreUsage, Truncated, Worker, WorkerCounts, name,
 };
 
 use crate::events::newer;
@@ -52,6 +51,8 @@ pub struct Builder {
     skipped: u32,
     last_traffic: Traffic,
     last_evicted: Option<u64>,
+    last_completed: Option<u64>,
+    last_unknown_step: Option<Timestamp>,
     scratch: Scratch,
 }
 
@@ -64,6 +65,10 @@ struct Scratch {
     /// Indices of sampled running actions, ordered by encoded action name.
     running_order: Vec<usize>,
     status_order: Vec<usize>,
+    /// Previous workers ordered by physical identity, independent of worker generation.
+    physical_order: Vec<usize>,
+    /// Current hosted workers ordered by encoded physical identity.
+    hosted_order: Vec<usize>,
     status_name: String,
     instance_name: String,
 }
@@ -78,6 +83,8 @@ impl Builder {
             skipped: 0,
             last_traffic: baseline.traffic,
             last_evicted: baseline.evicted,
+            last_completed: Some(0),
+            last_unknown_step: None,
             scratch: Scratch::default(),
         }
     }
@@ -103,18 +110,132 @@ impl Builder {
         }
     }
 
-    /// Fills `cur` with the frame for `inputs`, numbered `seq`.
-    ///
-    /// A completed pass rewrites every row of `cur` from `inputs`. A skipped pass copies the rows
-    /// of `prev` unchanged and reports the skip. Actions and recent builds are refreshed in both cases.
+    /// Fills `cur` from a control pass or observation, numbered `seq`.
     pub fn fill(&mut self, cur: &mut State, prev: &State, seq: u64, inputs: &Inputs<'_>) {
+        self.fill_header(cur, prev, seq, inputs);
+        let traffic = self.traffic_increase(inputs.traffic);
+        let mut completed = 0;
+        let mut evicted = 0;
+        let mut scheduler_known = None;
+        let mut passed = false;
+        let mut skipped = false;
+        match &inputs.pass {
+            PassStatus::Ok { applied, failed } => {
+                self.last_ok = Some(inputs.wall);
+                self.skipped = 0;
+                cur.pass = Pass::ok(self.config.interval, *applied, *failed);
+                self.project_control(cur, prev, inputs);
+                passed = true;
+            }
+            PassStatus::Skipped(reason) => {
+                self.skipped = self.skipped.saturating_add(1);
+                cur.pass = Pass::skipped(
+                    self.config.interval,
+                    reason.clone(),
+                    self.last_ok,
+                    self.skipped,
+                );
+                copy_skipped_state(cur, prev);
+                skipped = true;
+                // Only the independent observer establishes scheduler availability.
+            }
+            PassStatus::Observed { hosted, supplies } => {
+                let (observed_completed, observed_evicted, known) =
+                    self.observe(cur, prev, inputs, *hosted, supplies);
+                completed = observed_completed;
+                evicted = observed_evicted;
+                scheduler_known = Some(known);
+            }
+        }
+        let running = cur
+            .fleets
+            .iter()
+            .fold(0_u32, |sum, fleet| sum.saturating_add(fleet.demand.running));
+        let queued = cur.queue.total;
+        let last_unknown_step = &mut self.last_unknown_step;
+        let cur_scheduler_available = cur.scheduler_known == Some(true);
+        cur.recent.sample_at(inputs.wall, |sample| {
+            sample.lookups = sample
+                .lookups
+                .saturating_add(traffic.lookups.saturating_into());
+            sample.hits = sample.hits.saturating_add(traffic.hits.saturating_into());
+            sample.uploaded_bytes = sample.uploaded_bytes.saturating_add(traffic.uploaded);
+            sample.downloaded_bytes = sample.downloaded_bytes.saturating_add(traffic.downloaded);
+            sample.completed = sample.completed.saturating_add(completed.saturating_into());
+            sample.evicted_bytes = sample.evicted_bytes.saturating_add(evicted);
+            if let Some(known) = scheduler_known {
+                if !known {
+                    *last_unknown_step = Some(sample.start);
+                }
+                sample.scheduler_known = Some(known && *last_unknown_step != Some(sample.start));
+                if cur_scheduler_available {
+                    sample.running = running;
+                    sample.queued = queued;
+                }
+            }
+            if passed {
+                sample.passes = sample.passes.saturating_add(1);
+            }
+            if skipped {
+                sample.skipped = sample.skipped.saturating_add(1);
+            }
+        });
+        fill_actions(cur, prev, inputs, &self.config, &mut self.scratch);
+    }
+
+    /// Applies control-owned outlook and derived metadata without replacing observations.
+    fn project_control(&mut self, cur: &mut State, prev: &State, inputs: &Inputs<'_>) {
+        copy_skipped_state(cur, prev);
+        for (index, (pass, properties)) in inputs
+            .fleets
+            .iter()
+            .zip(inputs.catalog.fleets())
+            .enumerate()
+        {
+            if let Some(row) = cur.fleets.get_mut(index) {
+                fill_fleet(row, pass, properties);
+            } else {
+                let mut row = Fleet::default();
+                fill_fleet(&mut row, pass, properties);
+                cur.fleets.push(row);
+            }
+        }
+        for pass in inputs.fleets {
+            name::write_of::<name::Fleets>(&mut self.scratch.status_name, &pass.policy.name);
+            for (position, instance) in pass.supply.instances.iter().enumerate() {
+                name::write_of::<name::Instances>(&mut self.scratch.instance_name, &instance.id);
+                if let Ok(index) = cur
+                    .instances
+                    .binary_search_by(|row| row.name.cmp(&self.scratch.instance_name))
+                {
+                    let row = &mut cur.instances[index];
+                    if row.fleet == self.scratch.status_name
+                        && row.launch_time == instance.launched_at
+                        && row.lifecycle == Lifecycle::InService
+                    {
+                        row.past_boot_grace =
+                            pass.past_boot_grace.get(position).copied().unwrap_or(false);
+                    }
+                }
+            }
+        }
+        fill_infrastructure(
+            cur,
+            inputs.fleets,
+            inputs.infrastructure,
+            self.config.events_limit,
+            &mut self.scratch,
+        );
+    }
+
+    fn fill_header(&self, cur: &mut State, prev: &State, seq: u64, inputs: &Inputs<'_>) {
         name::STATE.clone_into(&mut cur.name);
         cur.seq = seq;
         cur.update_time = inputs.wall;
         cur.provisioner.clone_from(&self.config.provisioner);
         cur.events_limit = self.config.events_limit.saturating_into();
         cur.principals_epoch = inputs.principals_epoch;
-        // Field-wise: the derived `Recent::clone_from` would replace the buffer, not reuse it.
+        cur.scheduler_known = prev.scheduler_known;
         cur.recent.samples.clone_from(&prev.recent.samples);
         cur.recent.window = self.config.history_window;
         cur.recent.step = self.config.history_step;
@@ -133,98 +254,102 @@ impl Builder {
             objects: measured.objects,
             measure_time: measured.measured,
         });
-        let interval = self.config.interval;
-        match &inputs.pass {
-            PassStatus::Ok {
-                applied,
-                failed,
-                hosted,
-            } => {
-                let snapshot = hosted.snapshot();
-                self.last_ok = Some(inputs.wall);
-                self.skipped = 0;
-                cur.pass = Pass::ok(interval, *applied, *failed);
-                cur.completed = snapshot.completed;
-                fill_instances(cur, inputs.fleets, hosted, &mut self.scratch);
-                fill_workers(
-                    cur,
-                    prev,
-                    inputs.wall,
-                    snapshot,
-                    &self.scratch,
-                    self.config.history_window,
-                );
-                fill_fleets(cur, inputs.fleets, inputs.catalog);
-                fill_infrastructure(
-                    cur,
-                    inputs.fleets,
-                    inputs.infrastructure,
-                    self.config.events_limit,
-                    &mut self.scratch,
-                );
-                fill_queue(cur, inputs.fleets, snapshot);
-                let (traffic, evicted) = self.cache_increase(cur, snapshot, inputs.traffic);
-                let completed = snapshot
-                    .completed
-                    .checked_sub(prev.completed)
-                    .unwrap_or(snapshot.completed);
-                let lookups = traffic.lookups;
-                let hits = traffic.hits;
-                let uploaded = traffic.uploaded;
-                let downloaded = traffic.downloaded;
-                let running = cur
-                    .fleets
-                    .iter()
-                    .fold(0_u32, |sum, fleet| sum.saturating_add(fleet.demand.running));
-                let queued = cur.queue.total;
-                cur.recent.sample_at(inputs.wall, |sample| {
-                    sample.completed = sample.completed.saturating_add(completed.saturating_into());
-                    sample.lookups = sample.lookups.saturating_add(lookups.saturating_into());
-                    sample.hits = sample.hits.saturating_add(hits.saturating_into());
-                    sample.uploaded_bytes = sample.uploaded_bytes.saturating_add(uploaded);
-                    sample.downloaded_bytes = sample.downloaded_bytes.saturating_add(downloaded);
-                    sample.evicted_bytes = sample.evicted_bytes.saturating_add(evicted);
-                    sample.running = running;
-                    sample.queued = queued;
-                    sample.passes = sample.passes.saturating_add(1);
-                });
-            }
-            PassStatus::Skipped(reason) => {
-                self.skipped = self.skipped.saturating_add(1);
-                cur.pass = Pass::skipped(interval, reason.clone(), self.last_ok, self.skipped);
-                copy_skipped_state(cur, prev);
-                cur.recent.sample_at(inputs.wall, |sample| {
-                    sample.skipped = sample.skipped.saturating_add(1);
-                });
-            }
-        }
-        fill_actions(
-            cur,
-            prev,
-            inputs,
-            &self.config,
-            &mut self.scratch.running_order,
-        );
     }
 
-    /// Refreshes bounded stores and advances cumulative cache baselines on a successful pass.
-    fn cache_increase(
+    fn observe(
         &mut self,
         cur: &mut State,
-        snapshot: &SchedulerSnapshot,
-        traffic: Traffic,
-    ) -> (Traffic, u64) {
-        refill(&mut cur.cache.stores, &snapshot.stores, |row, store| {
-            *row = StoreUsage {
-                store: match store.store {
-                    StoreKind::Content => CacheStore::Content,
-                    StoreKind::Action => CacheStore::Action,
-                },
-                used_bytes: store.used,
-                budget_bytes: store.budget,
-            };
-            true
+        prev: &State,
+        inputs: &Inputs<'_>,
+        hosted: Option<&HostedSnapshot>,
+        supplies: &[bool],
+    ) -> (u64, u64, bool) {
+        cur.pass.clone_from(&prev.pass);
+        copy_observed_state(cur, prev);
+        cur.scheduler_known = Some(hosted.is_some());
+        self.scratch.physical_order.clear();
+        self.scratch.physical_order.extend(0..prev.workers.len());
+        self.scratch.physical_order.sort_unstable_by(|&a, &b| {
+            (&prev.workers[a].fleet, &prev.workers[a].instance)
+                .cmp(&(&prev.workers[b].fleet, &prev.workers[b].instance))
         });
+        self.scratch.hosted_order.clear();
+        if let Some(hosted) = hosted {
+            let workers = &hosted.snapshot().workers;
+            self.scratch.hosted_order.extend(
+                (0..workers.len()).filter(|&i| workers[i].id.instance_name().is_some()),
+            );
+            self.scratch.hosted_order.sort_unstable_by(|&a, &b| {
+                name::cmp_of::<name::Actions>(workers[a].fleet.as_str(), workers[b].fleet.as_str())
+                    .then_with(|| {
+                        name::cmp_of::<name::Actions>(
+                            workers[a].id.instance_name().unwrap_or_default(),
+                            workers[b].id.instance_name().unwrap_or_default(),
+                        )
+                    })
+            });
+        }
+        observe_fleets(
+            cur,
+            inputs.fleets,
+            inputs.catalog,
+            supplies,
+            hosted,
+            &mut self.scratch,
+        );
+        fill_instances(
+            cur,
+            prev,
+            inputs.fleets,
+            supplies,
+            hosted,
+            &mut self.scratch,
+        );
+        let Some(hosted) = hosted else {
+            self.last_completed = None;
+            self.last_evicted = None;
+            return (0, 0, false);
+        };
+        let snapshot = hosted.snapshot();
+        fill_workers(
+            cur,
+            prev,
+            inputs.wall,
+            snapshot,
+            &self.scratch,
+            self.config.history_window,
+        );
+        observe_scheduler(cur, inputs.fleets, snapshot);
+        cur.completed = snapshot.completed;
+        let known = self.last_completed.is_some() && self.last_evicted.is_some();
+        let (completed, evicted) = self.scheduler_increase(cur, snapshot);
+        for worker in &mut cur.workers {
+            let same = find_worker(&prev.workers, &worker.name)
+                .filter(|old| old.fleet == worker.fleet && old.instance == worker.instance);
+            let status = if let Some(old) = same {
+                old.infrastructure.as_ref()
+            } else {
+                let instance = prev.instances
+                    .binary_search_by(|old| old.name.cmp(&worker.instance))
+                    .ok()
+                    .map(|index| &prev.instances[index])
+                    .filter(|old| old.fleet == worker.fleet);
+                if let Some(old) = instance {
+                    old.infrastructure.as_ref()
+                } else {
+                    physical_worker(prev, &self.scratch.physical_order, &worker.fleet, &worker.instance)
+                        .and_then(|old| old.infrastructure.as_ref())
+                }
+            };
+            if worker.infrastructure.as_ref() != status {
+                worker.infrastructure = status.cloned();
+            }
+        }
+        (completed, evicted, known)
+    }
+
+    /// Advances the independent local traffic baseline.
+    fn traffic_increase(&mut self, traffic: Traffic) -> Traffic {
         let last = self.last_traffic;
         let delta = if traffic.lookups < last.lookups
             || traffic.hits < last.hits
@@ -240,6 +365,23 @@ impl Builder {
                 downloaded: traffic.downloaded - last.downloaded,
             }
         };
+        self.last_traffic = traffic;
+        delta
+    }
+
+    /// Refreshes scheduler stores and advances scheduler-owned counter baselines.
+    fn scheduler_increase(&mut self, cur: &mut State, snapshot: &SchedulerSnapshot) -> (u64, u64) {
+        refill(&mut cur.cache.stores, &snapshot.stores, |row, store| {
+            *row = StoreUsage {
+                store: match store.store {
+                    StoreKind::Content => CacheStore::Content,
+                    StoreKind::Action => CacheStore::Action,
+                },
+                used_bytes: store.used,
+                budget_bytes: store.budget,
+            };
+            true
+        });
         let evicted_total = snapshot
             .stores
             .iter()
@@ -247,13 +389,119 @@ impl Builder {
         let evicted = self
             .last_evicted
             .map_or(0, |last| increase(evicted_total, last));
-        self.last_traffic = traffic;
+        let completed = self
+            .last_completed
+            .map_or(0, |last| increase(snapshot.completed, last));
         self.last_evicted = Some(evicted_total);
-        (delta, evicted)
+        self.last_completed = Some(snapshot.completed);
+        (completed, evicted)
     }
 }
 
 /// Projects live operational observations without changing physical fleet counts.
+fn observe_fleets(
+    cur: &mut State,
+    fleets: &[FleetPass],
+    catalog: &FleetCatalog,
+    supplies: &[bool],
+    hosted: Option<&HostedSnapshot>,
+    scratch: &mut Scratch,
+) {
+    for (index, (pass, properties)) in fleets.iter().zip(catalog.fleets()).enumerate() {
+        if cur.fleets.get(index).is_none() {
+            let mut row = Fleet::default();
+            fill_fleet(&mut row, pass, properties);
+            cur.fleets.push(row);
+        }
+        if !supplies.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        let row = &mut cur.fleets[index];
+        row.desired = pass.supply.requested.unwrap_or(pass.supply.desired);
+        row.instances = instance_counts(&pass.supply);
+        if let Some(failure) = &pass.supply.launch_failure {
+            row.launch_failure
+                .get_or_insert_with(|| gang_wire::LaunchFailure {
+                    reason: String::new(),
+                })
+                .reason
+                .clone_from(&failure.reason);
+        } else {
+            row.launch_failure = None;
+        }
+    }
+    if let Some(hosted) = hosted {
+        scratch.launches.clear();
+        scratch
+            .launches
+            .resize(hosted.snapshot().workers.len(), None);
+        for (index, pass) in fleets.iter().enumerate() {
+            if supplies.get(index).copied().unwrap_or(false) {
+                for instance in &pass.supply.instances {
+                    for worker in hosted.workers_on(&pass.policy.name, &instance.id) {
+                        if let Some(launch) = scratch.launches.get_mut(worker) {
+                            *launch = Some(instance.launched_at);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn observe_scheduler(cur: &mut State, fleets: &[FleetPass], snapshot: &SchedulerSnapshot) {
+    for row in &mut cur.fleets {
+        row.workers = WorkerCounts::default();
+        row.demand.running = 0;
+    }
+    for worker in &snapshot.workers {
+        if let Some((index, _)) = fleets
+            .iter()
+            .enumerate()
+            .find(|(_, pass)| pass.policy.name == worker.fleet)
+            && let Some(row) = cur.fleets.get_mut(index)
+        {
+            let count = match Activity::from(worker) {
+                Activity::Busy => &mut row.workers.busy,
+                Activity::Idle => &mut row.workers.idle,
+                Activity::Draining => &mut row.workers.draining,
+            };
+            *count = count.saturating_add(1);
+            row.demand.running = row.demand.running.saturating_add(worker.running_actions);
+        }
+    }
+    for instance in &cur.instances {
+        if instance.lifecycle != Lifecycle::InService {
+            continue;
+        }
+        if let Some(row) = cur.fleets.iter_mut().find(|row| row.name == instance.fleet) {
+            row.workers.unconnected = row.workers.unconnected.saturating_add(1);
+        }
+    }
+    let total: u32 = snapshot.queued.len().saturating_into();
+    let unplaceable = snapshot
+        .queued
+        .iter()
+        .filter(|action| {
+            action
+                .candidates
+                .iter()
+                .next()
+                .is_none_or(|index| index >= fleets.len())
+        })
+        .count()
+        .saturating_into();
+    cur.queue = Queue {
+        total,
+        unplaceable,
+        oldest_queue_time: snapshot
+            .queued
+            .iter()
+            .map(|action| action.queued_since)
+            .min(),
+    };
+}
+
 fn fill_infrastructure(
     cur: &mut State,
     fleets: &[FleetPass],
@@ -369,9 +617,13 @@ fn increase(total: u64, previous: u64) -> u64 {
 }
 
 fn copy_skipped_state(cur: &mut State, prev: &State) {
+    copy_observed_state(cur, prev);
+    copy_if_changed(&mut cur.instances, &prev.instances);
+}
+
+fn copy_observed_state(cur: &mut State, prev: &State) {
     copy_if_changed(&mut cur.fleets, &prev.fleets);
     copy_if_changed(&mut cur.workers, &prev.workers);
-    copy_if_changed(&mut cur.instances, &prev.instances);
     copy_if_changed(&mut cur.status_events, &prev.status_events);
     copy_if_changed(&mut cur.queue, &prev.queue);
     cur.cache.stores.clone_from(&prev.cache.stores);
@@ -474,6 +726,8 @@ fn fill_workers(
             row.phases.drain(..ended);
             row.running = worker.running_actions;
             row.slots = worker.max_inflight_actions.map(NonZeroU32::get);
+            row.capacity = worker.capacity.map(reservation);
+            row.reserved = worker.reserved.map(reservation);
             row.paused = worker.paused;
             row.launch_time = scratch
                 .launches
@@ -514,67 +768,113 @@ fn fill_events(cur: &mut State, events: &[Event], limit: usize) {
     }
 }
 
-/// Fills instances without a hosting worker, ordered by name across fleets. An instance counts
-/// as hosted only when a worker of its own fleet runs on it. Every worker of the fleet on a
-/// hosted instance gets the instance's launch time in `scratch.launches`.
+/// Reuses row buffers while combining fresh supply with prior rows for failed reads.
 fn fill_instances(
     cur: &mut State,
+    prev: &State,
     fleets: &[FleetPass],
-    hosted: &HostedSnapshot,
+    supplies: &[bool],
+    hosted: Option<&HostedSnapshot>,
     scratch: &mut Scratch,
 ) {
-    let launches = &mut scratch.launches;
-    let workers = &hosted.snapshot().workers;
-    launches.clear();
-    launches.resize(workers.len(), None);
-    let triples = fleets.iter().flat_map(|pass| {
-        pass.supply
-            .instances
-            .iter()
-            .enumerate()
-            .map(move |(position, instance)| (pass, position, instance))
+    let fresh = fleets
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| supplies.get(*index).copied().unwrap_or(false))
+        .flat_map(|(_, pass)| {
+            pass.supply
+                .instances
+                .iter()
+                .map(move |instance| (pass, instance))
+        });
+    let retained = prev.instances.iter().filter(|row| {
+        !cur.fleets.iter().enumerate().any(|(index, fleet)| {
+            fleet.name == row.fleet && supplies.get(index).copied().unwrap_or(false)
+        })
     });
-    refill(
-        &mut cur.instances,
-        triples,
-        |row, (pass, position, instance)| {
-            let mut hosts = hosted
-                .workers_on(&pass.policy.name, &instance.id)
-                .peekable();
-            if hosts.peek().is_some() {
-                for worker in hosts {
-                    if let Some(launch) = launches.get_mut(worker) {
-                        launch.get_or_insert(instance.launched_at);
-                    }
-                }
-                return false;
-            }
+    let source = fresh
+        .map(|item| (Some(item), None))
+        .chain(retained.map(|row| (None, Some(row))));
+    refill(&mut cur.instances, source, |row, (fresh, retained)| {
+        if let Some((pass, instance)) = fresh {
             name::write_of::<name::Instances>(&mut row.name, &instance.id);
-            fill_instance(row, pass, instance, position);
-            true
-        },
-    );
+            name::write_of::<name::Fleets>(&mut row.fleet, &pass.policy.name);
+            row.lifecycle = Lifecycle::from(instance.lifecycle);
+            row.launch_time = instance.launched_at;
+            row.past_boot_grace = prev
+                .instances
+                .binary_search_by(|old| old.name.cmp(&row.name))
+                .ok()
+                .is_some_and(|index| {
+                    let old = &prev.instances[index];
+                    old.fleet == row.fleet
+                        && old.launch_time == row.launch_time
+                        && old.lifecycle == Lifecycle::InService
+                        && row.lifecycle == Lifecycle::InService
+                        && old.past_boot_grace
+                });
+        } else if let Some(old) = retained {
+            row.name.clone_from(&old.name);
+            row.fleet.clone_from(&old.fleet);
+            row.lifecycle = old.lifecycle.clone();
+            row.launch_time = old.launch_time;
+            row.past_boot_grace = old.past_boot_grace;
+        }
+        let connected = if let Some(hosted) = hosted {
+            if let Some((pass, instance)) = fresh {
+                hosted
+                    .workers_on(&pass.policy.name, &instance.id)
+                    .next()
+                    .is_some()
+            } else {
+                let workers = &hosted.snapshot().workers;
+                scratch.hosted_order.binary_search_by(|&index| {
+                    let worker = &workers[index];
+                    name::write_of::<name::Fleets>(&mut scratch.status_name, &worker.fleet);
+                    write_text_of::<name::Instances>(
+                        &mut scratch.instance_name,
+                        worker.id.instance_name().unwrap_or_default(),
+                    );
+                    (scratch.status_name.as_str(), scratch.instance_name.as_str())
+                        .cmp(&(row.fleet.as_str(), row.name.as_str()))
+                }).is_ok()
+            }
+        } else {
+            physical_worker(prev, &scratch.physical_order, &row.fleet, &row.name).is_some()
+        };
+        if connected {
+            return false;
+        }
+        let old = prev.instances
+            .binary_search_by(|old| old.name.cmp(&row.name))
+            .ok()
+            .map(|index| &prev.instances[index])
+            .filter(|old| old.fleet == row.fleet);
+        let status = if let Some(old) = old {
+            old.infrastructure.as_ref()
+        } else {
+            physical_worker(prev, &scratch.physical_order, &row.fleet, &row.name)
+                .and_then(|old| old.infrastructure.as_ref())
+        };
+        if row.infrastructure.as_ref() != status {
+            row.infrastructure = status.cloned();
+        }
+        true
+    });
     cur.instances.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 }
 
-/// Fills the fields of one unconnected instance row; its name is already in `row`.
-fn fill_instance(row: &mut Instance, pass: &FleetPass, instance: &FleetInstance, position: usize) {
-    name::write_of::<name::Fleets>(&mut row.fleet, &pass.policy.name);
-    row.lifecycle = Lifecycle::from(instance.lifecycle);
-    row.launch_time = instance.launched_at;
-    row.past_boot_grace = pass.past_boot_grace.get(position).is_some_and(|&past| past);
-}
-
-/// Fills one row per fleet, in declaration order, from the pass outlook.
-fn fill_fleets(cur: &mut State, fleets: &[FleetPass], catalog: &FleetCatalog) {
-    refill(
-        &mut cur.fleets,
-        fleets.iter().zip(catalog.fleets()),
-        |row, (pass, properties)| {
-            fill_fleet(row, pass, properties);
-            true
-        },
-    );
+/// Finds any prior worker on a physical instance, regardless of worker generation.
+fn physical_worker<'a>(
+    prev: &'a State,
+    order: &[usize],
+    fleet: &str,
+    instance: &str,
+) -> Option<&'a Worker> {
+    order.binary_search_by(|&index| {
+        let worker = &prev.workers[index];
+        (worker.fleet.as_str(), worker.instance.as_str()).cmp(&(fleet, instance))
+    }).ok().map(|index| &prev.workers[order[index]])
 }
 
 /// Overwrites one fleet row from its policy, supply, and outlook. The properties are rebuilt only
@@ -604,26 +904,9 @@ fn fill_fleet(row: &mut Fleet, pass: &FleetPass, properties: &FleetProperties) {
         max_drain_wait: policy.max_drain_wait,
         boot_grace: policy.boot_grace,
     };
-    row.desired = pass.supply.requested.unwrap_or(pass.supply.desired);
-    if let Some(failure) = &pass.supply.launch_failure {
-        row.launch_failure
-            .get_or_insert_with(|| gang_wire::LaunchFailure {
-                reason: String::new(),
-            })
-            .reason
-            .clone_from(&failure.reason);
-    } else {
-        row.launch_failure = None;
-    }
-    row.instances = instance_counts(&pass.supply);
-    row.workers = WorkerCounts {
-        busy: pass.outlook.workers.busy,
-        idle: pass.outlook.workers.idle,
-        draining: pass.outlook.workers.draining,
-        unconnected: pass.outlook.workers.unconnected,
-    };
+    let running = row.demand.running;
     row.demand = Demand {
-        running: pass.outlook.workers.running,
+        running,
         queued: pass.outlook.queued,
         candidates: pass.outlook.candidates,
         needed: pass.outlook.needed,
@@ -665,23 +948,6 @@ fn same_properties(row: &BTreeMap<String, String>, properties: &FleetProperties)
             .all(|(key, value)| row.get(key).is_some_and(|held| held.as_str() == value))
 }
 
-/// Fills the queue counts. Actions no fleet was charged for are unplaceable.
-fn fill_queue(cur: &mut State, fleets: &[FleetPass], snapshot: &SchedulerSnapshot) {
-    let total: u32 = snapshot.queued.len().saturating_into();
-    let charged = fleets
-        .iter()
-        .fold(0_u32, |sum, pass| sum.saturating_add(pass.outlook.queued));
-    cur.queue = Queue {
-        total,
-        unplaceable: total.saturating_sub(charged),
-        oldest_queue_time: snapshot
-            .queued
-            .iter()
-            .map(|action| action.queued_since)
-            .min(),
-    };
-}
-
 /// Fills the sampled actions, dropping the running rows whose worker is no longer in
 /// `cur.workers`. When the controller has no sample, keeps the previous frame's actions as they
 /// are, running rows of vanished workers included: a stale sample is flagged by its own
@@ -691,7 +957,7 @@ fn fill_actions(
     prev: &State,
     inputs: &Inputs<'_>,
     config: &BuilderConfig,
-    running_order: &mut Vec<usize>,
+    scratch: &mut Scratch,
 ) {
     let Some(sample) = inputs.actions else {
         copy_if_changed(&mut cur.actions, &prev.actions);
@@ -706,7 +972,8 @@ fn fill_actions(
         &mut actions.running,
         workers.as_slice(),
         sample,
-        running_order,
+        &mut scratch.running_order,
+        &mut scratch.instance_name,
     );
     fill_queued(&mut actions.queued, sample, inputs);
 }
@@ -728,6 +995,7 @@ fn fill_running(
     workers: &[Worker],
     sample: &ActionsSample,
     order: &mut Vec<usize>,
+    worker_name: &mut String,
 ) {
     let running = &sample.view.running;
     order.clear();
@@ -735,29 +1003,29 @@ fn fill_running(
     order.sort_unstable_by(|&a, &b| {
         name::cmp_of::<name::Actions>(&running[a].info.op, &running[b].info.op)
     });
-    refill(
-        rows,
-        order.iter().map(|&index| &running[index]),
-        |row, action| {
-            name::write_of::<name::Workers>(&mut row.worker, &action.worker);
-            let Some(worker) = find_worker(workers, &row.worker) else {
-                return false;
-            };
-            row.fleet.clone_from(&worker.fleet);
-            name::write_of::<name::Actions>(&mut row.name, &action.info.op);
-            row.digest.clone_from(&action.info.digest);
-            row.target.clone_from(&action.info.target);
-            row.mnemonic.clone_from(&action.info.mnemonic);
-            if let Some(build) = action.info.build {
-                name::write_of::<name::Builds>(&mut row.build, &build);
-            } else {
-                row.build.clear();
-            }
-            row.start_time = action.started;
-            row.priority = action.info.priority;
-            true
-        },
-    );
+    let matched = order.iter().filter_map(|&index| {
+        let action = &running[index];
+        name::write_of::<name::Workers>(worker_name, &action.worker);
+        find_worker(workers, worker_name).map(|worker| (action, worker))
+    });
+    refill(rows, matched, |row, (action, worker)| {
+        row.worker.clone_from(&worker.name);
+        row.fleet.clone_from(&worker.fleet);
+        name::write_of::<name::Actions>(&mut row.name, &action.info.op);
+        row.digest.clone_from(&action.info.digest);
+        row.target.clone_from(&action.info.target);
+        row.mnemonic.clone_from(&action.info.mnemonic);
+        if let Some(build) = action.info.build {
+            name::write_of::<name::Builds>(&mut row.build, &build);
+        } else {
+            row.build.clear();
+        }
+        row.start_time = action.started;
+        row.priority = action.info.priority;
+        row.reservation = Some(reservation(action.info.reservation));
+        row.learned_reservation = action.info.learned_reservation.map(reservation);
+        true
+    });
 }
 
 /// Finds the worker named `name` among `workers`, which is sorted by name.
@@ -789,6 +1057,8 @@ fn fill_queued_row(row: &mut QueuedAction, queued: &QueuedActionView, inputs: &I
     }
     row.queue_time = queued.queued_since;
     row.priority = queued.info.priority;
+    row.reservation = Some(reservation(queued.info.reservation));
+    row.learned_reservation = queued.info.learned_reservation.map(reservation);
     if let Some(refusal) = &queued.refusal {
         let text = row.refusal.get_or_insert_with(String::new);
         text.clear();
@@ -807,4 +1077,12 @@ fn fill_queued_row(row: &mut QueuedAction, queued: &QueuedActionView, inputs: &I
             true
         },
     );
+}
+
+/// Projects ledger resources without deriving or aggregating values.
+fn reservation(resources: ActionResources) -> Reservation {
+    Reservation {
+        cpu_millicores: resources.cpu_millicores,
+        memory: resources.memory.get(),
+    }
 }

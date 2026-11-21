@@ -894,6 +894,8 @@ impl System for ExecSim {
                 phase_time: at,
                 running: 0,
                 slots: None,
+                capacity: None,
+                reserved: None,
                 paused: false,
                 launch_time: at,
                 phases: Vec::new(),

@@ -1,7 +1,60 @@
 diff --git a/tf/toolchains/tofu/toolchain.bzl b/tf/toolchains/tofu/toolchain.bzl
 --- a/tf/toolchains/tofu/toolchain.bzl
 +++ b/tf/toolchains/tofu/toolchain.bzl
-@@ -62,21 +62,23 @@
+@@ -1,6 +1,4 @@
+-load("@rules_tf//tf/toolchains:utils.bzl", "get_sha256sum")
+-
+ def _download_impl(ctx):
+-    ctx.report_progress("Downloading tofu")
++    ctx.report_progress("Preparing OpenTofu")
+ 
+     ctx.template(
+@@ -16,31 +14,17 @@
+ 
+-    file = "tofu_{version}_{os}_{arch}.zip".format(version = ctx.attr.version, os = ctx.attr.os, arch = ctx.attr.arch)
+-
+-    url_template = "https://github.com/opentofu/opentofu/releases/download/v{version}/{file}"
+-    url = url_template.format(version = ctx.attr.version, file = file)
+-
+-    url_sha256sums_template = "https://github.com/opentofu/opentofu/releases/download/v{version}/tofu_{version}_SHA256SUMS"
+-    url_sha256sums = url_sha256sums_template.format(version = ctx.attr.version)
+-
+-    ctx.download(
+-        url = [ url_sha256sums],
+-        output = "sha256sums",
+-    )
+-
+-    data = ctx.read("sha256sums")
+-    sha256sum = get_sha256sum(data, file)
+-    if sha256sum == None or sha256sum == "":
+-        fail("Could not find sha256sum for file {}".format(file))
+-
+-    res = ctx.download_and_extract(
+-        url = url,
+-        sha256 = sha256sum,
+-        type = "zip",
+-        output = "tofu",
+-    )
+-
+-    if not res.success:
+-        fail("!failed to dl: ", url)
++    package = ctx.getenv("GANG_OPENTOFU")
++    if not package:
++        fail("GANG_OPENTOFU is not set; run Bazel inside nix develop")
++    version = ctx.read(package + "/share/opentofu/version").strip()
++    if version != ctx.attr.version:
++        fail("GANG_OPENTOFU version {} does not match required version {}; run Bazel inside nix develop".format(version, ctx.attr.version))
++    checksum = ctx.read(package + "/share/opentofu/sha256").strip()
++    ctx.download(
++        url = "file://" + package + "/bin/tofu",
++        sha256 = checksum,
++        output = "tofu/tofu",
++        executable = True,
++    )
+ 
+     providers = {}
+     for k in ctx.attr.mirror:
+@@ -62,21 +46,23 @@
              "source": elems[0], "version": elems[1],
          }
  
@@ -40,7 +93,7 @@ diff --git a/tf/toolchains/tofu/toolchain.bzl b/tf/toolchains/tofu/toolchain.bzl
  
      return
  
-@@ -87,6 +89,7 @@
+@@ -87,6 +73,7 @@
          "os": attr.string(mandatory = True),
          "arch": attr.string(mandatory = True),
          "mirror": attr.string_dict(mandatory = True),

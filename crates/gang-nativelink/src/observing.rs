@@ -21,7 +21,9 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 };
 use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
 use nativelink_scheduler::worker::{Worker, WorkerTimestamp};
-use nativelink_scheduler::worker_scheduler::{WorkerScheduler, WorkerSummary};
+use nativelink_scheduler::worker_scheduler::{
+    ResourceCapacitySnapshot, WorkerScheduler, WorkerSummary,
+};
 use nativelink_util::action_messages::{
     ActionInfo as NativeActionInfo, ActionResult, ActionStage, ExecutionMetadata, OperationId,
     WorkerId,
@@ -33,9 +35,11 @@ use nativelink_util::operation_state_manager::{
 use nativelink_util::origin_event::OriginMetadata;
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use parking_lot::Mutex;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 
+use crate::acquisition::Acquisition;
 use crate::actions::digest_text;
+use crate::capacity::RuntimeCatalog;
 use crate::cordons::InstanceCordons;
 use crate::durations::ActionDurations;
 use crate::handoff::HandOff;
@@ -54,7 +58,7 @@ pub(crate) struct ObservingWorkerScheduler {
     handoff: HandOff,
     durations: Arc<Mutex<ActionDurations>>,
     clock: Arc<dyn Clock>,
-    fleets: Arc<FleetCatalog>,
+    fleets: Arc<RuntimeCatalog>,
     rates: Arc<SourceRates>,
     cordons: InstanceCordons,
     retiring: RwLock<bool>,
@@ -71,7 +75,8 @@ impl ObservingWorkerScheduler {
         handoff: HandOff,
         durations: Arc<Mutex<ActionDurations>>,
         clock: Arc<dyn Clock>,
-        fleets: Arc<FleetCatalog>,
+        fleets: &Arc<FleetCatalog>,
+        runtime: Arc<RuntimeCatalog>,
         rates: Arc<SourceRates>,
     ) -> Self {
         Self {
@@ -82,8 +87,8 @@ impl ObservingWorkerScheduler {
             handoff,
             durations,
             clock,
-            cordons: InstanceCordons::new(Arc::clone(&fleets)),
-            fleets,
+            cordons: InstanceCordons::new(Arc::clone(fleets)),
+            fleets: runtime,
             rates,
             retiring: RwLock::new(false),
         }
@@ -95,8 +100,9 @@ impl ObservingWorkerScheduler {
         fleet: &FleetName,
         instance: &InstanceId,
         draining: bool,
+        acquisition: &Acquisition<'_>,
     ) -> Result<(), PortError> {
-        let retiring = self.retiring.read().await;
+        let retiring = acquisition.wait(self.retiring.read()).await?;
         if *retiring && !draining {
             return Err(PortError::backend(make_err!(
                 Code::Unavailable,
@@ -104,7 +110,7 @@ impl ObservingWorkerScheduler {
             )));
         }
         self.cordons
-            .set_draining(&*self.inner, fleet, instance, draining)
+            .set_draining(&*self.inner, fleet, instance, draining, acquisition)
             .await
     }
 
@@ -113,8 +119,9 @@ impl ObservingWorkerScheduler {
         now: Tick,
         grace: Duration,
         live: &[(&FleetName, &FleetSupply)],
-    ) {
-        self.cordons.retain(now, grace, live).await;
+        acquisition: &Acquisition<'_>,
+    ) -> Result<(), PortError> {
+        self.cordons.retain(now, grace, live, acquisition).await
     }
 
     pub(crate) async fn cordons_into(&self, into: &mut Vec<InstanceCordon>) {
@@ -258,6 +265,10 @@ impl WorkerScheduler for ObservingWorkerScheduler {
         self.inner.get_platform_property_manager()
     }
 
+    fn resource_capacity_updates(&self) -> Option<watch::Receiver<Arc<ResourceCapacitySnapshot>>> {
+        self.inner.resource_capacity_updates()
+    }
+
     async fn add_worker(&self, mut worker: Worker) -> Result<(), Error> {
         let retiring = self.retiring.read().await;
         if *retiring {
@@ -347,12 +358,9 @@ impl WorkerScheduler for ObservingWorkerScheduler {
         {
             self.completed.fetch_add(1, Ordering::Relaxed);
             let action = operation.as_action_info().await.ok();
+            let fleets = self.fleets.current()?;
             if let Some((info, _)) = &action
-                && let Some(preferred) = self
-                    .fleets
-                    .accepting(|key| info.platform_properties.get(key).map(String::as_str))
-                    .iter()
-                    .next()
+                && let Some(preferred) = crate::snapshot::accepting(info, &fleets).iter().next()
             {
                 let source = self.rates.source(origin.as_ref());
                 self.rates.record(
@@ -650,6 +658,7 @@ mod tests {
     fn test_action_info() -> Arc<ActionInfo> {
         let digest = DigestInfo::new([3; 32], 30);
         Arc::new(ActionInfo {
+            memory_reservation: None,
             command_digest: digest,
             input_root_digest: digest,
             timeout: Duration::from_mins(1),
@@ -657,6 +666,7 @@ mod tests {
                 gang_types::property::ACTION_ENVIRONMENT.to_owned(),
                 "host:test".to_owned(),
             )]),
+            pre_fit_reservation: None,
             priority: 0,
             load_timestamp: SystemTime::UNIX_EPOCH,
             insert_timestamp: SystemTime::UNIX_EPOCH,
@@ -728,7 +738,8 @@ mod tests {
                 HandOff::new(),
                 test_durations(),
                 test_clock(),
-                test_fleets(),
+                &test_fleets(),
+                crate::capacity::test_catalog((*test_fleets()).clone()),
                 test_rates(),
             );
             let forwarded = scheduler
@@ -853,7 +864,8 @@ mod tests {
                 HandOff::new(),
                 test_durations(),
                 test_clock(),
-                test_fleets(),
+                &test_fleets(),
+                crate::capacity::test_catalog((*test_fleets()).clone()),
                 test_rates(),
             );
             scheduler
@@ -965,7 +977,8 @@ mod tests {
                 HandOff::new(),
                 Arc::clone(&durations),
                 clock.clone(),
-                test_fleets(),
+                &test_fleets(),
+                crate::capacity::test_catalog((*test_fleets()).clone()),
                 Arc::clone(&rates),
             );
             let duplicate = result.clone();
@@ -1108,6 +1121,12 @@ mod tests {
     impl WorkerScheduler for RecordingScheduler {
         fn get_platform_property_manager(&self) -> &PlatformPropertyManager {
             &self.manager
+        }
+
+        fn resource_capacity_updates(
+            &self,
+        ) -> Option<watch::Receiver<Arc<ResourceCapacitySnapshot>>> {
+            None
         }
 
         async fn add_worker(&self, worker: Worker) -> Result<(), Error> {
@@ -1266,6 +1285,7 @@ mod tests {
                 platform_properties: HashMap::new(),
                 available_platform_properties: HashMap::new(),
                 free_memory_kb: None,
+                latest_attempt_deadline: None,
             }]
         }
 
@@ -1295,7 +1315,8 @@ mod tests {
             HandOff::new(),
             test_durations(),
             test_clock(),
-            test_fleets(),
+            &test_fleets(),
+            crate::capacity::test_catalog((*test_fleets()).clone()),
             test_rates(),
         );
         (inner, counting, completed)
@@ -1322,8 +1343,7 @@ mod tests {
             .expect("self drain");
         scheduler.cordons_into(&mut cordons).await;
         assert!(cordons.is_empty());
-        scheduler
-            .set_draining(&fleet, &instance, true)
+        scheduler.set_draining(&fleet, &instance, true, crate::acquisition::test_acquisition())
             .await
             .expect("controller cordon");
         scheduler.cordons_into(&mut cordons).await;
@@ -1339,8 +1359,7 @@ mod tests {
                 .iter()
                 .all(|worker| worker.is_draining)
         );
-        scheduler
-            .set_draining(&fleet, &instance, false)
+        scheduler.set_draining(&fleet, &instance, false, crate::acquisition::test_acquisition())
             .await
             .expect("controller cancel");
         let workers = inner.worker_snapshot().await;
@@ -1356,8 +1375,7 @@ mod tests {
         *inner.workers.lock() = Some(Vec::new());
         let fleet = FleetName::try_new("fleet-a").expect("fleet");
         let instance = InstanceId::try_new("local-1").expect("instance");
-        scheduler
-            .set_draining(&fleet, &instance, true)
+        scheduler.set_draining(&fleet, &instance, true, crate::acquisition::test_acquisition())
             .await
             .expect("unconnected cordon");
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);

@@ -83,6 +83,6 @@ pub use state::{
     Actions, BucketUsage, Cache, CacheStore, Connections, Demand, Fleet, InfrastructurePhase,
     InfrastructureReason, InfrastructureStatus, Instance, InstanceCounts, InstanceSize,
     LaunchFailure, Lifecycle, Named, Pass, PassState, Phase, PhaseSpan, Policy, Queue,
-    QueuedAction, Recent, RunningAction, Sample, SkipReason, State, StoreUsage, Truncated, Worker,
-    WorkerCounts,
+    QueuedAction, Recent, Reservation, RunningAction, Sample, SkipReason, State, StoreUsage,
+    Truncated, Worker, WorkerCounts,
 };

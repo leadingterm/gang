@@ -61,24 +61,25 @@ pub enum WorkerError {
         /// worker's own fast content store, less the fast content store's budget.
         measured: Bytes,
     },
-    /// The prepared action memory pool is smaller than the fleet's declared memory.
-    #[error(
-        "fleet `{fleet}` declares memory_per_instance {declared}, but this worker's action memory pool has capacity {capacity} after reserve {reserve}"
-    )]
-    #[fix(
-        "lower memory_per_instance of fleet `{}` to at most {}, reduce actions.memory.reserve, or give its instances more memory",
-        fleet,
-        capacity
-    )]
-    FleetMemoryUnavailable {
-        /// The fleet of the instance.
-        fleet: FleetName,
-        /// The fleet's declared `memory_per_instance`.
-        declared: Bytes,
-        /// The prepared action pool's actual capacity.
-        capacity: Bytes,
+    /// The memory reserve leaves no physical memory for actions.
+    #[error("actions.memory.reserve {reserve} exhausts physical memory {physical}")]
+    #[fix("reduce actions.memory.reserve or give the instance more memory")]
+    MemoryReserveExhausted {
+        /// Physical memory reported by the operating system.
+        physical: Bytes,
         /// The memory reserved outside the action pool.
         reserve: Bytes,
+    },
+    /// The actual action memory capacity cannot satisfy the minimum reservation.
+    #[error("action memory capacity {capacity} is below actions.memory.min_reservation {minimum}")]
+    #[fix(
+        "lower actions.memory.min_reservation or actions.memory.reserve, or give the instance more memory"
+    )]
+    MemoryBelowMinimum {
+        /// Actual memory available for actions.
+        capacity: Bytes,
+        /// Minimum memory reservation for an action.
+        minimum: Bytes,
     },
     /// A provisioner, cache, sandbox, or limits port failed.
     #[error("a provisioner, cache, sandbox, or limits port failed")]
@@ -149,11 +150,13 @@ mod tests {
                 declared: Bytes::gib(10),
                 measured: Bytes::gib(5),
             },
-            WorkerError::FleetMemoryUnavailable {
-                fleet: fleet("linux-arm64"),
-                declared: Bytes::gib(8),
-                capacity: Bytes::gib(7),
-                reserve: Bytes::gib(2),
+            WorkerError::MemoryReserveExhausted {
+                physical: Bytes::gib(8),
+                reserve: Bytes::gib(8),
+            },
+            WorkerError::MemoryBelowMinimum {
+                capacity: Bytes::mib(4),
+                minimum: Bytes::mib(8),
             },
             WorkerError::Port(PortError::backend(CAUSE)),
             WorkerError::Enroll(EnrollError::new(io::Error::other(CAUSE))),
@@ -228,27 +231,37 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_memory_names_values_and_operator_fix() {
-        let error = WorkerError::FleetMemoryUnavailable {
-            fleet: fleet("linux-arm64"),
-            declared: Bytes::gib(8),
-            capacity: Bytes::gib(7),
-            reserve: Bytes::gib(2),
+    fn exhausted_memory_names_values_and_operator_fix() {
+        let error = WorkerError::MemoryReserveExhausted {
+            physical: Bytes::gib(8),
+            reserve: Bytes::gib(9),
         };
         let message = error.to_string();
-        for value in [
-            "linux-arm64".to_owned(),
-            "memory_per_instance".to_owned(),
-            Bytes::gib(8).to_string(),
-            Bytes::gib(7).to_string(),
-            Bytes::gib(2).to_string(),
-        ] {
-            assert!(message.contains(&value), "{message}");
-        }
-        let fix = fix_of(&error).expect("memory failure has an operator fix");
-        assert!(fix.contains("linux-arm64"));
-        assert!(fix.contains("actions.memory.reserve"));
-        assert!(fix.contains(&Bytes::gib(7).to_string()));
+        assert!(message.contains("actions.memory.reserve"));
+        assert!(message.contains(&Bytes::gib(8).to_string()));
+        assert!(message.contains(&Bytes::gib(9).to_string()));
+        assert_eq!(
+            fix_of(&error).as_deref(),
+            Some("reduce actions.memory.reserve or give the instance more memory")
+        );
+    }
+
+    #[test]
+    fn below_minimum_memory_names_values_and_operator_fix() {
+        let error = WorkerError::MemoryBelowMinimum {
+            capacity: Bytes::mib(4),
+            minimum: Bytes::mib(8),
+        };
+        let message = error.to_string();
+        assert!(message.contains("actions.memory.min_reservation"));
+        assert!(message.contains(&Bytes::mib(4).to_string()));
+        assert!(message.contains(&Bytes::mib(8).to_string()));
+        assert_eq!(
+            fix_of(&error).as_deref(),
+            Some(
+                "lower actions.memory.min_reservation or actions.memory.reserve, or give the instance more memory"
+            )
+        );
     }
 
     #[test]

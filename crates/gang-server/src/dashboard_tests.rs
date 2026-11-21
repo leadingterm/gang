@@ -377,16 +377,7 @@ async fn snapshot_carries_the_recent_window_after_completions() {
             let gang_wire::Frame::Snapshot(initial) = decode_sse(first.as_bytes()) else {
                 panic!("first frame is a snapshot");
             };
-            if initial.recent.samples.is_empty() {
-                loop {
-                    let text = next_text(&mut stream).await.expect("initial pass");
-                    if let gang_wire::Frame::Delta(delta) = decode_sse(text.as_bytes())
-                        && delta.recent.is_some()
-                    {
-                        break;
-                    }
-                }
-            }
+            wait_for_initial_observation(&mut stream, &initial.recent).await;
 
             for completed in [4, 9, 15] {
                 scheduler.set_snapshot(SchedulerSnapshot {
@@ -445,6 +436,28 @@ async fn snapshot_carries_the_recent_window_after_completions() {
         },
     )
     .await;
+}
+
+async fn wait_for_initial_observation(body: &mut ApiResponseBody, initial: &gang_wire::Recent) {
+    if initial
+        .samples
+        .last()
+        .is_none_or(|sample| sample.scheduler_known != Some(true))
+    {
+        loop {
+            let text = next_text(body).await.expect("initial observation");
+            if let gang_wire::Frame::Delta(delta) = decode_sse(text.as_bytes())
+                && delta.recent.as_ref().is_some_and(|recent| {
+                    recent
+                        .samples
+                        .last()
+                        .is_some_and(|sample| sample.scheduler_known == Some(true))
+                })
+            {
+                break;
+            }
+        }
+    }
 }
 
 /// The next frame of `body` as text, or `None` when the body ends or fails.

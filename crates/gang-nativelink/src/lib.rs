@@ -27,7 +27,9 @@
 
 #![recursion_limit = "256"]
 
+mod acquisition;
 mod actions;
+mod capacity;
 mod config;
 mod controller;
 mod cordons;

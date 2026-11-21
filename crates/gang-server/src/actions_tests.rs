@@ -25,6 +25,8 @@ fn queued(op: &str) -> QueuedActionView {
             mnemonic: "Javac".to_owned(),
             priority: 0,
             build: None,
+            reservation: gang_types::ActionResources::default(),
+            learned_reservation: None,
         },
         queued_since: Timestamp::UNIX_EPOCH,
         candidates: FleetSet::EMPTY,

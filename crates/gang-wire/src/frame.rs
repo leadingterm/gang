@@ -107,6 +107,9 @@ pub struct Delta {
     /// A new scheduling pass outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass: Option<Pass>,
+    /// Current scheduler availability, when changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_known: Option<bool>,
     /// A new action queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<Queue>,
@@ -160,6 +163,7 @@ impl Delta {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pass.is_none()
+            && self.scheduler_known.is_none()
             && self.queue.is_none()
             && self.cache.is_none()
             && self.connections.is_none()

@@ -14,6 +14,8 @@ use nativelink_util::action_messages::WorkerId as NativeWorkerId;
 use nativelink_util::platform_properties::PlatformPropertyValue;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use crate::acquisition::Acquisition;
+
 struct Entry {
     id: Arc<InstanceId>,
     present: bool,
@@ -118,11 +120,13 @@ impl InstanceCordons {
         fleet: &FleetName,
         instance: &InstanceId,
         draining: bool,
+        acquisition: &Acquisition<'_>,
     ) -> Result<(), PortError> {
         let fleet_index = self.fleet_index(fleet.as_str()).ok_or_else(|| {
             PortError::config(make_err!(Code::InvalidArgument, "unknown fleet {fleet}"))
         })?;
-        let mut state = self.state.write().await;
+        let mut state = acquisition.wait(self.state.write()).await?;
+        let workers = acquisition.wait(inner.worker_snapshot()).await?;
         let position = state.fleets[fleet_index]
             .binary_search_by(|entry| entry.id.as_str().cmp(instance.as_str()));
         let position = match (position, draining) {
@@ -140,7 +144,7 @@ impl InstanceCordons {
                 position
             }
         };
-        for worker in inner.worker_snapshot().await {
+        for worker in workers {
             if worker
                 .platform_properties
                 .get(property::FLEET)
@@ -229,8 +233,9 @@ impl InstanceCordons {
         now: Tick,
         grace: Duration,
         live: &[(&FleetName, &FleetSupply)],
-    ) {
-        let mut state = self.state.write().await;
+        acquisition: &Acquisition<'_>,
+    ) -> Result<(), PortError> {
+        let mut state = acquisition.wait(self.state.write()).await?;
         for entries in &mut state.fleets {
             for entry in entries {
                 entry.present = false;
@@ -262,6 +267,7 @@ impl InstanceCordons {
                 now < absent || now.saturating_duration_since(absent) < grace
             });
         }
+        Ok(())
     }
 
     /// Copies sorted unique controller intents, reusing the destination vector and Arc slots.
@@ -390,6 +396,16 @@ mod tests {
             &self.manager
         }
 
+        fn resource_capacity_updates(
+            &self,
+        ) -> Option<
+            tokio::sync::watch::Receiver<
+                Arc<nativelink_scheduler::worker_scheduler::ResourceCapacitySnapshot>,
+            >,
+        > {
+            None
+        }
+
         async fn add_worker(&self, worker: Worker) -> Result<(), Error> {
             let properties = worker
                 .total_platform_properties
@@ -407,6 +423,7 @@ mod tests {
                 platform_properties: properties,
                 available_platform_properties: HashMap::new(),
                 free_memory_kb: None,
+                latest_attempt_deadline: None,
             });
             Ok(())
         }
@@ -613,8 +630,7 @@ mod tests {
         ] {
             admit(&cordons, &inner, fleet, worker).await?;
         }
-        cordons
-            .set_draining(&inner, &fleet, &instance, true)
+        cordons.set_draining(&inner, &fleet, &instance, true, crate::acquisition::test_acquisition())
             .await?;
         assert_eq!(inner.draining(&old), Some(true));
         assert_eq!(inner.draining(&new), Some(true));
@@ -635,13 +651,7 @@ mod tests {
     async fn disconnected_physical_intent_gates_later_admission() -> TestResult {
         let cordons = InstanceCordons::new(catalog()?);
         let inner = Scheduler::new();
-        cordons
-            .set_draining(
-                &inner,
-                &FleetName::try_new("alpha")?,
-                &InstanceId::try_new("host")?,
-                true,
-            )
+        cordons.set_draining(&inner, &FleetName::try_new("alpha")?, &InstanceId::try_new("host")?, true, crate::acquisition::test_acquisition())
             .await?;
         let later = id("host", 1);
         admit(&cordons, &inner, "alpha", later.clone()).await?;
@@ -657,12 +667,11 @@ mod tests {
         let instance = InstanceId::try_new("host")?;
         let old = id("host", 1);
         admit(&cordons, &inner, "alpha", old.clone()).await?;
-        cordons
-            .set_draining(&inner, &fleet, &instance, true)
+        cordons.set_draining(&inner, &fleet, &instance, true, crate::acquisition::test_acquisition())
             .await?;
         let gate = Arc::new(Gate::default());
         inner.workers.lock().update_gate = Some(Arc::clone(&gate));
-        let cancel = cordons.set_draining(&inner, &fleet, &instance, false);
+        let cancel = cordons.set_draining(&inner, &fleet, &instance, false, crate::acquisition::test_acquisition());
         tokio::pin!(cancel);
         assert!(futures::poll!(cancel.as_mut()).is_pending());
         let entered = gate.entered.notified();
@@ -678,8 +687,7 @@ mod tests {
         assert_eq!(inner.draining(&old), Some(false));
         assert_eq!(inner.draining(&incoming), Some(false));
 
-        cordons
-            .set_draining(&inner, &fleet, &instance, true)
+        cordons.set_draining(&inner, &fleet, &instance, true, crate::acquisition::test_acquisition())
             .await?;
         let incoming = id("host", 3);
         let mut worker = worker(
@@ -688,7 +696,7 @@ mod tests {
         );
         let admission = cordons.admission(&inner, &mut worker).await;
         assert!(worker.is_draining);
-        let cancel = cordons.set_draining(&inner, &fleet, &instance, false);
+        let cancel = cordons.set_draining(&inner, &fleet, &instance, false, crate::acquisition::test_acquisition());
         tokio::pin!(cancel);
         assert!(futures::poll!(cancel.as_mut()).is_pending());
         inner.add_worker(worker).await?;
@@ -712,18 +720,15 @@ mod tests {
         assert!(snapshot(&cordons).await.is_empty());
         admit(&cordons, &inner, "alpha", new.clone()).await?;
         assert_eq!(inner.draining(&new), Some(false));
-        cordons
-            .set_draining(&inner, &fleet, &instance, true)
+        cordons.set_draining(&inner, &fleet, &instance, true, crate::acquisition::test_acquisition())
             .await?;
         cordons.set_worker_draining(&inner, &new, false).await?;
         assert_eq!(inner.draining(&new), Some(true));
-        cordons
-            .set_draining(&inner, &fleet, &instance, false)
+        cordons.set_draining(&inner, &fleet, &instance, false, crate::acquisition::test_acquisition())
             .await?;
         assert_eq!(inner.draining(&old), Some(true));
         assert_eq!(inner.draining(&new), Some(false));
-        cordons
-            .set_draining(&inner, &fleet, &instance, false)
+        cordons.set_draining(&inner, &fleet, &instance, false, crate::acquisition::test_acquisition())
             .await?;
         assert_eq!(inner.draining(&old), Some(true));
         cordons.set_worker_draining(&inner, &old, false).await?;
@@ -749,8 +754,7 @@ mod tests {
         assert_eq!(inner.draining(&first), Some(true));
         assert_eq!(inner.draining(&second), Some(false));
         assert_eq!(snapshot(&cordons).await.len(), 1);
-        cordons
-            .set_draining(&inner, &fleet, &instance, true)
+        cordons.set_draining(&inner, &fleet, &instance, true, crate::acquisition::test_acquisition())
             .await?;
         inner.fail(&second, Failure::Connected);
         assert!(
@@ -763,8 +767,7 @@ mod tests {
         let late = id("host", 3);
         admit(&cordons, &inner, "alpha", late.clone()).await?;
         assert_eq!(inner.draining(&late), Some(true));
-        cordons
-            .set_draining(&inner, &fleet, &instance, false)
+        cordons.set_draining(&inner, &fleet, &instance, false, crate::acquisition::test_acquisition())
             .await?;
         assert!(snapshot(&cordons).await.is_empty());
         for worker in [&first, &second, &late] {
@@ -783,8 +786,7 @@ mod tests {
             let worker = id("host", u8::from(draining));
             admit(&cordons, &inner, "alpha", worker.clone()).await?;
             inner.fail(&worker, Failure::Disappeared);
-            cordons
-                .set_draining(&inner, &fleet, &instance, draining)
+            cordons.set_draining(&inner, &fleet, &instance, draining, crate::acquisition::test_acquisition())
                 .await?;
             assert_eq!(inner.draining(&worker), None);
             assert_eq!(snapshot(&cordons).await.len(), usize::from(draining));
@@ -801,13 +803,7 @@ mod tests {
         admit(&engine_registry, &inner, "alpha", worker.clone()).await?;
         {
             let consumer = Arc::clone(&engine_registry);
-            consumer
-                .set_draining(
-                    &inner,
-                    &FleetName::try_new("alpha")?,
-                    &InstanceId::try_new("host")?,
-                    true,
-                )
+            consumer.set_draining(&inner, &FleetName::try_new("alpha")?, &InstanceId::try_new("host")?, true, crate::acquisition::test_acquisition())
                 .await?;
         }
         let replacement = Arc::clone(&engine_registry);
@@ -830,13 +826,12 @@ mod tests {
         let instance = InstanceId::try_new("host")?;
         let grace = Duration::from_secs(10);
         for fleet in [&alpha, &beta] {
-            cordons.set_draining(&inner, fleet, &instance, true).await?;
+            cordons.set_draining(&inner, fleet, &instance, true, crate::acquisition::test_acquisition()).await?;
         }
         let beta_supply = supplied(&instance, InstanceLifecycle::Terminating);
         let live = [(&beta, &beta_supply)];
-        cordons.retain(Tick::ORIGIN, grace, &live).await;
-        cordons
-            .retain(Tick::ORIGIN + Duration::from_secs(9), grace, &live)
+        cordons.retain(Tick::ORIGIN, grace, &live, crate::acquisition::test_acquisition()).await;
+        cordons.retain(Tick::ORIGIN + Duration::from_secs(9), grace, &live, crate::acquisition::test_acquisition())
             .await;
         assert_eq!(snapshot(&cordons).await.len(), 2);
         let alpha_supply = supplied(&instance, InstanceLifecycle::Pending);
@@ -846,22 +841,17 @@ mod tests {
             (&beta, &beta_supply),
             (&alpha, &old_generation),
         ];
-        cordons
-            .retain(Tick::ORIGIN + grace, grace, &all_generations)
+        cordons.retain(Tick::ORIGIN + grace, grace, &all_generations, crate::acquisition::test_acquisition())
             .await;
-        cordons
-            .retain(Tick::ORIGIN + Duration::from_secs(11), grace, &live)
+        cordons.retain(Tick::ORIGIN + Duration::from_secs(11), grace, &live, crate::acquisition::test_acquisition())
             .await;
         // Reissuing an existing physical intent must not restart its absence timer.
-        cordons
-            .set_draining(&inner, &alpha, &instance, true)
+        cordons.set_draining(&inner, &alpha, &instance, true, crate::acquisition::test_acquisition())
             .await?;
-        cordons
-            .retain(Tick::ORIGIN + Duration::from_secs(20), grace, &live)
+        cordons.retain(Tick::ORIGIN + Duration::from_secs(20), grace, &live, crate::acquisition::test_acquisition())
             .await;
         assert_eq!(snapshot(&cordons).await.len(), 2);
-        cordons
-            .retain(Tick::ORIGIN + Duration::from_secs(21), grace, &live)
+        cordons.retain(Tick::ORIGIN + Duration::from_secs(21), grace, &live, crate::acquisition::test_acquisition())
             .await;
         let remaining = snapshot(&cordons).await;
         assert_eq!(remaining.len(), 1);
@@ -879,7 +869,7 @@ mod tests {
         let serving = InstanceId::try_new("serving")?;
         let terminating = InstanceId::try_new("terminating")?;
         for instance in [&pending, &serving, &terminating] {
-            cordons.set_draining(&inner, &fleet, instance, true).await?;
+            cordons.set_draining(&inner, &fleet, instance, true, crate::acquisition::test_acquisition()).await?;
         }
         let mut supply = supplied(&pending, InstanceLifecycle::Pending);
         supply
@@ -889,8 +879,8 @@ mod tests {
             .instances
             .extend(supplied(&terminating, InstanceLifecycle::Terminating).instances);
         let live = [(&fleet, &supply)];
-        cordons.retain(Tick::ORIGIN, Duration::ZERO, &live).await;
-        let retention = cordons.retain(Tick::from_elapsed(Duration::MAX), Duration::ZERO, &live);
+        cordons.retain(Tick::ORIGIN, Duration::ZERO, &live, crate::acquisition::test_acquisition()).await;
+        let retention = cordons.retain(Tick::from_elapsed(Duration::MAX), Duration::ZERO, &live, crate::acquisition::test_acquisition());
         assert_send(&retention);
         tokio::pin!(retention);
         let mut context = Context::from_waker(futures::task::noop_waker_ref());
@@ -908,28 +898,21 @@ mod tests {
         let inner = Scheduler::new();
         let fleet = FleetName::try_new("alpha")?;
         let instance = InstanceId::try_new("host")?;
-        cordons
-            .set_draining(&inner, &fleet, &instance, true)
+        cordons.set_draining(&inner, &fleet, &instance, true, crate::acquisition::test_acquisition())
             .await?;
         let maximum = Tick::from_elapsed(Duration::MAX);
-        cordons.retain(maximum, Duration::MAX, &[]).await;
-        cordons.retain(Tick::ORIGIN, Duration::ZERO, &[]).await;
+        cordons.retain(maximum, Duration::MAX, &[], crate::acquisition::test_acquisition()).await;
+        cordons.retain(Tick::ORIGIN, Duration::ZERO, &[], crate::acquisition::test_acquisition()).await;
         assert_eq!(snapshot(&cordons).await.len(), 1);
-        cordons.retain(maximum, Duration::ZERO, &[]).await;
+        cordons.retain(maximum, Duration::ZERO, &[], crate::acquisition::test_acquisition()).await;
         assert!(snapshot(&cordons).await.is_empty());
-        cordons
-            .set_draining(&inner, &fleet, &instance, true)
+        cordons.set_draining(&inner, &fleet, &instance, true, crate::acquisition::test_acquisition())
             .await?;
-        cordons.retain(Tick::ORIGIN, Duration::MAX, &[]).await;
-        cordons
-            .retain(
-                Tick::from_elapsed(Duration::MAX.saturating_sub(Duration::from_nanos(1))),
-                Duration::MAX,
-                &[],
-            )
+        cordons.retain(Tick::ORIGIN, Duration::MAX, &[], crate::acquisition::test_acquisition()).await;
+        cordons.retain(Tick::from_elapsed(Duration::MAX.saturating_sub(Duration::from_nanos(1))), Duration::MAX, &[], crate::acquisition::test_acquisition())
             .await;
         assert_eq!(snapshot(&cordons).await.len(), 1);
-        cordons.retain(maximum, Duration::MAX, &[]).await;
+        cordons.retain(maximum, Duration::MAX, &[], crate::acquisition::test_acquisition()).await;
         assert!(snapshot(&cordons).await.is_empty());
         Ok(())
     }
@@ -1017,11 +1000,9 @@ mod tests {
         inner.fail(&uncertain, Failure::Applied);
         let error = cordons.set_worker_draining(&inner, &uncertain, true).await;
         assert!(matches!(error, Err(error) if error.code == Code::Internal));
-        cordons
-            .set_draining(&inner, &fleet, &instance, true)
+        cordons.set_draining(&inner, &fleet, &instance, true, crate::acquisition::test_acquisition())
             .await?;
-        cordons
-            .set_draining(&inner, &fleet, &instance, false)
+        cordons.set_draining(&inner, &fleet, &instance, false, crate::acquisition::test_acquisition())
             .await?;
         assert_eq!(inner.draining(&preset), Some(true));
         assert_eq!(inner.draining(&uncertain), Some(true));
@@ -1033,13 +1014,7 @@ mod tests {
     async fn unmanaged_or_invalid_raw_identity_does_not_inherit_controller_intent() -> TestResult {
         let cordons = InstanceCordons::new(catalog()?);
         let inner = Scheduler::new();
-        cordons
-            .set_draining(
-                &inner,
-                &FleetName::try_new("alpha")?,
-                &InstanceId::try_new("host")?,
-                true,
-            )
+        cordons.set_draining(&inner, &FleetName::try_new("alpha")?, &InstanceId::try_new("host")?, true, crate::acquisition::test_acquisition())
             .await?;
         for (fleet, id) in [
             (
@@ -1074,13 +1049,7 @@ mod tests {
             ("alpha", "a"),
             ("alpha", "z"),
         ] {
-            cordons
-                .set_draining(
-                    &inner,
-                    &FleetName::try_new(fleet)?,
-                    &InstanceId::try_new(instance)?,
-                    true,
-                )
+            cordons.set_draining(&inner, &FleetName::try_new(fleet)?, &InstanceId::try_new(instance)?, true, crate::acquisition::test_acquisition())
                 .await?;
         }
         let mut output = snapshot(&cordons).await;
@@ -1112,13 +1081,7 @@ mod tests {
                 .zip(&identity)
                 .all(|(entry, id)| Arc::ptr_eq(&entry.instance, id))
         );
-        cordons
-            .set_draining(
-                &inner,
-                &FleetName::try_new("alpha")?,
-                &InstanceId::try_new("a")?,
-                false,
-            )
+        cordons.set_draining(&inner, &FleetName::try_new("alpha")?, &InstanceId::try_new("a")?, false, crate::acquisition::test_acquisition())
             .await?;
         cordons.snapshot_into(&mut output).await;
         assert_eq!(output.len(), 2);
@@ -1131,13 +1094,7 @@ mod tests {
     async fn warmed_admission_uses_borrowed_identity_without_allocations() -> TestResult {
         let cordons = InstanceCordons::new(catalog()?);
         let inner = Scheduler::new();
-        cordons
-            .set_draining(
-                &inner,
-                &FleetName::try_new("alpha")?,
-                &InstanceId::try_new("host")?,
-                true,
-            )
+        cordons.set_draining(&inner, &FleetName::try_new("alpha")?, &InstanceId::try_new("host")?, true, crate::acquisition::test_acquisition())
             .await?;
         let mut incoming = worker(
             PlatformPropertyValue::Exact("alpha".to_owned()),

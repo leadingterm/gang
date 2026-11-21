@@ -867,6 +867,7 @@ impl SchedulerPort for FakeScheduler {
         into.source_rates.clone_from(&state.snapshot.source_rates);
         into.source_rates_at = state.snapshot.source_rates_at;
         into.cordons.clone_from(&state.snapshot.cordons);
+        into.fleet_memory.clone_from(&state.snapshot.fleet_memory);
         into.stores.clone_from(&state.snapshot.stores);
         into.workers.clone_from(&state.snapshot.workers);
         into.queued.clone_from(&state.snapshot.queued);
@@ -1317,6 +1318,8 @@ mod tests {
             environment: Some("host:test".parse()?),
             running_actions: 1,
             max_inflight_actions: None,
+            capacity: None,
+            reserved: None,
             draining: false,
             paused: false,
             last_seen: Timestamp::UNIX_EPOCH,
@@ -1350,20 +1353,22 @@ mod tests {
         Ok((queued, executions))
     }
 
-    fn snapshot_capacities(snapshot: &SchedulerSnapshot) -> [usize; 5] {
+    fn snapshot_capacities(snapshot: &SchedulerSnapshot) -> [usize; 6] {
         [
             snapshot.workers.capacity(),
             snapshot.queued.capacity(),
             snapshot.executing.capacity(),
             snapshot.source_rates.capacity(),
             snapshot.cordons.capacity(),
+            snapshot.fleet_memory.capacity(),
         ]
     }
 
     #[tokio::test]
     async fn snapshot_sorts_workers_remaps_executions_and_reuses_buffers() -> TestResult {
         use gang_clock::{Clock, TestClock};
-        use gang_spi::InstanceCordon;
+        use gang_spi::{FleetMemoryCapacity, InstanceCordon};
+        use gang_types::NonZeroBytes;
 
         let scheduler = FakeScheduler::new()?;
         let clock = TestClock::new(Timestamp::UNIX_EPOCH);
@@ -1371,6 +1376,10 @@ mod tests {
         let rates = frame.source_rates;
         let rates_at = frame.source_rates_at;
         let cordons = frame.cordons;
+        let fleet_memory = vec![FleetMemoryCapacity {
+            fleet: 0,
+            capacity: NonZeroBytes::gib(8),
+        }];
         let (queued, executions) = snapshot_demand_fixture()?;
         scheduler.set_snapshot(SchedulerSnapshot {
             workers: vec![snapshot_worker("z")?, snapshot_worker("a")?],
@@ -1379,6 +1388,7 @@ mod tests {
             source_rates: rates.iter().rev().copied().collect(),
             source_rates_at: rates_at,
             cordons: cordons.iter().rev().cloned().collect(),
+            fleet_memory: fleet_memory.clone(),
             ..SchedulerSnapshot::default()
         });
         let mut into = SchedulerSnapshot {
@@ -1387,6 +1397,7 @@ mod tests {
             executing: Vec::with_capacity(8),
             source_rates: Vec::with_capacity(8),
             cordons: Vec::with_capacity(8),
+            fleet_memory: Vec::with_capacity(8),
             ..SchedulerSnapshot::default()
         };
         into.workers.push(snapshot_worker("stale")?);
@@ -1399,6 +1410,10 @@ mod tests {
             fleet: 9,
             instance: Arc::new(InstanceId::try_new("stale")?),
         });
+        into.fleet_memory.push(FleetMemoryCapacity {
+            fleet: 1,
+            capacity: NonZeroBytes::gib(1),
+        });
         let capacities = snapshot_capacities(&into);
         scheduler.snapshot(&mut into).await?;
         assert_eq!(into.workers[0].id, crate::worker_id("a")?);
@@ -1410,6 +1425,7 @@ mod tests {
         assert_eq!(into.source_rates, rates);
         assert_eq!(into.source_rates_at, rates_at);
         assert_eq!(into.cordons, cordons);
+        assert_eq!(into.fleet_memory, fleet_memory);
         assert!(Arc::ptr_eq(&into.cordons[0].instance, &cordons[0].instance));
         scheduler.snapshot(&mut into).await?;
         assert_eq!(
@@ -1420,12 +1436,14 @@ mod tests {
             into.cordons, cordons,
             "a repeated fill must not append intents"
         );
+        assert_eq!(into.fleet_memory, fleet_memory);
         assert_eq!(into.queued, vec![queued.clone()]);
         assert_eq!(snapshot_capacities(&into), capacities);
         scheduler.set_snapshot(SchedulerSnapshot::default());
         scheduler.snapshot(&mut into).await?;
         assert!(into.workers.is_empty() && into.queued.is_empty() && into.executing.is_empty());
         assert!(into.source_rates.is_empty() && into.cordons.is_empty());
+        assert!(into.fleet_memory.is_empty());
         assert_eq!(into.source_rates_at, Tick::ORIGIN);
         let mut expected = executions[1].clone();
         expected.worker = 0;

@@ -159,6 +159,7 @@ fn delta(seq: u64) -> Delta {
         base: seq - 1,
         update_time: Timestamp::from_unix_millis(1_768_471_772_000),
         pass: None,
+        scheduler_known: None,
         queue: None,
         cache: None,
         connections: None,

@@ -18,7 +18,7 @@ const VICTIM_ACTION: &str = "pressure_victim";
 const NEIGHBOUR_ACTION: &str = "pressure_neighbour";
 const VICTIM_KB: u64 = 64 * 1024;
 const NEIGHBOUR_KB: u64 = 320 * 1024;
-const CAPACITY_KB: u64 = 512 * 1024;
+const CAPACITY_KB: u64 = 736 * 1024;
 
 /// Observations used to judge both pressure and subsequent learning.
 #[derive(Debug)]
@@ -67,7 +67,7 @@ pub fn verdicts(evidence: &Evidence<'_>) -> Vec<Check> {
     let retry = victims.get(1).map(|a| a.memory_kb);
     let neighbour = neighbours.first().map(|a| a.memory_kb);
     let required = headroom(peak_kb)
-        .max((u128::from(VICTIM_KB) * 250).div_ceil(100))
+        .max((u128::from(VICTIM_KB) * 700).div_ceil(100))
         .max(u128::from(VICTIM_KB) + 1)
         .min(u128::from(CAPACITY_KB));
     let victim_ok = evidence
