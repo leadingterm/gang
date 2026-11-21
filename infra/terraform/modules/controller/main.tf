@@ -6,7 +6,7 @@ locals {
   group_shape    = var.shape == "group"
   # The image's gang.stateDevice; the role line names it.
   state_device = "/dev/sdg"
-  hook = jsondecode(file("${path.module}/lifecycle-hook.json"))
+  hook         = jsondecode(file("${path.module}/lifecycle-hook.json"))
 }
 
 moved {

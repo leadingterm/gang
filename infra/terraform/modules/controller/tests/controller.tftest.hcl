@@ -623,12 +623,12 @@ run "instance_requires_eip" {
 run "group_uses_ec2_health_for_refresh" {
   command = plan
   variables {
-    shape                  = "group"
-    controller_count       = 2
-    subnet_ids             = ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1"]
-    target_group_arns      = ["arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/serve/0123456789abcdef"]
-    config_digest          = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    dynamodb_table_arn     = "arn:aws:dynamodb:eu-north-1:000000000000:table/gang"
+    shape              = "group"
+    controller_count   = 2
+    subnet_ids         = ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1"]
+    target_group_arns  = ["arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/serve/0123456789abcdef"]
+    config_digest      = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    dynamodb_table_arn = "arn:aws:dynamodb:eu-north-1:000000000000:table/gang"
   }
   assert {
     condition     = aws_autoscaling_group.controller[0].health_check_type == "EC2"

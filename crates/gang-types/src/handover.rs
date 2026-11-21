@@ -49,7 +49,8 @@ pub const fn snapshot_timeout(renew_interval: Duration, call_timeout: Duration) 
 /// Bounds healthy observation, candidate observation, and four handover calls.
 #[must_use]
 pub const fn handover_window(renew_interval: Duration, call_timeout: Duration) -> Duration {
-    health_check().healthy_window()
+    health_check()
+        .healthy_window()
         .saturating_add(renew_interval)
         .saturating_add(call_timeout.saturating_mul(4))
 }
@@ -68,8 +69,14 @@ mod tests {
 
     #[test]
     fn window_uses_all_four_calls_and_saturates() {
-        assert_eq!(handover_window(Duration::from_millis(500), Duration::from_millis(250)), Duration::from_millis(11_500));
+        assert_eq!(
+            handover_window(Duration::from_millis(500), Duration::from_millis(250)),
+            Duration::from_millis(11_500)
+        );
         assert_eq!(handover_window(Duration::MAX, Duration::MAX), Duration::MAX);
-        assert_eq!(snapshot_timeout(Duration::from_secs(2), Duration::from_secs(1)), Duration::from_secs(1));
+        assert_eq!(
+            snapshot_timeout(Duration::from_secs(2), Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
     }
 }

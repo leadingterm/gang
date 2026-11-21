@@ -1,4 +1,4 @@
-//! One-shot previous-client cold mints and canonical workload proof requests.
+//! Previous-client cold mints, unchanged warm sessions, and canonical workload proofs.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -82,6 +82,42 @@ impl ColdHelpers {
     /// does not by itself witness which backend served either mint.
     pub(crate) fn mint_pair(self) -> Result<[String; 2]> {
         Ok([self.mint(0)?, self.mint(1)?])
+    }
+
+    /// Captures the opaque original session without logging in or rewriting its bound proof.
+    pub(crate) fn session_bytes(cli: &GangCli, endpoint: &Url) -> Result<Vec<u8>> {
+        let bytes = fs::read(client_directory(cli.home()).join("session.json"))
+            .map_err(|_| E2eError::system("original workload session unavailable"))?;
+        validate_session(&bytes, endpoint)?;
+        Ok(bytes)
+    }
+
+    /// Reuses the actual old helper home, rejecting any replacement of its original session.
+    pub(crate) fn warm_token(
+        cli: &GangCli,
+        endpoint: &Url,
+        original_session: &[u8],
+        timeout: Duration,
+    ) -> Result<String> {
+        if Self::session_bytes(cli, endpoint)? != original_session {
+            return Err(E2eError::system("original warm workload session changed"));
+        }
+        let request = serde_json::json!({ "uri": endpoint.as_str() }).to_string();
+        let answer = process::run(cli.get(), Some(request.as_bytes()), timeout)?;
+        if !answer.succeeded() {
+            return Err(E2eError::system(
+                "original warm gang get failed; helper output withheld to protect credentials",
+            ));
+        }
+        let token = secured::bearer_of(&answer.stdout).map_err(|_| {
+            E2eError::system("original warm gang get returned no bearer authorization")
+        })?;
+        if Self::session_bytes(cli, endpoint)? != original_session {
+            return Err(E2eError::system(
+                "original warm gang get replaced its session",
+            ));
+        }
+        Ok(token)
     }
 
     /// Builds a canonical proof request from the original session and current bound proof.
@@ -226,7 +262,6 @@ fn helper_failure(stderr: &str) -> String {
     format!("helper_stage=server_response; helper_http_status={status}")
 }
 
-
 fn authentication_body(provider: &ProviderName, source: &ProofSource) -> Result<Bytes> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -242,7 +277,6 @@ fn authentication_body(provider: &ProviderName, source: &ProofSource) -> Result<
     .map(Bytes::from)
     .map_err(|_| E2eError::system("serializing the authentication request unavailable"))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -284,6 +318,31 @@ mod tests {
         .expect("the old rc exists");
         let cli = GangCli::new(root.join("previous-gang"), root.join("previous.toml"), home);
         (cli, endpoint, session)
+    }
+
+    #[test]
+    fn warm_reuse_rejects_a_replaced_session_before_running_the_old_helper() {
+        let root = private_tempdir();
+        let (cli, endpoint, session) = stored_client(root.path());
+        assert_eq!(
+            ColdHelpers::session_bytes(&cli, &endpoint).expect("original session is readable"),
+            session,
+        );
+        let mut changed = session.clone();
+        changed.push(b'\n');
+        fs::write(client_directory(cli.home()).join("session.json"), changed)
+            .expect("replace session without changing its parsed content");
+        let error = ColdHelpers::warm_token(&cli, &endpoint, &session, Duration::from_secs(1))
+            .expect_err("even a byte-level session replacement must fail before helper execution");
+        assert!(
+            error
+                .to_string()
+                .contains("original warm workload session changed")
+        );
+        assert_eq!(
+            fs::read_to_string(cli.home().join("proof.jwt")).expect("original proof remains"),
+            "original proof with unchanged lifetime",
+        );
     }
 
     #[test]
@@ -570,7 +629,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn refusal_request_reads_rotated_proof_with_canonical_wire_semantics() {
         let root = private_tempdir();
@@ -605,5 +663,4 @@ mod tests {
             "original cached bearer"
         );
     }
-
 }

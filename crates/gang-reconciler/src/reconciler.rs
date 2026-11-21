@@ -374,7 +374,11 @@ impl Reconciler {
             let mut census = Census::default();
             for (position, instance) in fleet.supply.instances.iter().enumerate() {
                 let protected = fleet.handover_protected.binary_search(&instance.id).is_ok()
-                    && pass.hosted.workers_on(&fleet.policy.name, &instance.id).next().is_none();
+                    && pass
+                        .hosted
+                        .workers_on(&fleet.policy.name, &instance.id)
+                        .next()
+                        .is_none();
                 if instance.lifecycle == InstanceLifecycle::Terminating && !protected {
                     continue;
                 }

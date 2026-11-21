@@ -9,13 +9,16 @@ gang_version = use_extension("//bazel/version:extensions.bzl", "workspace_versio
 use_repo(gang_version, "gang_version")
 
 action_environment_repository = use_repo_rule("//bazel/action_environment:repository.bzl", "action_environment_repository")
+
 action_environment_repository(name = "gang_env")
 
 RUST_VERSION = "1.97.1"
+
 OPENTOFU_VERSION = "1.13.9"
 
 # zig's musl supplies the C runtime, so rustc must not add its own self-contained copy (duplicate _start).
 MUSL_RUSTC_FLAGS = ["-Clink-self-contained=no"]
+
 MUSL_RUSTC_FLAGS_BY_TRIPLE = {
     "x86_64-unknown-linux-musl": MUSL_RUSTC_FLAGS,
     "aarch64-unknown-linux-musl": MUSL_RUSTC_FLAGS,
@@ -26,6 +29,7 @@ LINUX_X86_64_MUSL_COMPATIBLE = [
     "@platforms//os:linux",
     "@zig_sdk//libc:musl",
 ]
+
 LINUX_AARCH64_MUSL_COMPATIBLE = [
     "@platforms//cpu:aarch64",
     "@platforms//os:linux",
@@ -55,13 +59,23 @@ single_version_override(
 )
 
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
 devshell_chromium = use_repo_rule("//bazel/chromium:chromium.bzl", "devshell_chromium")
+
 devshell_import_tools = use_repo_rule("//infra/scripts:tools.bzl", "devshell_import_tools")
 
 # The devShell's pinned headless Chromium (flake.nix e2eChromium), for //ui:layout_test.
-devshell_chromium(name = "chromium", dev_dependency = True)
-devshell_import_tools(name = "import_test_tools", dev_dependency = True)
+devshell_chromium(
+    name = "chromium",
+    dev_dependency = True,
+)
+
+devshell_import_tools(
+    name = "import_test_tools",
+    dev_dependency = True,
+)
 
 # Released Linux binaries and source trees used by the mixed-version upgrade gate.
 http_file(
@@ -109,6 +123,7 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 """
+
 UPGRADE_SOURCE_PATCH = "find infra configs -type f \\( -name BUILD -o -name BUILD.bazel \\) -delete"
 
 http_archive(

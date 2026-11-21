@@ -587,7 +587,8 @@ fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
         fleets: &catalog,
         max_workers: 8,
         client_action_timeout: Duration::from_mins(1),
-        attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
+        attempt_budget: gang_config::WorkerConfig::default()
+            .attempt_budget(gang_config::ActionsConfig::default().timeout),
         observations: &observations,
     };
     let connections = ControllerConnections {

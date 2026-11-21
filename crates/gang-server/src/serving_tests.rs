@@ -1097,9 +1097,13 @@ async fn promotion_fails_closed_when_revocations_cannot_be_reloaded() {
             matches!(result, Err(ServerError::Revocations(_))),
             "takeover preparation fails on the revocation read: {result:?}"
         );
-        assert!(!host.milestones().iter().any(|milestone| matches!(milestone,
-            gang_spi::HostMilestone::Prepared | gang_spi::HostMilestone::Serving)),
-            "authorization preparation must finish before routing registration or launch completion");
+        assert!(
+            !host.milestones().iter().any(|milestone| matches!(
+                milestone,
+                gang_spi::HostMilestone::Prepared | gang_spi::HostMilestone::Serving
+            )),
+            "authorization preparation must finish before routing registration or launch completion"
+        );
         assert_eq!(
             handles.scheduler.snapshots().get(),
             0,

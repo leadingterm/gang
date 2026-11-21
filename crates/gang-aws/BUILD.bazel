@@ -4,7 +4,11 @@ workspace_rust_library(
     name = "gang_aws",
     dev_deps = ["//crates/gang-testkit:gang_testkit"],
     test_data = glob(
-        ["Cargo.toml", "src/**/*.rs", "tests/fixtures/**"],
+        [
+            "Cargo.toml",
+            "src/**/*.rs",
+            "tests/fixtures/**",
+        ],
         allow_empty = True,
     ) + ["//infra/terraform/modules/controller:lifecycle-hook.json"],  # keep
     deps = [

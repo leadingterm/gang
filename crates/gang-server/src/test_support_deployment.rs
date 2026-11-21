@@ -204,7 +204,8 @@ pub fn tls_settings() -> ServerSettings {
         scaling: Arc::new(gang_config::ScalingConfig::default()),
         proxy_protocol: None,
         leadership: gang_config::LeadershipConfig::default(),
-        attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
+        attempt_budget: gang_config::WorkerConfig::default()
+            .attempt_budget(gang_config::ActionsConfig::default().timeout),
         revocation_refresh_interval: NonZeroDuration::from_secs(1),
         poll_interval: NonZeroDuration::from_secs(1),
         client_action_timeout: NonZeroDuration::from_mins(1),

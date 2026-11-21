@@ -55,7 +55,6 @@ impl Readiness {
         *self.0.fence.lock() = Some(fence);
     }
 
-
     pub(crate) fn serve(&self) {
         self.0.serving.store(true, Ordering::Release);
     }

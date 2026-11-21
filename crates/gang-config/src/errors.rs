@@ -253,7 +253,9 @@ pub enum ConfigError {
         worker_timeout: Duration,
     },
     /// A planned handover must leave a call timeout before the oldest supported CLI's final retry.
-    #[error("planned handover {window:?} plus call timeout {call_timeout:?} must be below the minimum CLI last retry {last_attempt:?}")]
+    #[error(
+        "planned handover {window:?} plus call timeout {call_timeout:?} must be below the minimum CLI last retry {last_attempt:?}"
+    )]
     #[fix("lower server.leadership.renew_interval or call_timeout")]
     HandoverOutlastsCli {
         /// Planned handover window.

@@ -279,10 +279,7 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
     }
 
     /// Checks the default ISA against resolved fleets.
-    fn check_fleet_settings(
-        fleets: &Fleets<P>,
-        default_isa: Isa,
-    ) -> Result<(), ConfigError> {
+    fn check_fleet_settings(fleets: &Fleets<P>, default_isa: Isa) -> Result<(), ConfigError> {
         if !fleets
             .policies()
             .iter()

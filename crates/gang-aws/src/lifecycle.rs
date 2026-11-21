@@ -160,7 +160,10 @@ impl Metadata {
         match self.imds.get(TARGET_LIFECYCLE_PATH).await {
             Ok(body) if body.as_ref() == TERMINATED_STATE => Ok(Some(true)),
             Ok(body) if body.as_ref() == "InService" => Ok(Some(false)),
-            Ok(_) => Err(AwsError::malformed(IMDS_OPERATION, "target lifecycle state")),
+            Ok(_) => Err(AwsError::malformed(
+                IMDS_OPERATION,
+                "target lifecycle state",
+            )),
             Err(error) if is_not_found(&error) => Ok(None),
             Err(error) => Err(imds_error(error)),
         }

@@ -423,8 +423,9 @@ mod tests {
         async fn worker_disconnected(&self, id: &NativeWorkerId) -> Result<(), Error> {
             self.remove_worker(id).await
         }
-        async fn expire_attempts(&self, _now: std::time::SystemTime) -> Result<(), Error> { Ok(()) }
-
+        async fn expire_attempts(&self, _now: std::time::SystemTime) -> Result<(), Error> {
+            Ok(())
+        }
 
         async fn worker_snapshot(&self) -> Vec<WorkerSummary> {
             let gate = self.workers.lock().snapshot_gate.take();

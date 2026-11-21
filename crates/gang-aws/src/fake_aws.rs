@@ -683,14 +683,26 @@ fn query_operation(
         }
         "DescribeTargetHealth" => {
             let arn = required(params, "TargetGroupArn")?;
-            let targets = state.target_health.get(arn).ok_or_else(|| invalid("unknown target group"))?;
+            let targets = state
+                .target_health
+                .get(arn)
+                .ok_or_else(|| invalid("unknown target group"))?;
             let descriptions: String = targets.iter().map(|(id, health)| format!("<member><Target><Id>{id}</Id></Target><TargetHealth><State>{health}</State></TargetHealth></member>")).collect();
-            Ok(query_ok(QueryService::Elbv2, action, Some(&format!("<TargetHealthDescriptions>{descriptions}</TargetHealthDescriptions>"))))
+            Ok(query_ok(
+                QueryService::Elbv2,
+                action,
+                Some(&format!(
+                    "<TargetHealthDescriptions>{descriptions}</TargetHealthDescriptions>"
+                )),
+            ))
         }
         "RegisterTargets" => {
             let arn = required(params, "TargetGroupArn")?;
             let id = required(params, "Targets.member.1.Id")?;
-            let targets = state.target_health.get_mut(arn).ok_or_else(|| invalid("unknown target group"))?;
+            let targets = state
+                .target_health
+                .get_mut(arn)
+                .ok_or_else(|| invalid("unknown target group"))?;
             if !targets.iter().any(|(target, _)| target == id) {
                 targets.push((id.to_owned(), "initial".to_owned()));
             }
@@ -700,9 +712,23 @@ fn query_operation(
             let group_name = required(params, "AutoScalingGroupName")?;
             let hook_name = required(params, "LifecycleHookName")?;
             let id = required(params, "InstanceId")?;
-            let valid_hook = state.lifecycle_hooks.get(group_name).is_some_and(|hooks| hooks.iter().any(|(name, transition)| name == hook_name && transition == "autoscaling:EC2_INSTANCE_TERMINATING"));
-            let waiting = state.groups.iter().find(|group| group.name == group_name).is_some_and(|group| group.instances.iter().any(|instance| instance.id == id && instance.lifecycle_state == "Terminating:Wait"));
-            if !valid_hook || !waiting { return Err(invalid("no active lifecycle action")); }
+            let valid_hook = state.lifecycle_hooks.get(group_name).is_some_and(|hooks| {
+                hooks.iter().any(|(name, transition)| {
+                    name == hook_name && transition == "autoscaling:EC2_INSTANCE_TERMINATING"
+                })
+            });
+            let waiting = state
+                .groups
+                .iter()
+                .find(|group| group.name == group_name)
+                .is_some_and(|group| {
+                    group.instances.iter().any(|instance| {
+                        instance.id == id && instance.lifecycle_state == "Terminating:Wait"
+                    })
+                });
+            if !valid_hook || !waiting {
+                return Err(invalid("no active lifecycle action"));
+            }
             Ok(query_ok(QueryService::AutoScaling, action, None))
         }
         "CompleteLifecycleAction" => {
@@ -841,7 +867,11 @@ fn group_xml(group: &FakeGroup) -> String {
         min_size = group.min_size,
         max_size = group.max_size,
         protected = group.new_instances_protected,
-        target_groups = group.target_group_arns.iter().map(|arn| format!("<member>{arn}</member>")).collect::<String>(),
+        target_groups = group
+            .target_group_arns
+            .iter()
+            .map(|arn| format!("<member>{arn}</member>"))
+            .collect::<String>(),
     )
 }
 

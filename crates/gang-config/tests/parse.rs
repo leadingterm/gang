@@ -1028,13 +1028,18 @@ fn worker_connect_timeout_must_be_below_twice_worker_timeout() {
 #[test]
 fn planned_handover_must_precede_legacy_cli_last_attempt() {
     for (call, valid) in [("1059ms", true), ("1060ms", false)] {
-        let server = format!(
-            "{SERVER}\n[server.leadership]\ncall_timeout = \"{call}\"\n"
-        );
-        let result = Sections { server: server.leak(), ..Sections::VALID }.parse();
+        let server = format!("{SERVER}\n[server.leadership]\ncall_timeout = \"{call}\"\n");
+        let result = Sections {
+            server: server.leak(),
+            ..Sections::VALID
+        }
+        .parse();
         assert_eq!(result.is_ok(), valid);
         if !valid {
-            assert!(matches!(result, Err(ConfigError::HandoverOutlastsCli { .. })));
+            assert!(matches!(
+                result,
+                Err(ConfigError::HandoverOutlastsCli { .. })
+            ));
         }
     }
 }
@@ -1042,7 +1047,14 @@ fn planned_handover_must_precede_legacy_cli_last_attempt() {
 #[test]
 fn removed_shutdown_grace_is_rejected() {
     let server = format!("{SERVER}\n[server.http2]\nshutdown_grace = \"1s\"\n");
-    assert!(Sections { server: server.leak(), ..Sections::VALID }.parse().is_err());
+    assert!(
+        Sections {
+            server: server.leak(),
+            ..Sections::VALID
+        }
+        .parse()
+        .is_err()
+    );
 }
 
 #[test]
@@ -4762,7 +4774,10 @@ fn cold_readiness_prior_clamps_each_fleet_without_changing_boot_grace() -> Resul
             ..Sections::VALID
         }
         .text()
-        .replace("boot_grace = \"1m\"", &format!("boot_grace = \"{seconds}s\""));
+        .replace(
+            "boot_grace = \"1m\"",
+            &format!("boot_grace = \"{seconds}s\""),
+        );
         let config: GangConfig<Plugins> = text.parse()?;
         let fleet = config.fleets.get(0).ok_or("missing fleet")?;
         assert_eq!(fleet.policy.boot_grace, Duration::from_secs(seconds));

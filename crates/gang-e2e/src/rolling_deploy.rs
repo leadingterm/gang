@@ -179,7 +179,11 @@ pub fn rolling_deploy(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
             for index in [0, 1] {
                 cluster.deregister_controller(index)?;
                 let stopped = cluster.retire(index)?;
-                statuses.push(if index == initial_leader { natural } else { stopped });
+                statuses.push(if index == initial_leader {
+                    natural
+                } else {
+                    stopped
+                });
             }
             Ok((held, retired_leader, statuses))
         })();
@@ -218,10 +222,20 @@ mod tests {
     fn successor_health_and_original_identity_precede_release() {
         let events = RefCell::new(Vec::new());
         release_after_promotion(
-            || { events.borrow_mut().push("healthy"); Ok(()) },
-            || { events.borrow_mut().push("original held"); Ok(()) },
-            || { events.borrow_mut().push("release"); Ok(()) },
-        ).expect("handover");
+            || {
+                events.borrow_mut().push("healthy");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("original held");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("release");
+                Ok(())
+            },
+        )
+        .expect("handover");
         assert_eq!(*events.borrow(), ["healthy", "original held", "release"]);
     }
 
@@ -231,6 +245,7 @@ mod tests {
             || Err(E2eError::system("successor unhealthy")),
             || panic!("must not observe after failed promotion"),
             || panic!("must not release after failed promotion"),
-        ).expect_err("unhealthy successor");
+        )
+        .expect_err("unhealthy successor");
     }
 }

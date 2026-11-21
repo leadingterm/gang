@@ -396,7 +396,6 @@ mod tests {
         Ok(())
     }
 
-
     #[test]
     fn connection_settings_reject_invalid_values() {
         assert!(

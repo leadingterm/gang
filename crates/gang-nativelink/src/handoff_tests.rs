@@ -208,7 +208,9 @@ impl gang_spi::RequestGate for Allow {
     ) -> Result<gang_spi::GateDecision, gang_spi::PortError> {
         self.scopes.lock().push(scope);
         if parts.headers.contains_key("x-revoked") {
-            return Err(gang_spi::PortError::refused(gang_spi::Rejection::PrincipalRevoked));
+            return Err(gang_spi::PortError::refused(
+                gang_spi::Rejection::PrincipalRevoked,
+            ));
         }
         let permitted = match scope {
             gang_spi::RequestScope::Controller => &self.leading,
@@ -310,7 +312,11 @@ async fn public_listener_serves_execution_and_waits_for_worker_stream() -> gang_
     let (ready, waiting) = ControllerReady::channel();
     let task = tokio::spawn(run_held_controller(
         Arc::clone(&plugin),
-        ControllerConnections { public, worker, api: Api },
+        ControllerConnections {
+            public,
+            worker,
+            api: Api,
+        },
         ready,
     ));
     waiting.await?;
@@ -341,7 +347,11 @@ async fn public_listener_serves_execution_and_waits_for_worker_stream() -> gang_
     {
         let scopes = gate.scopes.lock();
         assert_eq!(scopes.len(), 7);
-        assert!(scopes.iter().all(|scope| *scope == gang_spi::RequestScope::Controller));
+        assert!(
+            scopes
+                .iter()
+                .all(|scope| *scope == gang_spi::RequestScope::Controller)
+        );
     }
     drop(api_response);
     drop(worker_feed);
@@ -375,7 +385,6 @@ impl gang_spi::ApiService for HeldApi {
         http::Response::new(gang_spi::full_body("completed"))
     }
 }
-
 
 fn test_plugin(server: serde_json::Value) -> gang_testkit::TestResult<crate::NativeLink> {
     let server = serde_json::from_value(server)?;
@@ -419,12 +428,12 @@ async fn run_held_controller<A: gang_spi::ApiService>(
         fleets: &fleets,
         max_workers: 8,
         client_action_timeout: Duration::from_mins(10),
-        attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
+        attempt_budget: gang_config::WorkerConfig::default()
+            .attempt_budget(gang_config::ActionsConfig::default().timeout),
         observations: &observations,
     };
     plugin.run_controller(&spec, connections, ready).await
 }
-
 
 async fn assert_wire_refusal(
     feed: &tokio::sync::mpsc::UnboundedSender<gang_spi::Accepted>,
@@ -460,11 +469,16 @@ async fn assert_http_refusal(
     feed: &tokio::sync::mpsc::UnboundedSender<gang_spi::Accepted>,
 ) -> gang_testkit::TestResult {
     let mut client = client(feed).await?;
-    let response = client.send_request(
-        http::Request::get("http://localhost/v1/info").body(axum::body::Body::empty())?
-    ).await?;
+    let response = client
+        .send_request(
+            http::Request::get("http://localhost/v1/info").body(axum::body::Body::empty())?,
+        )
+        .await?;
     assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.headers()[gang_types::handover::REQUEST_NOT_STARTED_HEADER], "true");
+    assert_eq!(
+        response.headers()[gang_types::handover::REQUEST_NOT_STARTED_HEADER],
+        "true"
+    );
     let body = axum::body::to_bytes(axum::body::Body::new(response.into_body()), 1024).await?;
     assert!(!body.is_empty());
     Ok(())
@@ -505,33 +519,54 @@ async fn fresh_wire_refusals_coexist_with_a_held_controller_drain() -> gang_test
         ControllerConnections {
             public,
             worker,
-            api: HeldApi { entered, release: Arc::clone(&release) },
+            api: HeldApi {
+                entered,
+                release: Arc::clone(&release),
+            },
         },
         ready,
     ));
     waiting.await?;
     assert_leader_refusals(&public_feed, &worker_feed).await?;
     assert_http_refusal(&public_feed).await?;
-    assert_wire_refusal(&public_feed, "build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs").await?;
+    assert_wire_refusal(
+        &public_feed,
+        "build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs",
+    )
+    .await?;
     assert_wire_refusal(&worker_feed, "google.bytestream.ByteStream/Write").await?;
     gate.leading.store(true, Ordering::SeqCst);
     gate.worker_store.store(true, Ordering::SeqCst);
     let mut old_client = client(&public_feed).await?;
     let admitted = tokio::spawn(async move {
-        old_client.send_request(
-            http::Request::post("http://localhost/held")
-                .body(axum::body::Body::empty()).expect("valid request")
-        ).await
+        old_client
+            .send_request(
+                http::Request::post("http://localhost/held")
+                    .body(axum::body::Body::empty())
+                    .expect("valid request"),
+            )
+            .await
     });
-    entered_rx.recv().await.ok_or("old API request did not enter")?;
+    entered_rx
+        .recv()
+        .await
+        .ok_or("old API request did not enter")?;
     gate.leading.store(false, Ordering::SeqCst);
     let mut drain = ControllerDrain::default();
     plugin.hand_off(&mut drain).await?;
     assert!(!drain.complete, "the admitted response is still held");
     assert_leader_refusals(&public_feed, &worker_feed).await?;
-    assert_wire_refusal(&public_feed, "build.bazel.remote.execution.v2.Capabilities/GetCapabilities").await?;
+    assert_wire_refusal(
+        &public_feed,
+        "build.bazel.remote.execution.v2.Capabilities/GetCapabilities",
+    )
+    .await?;
     assert_http_refusal(&public_feed).await?;
-    assert_wire_refusal(&public_feed, "build.bazel.remote.execution.v2.ActionCache/GetActionResult").await?;
+    assert_wire_refusal(
+        &public_feed,
+        "build.bazel.remote.execution.v2.ActionCache/GetActionResult",
+    )
+    .await?;
     assert_wire_refusal(&public_feed, "google.bytestream.ByteStream/Read").await?;
     release.notify_one();
     let response = admitted.await??;
@@ -541,7 +576,10 @@ async fn fresh_wire_refusals_coexist_with_a_held_controller_drain() -> gang_test
     plugin.hand_off(&mut drain).await?;
     assert!(drain.complete);
     assert_leader_refusals(&public_feed, &worker_feed).await?;
-    assert!(!controller.is_finished(), "completed drain retains the original listeners");
+    assert!(
+        !controller.is_finished(),
+        "completed drain retains the original listeners"
+    );
     drop((public_feed, worker_feed));
     controller.await??;
     Ok(())
@@ -645,7 +683,9 @@ async fn assert_cache_roundtrip(
 
 #[tokio::test]
 async fn worker_store_remains_authenticated_during_controller_drain() -> gang_testkit::TestResult {
-    use gang_spi::{ControllerConnections, ControllerDrain, ControllerReady, RequestScope, SchedulerPort};
+    use gang_spi::{
+        ControllerConnections, ControllerDrain, ControllerReady, RequestScope, SchedulerPort,
+    };
     use std::sync::atomic::Ordering;
 
     let plugin = Arc::new(test_plugin(serde_json::json!({
@@ -664,7 +704,10 @@ async fn worker_store_remains_authenticated_during_controller_drain() -> gang_te
         ControllerConnections {
             public,
             worker,
-            api: HeldApi { entered, release: Arc::new(tokio::sync::Notify::new()) },
+            api: HeldApi {
+                entered,
+                release: Arc::new(tokio::sync::Notify::new()),
+            },
         },
         ready,
     ));
@@ -680,23 +723,37 @@ async fn worker_store_remains_authenticated_during_controller_drain() -> gang_te
     assert_cache_roundtrip(&mut worker_client).await?;
     let mut second_worker_client = client(&worker_feed).await?;
     assert_cache_roundtrip(&mut second_worker_client).await?;
-    let response = worker_client.send_request(
-        http::Request::post("http://localhost/build.bazel.remote.execution.v2.ActionCache/GetActionResult")
+    let response = worker_client
+        .send_request(
+            http::Request::post(
+                "http://localhost/build.bazel.remote.execution.v2.ActionCache/GetActionResult",
+            )
             .header(http::header::CONTENT_TYPE, "application/grpc")
             .header("x-revoked", "true")
-            .body(axum::body::Body::empty())?
-    ).await?;
+            .body(axum::body::Body::empty())?,
+        )
+        .await?;
     assert_eq!(response.headers()["grpc-status"], "7");
-    assert!(!response.headers().contains_key(gang_types::handover::REQUEST_NOT_STARTED_HEADER));
+    assert!(
+        !response
+            .headers()
+            .contains_key(gang_types::handover::REQUEST_NOT_STARTED_HEADER)
+    );
     assert_wire_refusal(
         &worker_feed,
         "com.github.trace_machina.nativelink.remote_execution.WorkerApi/ConnectWorker",
-    ).await?;
+    )
+    .await?;
     let scopes = gate.scopes.lock();
     assert!(scopes.contains(&RequestScope::Controller));
     assert!(scopes.contains(&RequestScope::WorkerStore));
     drop(scopes);
-    drop((worker_client, second_worker_client, public_feed, worker_feed));
+    drop((
+        worker_client,
+        second_worker_client,
+        public_feed,
+        worker_feed,
+    ));
     serving.await??;
     Ok(())
 }
@@ -815,7 +872,10 @@ async fn worker_upload_resumes_on_original_controller_after_handoff() -> gang_te
         ControllerConnections {
             public,
             worker,
-            api: HeldApi { entered, release: Arc::new(tokio::sync::Notify::new()) },
+            api: HeldApi {
+                entered,
+                release: Arc::new(tokio::sync::Notify::new()),
+            },
         },
         ready,
     ));
@@ -831,12 +891,17 @@ async fn worker_upload_resumes_on_original_controller_after_handoff() -> gang_te
             finish_write: false,
             data: "he".into(),
         },
-    ).await?;
+    )
+    .await?;
     gate.leading.store(false, Ordering::SeqCst);
     let mut drain = ControllerDrain::default();
     plugin.hand_off(&mut drain).await?;
     assert_wire_refusal(&public_feed, "google.bytestream.ByteStream/Write").await?;
-    assert_wire_refusal(&worker_feed, "com.github.trace_machina.nativelink.remote_execution.WorkerApi/ConnectWorker").await?;
+    assert_wire_refusal(
+        &worker_feed,
+        "com.github.trace_machina.nativelink.remote_execution.WorkerApi/ConnectWorker",
+    )
+    .await?;
     resume_upload(&mut worker_client, resource).await?;
     plugin.hand_off(&mut drain).await?;
     assert!(drain.complete);

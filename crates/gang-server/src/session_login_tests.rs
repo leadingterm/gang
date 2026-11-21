@@ -277,7 +277,11 @@ async fn sign_in_redirects_to_the_provider_and_issues_a_session() {
     let (mut parts, _) = request("GET", GET_SESSION.template, &cookies).into_parts();
     harness
         .gate
-        .admit(gang_spi::RequestScope::Controller, &Peer::default(), &mut parts)
+        .admit(
+            gang_spi::RequestScope::Controller,
+            &Peer::default(),
+            &mut parts,
+        )
         .await
         .expect("the gate admits the session cookie");
     let authenticated = Caller::of(&parts.extensions)
@@ -651,7 +655,11 @@ async fn session_valid_until(
     let (mut parts, _) = request("GET", GET_SESSION.template, &cookies).into_parts();
     harness
         .gate
-        .admit(gang_spi::RequestScope::Controller, &Peer::default(), &mut parts)
+        .admit(
+            gang_spi::RequestScope::Controller,
+            &Peer::default(),
+            &mut parts,
+        )
         .await
         .expect("the gate admits the open API route");
     Caller::of(&parts.extensions)

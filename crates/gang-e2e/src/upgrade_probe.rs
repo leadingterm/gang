@@ -42,8 +42,6 @@ pub(crate) struct AuthenticationObservation {
     pub(crate) elapsed: Duration,
 }
 
-
-
 struct DirectExchange {
     request: Request<()>,
     payload: Bytes,
@@ -215,10 +213,7 @@ fn direct_request(endpoint: &Url, path: &str, content_type: &str) -> Result<Requ
         .map_err(|_| E2eError::system("building direct probe request"))
 }
 
-fn authentication_exchange(
-    endpoint: &Url,
-    body: Bytes,
-) -> Result<DirectExchange> {
+fn authentication_exchange(endpoint: &Url, body: Bytes) -> Result<DirectExchange> {
     Ok(DirectExchange {
         request: direct_request(
             endpoint,
@@ -268,7 +263,6 @@ async fn receive_direct(
         .unwrap_or_default();
     Ok(reply)
 }
-
 
 fn grpc_payload(data: &[u8]) -> Result<Option<(&[u8], usize)>> {
     let Some(header) = data.get(..5) else {
@@ -649,8 +643,9 @@ mod tests {
             proxy_protocol_v2: framed,
         };
         let exchange = match kind {
-            WireKind::Authentication | WireKind::Diagnostic =>
-                authentication_exchange(&endpoint, Bytes::from_static(MINT_BODY))?,
+            WireKind::Authentication | WireKind::Diagnostic => {
+                authentication_exchange(&endpoint, Bytes::from_static(MINT_BODY))?
+            }
         };
         let transport = async {
             let tcp = TcpStream::connect(target.address)
@@ -826,10 +821,7 @@ mod tests {
                 .map_err(|error| E2eError::system(format!("serving unfinished fixture: {error}")))
         });
         let mut deadline = std::pin::pin!(tokio::time::sleep(WIRE_DEADLINE));
-        let exchange = authentication_exchange(
-            &endpoint,
-            Bytes::from_static(MINT_BODY),
-        )?;
+        let exchange = authentication_exchange(&endpoint, Bytes::from_static(MINT_BODY))?;
         let transport = async {
             let tcp = TcpStream::connect(target.address)
                 .await
@@ -978,7 +970,10 @@ mod tests {
         // Preparation, health detection or a cold-helper command cannot reset the clock or
         // turn an unsampled interval into successful fresh connections.
         samples.sample(Duration::from_secs(20), true);
-        assert_eq!(samples.finish(Duration::from_secs(21)), Duration::from_secs(16));
+        assert_eq!(
+            samples.finish(Duration::from_secs(21)),
+            Duration::from_secs(16)
+        );
         assert_eq!((samples.successes, samples.failures), (2, 2));
     }
 

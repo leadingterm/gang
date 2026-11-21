@@ -73,13 +73,13 @@ module "storage" {
 }
 
 locals {
-  config_parameter_name  = coalesce(var.config_parameter_name, "/${var.name}/gang.toml")
-  group                  = var.database.engine != "sqlite"
-  controller_shape       = local.group ? "group" : "instance"
-  public_port            = module.network.public_port
-  worker_port            = module.network.worker_port
-  network_granted        = anytrue([for fleet in var.fleets : contains(fleet.actions.grants, "network")])
-  public_subnets         = module.network.public_subnets_by_az
+  config_parameter_name = coalesce(var.config_parameter_name, "/${var.name}/gang.toml")
+  group                 = var.database.engine != "sqlite"
+  controller_shape      = local.group ? "group" : "instance"
+  public_port           = module.network.public_port
+  worker_port           = module.network.worker_port
+  network_granted       = anytrue([for fleet in var.fleets : contains(fleet.actions.grants, "network")])
+  public_subnets        = module.network.public_subnets_by_az
   protected_networks = local.network_granted && var.execution_egress != null ? concat(
     var.execution_egress.protected_networks,
     [module.network.vpc_cidr_block],
@@ -87,11 +87,11 @@ locals {
     local.group ? [] : ["${module.network.controller_public_ip}/32"],
     var.load_balancer == null ? [] : [for ip in module.load_balancer[0].public_static_ips : "${ip}/32"]
   ) : []
-  public_host                       = var.hostname != null ? var.hostname : module.network.controller_public_dns
-  worker_host                       = local.group ? var.hostname : module.network.controller_private_dns
-  endpoint                          = local.group && var.hostname == null ? null : (local.public_port == 443 ? "https://${local.public_host}" : "https://${local.public_host}:${local.public_port}")
-  worker_endpoint                   = local.group && var.hostname == null ? null : "grpcs://${local.worker_host}:${local.worker_port}"
-  health                            = jsondecode(file("${path.module}/../load-balancer/health-check.json"))
+  public_host     = var.hostname != null ? var.hostname : module.network.controller_public_dns
+  worker_host     = local.group ? var.hostname : module.network.controller_private_dns
+  endpoint        = local.group && var.hostname == null ? null : (local.public_port == 443 ? "https://${local.public_host}" : "https://${local.public_host}:${local.public_port}")
+  worker_endpoint = local.group && var.hostname == null ? null : "grpcs://${local.worker_host}:${local.worker_port}"
+  health          = jsondecode(file("${path.module}/../load-balancer/health-check.json"))
 
   database_secret_parameters = var.database.engine != "postgres" ? {} : merge(
     try(var.database.postgres.rds, null) != null ? {

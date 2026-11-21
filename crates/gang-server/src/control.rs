@@ -248,7 +248,11 @@ where
             let Action::Terminate { instance, .. } = &pending.action else {
                 return false;
             };
-            if self.passes[pending.fleet].handover_protected.binary_search(instance).is_ok() {
+            if self.passes[pending.fleet]
+                .handover_protected
+                .binary_search(instance)
+                .is_ok()
+            {
                 return false;
             }
             if let Some(planned) = self

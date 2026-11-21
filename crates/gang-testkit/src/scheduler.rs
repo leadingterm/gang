@@ -10,16 +10,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use futures::{FutureExt, StreamExt};
 use futures::future::{BoxFuture, Shared};
+use futures::{FutureExt, StreamExt};
 use gang_clock::{Clock, Tick, Timestamp};
 use gang_spi::{
     ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService, BoxedConnection,
     ControllerConnections, ControllerDrain, ControllerEndpoints, ControllerReady, ControllerSpec,
-    DrainingWorker, FleetSupply,
-    GateDecision, LeaderUnavailable, LearnedHistory, Listening, ListingLimits, Peer, PortError,
-    RecordKind, Rejection, RequestGate, RequestScope, SchedulerPort, SchedulerSnapshot, Slots,
-    WorkerSpec, WorkerTls, full_body,
+    DrainingWorker, FleetSupply, GateDecision, LeaderUnavailable, LearnedHistory, Listening,
+    ListingLimits, Peer, PortError, RecordKind, Rejection, RequestGate, RequestScope,
+    SchedulerPort, SchedulerSnapshot, Slots, WorkerSpec, WorkerTls, full_body,
 };
 use gang_types::{Bytes, FleetName, FleetProperties, InstanceId};
 use parking_lot::Mutex;
@@ -92,11 +91,13 @@ impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> 
     ) -> BoxFuture<'a, Result<GateDecision, PortError>> {
         Box::pin(async move {
             let decision = self.public.admit(scope, peer, parts).await?;
-            Ok(if self.draining.load(Ordering::Acquire) && scope == RequestScope::Controller {
-                GateDecision::NotLeading
-            } else {
-                decision
-            })
+            Ok(
+                if self.draining.load(Ordering::Acquire) && scope == RequestScope::Controller {
+                    GateDecision::NotLeading
+                } else {
+                    decision
+                },
+            )
         })
     }
 
@@ -108,11 +109,13 @@ impl<P: RequestGate, W: RequestGate, A: ApiService> Services for Gates<P, W, A> 
     ) -> BoxFuture<'a, Result<GateDecision, PortError>> {
         Box::pin(async move {
             let decision = self.worker.admit(scope, peer, parts).await?;
-            Ok(if self.draining.load(Ordering::Acquire) && scope == RequestScope::Controller {
-                GateDecision::NotLeading
-            } else {
-                decision
-            })
+            Ok(
+                if self.draining.load(Ordering::Acquire) && scope == RequestScope::Controller {
+                    GateDecision::NotLeading
+                } else {
+                    decision
+                },
+            )
         })
     }
 
@@ -644,7 +647,13 @@ impl FakeScheduler {
     #[must_use]
     pub fn hold_drain(&self) -> oneshot::Sender<()> {
         let (release, hold) = oneshot::channel();
-        self.state.lock().drain_hold = Some(async move { let _ = hold.await; }.boxed().shared());
+        self.state.lock().drain_hold = Some(
+            async move {
+                let _ = hold.await;
+            }
+            .boxed()
+            .shared(),
+        );
         release
     }
 
@@ -906,8 +915,7 @@ impl SchedulerPort for FakeScheduler {
             peer: accepted.peer,
         });
         let merged = futures::stream::select(public_side, worker_side);
-        serve_controller_connections(merged, sender, ready, ready_hold, drain_hold)
-            .await;
+        serve_controller_connections(merged, sender, ready, ready_hold, drain_hold).await;
         self.state.lock().drain_hold = None;
         Ok(())
     }
@@ -920,11 +928,19 @@ impl SchedulerPort for FakeScheduler {
         into.workers.clear();
         let has_work = !state.snapshot.executing.is_empty()
             || !state.actions.running.is_empty()
-            || state.snapshot.workers.iter().any(|worker| worker.running_actions != 0);
+            || state
+                .snapshot
+                .workers
+                .iter()
+                .any(|worker| worker.running_actions != 0);
         let now = if has_work {
-            state.clock.as_ref().ok_or_else(|| {
-                PortError::config("handoff with attempts requires a controller clock")
-            })?.wall()
+            state
+                .clock
+                .as_ref()
+                .ok_or_else(|| {
+                    PortError::config("handoff with attempts requires a controller clock")
+                })?
+                .wall()
         } else {
             Timestamp::UNIX_EPOCH
         };
@@ -935,12 +951,19 @@ impl SchedulerPort for FakeScheduler {
             let instance = worker.id.instance().ok_or_else(|| {
                 PortError::config("executing worker has no physical instance identity")
             })?;
-            let stamp = state.attempt_deadlines.iter().find(|stamp| {
-                stamp.fleet == worker.fleet && stamp.instance == instance
-            }).ok_or_else(|| PortError::config("executing worker has no dispatch-stamped attempt deadline"))?;
-            if stamp.deadline > now && !into.workers.iter().any(|entry| {
-                entry.fleet == stamp.fleet && entry.instance == stamp.instance
-            }) {
+            let stamp = state
+                .attempt_deadlines
+                .iter()
+                .find(|stamp| stamp.fleet == worker.fleet && stamp.instance == instance)
+                .ok_or_else(|| {
+                    PortError::config("executing worker has no dispatch-stamped attempt deadline")
+                })?;
+            if stamp.deadline > now
+                && !into
+                    .workers
+                    .iter()
+                    .any(|entry| entry.fleet == stamp.fleet && entry.instance == stamp.instance)
+            {
                 into.workers.push(stamp.clone());
             }
         }
@@ -951,27 +974,45 @@ impl SchedulerPort for FakeScheduler {
             let instance = worker.id.instance().ok_or_else(|| {
                 PortError::config("running worker has no physical instance identity")
             })?;
-            let stamp = state.attempt_deadlines.iter().find(|stamp| {
-                stamp.fleet == worker.fleet && stamp.instance == instance
-            }).ok_or_else(|| PortError::config("running worker has no dispatch-stamped attempt deadline"))?;
-            if stamp.deadline > now && !into.workers.iter().any(|entry| {
-                entry.fleet == stamp.fleet && entry.instance == stamp.instance
-            }) {
+            let stamp = state
+                .attempt_deadlines
+                .iter()
+                .find(|stamp| stamp.fleet == worker.fleet && stamp.instance == instance)
+                .ok_or_else(|| {
+                    PortError::config("running worker has no dispatch-stamped attempt deadline")
+                })?;
+            if stamp.deadline > now
+                && !into
+                    .workers
+                    .iter()
+                    .any(|entry| entry.fleet == stamp.fleet && entry.instance == stamp.instance)
+            {
                 into.workers.push(stamp.clone());
             }
         }
         for action in &state.actions.running {
-            let worker = state.snapshot.workers.iter().find(|worker| worker.id == action.worker)
+            let worker = state
+                .snapshot
+                .workers
+                .iter()
+                .find(|worker| worker.id == action.worker)
                 .ok_or_else(|| PortError::config("running action references an unknown worker"))?;
             let instance = worker.id.instance().ok_or_else(|| {
                 PortError::config("running worker has no physical instance identity")
             })?;
-            let stamp = state.attempt_deadlines.iter().find(|stamp| {
-                stamp.fleet == worker.fleet && stamp.instance == instance
-            }).ok_or_else(|| PortError::config("running worker has no dispatch-stamped attempt deadline"))?;
-            if stamp.deadline > now && !into.workers.iter().any(|entry| {
-                entry.fleet == stamp.fleet && entry.instance == stamp.instance
-            }) {
+            let stamp = state
+                .attempt_deadlines
+                .iter()
+                .find(|stamp| stamp.fleet == worker.fleet && stamp.instance == instance)
+                .ok_or_else(|| {
+                    PortError::config("running worker has no dispatch-stamped attempt deadline")
+                })?;
+            if stamp.deadline > now
+                && !into
+                    .workers
+                    .iter()
+                    .any(|entry| entry.fleet == stamp.fleet && entry.instance == stamp.instance)
+            {
                 into.workers.push(stamp.clone());
             }
         }
@@ -982,7 +1023,9 @@ impl SchedulerPort for FakeScheduler {
         for worker in &mut state.snapshot.workers {
             worker.draining = true;
         }
-        let response_held = state.drain_hold.as_ref()
+        let response_held = state
+            .drain_hold
+            .as_ref()
             .is_some_and(|hold| hold.clone().now_or_never().is_none());
         into.complete = !held && !response_held;
         Ok(())
@@ -1277,13 +1320,18 @@ mod tests {
         let mut workers = vec![snapshot_worker("b")?, snapshot_worker("a")?];
         workers[0].fleet = FleetName::try_new("a-fleet")?;
         workers[1].fleet = FleetName::try_new("z-fleet")?;
-        let stamps = workers.iter().enumerate().rev().map(|(index, worker)| {
-            Ok(DrainingWorker {
-                fleet: worker.fleet.clone(),
-                instance: worker.id.instance().ok_or("worker instance missing")?,
-                deadline: Timestamp::from_unix_millis(15_000 + index as u64),
+        let stamps = workers
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(index, worker)| {
+                Ok(DrainingWorker {
+                    fleet: worker.fleet.clone(),
+                    instance: worker.id.instance().ok_or("worker instance missing")?,
+                    deadline: Timestamp::from_unix_millis(15_000 + index as u64),
+                })
             })
-        }).collect::<TestResult<Vec<_>>>()?;
+            .collect::<TestResult<Vec<_>>>()?;
         scheduler.set_snapshot(SchedulerSnapshot {
             workers,
             executing: executions,
@@ -1300,13 +1348,22 @@ mod tests {
         assert_eq!(drain.workers.len(), 2);
         assert_eq!(drain.workers[0].fleet, FleetName::try_new("a-fleet")?);
         assert_eq!(drain.workers[1].fleet, FleetName::try_new("z-fleet")?);
-        assert_eq!(drain.workers[0].deadline, Timestamp::from_unix_millis(15_000));
-        assert_eq!(drain.workers[1].deadline, Timestamp::from_unix_millis(15_001));
+        assert_eq!(
+            drain.workers[0].deadline,
+            Timestamp::from_unix_millis(15_000)
+        );
+        assert_eq!(
+            drain.workers[1].deadline,
+            Timestamp::from_unix_millis(15_001)
+        );
         clock.advance(Duration::from_millis(15_000));
         scheduler.hand_off(&mut drain).await?;
         assert!(!drain.complete);
         assert_eq!(drain.workers.len(), 1);
-        assert_eq!(drain.workers[0].deadline, Timestamp::from_unix_millis(15_001));
+        assert_eq!(
+            drain.workers[0].deadline,
+            Timestamp::from_unix_millis(15_001)
+        );
         clock.advance(Duration::from_millis(1));
         scheduler.hand_off(&mut drain).await?;
         assert!(drain.complete);
@@ -1893,7 +1950,8 @@ mod tests {
             fleets: &catalog,
             max_workers: 8,
             client_action_timeout: std::time::Duration::from_mins(1),
-            attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
+            attempt_budget: gang_config::WorkerConfig::default()
+                .attempt_budget(gang_config::ActionsConfig::default().timeout),
             observations: &observations,
         };
         {
@@ -2089,7 +2147,10 @@ mod tests {
         let previous_drains = scheduler.drains().get();
         assert!(run.as_mut().now_or_never().is_none());
         let mut drain = ControllerDrain::default();
-        scheduler.hand_off(&mut drain).await.expect("handoff succeeds");
+        scheduler
+            .hand_off(&mut drain)
+            .await
+            .expect("handoff succeeds");
         assert!(!drain.complete);
         assert_eq!(scheduler.drains().get(), previous_drains + 1);
         assert!(readiness.await.is_err());
@@ -2097,7 +2158,10 @@ mod tests {
         assert!(scheduler.published.borrow().is_some());
         drop(drain_release);
         assert!(matches!(run.as_mut().now_or_never(), Some(Ok(()))));
-        scheduler.hand_off(&mut drain).await.expect("handoff refresh succeeds");
+        scheduler
+            .hand_off(&mut drain)
+            .await
+            .expect("handoff refresh succeeds");
         assert!(drain.complete);
         assert!(scheduler.published.borrow().is_none());
     }
@@ -2155,7 +2219,8 @@ mod tests {
             fleets: &catalog,
             max_workers: 8,
             client_action_timeout: std::time::Duration::from_mins(1),
-            attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
+            attempt_budget: gang_config::WorkerConfig::default()
+                .attempt_budget(gang_config::ActionsConfig::default().timeout),
             observations: &observations,
         };
         let scheduler = FakeScheduler::new()?;
@@ -2202,7 +2267,8 @@ mod tests {
             fleets: &catalog,
             max_workers: 8,
             client_action_timeout: std::time::Duration::from_mins(1),
-            attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
+            attempt_budget: gang_config::WorkerConfig::default()
+                .attempt_budget(gang_config::ActionsConfig::default().timeout),
             observations: &observations,
         };
         let scheduler = FakeScheduler::new()?;

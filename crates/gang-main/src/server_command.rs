@@ -14,8 +14,7 @@ use gang_config::{
 use gang_nativelink::{NativeLink, NativeLinkConfig};
 use gang_server::{
     DeviceSettings, HandshakeSettings, Listeners, LoginSettings, Parts, Provider, Providers,
-    PublicEndpoint, RequestLimits, Server, ServerSettings, TlsSettings,
-    TransportSettings,
+    PublicEndpoint, RequestLimits, Server, ServerSettings, TlsSettings, TransportSettings,
 };
 use gang_spi::{
     ControllerHostPort, ControllerId, ControllerReady, LoginClient, PluginContext, PortError,
@@ -84,7 +83,6 @@ pub(crate) fn run(config: &Path, out: &Output) -> Result<ExitCode> {
     runtime.shutdown_timeout(std::time::Duration::ZERO);
     result
 }
-
 
 /// Builds the server from `loaded`, announces how it is reached once ready, and runs it until
 /// shutdown.
@@ -179,7 +177,8 @@ async fn serve_prepared(
     let providers = identity_providers(identity, &context)?;
     let attempt_budget = worker.attempt_budget(actions.timeout);
     if let Some(limit) = fleet.drain_limit().await.map_err(MainError::Scheduler)?
-        && attempt_budget > limit {
+        && attempt_budget > limit
+    {
         return Err(MainError::Scheduler(PortError::config(format!(
             "configured whole-attempt budget {attempt_budget:?} exceeds the controller lifecycle hook limit {limit:?}"
         ))));
@@ -261,7 +260,6 @@ async fn bind_health(
         .map_err(MainError::LocalAddress)?;
     Ok((listener, bound))
 }
-
 
 fn server_announcements(
     server: &Server<GangDeployment>,
@@ -522,7 +520,6 @@ mod tests {
         Ok(())
     }
 
-
     #[tokio::test]
     async fn signal_during_preparation_exits_successfully() {
         let (prepared, preparation) = oneshot::channel();
@@ -537,7 +534,6 @@ mod tests {
         assert!(matches!(result, Ok(None)));
         drop(prepared);
     }
-
 
     /// A controller that fails before readiness produces no startup announcements.
     #[tokio::test]

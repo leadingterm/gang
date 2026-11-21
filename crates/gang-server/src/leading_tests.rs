@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use gang_clock::Clock;
 use gang_spi::{
-    Acquisition, CandidateGeneration, ControllerId, ControllerReady,
-    HostMilestone, LeaderLeasePort, LeaseCandidate, Peer, SchedulerSnapshot, Takeover,
+    Acquisition, CandidateGeneration, ControllerId, ControllerReady, HostMilestone,
+    LeaderLeasePort, LeaseCandidate, Peer, SchedulerSnapshot, Takeover,
 };
 use gang_testkit::{Side, TestResult};
 use gang_types::{FleetSet, Url};
@@ -80,34 +80,61 @@ async fn shutdown_during_initial_preparation_skips_standby() -> TestResult {
     Ok(())
 }
 
-
 #[tokio::test]
 async fn unpromoted_controller_refuses_public_and_worker_store_requests() -> TestResult {
     let (parts, _dials, handles) = plain_parts();
     let now = handles.clock.wall();
-    let Acquisition::Acquired(old_lease) = handles.repository.acquire(
-        &LeaseCandidate {
-            holder: ControllerId::new("old-controller"),
-            priority: gang_spi::CandidatePriority::registered(CandidateGeneration::new(0)),
-        },
-        now, now, now + Duration::from_mins(1), Takeover::Observe,
-    ).await? else {
+    let Acquisition::Acquired(old_lease) = handles
+        .repository
+        .acquire(
+            &LeaseCandidate {
+                holder: ControllerId::new("old-controller"),
+                priority: gang_spi::CandidatePriority::registered(CandidateGeneration::new(0)),
+            },
+            now,
+            now,
+            now + Duration::from_mins(1),
+            Takeover::Observe,
+        )
+        .await?
+    else {
         return Err("old lease was not acquired".into());
     };
     let server = Server::prepare(parts, plain_settings()).await?;
     let (stop, stopped) = oneshot::channel::<()>();
     let (ready, prepared) = ControllerReady::channel();
-    let run = tokio::spawn(server.run(async { let _ = stopped.await; }, ready));
+    let run = tokio::spawn(server.run(
+        async {
+            let _ = stopped.await;
+        },
+        ready,
+    ));
     prepared.await?;
-    let controller = handles.scheduler.controller().await.ok_or("controller missing")?;
+    let controller = handles
+        .scheduler
+        .controller()
+        .await
+        .ok_or("controller missing")?;
     let mut public = api_request("POST", "/execute", None, None).into_parts().0;
     assert!(matches!(
-        controller.admit_public(gang_spi::RequestScope::Controller, &Peer::default(), &mut public).await,
+        controller
+            .admit_public(
+                gang_spi::RequestScope::Controller,
+                &Peer::default(),
+                &mut public
+            )
+            .await,
         Ok(gang_spi::GateDecision::NotLeading)
     ));
     let mut store = api_request("POST", "/store", None, None).into_parts().0;
     assert!(matches!(
-        controller.admit_worker(gang_spi::RequestScope::WorkerStore, &Peer::default(), &mut store).await,
+        controller
+            .admit_worker(
+                gang_spi::RequestScope::WorkerStore,
+                &Peer::default(),
+                &mut store
+            )
+            .await,
         Ok(gang_spi::GateDecision::NotLeading)
     ));
     stop.send(()).map_err(|()| "server stopped early")?;
@@ -128,35 +155,65 @@ async fn prepared_milestone_precedes_takeover_and_serving() -> TestResult {
     let interval = plain_settings().leadership.renew_interval.get();
     let (old_health, old_dial) = crate::test_support_memory::memory_listener();
     let (new_health, new_dial) = crate::test_support_memory::memory_listener();
-    let first = Server::prepare(first, plain_settings()).await?.with_health(Some(old_health));
-    let second = Server::prepare(second, plain_settings()).await?.with_health(Some(new_health));
+    let first = Server::prepare(first, plain_settings())
+        .await?
+        .with_health(Some(old_health));
+    let second = Server::prepare(second, plain_settings())
+        .await?
+        .with_health(Some(new_health));
     let (stop_old, stopped_old) = oneshot::channel::<()>();
     let (stop_new, stopped_new) = oneshot::channel::<()>();
     let (ready_old, old_ready) = ControllerReady::channel();
     let (ready_new, new_ready) = ControllerReady::channel();
-    let first = tokio::spawn(first.run(async { let _ = stopped_old.await; }, ready_old));
+    let first = tokio::spawn(first.run(
+        async {
+            let _ = stopped_old.await;
+        },
+        ready_old,
+    ));
     old_ready.await?;
     old.scheduler.snapshots().reached(1).await;
-    let second = tokio::spawn(second.run(async { let _ = stopped_new.await; }, ready_new));
+    let second = tokio::spawn(second.run(
+        async {
+            let _ = stopped_new.await;
+        },
+        ready_new,
+    ));
     host.prepared_attempts().reached(1).await;
     assert!(host.milestones().is_empty());
     assert_eq!(new.scheduler.snapshots().get(), 0);
-    assert_eq!(health_status(&new_dial).await?, http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        health_status(&new_dial).await?,
+        http::StatusCode::SERVICE_UNAVAILABLE
+    );
     old.clock.advance(interval);
     tokio::task::yield_now().await;
-    assert!(!first.is_finished(), "unprepared successor caused a handoff");
+    assert!(
+        !first.is_finished(),
+        "unprepared successor caused a handoff"
+    );
     assert_eq!(health_status(&old_dial).await?, http::StatusCode::OK);
     assert_eq!(new.scheduler.snapshots().get(), 0);
-    release_prepared.send(()).map_err(|()| "prepared milestone stopped early")?;
+    release_prepared
+        .send(())
+        .map_err(|()| "prepared milestone stopped early")?;
     new_ready.await?;
     for _ in 0..20 {
-        if new.scheduler.snapshots().get() > 0 { break; }
+        if new.scheduler.snapshots().get() > 0 {
+            break;
+        }
         tokio::task::yield_now().await;
         old.clock.advance(interval);
     }
-    assert!(new.scheduler.snapshots().get() > 0, "prepared successor did not promote");
+    assert!(
+        new.scheduler.snapshots().get() > 0,
+        "prepared successor did not promote"
+    );
     assert_eq!(health_status(&new_dial).await?, http::StatusCode::OK);
-    assert_eq!(host.milestones(), vec![HostMilestone::Prepared, HostMilestone::Serving]);
+    assert_eq!(
+        host.milestones(),
+        vec![HostMilestone::Prepared, HostMilestone::Serving]
+    );
     first.await??;
     drop(stop_old);
     stop_new.send(()).map_err(|()| "successor stopped early")?;
@@ -228,7 +285,10 @@ async fn replacement_refuses_requests_until_legacy_leader_releases() -> TestResu
     handles.clock.advance(renew_interval);
     handles.scheduler.snapshots().reached(1).await;
     assert_promoted(&controller, &health_dial).await?;
-    assert_eq!(host.milestones(), vec![HostMilestone::Prepared, HostMilestone::Serving]);
+    assert_eq!(
+        host.milestones(),
+        vec![HostMilestone::Prepared, HostMilestone::Serving]
+    );
     stop.send(()).map_err(|()| "server stopped early")?;
     run.await??;
     Ok(())
@@ -274,7 +334,10 @@ async fn assert_follower(
     controller: &gang_testkit::Controller,
     health_dial: &crate::test_support_memory::MemoryDialer,
 ) -> TestResult {
-    assert_eq!(health_status(health_dial).await?, http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        health_status(health_dial).await?,
+        http::StatusCode::SERVICE_UNAVAILABLE
+    );
     assert_eq!(
         controller
             .call_api(api_request("GET", "/v1/server", None, None))
@@ -324,7 +387,8 @@ async fn health_status(
 }
 
 #[tokio::test]
-async fn newer_controller_promotes_while_original_attempt_drains_without_reacquisition() -> TestResult {
+async fn newer_controller_promotes_while_original_attempt_drains_without_reacquisition()
+-> TestResult {
     let (first, _dials, handles) = plain_parts();
     let (mut second, _dials, other) = plain_parts();
     second.repository = first.repository.clone();
@@ -334,25 +398,42 @@ async fn newer_controller_promotes_while_original_attempt_drains_without_reacqui
     let old_host = first.provisioner.clone();
     let (first_health, first_dial) = crate::test_support_memory::memory_listener();
     let (second_health, second_dial) = crate::test_support_memory::memory_listener();
-    let first = Server::prepare(first, plain_settings()).await?.with_health(Some(first_health));
-    let second = Server::prepare(second, plain_settings()).await?.with_health(Some(second_health));
+    let first = Server::prepare(first, plain_settings())
+        .await?
+        .with_health(Some(first_health));
+    let second = Server::prepare(second, plain_settings())
+        .await?
+        .with_health(Some(second_health));
     let (stop_first, stopped_first) = oneshot::channel::<()>();
     let (stop_second, stopped_second) = oneshot::channel::<()>();
     let (ready_first, first_ready) = ControllerReady::channel();
     let (ready_second, second_ready) = ControllerReady::channel();
-    let first = tokio::spawn(first.run(async { let _ = stopped_first.await; }, ready_first));
+    let first = tokio::spawn(first.run(
+        async {
+            let _ = stopped_first.await;
+        },
+        ready_first,
+    ));
     first_ready.await?;
     handles.scheduler.snapshots().reached(1).await;
-    let original = handles.scheduler.controller().await.ok_or("original controller missing")?;
+    let original = handles
+        .scheduler
+        .controller()
+        .await
+        .ok_or("original controller missing")?;
     assert_eq!(health_status(&first_dial).await?, http::StatusCode::OK);
 
     let instance = gang_types::InstanceId::try_new("old-worker")?;
     let fleet = gang_types::FleetName::try_new("example-fleet")?;
     let deadline = handles.clock.wall() + Duration::from_secs(120);
     handles.scheduler.set_clock(handles.clock.clone());
-    handles.scheduler.set_attempt_deadlines(vec![gang_spi::DrainingWorker {
-        fleet: fleet.clone(), instance: instance.clone(), deadline,
-    }]);
+    handles
+        .scheduler
+        .set_attempt_deadlines(vec![gang_spi::DrainingWorker {
+            fleet: fleet.clone(),
+            instance: instance.clone(),
+            deadline,
+        }]);
     handles.scheduler.set_snapshot(SchedulerSnapshot {
         workers: vec![gang_spi::WorkerState {
             id: gang_testkit::worker_id(instance.as_str())?,
@@ -375,59 +456,113 @@ async fn newer_controller_promotes_while_original_attempt_drains_without_reacqui
         ..SchedulerSnapshot::default()
     });
 
-    let second = tokio::spawn(second.run(async { let _ = stopped_second.await; }, ready_second));
+    let second = tokio::spawn(second.run(
+        async {
+            let _ = stopped_second.await;
+        },
+        ready_second,
+    ));
     second_ready.await?;
     for _ in 0..20 {
-        if other.scheduler.snapshots().get() != 0 { break; }
+        if other.scheduler.snapshots().get() != 0 {
+            break;
+        }
         tokio::task::yield_now().await;
         handles.clock.advance(interval);
     }
-    assert!(other.scheduler.snapshots().get() > 0, "new controller did not promote");
-    assert!(!first.is_finished(), "original exited with an outstanding stamped attempt");
+    assert!(
+        other.scheduler.snapshots().get() > 0,
+        "new controller did not promote"
+    );
+    assert!(
+        !first.is_finished(),
+        "original exited with an outstanding stamped attempt"
+    );
     assert_eq!(handles.scheduler.controller_runs().get(), 1);
-    assert_eq!(health_status(&first_dial).await?, http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        health_status(&first_dial).await?,
+        http::StatusCode::SERVICE_UNAVAILABLE
+    );
     assert_eq!(health_status(&second_dial).await?, http::StatusCode::OK);
-    let response = original.call_api(api_request("GET", "/v1/server", None, None)).await;
+    let response = original
+        .call_api(api_request("GET", "/v1/server", None, None))
+        .await;
     assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.headers().get(gang_types::handover::REQUEST_NOT_STARTED_HEADER).and_then(|v| v.to_str().ok()), Some("true"));
+    assert_eq!(
+        response
+            .headers()
+            .get(gang_types::handover::REQUEST_NOT_STARTED_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
     let mut registration = api_request("POST", "/worker", None, None).into_parts().0;
     assert!(matches!(
-        original.admit_worker(gang_spi::RequestScope::Controller, &Peer::default(), &mut registration).await,
+        original
+            .admit_worker(
+                gang_spi::RequestScope::Controller,
+                &Peer::default(),
+                &mut registration
+            )
+            .await,
         Ok(gang_spi::GateDecision::NotLeading)
     ));
     let mut store = api_request("POST", "/store", None, None).into_parts().0;
     assert!(matches!(
-        original.admit_worker(gang_spi::RequestScope::WorkerStore, &Peer::default(), &mut store).await,
+        original
+            .admit_worker(
+                gang_spi::RequestScope::WorkerStore,
+                &Peer::default(),
+                &mut store
+            )
+            .await,
         Ok(gang_spi::GateDecision::Admit(_))
     ));
     let mut records = Vec::new();
     gang_spi::ExpiringRecordPort::records(
-        &handles.repository, gang_spi::RecordKind::ControllerDrain, None,
+        &handles.repository,
+        gang_spi::RecordKind::ControllerDrain,
+        None,
         std::num::NonZeroUsize::new(10).ok_or("nonzero page")?,
-        handles.clock.wall(), &mut records,
-    ).await?;
-    assert!(!records.is_empty(), "old worker protection was not installed");
+        handles.clock.wall(),
+        &mut records,
+    )
+    .await?;
+    assert!(
+        !records.is_empty(),
+        "old worker protection was not installed"
+    );
     let protected: serde_json::Value = serde_json::from_slice(&records[0].1.body)?;
     assert_eq!(protected[0]["fleet"], "example-fleet");
     assert_eq!(protected[0]["instance"], "old-worker");
     assert!(!old_host.milestones().contains(&HostMilestone::Unrouted));
-    stop_second.send(()).map_err(|()| "new server stopped early")?;
+    stop_second
+        .send(())
+        .map_err(|()| "new server stopped early")?;
     second.await??;
-    stop_first.send(()).map_err(|()| "original exited while still draining")?;
+    stop_first
+        .send(())
+        .map_err(|()| "original exited while still draining")?;
     handles.clock.advance(interval);
     tokio::task::yield_now().await;
     assert!(!first.is_finished());
     assert_eq!(handles.scheduler.controller_runs().get(), 1);
-    assert_eq!(health_status(&first_dial).await?, http::StatusCode::SERVICE_UNAVAILABLE);
-
+    assert_eq!(
+        health_status(&first_dial).await?,
+        http::StatusCode::SERVICE_UNAVAILABLE
+    );
 
     handles.scheduler.set_snapshot(SchedulerSnapshot::default());
     for _ in 0..20 {
-        if first.is_finished() { break; }
+        if first.is_finished() {
+            break;
+        }
         tokio::task::yield_now().await;
         handles.clock.advance(interval);
     }
-    assert!(first.is_finished(), "original did not exit after its attempt completed");
+    assert!(
+        first.is_finished(),
+        "original did not exit after its attempt completed"
+    );
     first.await??;
     assert_eq!(handles.scheduler.controller_runs().get(), 1);
     assert!(old_host.milestones().contains(&HostMilestone::Unrouted));
@@ -456,7 +591,6 @@ async fn shutdown_cancels_candidate_registration() -> TestResult {
     run.await?;
     Ok(())
 }
-
 
 #[tokio::test]
 async fn promotion_survives_dashboard_history_read_failure() -> TestResult {

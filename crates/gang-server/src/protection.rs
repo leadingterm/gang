@@ -5,10 +5,13 @@ use std::time::Duration;
 
 use gang_clock::Timestamp;
 use gang_reconciler::FleetPass;
-use gang_spi::{ControllerDrain, ControllerId, ExpiringRecordPort, Insert, PortError, Record, RecordId, RecordKey, RecordKind, RecordVersion, Replace, SchedulerSnapshot, MAX_RECORD_BODY_BYTES};
+use gang_spi::{
+    ControllerDrain, ControllerId, ExpiringRecordPort, Insert, MAX_RECORD_BODY_BYTES, PortError,
+    Record, RecordId, RecordKey, RecordKind, RecordVersion, Replace, SchedulerSnapshot,
+};
 use gang_types::{FleetName, InstanceId};
-use serde::{Deserialize, Serialize};
 use ring::digest::{Context, SHA256};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 struct Worker {
@@ -30,7 +33,10 @@ fn key(holder: &ControllerId, index: usize) -> RecordKey {
     digest.update(&index.to_be_bytes());
     let mut id = [0; 32];
     id.copy_from_slice(digest.finish().as_ref());
-    RecordKey { kind: RecordKind::ControllerDrain, id: RecordId::new(id) }
+    RecordKey {
+        kind: RecordKind::ControllerDrain,
+        id: RecordId::new(id),
+    }
 }
 
 fn encode(workers: &[Worker], into: &mut Vec<u8>) -> Result<(), PortError> {
@@ -50,23 +56,43 @@ impl Outgoing {
         let mut body = vec![b'['];
         let mut encoded = Vec::new();
         for entry in &drain.workers {
-            let worker = Worker { fleet: entry.fleet.clone(), instance: entry.instance.clone(), deadline: entry.deadline };
+            let worker = Worker {
+                fleet: entry.fleet.clone(),
+                instance: entry.instance.clone(),
+                deadline: entry.deadline,
+            };
             encoded.clear();
             serde_json::to_writer(&mut encoded, &worker).map_err(PortError::backend)?;
             if encoded.len() + 2 > MAX_RECORD_BODY_BYTES {
-                return Err(PortError::config("one physical worker exceeds the record body limit"));
+                return Err(PortError::config(
+                    "one physical worker exceeds the record body limit",
+                ));
             }
-            if body.len() + encoded.len() + usize::from(!workers.is_empty()) + 1 > MAX_RECORD_BODY_BYTES {
+            if body.len() + encoded.len() + usize::from(!workers.is_empty()) + 1
+                > MAX_RECORD_BODY_BYTES
+            {
                 body.push(b']');
-                chunks.push(Chunk { key: key(holder, chunks.len()), version: RecordVersion::fresh().map_err(PortError::backend)?, workers: std::mem::take(&mut workers), body: std::mem::replace(&mut body, vec![b'[']) });
+                chunks.push(Chunk {
+                    key: key(holder, chunks.len()),
+                    version: RecordVersion::fresh().map_err(PortError::backend)?,
+                    workers: std::mem::take(&mut workers),
+                    body: std::mem::replace(&mut body, vec![b'[']),
+                });
             }
-            if !workers.is_empty() { body.push(b','); }
+            if !workers.is_empty() {
+                body.push(b',');
+            }
             body.extend_from_slice(&encoded);
             workers.push(worker);
         }
         if !workers.is_empty() {
             body.push(b']');
-            chunks.push(Chunk { key: key(holder, chunks.len()), version: RecordVersion::fresh().map_err(PortError::backend)?, workers, body });
+            chunks.push(Chunk {
+                key: key(holder, chunks.len()),
+                version: RecordVersion::fresh().map_err(PortError::backend)?,
+                workers,
+                body,
+            });
         }
         Ok(Self { chunks })
     }
@@ -79,17 +105,42 @@ impl Outgoing {
         ttl: Duration,
     ) -> Result<(), PortError> {
         for chunk in &mut self.chunks {
-            let expires = chunk.workers.iter().map(|worker| worker.deadline).max().unwrap_or(now).min(now + ttl);
-            if expires <= now { continue; }
-            match repository.insert(&[(chunk.key, &chunk.body)], chunk.version, now, expires).await? {
+            let expires = chunk
+                .workers
+                .iter()
+                .map(|worker| worker.deadline)
+                .max()
+                .unwrap_or(now)
+                .min(now + ttl);
+            if expires <= now {
+                continue;
+            }
+            match repository
+                .insert(&[(chunk.key, &chunk.body)], chunk.version, now, expires)
+                .await?
+            {
                 Insert::Inserted => {}
                 Insert::Exists => {
-                    let current = repository.get(&chunk.key, now).await?
-                        .ok_or_else(|| PortError::unavailable("controller drain record expired during installation"))?;
-                    if current.body != chunk.body { return Err(PortError::backend("controller drain record has different frozen workers")); }
-                    chunk.version = match repository.replace(&chunk.key, current.version, &chunk.body, now, expires).await? {
+                    let current = repository.get(&chunk.key, now).await?.ok_or_else(|| {
+                        PortError::unavailable(
+                            "controller drain record expired during installation",
+                        )
+                    })?;
+                    if current.body != chunk.body {
+                        return Err(PortError::backend(
+                            "controller drain record has different frozen workers",
+                        ));
+                    }
+                    chunk.version = match repository
+                        .replace(&chunk.key, current.version, &chunk.body, now, expires)
+                        .await?
+                    {
                         Replace::Replaced(version) => version,
-                        Replace::Stale => return Err(PortError::unavailable("controller drain installation changed")),
+                        Replace::Stale => {
+                            return Err(PortError::unavailable(
+                                "controller drain installation changed",
+                            ));
+                        }
                     };
                 }
             }
@@ -101,9 +152,12 @@ impl Outgoing {
         into.workers.clear();
         into.complete = false;
         for chunk in &self.chunks {
-            into.workers.extend(chunk.workers.iter().map(|worker| gang_spi::DrainingWorker {
-                fleet: worker.fleet.clone(), instance: worker.instance.clone(), deadline: worker.deadline,
-            }));
+            into.workers
+                .extend(chunk.workers.iter().map(|worker| gang_spi::DrainingWorker {
+                    fleet: worker.fleet.clone(),
+                    instance: worker.instance.clone(),
+                    deadline: worker.deadline,
+                }));
         }
     }
 
@@ -119,33 +173,55 @@ impl Outgoing {
             let mut changed = false;
             let mut latest = now;
             chunk.workers.retain_mut(|worker| {
-                let Ok(index) = drain.workers.binary_search_by(|current| (&current.fleet, &current.instance).cmp(&(&worker.fleet, &worker.instance))) else { return false };
+                let Ok(index) = drain.workers.binary_search_by(|current| {
+                    (&current.fleet, &current.instance).cmp(&(&worker.fleet, &worker.instance))
+                }) else {
+                    return false;
+                };
                 let current = &drain.workers[index];
                 let deadline = worker.deadline.min(current.deadline);
                 changed |= deadline != worker.deadline;
                 worker.deadline = deadline;
-                if deadline <= now { return false; }
+                if deadline <= now {
+                    return false;
+                }
                 latest = latest.max(deadline);
                 true
             });
             if chunk.workers.is_empty() {
-                if repository.remove(&chunk.key, chunk.version, now).await? == gang_spi::Remove::Stale
-                    && let Some(current) = repository.get(&chunk.key, now).await? {
+                if repository.remove(&chunk.key, chunk.version, now).await?
+                    == gang_spi::Remove::Stale
+                    && let Some(current) = repository.get(&chunk.key, now).await?
+                {
                     repository.remove(&chunk.key, current.version, now).await?;
                 }
                 continue;
             }
             // Never add workers, extend a dispatch stamp, or resurrect an expired incarnation.
-            if changed || previous != chunk.workers.len() { encode(&chunk.workers, &mut chunk.body)?; }
+            if changed || previous != chunk.workers.len() {
+                encode(&chunk.workers, &mut chunk.body)?;
+            }
             let expires = latest.min(now + ttl);
-            match repository.replace(&chunk.key, chunk.version, &chunk.body, now, expires).await? {
+            match repository
+                .replace(&chunk.key, chunk.version, &chunk.body, now, expires)
+                .await?
+            {
                 Replace::Replaced(version) => chunk.version = version,
                 Replace::Stale => {
-                    let current = repository.get(&chunk.key, now).await?
+                    let current = repository
+                        .get(&chunk.key, now)
+                        .await?
                         .ok_or_else(|| PortError::backend("controller drain protection expired"))?;
-                    chunk.version = match repository.replace(&chunk.key, current.version, &chunk.body, now, expires).await? {
+                    chunk.version = match repository
+                        .replace(&chunk.key, current.version, &chunk.body, now, expires)
+                        .await?
+                    {
                         Replace::Replaced(version) => version,
-                        Replace::Stale => return Err(PortError::unavailable("controller drain protection changed during renewal")),
+                        Replace::Stale => {
+                            return Err(PortError::unavailable(
+                                "controller drain protection changed during renewal",
+                            ));
+                        }
                     };
                 }
             }
@@ -180,22 +256,48 @@ impl Incoming {
             self.records.clear();
             let mut after = None;
             loop {
-                let more = repository.records(RecordKind::ControllerDrain, after, NonZeroUsize::new(gang_spi::MAX_RECORD_CHANGES).ok_or_else(|| PortError::backend("zero record page"))?, now, &mut self.page).await?;
+                let more = repository
+                    .records(
+                        RecordKind::ControllerDrain,
+                        after,
+                        NonZeroUsize::new(gang_spi::MAX_RECORD_CHANGES)
+                            .ok_or_else(|| PortError::backend("zero record page"))?,
+                        now,
+                        &mut self.page,
+                    )
+                    .await?;
                 after = self.page.last().map(|entry| entry.0);
                 for (id, record) in self.page.drain(..) {
-                    let workers = serde_json::from_slice(&record.body).map_err(PortError::backend)?;
+                    let workers =
+                        serde_json::from_slice(&record.body).map_err(PortError::backend)?;
                     self.records.push((id, record, workers));
                 }
-                if !more { break; }
-                if after.is_none() { return Err(PortError::backend("empty controller drain page")); }
+                if !more {
+                    break;
+                }
+                if after.is_none() {
+                    return Err(PortError::backend("empty controller drain page"));
+                }
             }
             self.loaded = true;
         } else {
             for (id, record, workers) in &mut self.records {
-                if let Some(current) = repository.get(&RecordKey { kind: RecordKind::ControllerDrain, id: *id }, now).await? {
+                if let Some(current) = repository
+                    .get(
+                        &RecordKey {
+                            kind: RecordKind::ControllerDrain,
+                            id: *id,
+                        },
+                        now,
+                    )
+                    .await?
+                {
                     if record.body != current.body {
-                        Vec::<Worker>::deserialize_in_place(&mut serde_json::Deserializer::from_slice(&current.body), workers)
-                            .map_err(PortError::backend)?;
+                        Vec::<Worker>::deserialize_in_place(
+                            &mut serde_json::Deserializer::from_slice(&current.body),
+                            workers,
+                        )
+                        .map_err(PortError::backend)?;
                     }
                     *record = current;
                 } else {
@@ -203,7 +305,8 @@ impl Incoming {
                 }
             }
         }
-        self.records.retain(|(_, record, _)| record.expires_at > now);
+        self.records
+            .retain(|(_, record, _)| record.expires_at > now);
         self.retain(now, snapshot, fleets);
         Ok(())
     }
@@ -212,11 +315,18 @@ impl Incoming {
     fn index(&mut self, snapshot: &SchedulerSnapshot, fleets: &[FleetPass]) {
         self.live.clear();
         for (fleet, pass) in fleets.iter().enumerate() {
-            self.live.extend((0..pass.supply.instances.len()).map(|instance| (fleet, instance)));
+            self.live
+                .extend((0..pass.supply.instances.len()).map(|instance| (fleet, instance)));
         }
         self.live.sort_unstable_by(|a, b| {
-            (&fleets[a.0].policy.name, &fleets[a.0].supply.instances[a.1].id)
-                .cmp(&(&fleets[b.0].policy.name, &fleets[b.0].supply.instances[b.1].id))
+            (
+                &fleets[a.0].policy.name,
+                &fleets[a.0].supply.instances[a.1].id,
+            )
+                .cmp(&(
+                    &fleets[b.0].policy.name,
+                    &fleets[b.0].supply.instances[b.1].id,
+                ))
         });
         self.connected.clear();
         self.connected.extend(0..snapshot.workers.len());
@@ -229,7 +339,9 @@ impl Incoming {
 
     fn retain(&mut self, now: Timestamp, snapshot: &SchedulerSnapshot, fleets: &mut [FleetPass]) {
         if self.records.is_empty() {
-            for fleet in fleets { fleet.handover_protected.clear(); }
+            for fleet in fleets {
+                fleet.handover_protected.clear();
+            }
             return;
         }
         self.index(snapshot, fleets);
@@ -238,20 +350,31 @@ impl Incoming {
         self.retained.fill(false);
         for (record, (_, _, workers)) in self.records.iter().enumerate() {
             for (index, worker) in workers.iter().enumerate() {
-                if worker.deadline <= now { continue; }
-                let ignored = self.ignored.binary_search_by(|entry| (&entry.0, &entry.1).cmp(&(&worker.fleet, &worker.instance)));
+                if worker.deadline <= now {
+                    continue;
+                }
+                let ignored = self.ignored.binary_search_by(|entry| {
+                    (&entry.0, &entry.1).cmp(&(&worker.fleet, &worker.instance))
+                });
                 let Err(ignored) = ignored else { continue };
                 let present = self.live.binary_search_by(|entry| {
-                    (&fleets[entry.0].policy.name, &fleets[entry.0].supply.instances[entry.1].id)
+                    (
+                        &fleets[entry.0].policy.name,
+                        &fleets[entry.0].supply.instances[entry.1].id,
+                    )
                         .cmp(&(&worker.fleet, &worker.instance))
                 });
-                let reconnected = self.connected.binary_search_by(|entry| {
-                    let connected = &snapshot.workers[*entry];
-                    (&connected.fleet, connected.id.instance_name())
-                        .cmp(&(&worker.fleet, Some(worker.instance.as_str())))
-                }).is_ok();
+                let reconnected = self
+                    .connected
+                    .binary_search_by(|entry| {
+                        let connected = &snapshot.workers[*entry];
+                        (&connected.fleet, connected.id.instance_name())
+                            .cmp(&(&worker.fleet, Some(worker.instance.as_str())))
+                    })
+                    .is_ok();
                 if reconnected || present.is_err() {
-                    self.ignored.insert(ignored, (worker.fleet.clone(), worker.instance.clone()));
+                    self.ignored
+                        .insert(ignored, (worker.fleet.clone(), worker.instance.clone()));
                     continue;
                 }
                 if let Ok(present) = present {
@@ -278,10 +401,12 @@ impl Incoming {
         for fleet in fleets.iter_mut() {
             let name = &fleet.policy.name;
             fleet.handover_protected.retain(|instance| {
-                self.active.binary_search_by(|entry| {
-                    let worker = &self.records[entry.0].2[entry.1];
-                    (&worker.fleet, &worker.instance).cmp(&(name, instance))
-                }).is_ok()
+                self.active
+                    .binary_search_by(|entry| {
+                        let worker = &self.records[entry.0].2[entry.1];
+                        (&worker.fleet, &worker.instance).cmp(&(name, instance))
+                    })
+                    .is_ok()
             });
         }
         for &(record, index, fleet) in &self.active {
@@ -320,7 +445,8 @@ mod tests {
         });
         let drain = ControllerDrain {
             workers: vec![DrainingWorker {
-                fleet: pass.policy.name.clone(), instance,
+                fleet: pass.policy.name.clone(),
+                instance,
                 deadline: clock.wall() + Duration::from_secs(360),
             }],
             complete: false,
@@ -329,65 +455,127 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_worker_counts_live_but_never_as_free_or_booting_and_cannot_be_terminated() -> TestResult {
+    async fn old_worker_counts_live_but_never_as_free_or_booting_and_cannot_be_terminated()
+    -> TestResult {
         let (clock, mut fleets, drain) = fixture()?;
         let repository = FakeRepository::default();
         let mut outgoing = Outgoing::new(&ControllerId::new("old"), &drain)?;
-        outgoing.install(&repository, clock.wall(), Duration::from_secs(10)).await?;
+        outgoing
+            .install(&repository, clock.wall(), Duration::from_secs(10))
+            .await?;
         let mut incoming = Incoming::default();
         let mut snapshot = SchedulerSnapshot {
-            queued: vec![crate::test_support_fleet::queued_demand(FleetSet::prefix(1)?)],
+            queued: vec![crate::test_support_fleet::queued_demand(FleetSet::prefix(
+                1,
+            )?)],
             ..Default::default()
         };
-        incoming.refresh(&repository, clock.wall(), &snapshot, &mut fleets).await?;
+        incoming
+            .refresh(&repository, clock.wall(), &snapshot, &mut fleets)
+            .await?;
         let policies = vec![fleets[0].policy.clone()];
         let scaling = Arc::new(gang_config::ScalingConfig::default());
-        let profiles = SourceProfiles::new(&scaling, gang_config::ActionsConfig::default().history_window);
+        let profiles = SourceProfiles::new(
+            &scaling,
+            gang_config::ActionsConfig::default().history_window,
+        );
         let mut reconciler = Reconciler::new(&policies, Arc::clone(&scaling), profiles.clone());
         let mut hosted = HostedSnapshot::default();
         hosted.replace(&mut snapshot);
         let mut plan = Plan::new();
         reconciler.reconcile(&mut fleets, &hosted, PassTime::read(&clock), &mut plan);
-        assert!(plan.steps.iter().any(|step| matches!(step.action, Action::ScaleOut { to: 2, .. })),
-            "the old live instance must not satisfy new-engine demand as usable or booting");
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| matches!(step.action, Action::ScaleOut { to: 2, .. })),
+            "the old live instance must not satisfy new-engine demand as usable or booting"
+        );
         let mut limited = fleets.clone();
         limited[0].policy.instances = gang_config::InstanceBounds::up_to(std::num::NonZeroU32::MIN);
         let mut capped = Reconciler::new(&[limited[0].policy.clone()], scaling, profiles);
         let mut capped_plan = Plan::new();
-        capped.reconcile(&mut limited, &hosted, PassTime::read(&clock), &mut capped_plan);
-        assert!(!capped_plan.steps.iter().any(|step| matches!(step.action, Action::ScaleOut { .. })),
-            "the protected instance must still consume the fleet's live/max allowance");
+        capped.reconcile(
+            &mut limited,
+            &hosted,
+            PassTime::read(&clock),
+            &mut capped_plan,
+        );
+        assert!(
+            !capped_plan
+                .steps
+                .iter()
+                .any(|step| matches!(step.action, Action::ScaleOut { .. })),
+            "the protected instance must still consume the fleet's live/max allowance"
+        );
         snapshot.queued.clear();
         hosted.replace(&mut snapshot);
         // Hold past the former action-killing grace and every orphan/idle/drain threshold.
         for _ in 0..35 {
             clock.advance(Duration::from_secs(9));
-            outgoing.refresh(&repository, &drain, clock.wall(), Duration::from_secs(10)).await?;
-            incoming.refresh(&repository, clock.wall(), hosted.snapshot(), &mut fleets).await?;
+            outgoing
+                .refresh(&repository, &drain, clock.wall(), Duration::from_secs(10))
+                .await?;
+            incoming
+                .refresh(&repository, clock.wall(), hosted.snapshot(), &mut fleets)
+                .await?;
             reconciler.reconcile(&mut fleets, &hosted, PassTime::read(&clock), &mut plan);
-            assert!(!plan.steps.iter().any(|step| matches!(step.action, Action::Terminate { .. } | Action::StartDrain { .. })));
-            assert_eq!(fleets[0].handover_protected, vec![drain.workers[0].instance.clone()]);
+            assert!(!plan.steps.iter().any(|step| matches!(
+                step.action,
+                Action::Terminate { .. } | Action::StartDrain { .. }
+            )));
+            assert_eq!(
+                fleets[0].handover_protected,
+                vec![drain.workers[0].instance.clone()]
+            );
         }
         Ok(())
     }
 
     #[tokio::test]
-    async fn renewal_shrinks_to_actual_stamp_and_never_resurrects_an_expired_record() -> TestResult {
+    async fn renewal_shrinks_to_actual_stamp_and_never_resurrects_an_expired_record() -> TestResult
+    {
         let (clock, _fleets, mut drain) = fixture()?;
         let repository = FakeRepository::default();
         let holder = ControllerId::new("old");
         let mut outgoing = Outgoing::new(&holder, &drain)?;
-        outgoing.install(&repository, clock.wall(), Duration::from_secs(10)).await?;
-        outgoing.install(&repository, clock.wall(), Duration::from_secs(10)).await?;
+        outgoing
+            .install(&repository, clock.wall(), Duration::from_secs(10))
+            .await?;
+        outgoing
+            .install(&repository, clock.wall(), Duration::from_secs(10))
+            .await?;
         drain.workers[0].deadline = clock.wall() + Duration::from_secs(3);
-        outgoing.refresh(&repository, &drain, clock.wall(), Duration::from_secs(10)).await?;
-        assert_eq!(repository.get(&key(&holder, 0), clock.wall()).await?.ok_or("protection missing")?.expires_at, drain.workers[0].deadline);
+        outgoing
+            .refresh(&repository, &drain, clock.wall(), Duration::from_secs(10))
+            .await?;
+        assert_eq!(
+            repository
+                .get(&key(&holder, 0), clock.wall())
+                .await?
+                .ok_or("protection missing")?
+                .expires_at,
+            drain.workers[0].deadline
+        );
         clock.advance(Duration::from_secs(3));
-        outgoing.refresh(&repository, &drain, clock.wall(), Duration::from_secs(10)).await?;
-        assert!(repository.get(&key(&holder, 0), clock.wall()).await?.is_none());
+        outgoing
+            .refresh(&repository, &drain, clock.wall(), Duration::from_secs(10))
+            .await?;
+        assert!(
+            repository
+                .get(&key(&holder, 0), clock.wall())
+                .await?
+                .is_none()
+        );
         drain.workers[0].deadline = clock.wall() + Duration::from_secs(60);
-        outgoing.refresh(&repository, &drain, clock.wall(), Duration::from_secs(10)).await?;
-        assert!(repository.get(&key(&holder, 0), clock.wall()).await?.is_none());
+        outgoing
+            .refresh(&repository, &drain, clock.wall(), Duration::from_secs(10))
+            .await?;
+        assert!(
+            repository
+                .get(&key(&holder, 0), clock.wall())
+                .await?
+                .is_none()
+        );
         Ok(())
     }
 
@@ -396,24 +584,41 @@ mod tests {
         let (clock, mut fleets, drain) = fixture()?;
         let repository = FakeRepository::default();
         let mut outgoing = Outgoing::new(&ControllerId::new("old"), &drain)?;
-        outgoing.install(&repository, clock.wall(), Duration::from_secs(10)).await?;
+        outgoing
+            .install(&repository, clock.wall(), Duration::from_secs(10))
+            .await?;
         let mut incoming = Incoming::default();
         let snapshot = SchedulerSnapshot::default();
-        incoming.refresh(&repository, clock.wall(), &snapshot, &mut fleets).await?;
+        incoming
+            .refresh(&repository, clock.wall(), &snapshot, &mut fleets)
+            .await?;
         repository.fail_records(true);
-        assert!(incoming.refresh(&repository, clock.wall(), &snapshot, &mut fleets).await.is_err());
+        assert!(
+            incoming
+                .refresh(&repository, clock.wall(), &snapshot, &mut fleets)
+                .await
+                .is_err()
+        );
         assert_eq!(fleets[0].handover_protected.len(), 1);
         repository.fail_records(false);
         clock.advance(Duration::from_secs(10));
-        incoming.refresh(&repository, clock.wall(), &snapshot, &mut fleets).await?;
+        incoming
+            .refresh(&repository, clock.wall(), &snapshot, &mut fleets)
+            .await?;
         assert!(fleets[0].handover_protected.is_empty());
         repository.fail_records(true);
-        incoming.refresh(&repository, clock.wall(), &snapshot, &mut fleets).await?;
+        incoming
+            .refresh(&repository, clock.wall(), &snapshot, &mut fleets)
+            .await?;
         let repository = FakeRepository::default();
         let mut empty = Incoming::default();
-        empty.refresh(&repository, clock.wall(), &snapshot, &mut fleets).await?;
+        empty
+            .refresh(&repository, clock.wall(), &snapshot, &mut fleets)
+            .await?;
         repository.fail_records(true);
-        empty.refresh(&repository, clock.wall(), &snapshot, &mut fleets).await?;
+        empty
+            .refresh(&repository, clock.wall(), &snapshot, &mut fleets)
+            .await?;
         Ok(())
     }
 
@@ -423,24 +628,37 @@ mod tests {
             let (clock, mut fleets, drain) = fixture()?;
             let repository = FakeRepository::default();
             let mut outgoing = Outgoing::new(&ControllerId::new("old"), &drain)?;
-            outgoing.install(&repository, clock.wall(), Duration::from_secs(10)).await?;
+            outgoing
+                .install(&repository, clock.wall(), Duration::from_secs(10))
+                .await?;
             let mut incoming = Incoming::default();
             let mut snapshot = SchedulerSnapshot::default();
-            incoming.refresh(&repository, clock.wall(), &snapshot, &mut fleets).await?;
+            incoming
+                .refresh(&repository, clock.wall(), &snapshot, &mut fleets)
+                .await?;
             if reconnect {
                 snapshot.workers.push(gang_spi::WorkerState {
                     id: worker_on(&drain.workers[0].instance)?,
                     fleet: drain.workers[0].fleet.clone(),
                     environment: Some(fleets[0].policy.action_environment.clone()),
-                    running_actions: 0, max_inflight_actions: None, draining: false,
-                    last_seen: clock.wall(), paused: false,
+                    running_actions: 0,
+                    max_inflight_actions: None,
+                    draining: false,
+                    last_seen: clock.wall(),
+                    paused: false,
                 });
-            } else { fleets[0].supply.instances.clear(); }
-            incoming.refresh(&repository, clock.wall(), &snapshot, &mut fleets).await?;
+            } else {
+                fleets[0].supply.instances.clear();
+            }
+            incoming
+                .refresh(&repository, clock.wall(), &snapshot, &mut fleets)
+                .await?;
             assert!(fleets[0].handover_protected.is_empty());
             repository.fail_records(true);
             snapshot.workers.clear();
-            incoming.refresh(&repository, clock.wall(), &snapshot, &mut fleets).await?;
+            incoming
+                .refresh(&repository, clock.wall(), &snapshot, &mut fleets)
+                .await?;
             assert!(fleets[0].handover_protected.is_empty());
         }
         Ok(())
@@ -460,9 +678,23 @@ mod tests {
         }
         let mut outgoing = Outgoing::new(&ControllerId::new("large"), &drain)?;
         assert!(outgoing.chunks.len() > 1);
-        assert_eq!(outgoing.chunks.iter().map(|chunk| chunk.workers.len()).sum::<usize>(), drain.workers.len());
-        assert!(outgoing.chunks.iter().all(|chunk| chunk.body.len() <= MAX_RECORD_BODY_BYTES));
-        outgoing.install(&repository, now, Duration::from_secs(10)).await?;
+        assert_eq!(
+            outgoing
+                .chunks
+                .iter()
+                .map(|chunk| chunk.workers.len())
+                .sum::<usize>(),
+            drain.workers.len()
+        );
+        assert!(
+            outgoing
+                .chunks
+                .iter()
+                .all(|chunk| chunk.body.len() <= MAX_RECORD_BODY_BYTES)
+        );
+        outgoing
+            .install(&repository, now, Duration::from_secs(10))
+            .await?;
         assert_eq!(repository.stored_records(), outgoing.chunks.len());
         Ok(())
     }

@@ -505,8 +505,17 @@ mod tests {
     struct LifecycleGate(bool);
 
     impl RequestGate for LifecycleGate {
-        async fn admit(&self, scope: RequestScope, peer: &Peer, parts: &mut http::request::Parts) -> Result<GateDecision, PortError> {
-            if self.0 { Allow.admit(scope, peer, parts).await } else { Ok(GateDecision::NotLeading) }
+        async fn admit(
+            &self,
+            scope: RequestScope,
+            peer: &Peer,
+            parts: &mut http::request::Parts,
+        ) -> Result<GateDecision, PortError> {
+            if self.0 {
+                Allow.admit(scope, peer, parts).await
+            } else {
+                Ok(GateDecision::NotLeading)
+            }
         }
     }
 

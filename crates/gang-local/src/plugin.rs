@@ -6,9 +6,10 @@ use std::sync::{Arc, OnceLock};
 use gang_clock::SystemClock;
 use gang_os::fs::ensure_private_dir;
 use gang_spi::{
-    ControllerHostIdentity, ControllerHostPort, ControllerHostState, FleetSupply, Held, HostMilestone, InstanceIdentity,
-    MountedScratchVolume, NodeLifecyclePort, Plugin, PluginContext, PortError, PreemptionNotice,
-    ProvisionerPort, ScratchVolumePort, ServerEndpoints, Sidecar, WorkloadCredentialPort,
+    ControllerHostIdentity, ControllerHostPort, ControllerHostState, FleetSupply, Held,
+    HostMilestone, InstanceIdentity, MountedScratchVolume, NodeLifecyclePort, Plugin,
+    PluginContext, PortError, PreemptionNotice, ProvisionerPort, ScratchVolumePort,
+    ServerEndpoints, Sidecar, WorkloadCredentialPort,
 };
 use gang_types::{
     Audience, Fleet, FleetName, InstanceId, Isa, Proof, Resources, TokenTtl, WorkerLifetime,

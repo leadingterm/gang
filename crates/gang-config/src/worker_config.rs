@@ -80,7 +80,8 @@ impl WorkerConfig {
     /// The maximum time for an attempt, including download, execution and upload.
     #[must_use]
     pub fn attempt_budget(&self, action_timeout: WholeSeconds) -> Duration {
-        action_timeout.get()
+        action_timeout
+            .get()
             .saturating_add(self.download_timeout.get())
             .saturating_add(self.upload_timeout.get())
     }

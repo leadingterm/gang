@@ -74,7 +74,9 @@ pub use expiring_port::{
 pub use fence::{Deadline, Fence, Held, Keeper, LeaseLapsed, RunError, Work};
 pub use fleet_options::{FleetOptions, OptionSpec};
 pub use gang_macros::{FleetOptions, PortFailure, compose, port};
-pub use host_port::{ControllerHostIdentity, ControllerHostPort, ControllerHostState, HostMilestone};
+pub use host_port::{
+    ControllerHostIdentity, ControllerHostPort, ControllerHostState, HostMilestone,
+};
 pub use identity_port::{
     LoginChallenge, LoginClient, LoginGrant, LoginPort, LoginRequest, LoginSupport,
     ProofVerifierPort,
@@ -116,8 +118,8 @@ pub use scheduler_port::{
     ControllerEndpoints, ControllerReady, ControllerSpec, DrainingWorker, EngineStore,
     ExecutingDemand, GateDecision, InstanceCordon, LeaderUnavailable, LearnedHistory, Listening,
     ListingLimits, QueuedActionView, QueuedDemand, RequestGate, RequestScope, RunningActionView,
-    SchedulerPort, SchedulerSnapshot, Slots,
-    StoreAccess, StoreKind, WorkerSpec, WorkerState, WorkerTls, full_body,
+    SchedulerPort, SchedulerSnapshot, Slots, StoreAccess, StoreKind, WorkerSpec, WorkerState,
+    WorkerTls, full_body,
 };
 pub use schema::SchemaMismatch;
 pub use scratch_port::{MountedScratchVolume, ScratchVolumePort};

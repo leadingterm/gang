@@ -306,7 +306,8 @@ mod tests {
             max_workers: 1,
             observations: &observations,
             client_action_timeout: Duration::from_mins(1),
-            attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
+            attempt_budget: gang_config::WorkerConfig::default()
+                .attempt_budget(gang_config::ActionsConfig::default().timeout),
         };
         Ok(build_stores(settings::controller_stores(&spec)?).await?)
     }

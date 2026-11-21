@@ -11,7 +11,6 @@ use gang_spi::{
     Fence, Keeper, LeaderLeasePort, Lease, LeaseCandidate, PortError, Renewal, Takeover,
 };
 
-
 /// The `stale_before` under which no lease counts as stale, so only a released lease is free.
 const ONLY_RELEASED: Timestamp = Timestamp::from_unix_millis(0);
 
@@ -110,7 +109,6 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
         self.config.ttl.get()
     }
 
-
     /// Registers this host's durable priority, retrying transient failures until cancelled.
     pub(crate) async fn register_candidate(
         &self,
@@ -158,25 +156,45 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
             let wall = self.clock.wall();
             let stale_before = if reachable_since.is_some_and(|since| {
                 started.saturating_duration_since(since) >= self.config.ttl.get()
-            }) { wall - self.config.clock_skew } else { ONLY_RELEASED };
+            }) {
+                wall - self.config.clock_skew
+            } else {
+                ONLY_RELEASED
+            };
             let mut host_failed = false;
             let mut checking_host = true;
-            let attempt = self.clock.timeout(self.call_timeout(), async {
-                let state = host.state().await.map_err(|error| { host_failed = true; error })?;
-                checking_host = false;
-                if state == ControllerHostState::Retiring {
-                    return Ok(None);
-                }
-                self.lease.acquire(candidate, wall, stale_before, wall + self.config.ttl.get(), Takeover::Request)
-                    .await.map(Some)
-            }).await;
+            let attempt = self
+                .clock
+                .timeout(self.call_timeout(), async {
+                    let state = host.state().await.map_err(|error| {
+                        host_failed = true;
+                        error
+                    })?;
+                    checking_host = false;
+                    if state == ControllerHostState::Retiring {
+                        return Ok(None);
+                    }
+                    self.lease
+                        .acquire(
+                            candidate,
+                            wall,
+                            stale_before,
+                            wall + self.config.ttl.get(),
+                            Takeover::Request,
+                        )
+                        .await
+                        .map(Some)
+                })
+                .await;
             match attempt {
                 Ok(Ok(None)) => return Ok(None),
                 Ok(Ok(Some(Acquisition::Acquired(lease)))) => {
                     self.confirm(started);
                     return Ok(Some(lease));
                 }
-                Ok(Ok(Some(Acquisition::Contending(_) | Acquisition::Held(_) | Acquisition::Reserved))) => {
+                Ok(Ok(Some(
+                    Acquisition::Contending(_) | Acquisition::Held(_) | Acquisition::Reserved,
+                ))) => {
                     reachable_since.get_or_insert_with(|| self.clock.monotonic());
                 }
                 Ok(Err(error)) if host_failed => return Err(error),
@@ -190,7 +208,9 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
                     tracing::warn!(%error, "timed out acquiring the leader lease");
                 }
             }
-            self.clock.sleep_until(started + self.config.renew_interval.get()).await;
+            self.clock
+                .sleep_until(started + self.config.renew_interval.get())
+                .await;
         }
     }
 

@@ -74,9 +74,9 @@ run "group_resources_and_permissions" {
       "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/execute/0123456789abcdef",
       "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/workers/0123456789abcdef",
     ]
-    config_digest          = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    dynamodb_table_arn     = "arn:aws:dynamodb:eu-north-1:000000000000:table/gang"
-    secret_parameters      = { token = "/gang/token" }
+    config_digest      = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    dynamodb_table_arn = "arn:aws:dynamodb:eu-north-1:000000000000:table/gang"
+    secret_parameters  = { token = "/gang/token" }
   }
 
   assert {

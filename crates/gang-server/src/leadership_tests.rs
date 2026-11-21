@@ -86,7 +86,6 @@ fn timing() -> LeadershipConfig {
     }
 }
 
-
 fn candidate(id: &ControllerId) -> LeaseCandidate {
     LeaseCandidate {
         holder: id.clone(),
@@ -901,7 +900,10 @@ async fn newest_candidate_requests_immediately_and_acquires_next_epoch() -> Test
     let old_candidate = old.register_candidate(&host("old")?).await?;
     let new_candidate = new.register_candidate(&host("new")?).await?;
     let platform = FakeProvisioner::default();
-    let mut lease = old.acquire(&old_candidate, &platform).await?.ok_or("old retired")?;
+    let mut lease = old
+        .acquire(&old_candidate, &platform)
+        .await?
+        .ok_or("old retired")?;
     let epoch = lease.epoch;
     {
         let hold = old.hold(&mut lease);
@@ -910,14 +912,20 @@ async fn newest_candidate_requests_immediately_and_acquires_next_epoch() -> Test
         let next = new.acquire(&new_candidate, &platform);
         pin_mut!(next);
         assert!(poll!(next.as_mut()).is_pending());
-        assert_eq!(repository.attempts.lock().last().map(|(_, mode)| *mode), Some(Takeover::Request));
+        assert_eq!(
+            repository.attempts.lock().last().map(|(_, mode)| *mode),
+            Some(Takeover::Request)
+        );
         clock.advance(RENEW);
         assert_eq!(poll!(hold.as_mut()), Poll::Ready(LeaseEnd::YieldRequested));
     }
     assert!(old.fence().holds());
     old.release(&lease).await;
     assert!(!old.fence().holds());
-    let next = new.acquire(&new_candidate, &platform).await?.ok_or("new retired")?;
+    let next = new
+        .acquire(&new_candidate, &platform)
+        .await?
+        .ok_or("new retired")?;
     assert_eq!(next.holder, new_id);
     assert_eq!(next.epoch.get(), epoch.get() + 1);
     Ok(())

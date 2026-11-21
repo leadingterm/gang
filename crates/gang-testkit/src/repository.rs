@@ -123,7 +123,10 @@ impl FakeRepository {
     ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (entered, observed) = oneshot::channel();
         let (release, hold) = oneshot::channel();
-        self.state.lock().record_page_holds.insert(kind, (entered, hold));
+        self.state
+            .lock()
+            .record_page_holds
+            .insert(kind, (entered, hold));
         (observed, release)
     }
 
@@ -1358,25 +1361,42 @@ mod tests {
         let repository = FakeRepository::default();
         let (entered, release) = repository.hold_next_record_page(RecordKind::ResourceHistory);
         let mut other = Vec::new();
-        repository.records(
-            RecordKind::DurationHistory, None, NonZeroUsize::MIN, Timestamp::UNIX_EPOCH,
-            &mut other,
-        ).await?;
+        repository
+            .records(
+                RecordKind::DurationHistory,
+                None,
+                NonZeroUsize::MIN,
+                Timestamp::UNIX_EPOCH,
+                &mut other,
+            )
+            .await?;
         let runner = repository.clone();
         let task = tokio::spawn(async move {
             let mut records = Vec::new();
-            runner.records(
-                RecordKind::ResourceHistory, None, NonZeroUsize::MIN, Timestamp::UNIX_EPOCH,
-                &mut records,
-            ).await
+            runner
+                .records(
+                    RecordKind::ResourceHistory,
+                    None,
+                    NonZeroUsize::MIN,
+                    Timestamp::UNIX_EPOCH,
+                    &mut records,
+                )
+                .await
         });
         entered.await?;
         assert!(!task.is_finished());
         let mut next = Vec::new();
-        assert!(!repository.records(
-            RecordKind::ResourceHistory, None, NonZeroUsize::MIN, Timestamp::UNIX_EPOCH,
-            &mut next,
-        ).await?);
+        assert!(
+            !repository
+                .records(
+                    RecordKind::ResourceHistory,
+                    None,
+                    NonZeroUsize::MIN,
+                    Timestamp::UNIX_EPOCH,
+                    &mut next,
+                )
+                .await?
+        );
         release.send(()).map_err(|()| "held page disappeared")?;
         assert!(!task.await??);
         Ok(())

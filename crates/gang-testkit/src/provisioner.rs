@@ -9,9 +9,10 @@ use std::time::Duration;
 
 use gang_clock::TestClock;
 use gang_spi::{
-    ControllerHostIdentity, ControllerHostPort, ControllerHostState, FleetSupply, Held, HostMilestone, InstanceIdentity,
-    LaunchFailure, MountedScratchVolume, NodeLifecyclePort, PortError, PreemptionNotice,
-    ProvisionerPort, ScratchVolumePort, ServerEndpoints, Sidecar, WorkloadCredentialPort,
+    ControllerHostIdentity, ControllerHostPort, ControllerHostState, FleetSupply, Held,
+    HostMilestone, InstanceIdentity, LaunchFailure, MountedScratchVolume, NodeLifecyclePort,
+    PortError, PreemptionNotice, ProvisionerPort, ScratchVolumePort, ServerEndpoints, Sidecar,
+    WorkloadCredentialPort,
 };
 use gang_types::{
     Bytes, Fleet, FleetName, InstanceId, InstanceLifecycle, Isa, NameError, Proof, WorkerLifetime,

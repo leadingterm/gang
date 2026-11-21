@@ -201,9 +201,11 @@ impl LearnedHistoryStore {
     /// Stores fingerprints of the native post-import representation, not a second body copy.
     pub(crate) fn prepared(&mut self, records: &[LearnedHistory]) {
         self.prepared.clear();
-        self.prepared.extend(records.iter().map(|record| {
-            (record.key, (hash(&record.body), record.expires_at))
-        }));
+        self.prepared.extend(
+            records
+                .iter()
+                .map(|record| (record.key, (hash(&record.body), record.expires_at))),
+        );
         self.canonical_pending = true;
     }
 
@@ -228,28 +230,46 @@ impl LearnedHistoryStore {
     ) -> Result<(), HistoryError> {
         self.heads.clear();
         self.cleanup.clear();
-        if let Some(records) = into.as_mut() { records.clear(); }
+        if let Some(records) = into.as_mut() {
+            records.clear();
+        }
         self.uncertain = true;
         let mut page = Vec::new();
         let limit = NonZeroUsize::MIN.saturating_add(BATCH_LIMIT - 1);
-        for kind in [RecordKind::ResourceHistory, RecordKind::DurationHistory, RecordKind::SourceProfile] {
+        for kind in [
+            RecordKind::ResourceHistory,
+            RecordKind::DurationHistory,
+            RecordKind::SourceProfile,
+        ] {
             let mut after = None;
             loop {
-                let more = repository.records(kind, after, limit, now, &mut page).await?;
+                let more = repository
+                    .records(kind, after, limit, now, &mut page)
+                    .await?;
                 after = page.last().map(|(id, _)| *id);
                 for (id, record) in page.drain(..) {
                     let key = RecordKey { kind, id };
-                    if let Some((head, body)) = self.decode_latest(repository, key, record, now).await? {
+                    if let Some((head, body)) =
+                        self.decode_latest(repository, key, record, now).await?
+                    {
                         if let Some(records) = into.as_mut() {
-                            records.push(LearnedHistory { key, body, expires_at: head.expires_at });
+                            records.push(LearnedHistory {
+                                key,
+                                body,
+                                expires_at: head.expires_at,
+                            });
                         }
                         self.heads.insert(key, head);
                     } else {
                         self.cleanup.insert(key);
                     }
                 }
-                if !more { break; }
-                if after.is_none() { return Err(HistoryError::Malformed); }
+                if !more {
+                    break;
+                }
+                if after.is_none() {
+                    return Err(HistoryError::Malformed);
+                }
             }
         }
         Ok(())
@@ -264,23 +284,38 @@ impl LearnedHistoryStore {
     ) -> Result<(), HistoryError> {
         self.apply(repository, lease, now, &[]).await?;
         self.scan_heads(repository, now, into).await?;
-        let referenced: BTreeSet<_> = self.heads.iter().flat_map(|(&key, head)| chunks(key, head)).collect();
+        let referenced: BTreeSet<_> = self
+            .heads
+            .iter()
+            .flat_map(|(&key, head)| chunks(key, head))
+            .collect();
         self.clean(repository, lease, now).await?;
         self.uncertain = true;
         let mut page = Vec::new();
         let limit = NonZeroUsize::MIN.saturating_add(BATCH_LIMIT - 1);
         let mut after = None;
         loop {
-            let more = repository.records(RecordKind::HistoryChunk, after, limit, now, &mut page).await?;
+            let more = repository
+                .records(RecordKind::HistoryChunk, after, limit, now, &mut page)
+                .await?;
             for (id, _) in &page {
-                let key = RecordKey { kind: RecordKind::HistoryChunk, id: *id };
-                if !referenced.contains(&key) { self.cleanup.insert(key); }
+                let key = RecordKey {
+                    kind: RecordKind::HistoryChunk,
+                    id: *id,
+                };
+                if !referenced.contains(&key) {
+                    self.cleanup.insert(key);
+                }
             }
             after = page.last().map(|(id, _)| *id);
             self.clean(repository, lease, now).await?;
             self.uncertain = true;
-            if !more { break; }
-            if after.is_none() { return Err(HistoryError::Malformed); }
+            if !more {
+                break;
+            }
+            if after.is_none() {
+                return Err(HistoryError::Malformed);
+            }
         }
         self.uncertain = false;
         Ok(())
@@ -474,12 +509,19 @@ impl LearnedHistoryStore {
     ) -> Result<BTreeMap<RecordKey, Option<(&'a LearnedHistory, [u8; 32])>>, HistoryError> {
         let mut desired = BTreeMap::new();
         for record in records {
-            if !matches!(record.key.kind, RecordKind::ResourceHistory | RecordKind::DurationHistory | RecordKind::SourceProfile)
-                || record.body.len() > self.max_record_bytes.get() {
+            if !matches!(
+                record.key.kind,
+                RecordKind::ResourceHistory
+                    | RecordKind::DurationHistory
+                    | RecordKind::SourceProfile
+            ) || record.body.len() > self.max_record_bytes.get()
+            {
                 return Err(HistoryError::Malformed);
             }
             let entry = (record.expires_at > now).then(|| (record, hash(&record.body)));
-            if desired.insert(record.key, entry).is_some() { return Err(HistoryError::Malformed); }
+            if desired.insert(record.key, entry).is_some() {
+                return Err(HistoryError::Malformed);
+            }
         }
         Ok(desired)
     }
@@ -523,11 +565,18 @@ impl LearnedHistoryStore {
         let mut pending_bytes = 0;
         for (record, fingerprint) in desired.values().flatten() {
             let fingerprint = *fingerprint;
-            if self.prepared.get(&record.key)
-                .is_none_or(|&(prepared, expires)| prepared != fingerprint || expires != record.expires_at) {
+            if self
+                .prepared
+                .get(&record.key)
+                .is_none_or(|&(prepared, expires)| {
+                    prepared != fingerprint || expires != record.expires_at
+                })
+            {
                 self.preserved.remove(&record.key);
             }
-            if self.preserved.contains(&record.key) { continue; }
+            if self.preserved.contains(&record.key) {
+                continue;
+            }
             let old = self.heads.get(&record.key).cloned();
             if old.as_ref().is_some_and(|head| {
                 head.hash == fingerprint && head.expires_at == record.expires_at
@@ -914,41 +963,87 @@ mod tests {
         let repository = FakeRepository::default();
         let old_lease = lease(&repository).await;
         let mut old = store();
-        let mut old_records = vec![entry(1, 410 * 1024, time(50_000)), entry(2, 32, time(50_000))];
-        old.flush(&repository, &old_lease, time(10), &old_records).await.unwrap();
+        let mut old_records = vec![
+            entry(1, 410 * 1024, time(50_000)),
+            entry(2, 32, time(50_000)),
+        ];
+        old.flush(&repository, &old_lease, time(10), &old_records)
+            .await
+            .unwrap();
         let mut candidate = store();
         let mut prepared = Vec::new();
-        candidate.prepare(&repository, time(20), &mut prepared).await.unwrap();
+        candidate
+            .prepare(&repository, time(20), &mut prepared)
+            .await
+            .unwrap();
         // Import may migrate representation without adding any actual observations.
         prepared[0].body[1] = 77;
         candidate.prepared(&prepared);
         old_records[0].body[0] = 42;
         old_records.pop();
         old_records.push(entry(3, 410 * 1024, time(50_000)));
-        old.flush(&repository, &old_lease, time(30), &old_records).await.unwrap();
+        old.flush(&repository, &old_lease, time(30), &old_records)
+            .await
+            .unwrap();
         repository.release(&old_lease).await.unwrap();
         let lease = self::lease(&repository).await;
-        candidate.activate(&repository, &lease, time(40)).await.unwrap();
-        candidate.flush(&repository, &lease, time(50), &prepared).await.unwrap();
+        candidate
+            .activate(&repository, &lease, time(40))
+            .await
+            .unwrap();
+        candidate
+            .flush(&repository, &lease, time(50), &prepared)
+            .await
+            .unwrap();
         let mut observer = store();
         let mut canonical = Vec::new();
-        observer.prepare(&repository, time(60), &mut canonical).await.unwrap();
-        assert_eq!(canonical, old_records, "late updates and new keys win; deleted keys stay deleted");
-        assert_eq!(prepared[0].body[1], 77, "reconciliation does not mutate the running snapshot");
-        candidate.flush(&repository, &lease, time(65), &prepared).await.unwrap();
-        observer.prepare(&repository, time(66), &mut canonical).await.unwrap();
-        assert_eq!(canonical, old_records, "unchanged protection survives later periodic flushes");
+        observer
+            .prepare(&repository, time(60), &mut canonical)
+            .await
+            .unwrap();
+        assert_eq!(
+            canonical, old_records,
+            "late updates and new keys win; deleted keys stay deleted"
+        );
+        assert_eq!(
+            prepared[0].body[1], 77,
+            "reconciliation does not mutate the running snapshot"
+        );
+        candidate
+            .flush(&repository, &lease, time(65), &prepared)
+            .await
+            .unwrap();
+        observer
+            .prepare(&repository, time(66), &mut canonical)
+            .await
+            .unwrap();
+        assert_eq!(
+            canonical, old_records,
+            "unchanged protection survives later periodic flushes"
+        );
         // Actual new candidate learning may replace its key, but not delete unknown old keys.
         prepared.truncate(1);
         prepared[0].body[0] = 91;
         prepared[0].expires_at = time(60_000);
-        candidate.flush(&repository, &lease, time(70), &prepared).await.unwrap();
-        observer.prepare(&repository, time(80), &mut canonical).await.unwrap();
+        candidate
+            .flush(&repository, &lease, time(70), &prepared)
+            .await
+            .unwrap();
+        observer
+            .prepare(&repository, time(80), &mut canonical)
+            .await
+            .unwrap();
         assert_eq!(canonical.len(), 2);
         assert_eq!(&canonical[0], &prepared[0]);
         assert_eq!(&canonical[1], &old_records[1]);
-        candidate.flush(&repository, &lease, time(90), &[]).await.unwrap();
-        observer.prepare(&repository, time(100), &mut canonical).await.unwrap();
+        candidate
+            .flush(&repository, &lease, time(90), &[])
+            .await
+            .unwrap();
+        observer
+            .prepare(&repository, time(100), &mut canonical)
+            .await
+            .unwrap();
         assert_eq!(canonical.as_slice(), std::slice::from_ref(&old_records[1]));
     }
 }

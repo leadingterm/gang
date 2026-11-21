@@ -84,7 +84,6 @@ fn http_server(tuning: &Http2Config, listener: Listener) -> auto::Builder<TokioE
     http
 }
 
-
 /// Routers grouped by their admission scope, with the fallback owned by `shared`.
 pub(crate) struct ScopedRoutes {
     /// Leader-independent services and the listener's fallback.
@@ -98,7 +97,11 @@ impl ScopedRoutes {
         let shared = self.shared.layer(from_fn_with_state(
             GateState {
                 gate: gate.clone(),
-                scope: if listener == Listener::Worker { RequestScope::WorkerStore } else { RequestScope::Controller },
+                scope: if listener == Listener::Worker {
+                    RequestScope::WorkerStore
+                } else {
+                    RequestScope::Controller
+                },
             },
             admit::<G>,
         ));
@@ -250,7 +253,9 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
     }
     if listener == Listener::Worker {
         loop {
-            if served.is_empty() { return Ok(()); }
+            if served.is_empty() {
+                return Ok(());
+            }
             tokio::select! {
                 () = shutdown.handoff.workers_released() => break,
                 Some(finished) = served.join_next_with_id() => reap(finished, &mut open),
@@ -258,7 +263,9 @@ pub(crate) async fn serve<G: RequestGate, C: Clock + Clone + Send + Sync + 'stat
         }
     }
     let _ = graceful.send(());
-    while let Some(finished) = served.join_next_with_id().await { reap(finished, &mut open); }
+    while let Some(finished) = served.join_next_with_id().await {
+        reap(finished, &mut open);
+    }
     Ok(())
 }
 
@@ -269,7 +276,6 @@ async fn graceful_trigger(shutdown: &mut watch::Receiver<()>, standing: &Standin
         () = standing.retry_requested() => {}
     }
 }
-
 
 /// A served connection, in the order connections were handed in.
 struct Open {
@@ -416,10 +422,7 @@ mod tests {
                 Listener::Public,
                 tuning.max_connections,
                 SystemClock::new(),
-                ServeShutdown {
-                    ended,
-                    handoff,
-                },
+                ServeShutdown { ended, handoff },
             )
             .await
         });
@@ -704,7 +707,6 @@ mod tests {
     ) {
         start_scoped_in_mode(shared_routes(router), gate, tuning, listener, clock)
     }
-
 
     fn start_scoped_in_mode<G: RequestGate, C: Clock + Clone + Send + Sync + 'static>(
         routes: ScopedRoutes,
@@ -1354,12 +1356,8 @@ mod tests {
                 (Listener::Public, true),
                 (Listener::Worker, false),
             ] {
-                assert_retirement_preserves_shared_streams(
-                    authenticated,
-                    listener,
-                    api_marker,
-                )
-                .await?;
+                assert_retirement_preserves_shared_streams(authenticated, listener, api_marker)
+                    .await?;
             }
         }
         Ok(())
@@ -1992,13 +1990,8 @@ mod tests {
                     unproven_idle_timeout: NonZeroDuration::from_secs(5),
                     ..Http2Config::default()
                 };
-                let (feed, task) = start_clocked(
-                    Router::new(),
-                    Allow,
-                    tuning,
-                    listener,
-                    Arc::clone(&clock),
-                );
+                let (feed, task) =
+                    start_clocked(Router::new(), Allow, tuning, listener, Arc::clone(&clock));
                 let mut peer = connect(&feed)?;
                 peer.write_all(prefix).await?;
                 settle().await;
@@ -2010,7 +2003,6 @@ mod tests {
         }
         Ok(())
     }
-
 
     #[derive(Clone)]
     struct SignalledRefusal {

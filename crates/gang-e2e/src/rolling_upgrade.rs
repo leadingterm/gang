@@ -29,7 +29,9 @@ use crate::system::{Probe, Variant};
 use crate::upgrade_credentials::ColdHelpers;
 use crate::upgrade_evidence::BuildEvidence;
 use crate::upgrade_fixture::ReleaseFixture;
-use crate::upgrade_probe::{Availability, DirectTarget, probe_capabilities, probe_refusal};
+use crate::upgrade_probe::{
+    Availability, DirectTarget, probe_authentication, probe_capabilities, probe_refusal,
+};
 
 const PROBES: [Probe; 8] = [
     Probe::ControllerLoss0,
@@ -245,8 +247,15 @@ impl HeldDrainWitness {
     fn receipt(&self) -> String {
         format!(
             "held witness start/end/deadline={:?}/{:?}/{:?}, direct refusal={:?}, refusal required={}, original controllerPID={}, held before-launch/after-health={:?}/{:?}, successor healthy owner rechecked={}",
-            self.started, self.finished, self.deadline, self.refusal, self.refusal_required,
-            self.controller_pid, self.before, self.after, self.owner_rechecked,
+            self.started,
+            self.finished,
+            self.deadline,
+            self.refusal,
+            self.refusal_required,
+            self.controller_pid,
+            self.before,
+            self.after,
+            self.owner_rechecked,
         )
     }
 }
@@ -332,7 +341,8 @@ fn held_drain(
     })?;
     let started = handoff.applied.elapsed();
     let refusal = if releases.same_release {
-        let body = ColdHelpers::proof_request(cluster.stack().gang_cli(), &handoff.client.endpoint)?;
+        let body =
+            ColdHelpers::proof_request(cluster.stack().gang_cli(), &handoff.client.endpoint)?;
         let response = probe_refusal(
             &handoff.client.endpoint,
             &handoff.client.credentials,
@@ -345,6 +355,9 @@ fn held_drain(
         None
     };
     monitor.mint_pair()?;
+    handoff
+        .client
+        .assert_warm_credentials(cluster, next, remaining_budget(start, budget)?)?;
     let (_, after) = handoff.observe_held(cluster)?;
     let credentials = HeldDrainWitness {
         started,
@@ -355,10 +368,13 @@ fn held_drain(
         controller_pid: cluster.controller_pid(0)?,
         before,
         after,
-        owner_rechecked: cluster.controller_is_leader(next)? && cluster.controller_is_healthy(next)?,
+        owner_rechecked: cluster.controller_is_leader(next)?
+            && cluster.controller_is_healthy(next)?,
     };
     if !credentials.valid(handoff.applied.elapsed(), budget) {
-        return Err(E2eError::system("invalid original-process held drain witness"));
+        return Err(E2eError::system(
+            "invalid original-process held drain witness",
+        ));
     }
     Ok((
         DrainWitness {
@@ -372,7 +388,6 @@ fn held_drain(
         promotion,
     ))
 }
-
 
 #[derive(Clone, Copy)]
 struct PromotionTiming {
@@ -426,7 +441,6 @@ fn confirm_promotion(
     }
 }
 
-
 fn handoff<K: Fn(Option<&str>) -> Result<()>>(
     cluster: &Cluster<'_>,
     releases: &Releases<'_>,
@@ -460,7 +474,6 @@ fn handoff<K: Fn(Option<&str>) -> Result<()>>(
     hold.release()?;
     Ok((next, retiring, timing, witness))
 }
-
 
 enum MonitorCommand {
     Stop,
@@ -586,11 +599,14 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         && input.leader
         && input.cold_mints == 2
         && input.drain.retired
-        && (!input.same_release || input.drain.restarted_pid.is_some_and(|pid| {
-            input.drain.credentials.as_ref().is_some_and(|held| {
-                held.refusal_required && held.refusal == Some((503, true)) && pid != held.controller_pid
-            })
-        }))
+        && (!input.same_release
+            || input.drain.restarted_pid.is_some_and(|pid| {
+                input.drain.credentials.as_ref().is_some_and(|held| {
+                    held.refusal_required
+                        && held.refusal == Some((503, true))
+                        && pid != held.controller_pid
+                })
+            }))
         && drain_credentials_ok(input.drain, true, input.gap_limit)
         && input.timing.lease <= input.gap_limit
         && availability_ok(input.gap, input.gap_limit);
@@ -653,6 +669,7 @@ struct OldClient {
     credentials: Credentials,
     endpoint: Url,
     original_rc: Vec<u8>,
+    original_session: Vec<u8>,
 }
 
 impl OldClient {
@@ -665,6 +682,46 @@ impl OldClient {
             ));
         }
         Ok(())
+    }
+
+    fn assert_warm_credentials(
+        &self,
+        cluster: &Cluster<'_>,
+        leader: usize,
+        timeout: Duration,
+    ) -> Result<()> {
+        self.assert_original_rc()?;
+        let cli = cluster.stack().gang_cli();
+        if ColdHelpers::session_bytes(cli, &self.endpoint)? != self.original_session {
+            return Err(E2eError::system(
+                "original workload session changed during upgrade",
+            ));
+        }
+        let probe_timeout = timeout.min(cluster.stack().settings().upgrade_probe_timeout);
+        let proof = ColdHelpers::proof_request(cli, &self.endpoint)?;
+        let response = probe_authentication(
+            &self.endpoint,
+            &self.credentials,
+            cluster.controller_public_target(leader)?,
+            proof,
+            probe_timeout,
+        )?;
+        if response.status != 200 || response.marker {
+            return Err(E2eError::system(
+                "successor refused the original session's bound workload proof",
+            ));
+        }
+        let token = ColdHelpers::warm_token(cli, &self.endpoint, &self.original_session, timeout)?;
+        let mut credentials = self.credentials.clone();
+        credentials.token = token;
+        probe_capabilities(&self.endpoint, &credentials, probe_timeout)?;
+        probe_capabilities(&self.endpoint, &self.credentials, probe_timeout)?;
+        if !cluster.controller_is_leader(leader)? || !cluster.controller_is_healthy(leader)? {
+            return Err(E2eError::system(
+                "warm credentials were not witnessed at the healthy successor",
+            ));
+        }
+        self.assert_original_rc()
     }
 }
 
@@ -771,10 +828,7 @@ impl Drop for RunningMonitor<'_> {
     }
 }
 
-fn select_releases(
-    invocation: &DeploymentInputs,
-    same_release: bool,
-) -> Result<Releases<'_>> {
+fn select_releases(invocation: &DeploymentInputs, same_release: bool) -> Result<Releases<'_>> {
     let inputs = invocation
         .upgrade
         .as_ref()
@@ -811,6 +865,7 @@ fn prepare_client(cluster: &Cluster<'_>) -> Result<OldClient> {
     let original_rc = fs::read(remote.bazelrc())
         .map_err(E2eError::io("capturing original old client bazelrc"))?;
     let endpoint = executor(remote.bazelrc())?;
+    let original_session = ColdHelpers::session_bytes(stack.gang_cli(), &endpoint)?;
     probe_capabilities(
         &endpoint,
         &credentials,
@@ -825,6 +880,7 @@ fn prepare_client(cluster: &Cluster<'_>) -> Result<OldClient> {
         credentials,
         endpoint,
         original_rc,
+        original_session,
     })
 }
 
@@ -899,10 +955,7 @@ pub(crate) fn upgrade_cluster<'a>(
     upgrade_with_releases(cluster, releases)
 }
 
-fn upgrade_with_releases<'a>(
-    cluster: Cluster<'a>,
-    releases: Releases<'a>,
-) -> Result<Vec<Check>> {
+fn upgrade_with_releases<'a>(cluster: Cluster<'a>, releases: Releases<'a>) -> Result<Vec<Check>> {
     let client = prepare_client(&cluster)?;
     let builds = prepare_builds(&cluster)?;
     Upgrade {
@@ -1027,13 +1080,18 @@ impl Upgrade<'_> {
                 let status = match retiring {
                     Some(retiring) => self.cluster.finish_retire(retiring),
                     None => self.cluster.wait_exit(0).and_then(|status| {
-                        let (_, original_pid, _, _) = context.old_identity.as_ref()
-                            .ok_or_else(|| E2eError::system("original controller evidence missing"))?;
+                        let (_, original_pid, _, _) =
+                            context.old_identity.as_ref().ok_or_else(|| {
+                                E2eError::system("original controller evidence missing")
+                            })?;
                         let restarted_pid = self.cluster.wait_for_host_restart(
-                            0, *original_pid, &context.original_holder,
+                            0,
+                            *original_pid,
+                            &context.original_holder,
                         )?;
                         let body = ColdHelpers::proof_request(
-                            self.cluster.stack().gang_cli(), &self.client.endpoint,
+                            self.cluster.stack().gang_cli(),
+                            &self.client.endpoint,
                         )?;
                         probe_refusal(
                             &self.client.endpoint,
@@ -1096,6 +1154,11 @@ impl Upgrade<'_> {
         };
         let (initial, promotion) =
             self.finish_initial(observation.build, observation.attempts, promotion)?;
+        self.client.assert_warm_credentials(
+            &self.cluster,
+            promotion.index,
+            self.cluster.stack().settings().command_timeout,
+        )?;
         self.client.assert_original_rc()?;
         let old_post = self.post_build(
             scope,
@@ -1126,9 +1189,11 @@ impl Upgrade<'_> {
                 old_post.attempts.len(),
             ),
         ));
+        checks.push(Check::passed(
+            "original warm session and bound proof accepted by the successor while held and after old exit; original rc unchanged",
+        ));
         Ok(checks)
     }
-
 
     fn start_monitor<'scope, 'env>(
         &'env self,
@@ -1312,6 +1377,7 @@ mod tests {
             },
             endpoint: Url::parse("https://127.0.0.1:1234")?,
             original_rc: original.to_vec(),
+            original_session: Vec::new(),
         };
         client.assert_original_rc()?;
         fs::write(&rc, String::from_utf8_lossy(original).replace("\r\n", "\n"))?;
@@ -1511,7 +1577,11 @@ mod tests {
         assert!(final_verdict(&input).iter().any(Check::is_failure));
         input.drain = &held_drain;
         let mut invalid_refusal = credential_drain();
-        invalid_refusal.credentials.as_mut().expect("held witness").refusal = Some((200, false));
+        invalid_refusal
+            .credentials
+            .as_mut()
+            .expect("held witness")
+            .refusal = Some((200, false));
         input.drain = &invalid_refusal;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
         input.drain = &held_drain;
@@ -1552,7 +1622,6 @@ mod tests {
             assert!(final_verdict(&input).iter().any(Check::is_failure));
         }
     }
-
 
     fn credential_drain() -> DrainWitness {
         let state = HeldState {

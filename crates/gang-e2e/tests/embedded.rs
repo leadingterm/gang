@@ -834,7 +834,8 @@ async fn a_second_controller_is_refused() -> TestResult {
         max_workers: 8,
         observations: &observations,
         client_action_timeout: CLIENT_ACTION_TIMEOUT,
-        attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
+        attempt_budget: gang_config::WorkerConfig::default()
+            .attempt_budget(gang_config::ActionsConfig::default().timeout),
     };
     let (ready, readiness) = ControllerReady::channel();
     let result = harness
@@ -863,7 +864,8 @@ async fn sequential_controller_terms_drain_and_republish() -> TestResult {
         max_workers: 8,
         observations: &observations,
         client_action_timeout: CLIENT_ACTION_TIMEOUT,
-        attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
+        attempt_budget: gang_config::WorkerConfig::default()
+            .attempt_budget(gang_config::ActionsConfig::default().timeout),
     };
     for _ in 0..2 {
         let (public_tx, public_rx) = futures::channel::mpsc::unbounded::<Accepted>();
@@ -2533,10 +2535,9 @@ impl WorkerServer {
             clients: WorkerAnonymous(Arc::clone(&identity)),
             workers: WorkerAnonymous(identity),
         };
-        let server = gang_server::Server::prepare(
-            parts,
-            worker_server_settings(9000, &worker_config)?,
-        ).await?;
+        let server =
+            gang_server::Server::prepare(parts, worker_server_settings(9000, &worker_config)?)
+                .await?;
         let (stop, stopped) = oneshot::channel();
         let (ready, prepared) = ControllerReady::channel();
         let task = tokio::spawn(server.run(

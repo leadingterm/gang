@@ -187,7 +187,10 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
     };
     let client_leader = client_leader_routes(&client_services, &shared)?;
     let worker_leader = worker_leader_routes(&worker_services, &shared)?;
-    let public_routes = with_request_metadata(client_routes(&client_services, &shared).await?, spec.observations.clone());
+    let public_routes = with_request_metadata(
+        client_routes(&client_services, &shared).await?,
+        spec.observations.clone(),
+    );
     let worker_routes = worker_routes(&worker_services, &shared)?;
     let limits = connection_limits(&config.http2, spec.max_workers);
 
@@ -292,10 +295,7 @@ async fn serve_connections<P: RequestGate, W: RequestGate, A: ApiService>(
         leader: client_router.leader,
     };
     let (ended, mut endings) = tokio::sync::mpsc::unbounded_channel();
-    let shutdown = ServeShutdown {
-        ended,
-        handoff,
-    };
+    let shutdown = ServeShutdown { ended, handoff };
     let serving = async {
         tokio::try_join!(
             serve(
@@ -326,8 +326,14 @@ async fn serve_connections<P: RequestGate, W: RequestGate, A: ApiService>(
             _ = endings.recv() => {}
         }
     }
-    draining.begin_hand_off().await.map_err(NativeLinkEmbedError::Drain)?;
-    draining.refresh_drain(&mut gang_spi::ControllerDrain::default()).await.map_err(NativeLinkEmbedError::Drain)?;
+    draining
+        .begin_hand_off()
+        .await
+        .map_err(NativeLinkEmbedError::Drain)?;
+    draining
+        .refresh_drain(&mut gang_spi::ControllerDrain::default())
+        .await
+        .map_err(NativeLinkEmbedError::Drain)?;
     serving.await
 }
 
@@ -386,14 +392,23 @@ fn scheduler_stack(
         |simple, notify, sketch| {
             resource = Some(Arc::clone(&sketch));
             let dispatch_clock = Arc::clone(&clock);
-            let now = move || std::time::UNIX_EPOCH
-                + std::time::Duration::from_millis(dispatch_clock.wall().as_unix_millis());
+            let now = move || {
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_millis(dispatch_clock.wall().as_unix_millis())
+            };
             let db = memory_awaited_action_db_factory(
                 simple.retain_completed_for_s,
                 &notify,
                 now.clone(),
             );
-            SimpleScheduler::new_with_resource_sketch_and_now(simple, db, notify, None, Some(sketch), Arc::new(now))
+            SimpleScheduler::new_with_resource_sketch_and_now(
+                simple,
+                db,
+                notify,
+                None,
+                Some(sketch),
+                Arc::new(now),
+            )
         },
     )?;
     let resource = resource.ok_or_else(|| {
@@ -609,13 +624,12 @@ fn worker_leader_routes(
     Ok(live.into_axum_router())
 }
 
-
 #[cfg(test)]
 mod tests {
+    use gang_clock::SystemClock;
     use std::cell::Cell;
     use std::error::Error;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use gang_clock::SystemClock;
 
     use axum::middleware::from_fn_with_state;
     use axum::routing::get;
@@ -822,7 +836,8 @@ mod tests {
                 max_workers: 8,
                 observations: &observations,
                 client_action_timeout: CLIENT_ACTION_TIMEOUT,
-                attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
+                attempt_budget: gang_config::WorkerConfig::default()
+                    .attempt_budget(gang_config::ActionsConfig::default().timeout),
             },
         )?;
         let mut simple_slot = None;
@@ -1422,7 +1437,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn original_controller_retains_resource_and_duration_history_through_drain() -> TestResult {
+    async fn original_controller_retains_resource_and_duration_history_through_drain() -> TestResult
+    {
         let config = default_config();
         let fleets = x86_and_arm_fleets();
         let histories = Mutex::new(None);
@@ -1442,14 +1458,21 @@ mod tests {
             max_workers: 8,
             observations: &observations,
             client_action_timeout: CLIENT_ACTION_TIMEOUT,
-            attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
+            attempt_budget: gang_config::WorkerConfig::default()
+                .attempt_budget(gang_config::ActionsConfig::default().timeout),
         };
         let now = spec.clock.wall();
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        let stopped = async { let _ = stopped.await; }.boxed().shared();
+        let stopped = async {
+            let _ = stopped.await;
+        }
+        .boxed()
+        .shared();
         let connections = ControllerConnections {
             public: gang_spi::Listening {
-                connections: futures::stream::pending().take_until(stopped.clone()).boxed(),
+                connections: futures::stream::pending()
+                    .take_until(stopped.clone())
+                    .boxed(),
                 gate: Identify,
             },
             worker: gang_spi::Listening {
@@ -1459,25 +1482,55 @@ mod tests {
             api: Echo,
         };
         let (ready, waiting) = ControllerReady::channel();
-        let mut serving = Box::pin(run(&config, &spec, connections, ready, ControllerState {
-            handles: &handles, histories: &histories, resources: &resources, shared: &shared,
-        }));
+        let mut serving = Box::pin(run(
+            &config,
+            &spec,
+            connections,
+            ready,
+            ControllerState {
+                handles: &handles,
+                histories: &histories,
+                resources: &resources,
+                shared: &shared,
+            },
+        ));
         assert!(futures::poll!(serving.as_mut()).is_pending());
         waiting.await?;
         let history = histories.lock().clone().ok_or("original history missing")?;
         seed_controller_history(&history, now);
         let mut expected = Vec::new();
         history.snapshot(now, &mut expected)?;
-        assert!(expected.iter().any(|record| record.key.kind == gang_spi::RecordKind::ResourceHistory));
-        assert!(expected.iter().any(|record| record.key.kind == gang_spi::RecordKind::DurationHistory));
-        stop.send(()).map_err(|()| "original controller stopped early")?;
+        assert!(
+            expected
+                .iter()
+                .any(|record| record.key.kind == gang_spi::RecordKind::ResourceHistory)
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|record| record.key.kind == gang_spi::RecordKind::DurationHistory)
+        );
+        stop.send(())
+            .map_err(|()| "original controller stopped early")?;
         serving.await?;
-        assert!(handles.borrow().is_none(), "final transport stop clears serving handles");
-        assert!(Arc::ptr_eq(&history, &histories.lock().clone().ok_or("final history missing")?));
-        assert!(Arc::ptr_eq(&history.resource, resources.get().ok_or("original sketch missing")?));
+        assert!(
+            handles.borrow().is_none(),
+            "final transport stop clears serving handles"
+        );
+        assert!(Arc::ptr_eq(
+            &history,
+            &histories.lock().clone().ok_or("final history missing")?
+        ));
+        assert!(Arc::ptr_eq(
+            &history.resource,
+            resources.get().ok_or("original sketch missing")?
+        ));
         let mut actual = Vec::new();
         history.snapshot(now, &mut actual)?;
-        assert_eq!(actual, expected, "both learned models survive the original engine's drain");
+        assert_eq!(
+            actual, expected,
+            "both learned models survive the original engine's drain"
+        );
         Ok(())
     }
 
@@ -1701,16 +1754,22 @@ mod tests {
             max_workers: 8,
             observations: &observations,
             client_action_timeout: Duration::from_mins(10),
-            attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
+            attempt_budget: gang_config::WorkerConfig::default()
+                .attempt_budget(gang_config::ActionsConfig::default().timeout),
         };
         let mut scheduler = settings::scheduler(&config, &spec).expect("valid scheduler config");
         let SchedulerSpec::HistoricalResource(historical) = &mut scheduler.spec else {
             panic!("expected historical scheduler");
         };
         historical.learn_from_workers = false;
-        let SchedulerStack { actions, .. } =
-            scheduler_stack(&scheduler, &fleets, &actions, &OnceLock::new(), Arc::clone(&spec.clock))
-                .expect("scheduler stack");
+        let SchedulerStack { actions, .. } = scheduler_stack(
+            &scheduler,
+            &fleets,
+            &actions,
+            &OnceLock::new(),
+            Arc::clone(&spec.clock),
+        )
+        .expect("scheduler stack");
         let operation = OperationId::String("stack-wiring".to_owned());
         let digest = DigestInfo::new([1; 32], 1);
         let info = Arc::new(ActionInfo {
@@ -1804,15 +1863,22 @@ mod tests {
             max_workers: 8,
             observations: &sink,
             client_action_timeout: Duration::from_mins(10),
-            attempt_budget: gang_config::WorkerConfig::default().attempt_budget(gang_config::ActionsConfig::default().timeout),
+            attempt_budget: gang_config::WorkerConfig::default()
+                .attempt_budget(gang_config::ActionsConfig::default().timeout),
         };
         let mut scheduler = settings::scheduler(&config, &spec).expect("scheduler");
         let SchedulerSpec::HistoricalResource(historical) = &mut scheduler.spec else {
             panic!("historical scheduler")
         };
         historical.learn_from_workers = false;
-        let SchedulerStack { actions, .. } =
-            scheduler_stack(&scheduler, &fleets, &spec.actions, &OnceLock::new(), Arc::clone(&spec.clock)).expect("stack");
+        let SchedulerStack { actions, .. } = scheduler_stack(
+            &scheduler,
+            &fleets,
+            &spec.actions,
+            &OnceLock::new(),
+            Arc::clone(&spec.clock),
+        )
+        .expect("stack");
         let info = origin_test_action();
         let metadata = RequestMetadata {
             tool_invocation_id: "invocation".to_owned(),

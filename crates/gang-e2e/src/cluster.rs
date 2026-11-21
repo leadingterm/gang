@@ -570,10 +570,12 @@ impl<'a> Cluster<'a> {
         self.controllers
             .lock()
             .get(index)
-            .map(|controller| controller.child.as_ref().map_or_else(
-                || Arc::clone(&controller.identity),
-                ControllerHost::identity,
-            ))
+            .map(|controller| {
+                controller.child.as_ref().map_or_else(
+                    || Arc::clone(&controller.identity),
+                    ControllerHost::identity,
+                )
+            })
             .ok_or_else(|| E2eError::system("unknown controller"))
     }
 
@@ -898,12 +900,12 @@ impl<'a> Cluster<'a> {
             "controller {index}: targets registered and initially unhealthy before process launch; health path={}",
             health_policy.path,
         ));
-        let (mut child, log_start) = self
-            .spawn_controller(index, binary, &config)
-            .inspect_err(|_| {
-                self.balancer.deregister(Frontend::Serve, public);
-                self.balancer.deregister(Frontend::Workers, worker);
-            })?;
+        let (mut child, log_start) =
+            self.spawn_controller(index, binary, &config)
+                .inspect_err(|_| {
+                    self.balancer.deregister(Frontend::Serve, public);
+                    self.balancer.deregister(Frontend::Workers, worker);
+                })?;
         let startup = await_controller_start(&mut child, &log, log_start, timeout);
         let identity = match startup {
             Ok(identity) => identity,
@@ -1120,7 +1122,8 @@ impl<'a> Cluster<'a> {
             controller.exit_status = Some(status);
             controller.child = None;
             install_fetched_config(&controller.config, fetched)?;
-            let (mut child, log_start) = self.spawn_controller(index, binary, &controller.config)?;
+            let (mut child, log_start) =
+                self.spawn_controller(index, binary, &controller.config)?;
             let identity = match await_controller_start(
                 &mut child,
                 &self.controller_log_path(index),
@@ -1132,9 +1135,8 @@ impl<'a> Cluster<'a> {
                     // An explicit configuration restart begins a new observation. Preserve that
                     // attempted child's rejection, not the successful stop of the prior child.
                     child.kill()?;
-                    controller.exit_status = Some(
-                        child.wait_within(Duration::ZERO, "failed configuration restart")?,
-                    );
+                    controller.exit_status =
+                        Some(child.wait_within(Duration::ZERO, "failed configuration restart")?);
                     return Err(error);
                 }
             };
@@ -1318,10 +1320,14 @@ impl<'a> Cluster<'a> {
             child.wait_restarted(self.stack.settings().startup_timeout)?
         };
         if pid == original_pid || identity.as_ref() == original_holder {
-            return Err(E2eError::system("host restart retained original PID or holder"));
+            return Err(E2eError::system(
+                "host restart retained original PID or holder",
+            ));
         }
         if self.controller_is_leader(index)? {
-            return Err(E2eError::system("older restarted host reacquired leadership"));
+            return Err(E2eError::system(
+                "older restarted host reacquired leadership",
+            ));
         }
         Ok(pid)
     }
@@ -1372,7 +1378,12 @@ impl<'a> Cluster<'a> {
     /// # Errors
     /// Returns an error if the controller cannot be signalled.
     pub fn pause(&self, index: usize) -> Result<()> {
-        if let Some(child) = self.controllers.lock().get_mut(index).and_then(|c| c.child.as_mut()) {
+        if let Some(child) = self
+            .controllers
+            .lock()
+            .get_mut(index)
+            .and_then(|c| c.child.as_mut())
+        {
             // This deliberate zombie fault observes the original process after resumption,
             // not a fresh, legitimately contending host process.
             child.suppress_restart();

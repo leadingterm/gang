@@ -563,7 +563,10 @@ impl Clock for DeadlineClock {
 
     fn sleep_until(&self, deadline: Tick) -> Sleep {
         if deadline == self.deadline
-            && self.occurrences.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1
+            && self
+                .occurrences
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 1
         {
             self.sleeping.notify_one();
         }
@@ -853,10 +856,9 @@ async fn advancing_past_budget_during_backoff_returns_last_refusal() {
 #[tokio::test]
 async fn retries_share_one_overall_budget() {
     let harness = Harness::start_plain(ConsoleMode::Silent, no_auth_info()).await;
-    harness.server.script_responses(&[
-        (503, &[], b"warming"),
-        (503, &[], b"warming"),
-    ]);
+    harness
+        .server
+        .script_responses(&[(503, &[], b"warming"), (503, &[], b"warming")]);
     let clock = retry_clock(harness.clock.clone(), Duration::from_millis(100));
     let options = ClientOptions {
         api_retry_budget: gang_types::NonZeroDuration::from_secs(2),
@@ -876,7 +878,10 @@ async fn retries_share_one_overall_budget() {
         clock.sleeping.notified().await;
         clock.clock.advance(Duration::from_millis(1100));
     });
-    assert!(matches!(result, Err(ClientError::Server { status: 503, .. })));
+    assert!(matches!(
+        result,
+        Err(ClientError::Server { status: 503, .. })
+    ));
     assert_eq!(harness.server.requests().len(), 2);
 }
 
