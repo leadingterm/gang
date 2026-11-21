@@ -3007,6 +3007,7 @@ fn late_pass_publication_does_not_rewind_observation_time() {
         gang_state::PassStatus::Observed {
             hosted: None,
             supplies: &[],
+            fresh_supplies: &[],
         },
         &[],
         fleets.catalog(),
@@ -3466,6 +3467,33 @@ async fn healthy_observation_is_published_before_the_first_pass() -> TestResult 
     Ok(())
 }
 
+fn assert_retained_disconnected_supply(
+    state: &State,
+    instance: &InstanceId,
+    launched_at: Timestamp,
+) {
+    assert!(state.workers.is_empty());
+    assert_eq!(state.instances.len(), 1);
+    let row = &state.instances[0];
+    assert_eq!(row.name, name::of::<name::Instances>(instance));
+    assert_eq!(row.fleet, name::of::<name::Fleets>(&fleet_name()));
+    assert_eq!(row.lifecycle, gang_wire::Lifecycle::InService);
+    assert_eq!(row.launch_time, launched_at);
+    assert_eq!(state.fleets[0].instances.in_service, 1);
+    assert_eq!(state.fleets[0].workers.unconnected, 1);
+}
+
+fn assert_history_fleet(state: &State, desired: u32, in_service: u32) {
+    let sample = state.recent.samples.last().expect("history sample");
+    assert_eq!(sample.fleets.len(), 1);
+    assert_eq!(
+        sample.fleets[0].name,
+        name::of::<name::Fleets>(&fleet_name())
+    );
+    assert_eq!(sample.fleets[0].desired, desired);
+    assert_eq!(sample.fleets[0].instances.in_service, in_service);
+}
+
 #[tokio::test]
 async fn configuration_failure_retries_then_starts_observer_before_control() -> TestResult {
     let clock = clock_at(1_000_000);
@@ -3730,6 +3758,8 @@ async fn observation_retains_last_good_supply_when_worker_disconnects() -> TestR
     assert_eq!(initial.workers.len(), 1);
     assert!(initial.instances.is_empty());
     assert_eq!(initial.fleets[0].instances.in_service, 1);
+    assert_history_fleet(&initial, 1, 1);
+    let initial_step = initial.recent.samples.last().unwrap().start;
 
     fleet.fail.store(true, Ordering::SeqCst);
     scheduler.set_snapshot(SchedulerSnapshot::default());
@@ -3740,19 +3770,26 @@ async fn observation_retains_last_good_supply_when_worker_disconnects() -> TestR
         crate::hub::Next::Frame(_) | crate::hub::Next::Resync(_)
     ));
     let disconnected = served(&hub);
-    assert!(disconnected.workers.is_empty());
-    assert_eq!(disconnected.instances.len(), 1);
-    let row = &disconnected.instances[0];
-    assert_eq!(row.name, name::of::<name::Instances>(&instance));
-    assert_eq!(row.fleet, name::of::<name::Fleets>(&fleet_name()));
-    assert_eq!(row.lifecycle, gang_wire::Lifecycle::InService);
-    assert_eq!(row.launch_time, launched_at);
-    assert_eq!(disconnected.fleets[0].instances.in_service, 1);
-    assert_eq!(disconnected.fleets[0].workers.unconnected, 1);
+    assert_retained_disconnected_supply(&disconnected, &instance, launched_at);
+    let failed_sample = disconnected.recent.samples.last().unwrap();
+    assert_eq!(failed_sample.start, initial_step);
+    assert!(failed_sample.fleets.is_empty());
 
-    fleet
-        .inner
-        .set_supply(&fleet_name(), FleetSupply::default());
+    clock.advance(initial.recent.step);
+    assert!(poll!(run.as_mut()).is_pending());
+    let still_disconnected = served(&hub);
+    assert_retained_disconnected_supply(&still_disconnected, &instance, launched_at);
+    let next_sample = still_disconnected.recent.samples.last().unwrap();
+    assert_ne!(next_sample.start, initial_step);
+    assert!(next_sample.fleets.is_empty());
+
+    fleet.inner.set_supply(
+        &fleet_name(),
+        FleetSupply {
+            desired: 3,
+            ..FleetSupply::default()
+        },
+    );
     fleet.fail.store(false, Ordering::SeqCst);
     clock.advance(POLL_INTERVAL.get());
     assert!(poll!(run.as_mut()).is_pending());
@@ -3761,6 +3798,7 @@ async fn observation_retains_last_good_supply_when_worker_disconnects() -> TestR
     assert!(recovered.instances.is_empty());
     assert_eq!(recovered.fleets[0].instances.in_service, 0);
     assert_eq!(recovered.fleets[0].workers.unconnected, 0);
+    assert_history_fleet(&recovered, 3, 0);
     Ok(())
 }
 
@@ -4074,6 +4112,7 @@ async fn publish_observation<F: ProvisionerPort<FleetOptions = Opaque>>(
         gang_state::PassStatus::Observed {
             hosted: Some(&hosted),
             supplies: &supplies,
+            fresh_supplies: &supplies,
         },
         &passes,
         fleets.catalog(),

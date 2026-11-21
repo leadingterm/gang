@@ -349,6 +349,15 @@ async fn server_info_never_contains_the_dashboard_client_secret() {
     .await;
 }
 
+fn assert_fleet_sample_shape(fleet: &serde_json::Value) {
+    assert_eq!(fleet["name"], "fleets/example-fleet");
+    assert_eq!(fleet["max"], 4);
+    assert!(fleet["desired"].is_u64());
+    for field in ["pending", "inService", "terminating", "warm"] {
+        assert!(fleet["instances"][field].is_u64(), "{field}");
+    }
+}
+
 #[tokio::test]
 async fn snapshot_carries_the_recent_window_after_completions() {
     let (parts, _dials, handles) = tls_parts();
@@ -390,6 +399,10 @@ async fn snapshot_carries_the_recent_window_after_completions() {
                     if let gang_wire::Frame::Delta(delta) = decode_sse(text.as_bytes())
                         && delta.completed == Some(completed)
                     {
+                        let census = &sse_payload(&text)["recent"]["samples"];
+                        let entries = census.as_array().expect("delta samples");
+                        let fleet = &entries.last().expect("latest sample")["fleets"][0];
+                        assert_fleet_sample_shape(fleet);
                         break;
                     }
                 }
@@ -406,6 +419,9 @@ async fn snapshot_carries_the_recent_window_after_completions() {
                 .expect("state body")
                 .to_bytes();
             let state: State = serde_json::from_slice(&bytes).expect("state JSON");
+            let json: serde_json::Value = serde_json::from_slice(&bytes).expect("state JSON");
+            let fleet = &json["recent"]["samples"][3]["fleets"][0];
+            assert_fleet_sample_shape(fleet);
             assert_eq!(state.recent.window, Duration::from_mins(5));
             assert_eq!(state.recent.step, Duration::from_secs(10));
             assert_eq!(state.recent.samples.len(), 4);
@@ -433,6 +449,10 @@ async fn snapshot_carries_the_recent_window_after_completions() {
                 panic!("first frame is a snapshot");
             };
             assert_eq!(snapshot.recent, state.recent);
+            assert_eq!(
+                sse_payload(&first)["recent"]["samples"][3]["fleets"],
+                json["recent"]["samples"][3]["fleets"]
+            );
         },
     )
     .await;

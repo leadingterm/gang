@@ -17,8 +17,8 @@ const TYPES = {
   ".json": "application/json",
   ".map": "application/json",
 };
-const SCENARIOS = ["live", "stale", "lagging", "empty", "isolated", "cold", "disconnected", "forbidden", "signedout", "long-session"];
-const STREAMS = { stale: "stale", lagging: "lagging", empty: "empty", isolated: "isolated", cold: "cold" };
+const SCENARIOS = ["live", "stale", "lagging", "empty", "isolated", "instances", "cold", "disconnected", "forbidden", "signedout", "long-session"];
+const STREAMS = { stale: "stale", lagging: "lagging", empty: "empty", isolated: "isolated", instances: "instances", cold: "cold" };
 
 const fixture = (name) => readFileSync(join("fixtures", name), "utf8");
 

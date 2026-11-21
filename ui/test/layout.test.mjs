@@ -16,10 +16,12 @@ const code = JSON.parse(readFileSync("fixtures/device-authorization.json", "utf8
   .slice("deviceAuthorizations/".length).replaceAll("-", "");
 const pages = [
   { name: "overview", path: "/ui/", open: ".tape", ready: ".tape__key", stream: "live" },
+  { name: "overview-instances", path: "/ui/?scenario=instances", open: ".tape", ready: ".tape__key", stream: "instances" },
   { name: "actions", path: "/ui/actions", ready: "#run-h", stream: "live" },
   { name: "builds", path: "/ui/builds", ready: "#builds-h", stream: "live" },
   { name: "build", path: `/ui/builds/${build}`, ready: "#build-timeline", stream: "live" },
   { name: "workers", path: "/ui/workers", open: ".wrow__btn", ready: ".wdetail", stream: "live" },
+  { name: "workers-instances", path: "/ui/workers?scenario=instances", open: ".wrow__btn", ready: ".wdetail", stream: "instances" },
   { name: "activity", path: "/ui/activity", open: ".listfoot .btn", ready: ".line__prose", stream: "live" },
   { name: "access", path: "/ui/access", ready: "#ro-h", stream: "live" },
   { name: "device", path: "/ui/device", ready: "#device-request-title", stream: null },
@@ -175,6 +177,7 @@ const probe = async (ready, pageName) => {
     count++;
     if (violations.length < 50) violations.push(message);
   };
+  if (["overview-instances", "workers-instances"].includes(pageName) && /\/\s*0(?:\D|$)/.test(document.body.innerText)) add("rendered page contains a /0 denominator");
   for (const [index, family] of families.entries()) {
     if (!loadedFonts[index].length || !document.fonts.check(`16px "${family}"`, sample)) add(`font ${family} is not loaded`);
   }
@@ -522,7 +525,7 @@ test("dashboard layouts", { timeout: 240000 }, async () => {
       const focused = !FULL_WIDTHS.includes(width);
       const widths = [];
       for (const screen of pages) {
-        if (focused && !["overview", "actions", "builds", "build", "workers", "activity", "access"].includes(screen.name)) continue;
+        if (focused && !["overview", "overview-instances", "actions", "builds", "build", "workers", "workers-instances", "activity", "access"].includes(screen.name)) continue;
         await page.send("Network.clearBrowserCookies");
         await page.send("Emulation.setDeviceMetricsOverride", { width, height: 1000, deviceScaleFactor: 1, mobile: false });
         let frames;

@@ -501,6 +501,7 @@ fn fill_window(
         pass: PassStatus::Observed {
             hosted: Some(&hosted),
             supplies: &fresh,
+            fresh_supplies: &fresh,
         },
         ..inputs.clone()
     };

@@ -21,10 +21,10 @@ use gang_types::{
     ActionResources, FleetCatalog, FleetProperties, InstanceLifecycle, SaturatingInto,
 };
 use gang_wire::{
-    Actions, BucketUsage, CacheReads, CacheStore, Demand, Event, Fleet, FleetWorkerCache,
-    InstanceCounts, InstanceSize, Isa, Lifecycle, Pass, Phase, PhaseSpan, Policy, Queue,
-    QueuedAction, Recent, Reservation, RunningAction, SkipReason, State, StoreUsage, Truncated,
-    Worker, WorkerCache, WorkerCounts, name,
+    Actions, BucketUsage, CacheReads, CacheStore, Demand, Event, Fleet, FleetInstanceSample,
+    FleetWorkerCache, InstanceCounts, InstanceSize, Isa, Lifecycle, Pass, Phase, PhaseSpan, Policy,
+    Queue, QueuedAction, Recent, Reservation, RunningAction, SkipReason, State, StoreUsage,
+    Truncated, Worker, WorkerCache, WorkerCounts, name,
 };
 
 use crate::events::newer;
@@ -150,7 +150,9 @@ impl Builder {
                 skipped = true;
                 // Only the independent observer establishes scheduler availability.
             }
-            PassStatus::Observed { hosted, supplies } => {
+            PassStatus::Observed {
+                hosted, supplies, ..
+            } => {
                 let (observed_completed, observed_evicted, known) =
                     self.observe(cur, prev, inputs, *hosted, supplies);
                 completed = observed_completed;
@@ -165,6 +167,11 @@ impl Builder {
         let queued = cur.queue.total;
         let last_unknown_step = &mut self.last_unknown_step;
         let cur_scheduler_available = cur.scheduler_known == Some(true);
+        let fleets = &cur.fleets;
+        let supplies = match &inputs.pass {
+            PassStatus::Observed { fresh_supplies, .. } => Some(*fresh_supplies),
+            _ => None,
+        };
         cur.recent.sample_at(inputs.wall, |sample| {
             sample.lookups = sample
                 .lookups
@@ -174,6 +181,24 @@ impl Builder {
             sample.downloaded_bytes = sample.downloaded_bytes.saturating_add(traffic.downloaded);
             sample.completed = sample.completed.saturating_add(completed.saturating_into());
             sample.evicted_bytes = sample.evicted_bytes.saturating_add(evicted);
+            if let Some(supplies) = supplies {
+                let mut count = 0;
+                for (index, fleet) in fleets.iter().enumerate() {
+                    if !supplies.get(index).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    if count == sample.fleets.len() {
+                        sample.fleets.push(FleetInstanceSample::default());
+                    }
+                    let entry = &mut sample.fleets[count];
+                    entry.name.clone_from(&fleet.name);
+                    entry.instances = fleet.instances;
+                    entry.desired = fleet.desired;
+                    entry.max = fleet.policy.max;
+                    count += 1;
+                }
+                sample.fleets.truncate(count);
+            }
             if let Some(known) = scheduler_known {
                 if !known {
                     *last_unknown_step = Some(sample.start);
