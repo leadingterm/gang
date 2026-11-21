@@ -541,6 +541,140 @@ test("a reason this client does not know backs off like a shutdown", async () =>
   );
 });
 
+test("visibility suspends the stream and resumes with a fresh snapshot without losing rows", async () => {
+  const { env, client } = await live();
+  const first = env.source;
+  const links: string[] = [];
+  const unsubscribe = client.link.subscribe((link) => links.push(link.kind));
+  client.setVisible(false);
+  client.setVisible(false);
+  assert.equal(first.closed, true);
+  assert.equal(client.state.value?.seq, snapshot.seq);
+  const before = probes(env);
+  first.fail();
+  await flush();
+  assert.equal(probes(env), before);
+  env.clock += 10 * 60_000;
+  client.tick();
+  assert.deepEqual(pendingDelays(env), []);
+  client.setVisible(true);
+  client.setVisible(true);
+  assert.equal(env.sources.length, 2);
+  assert.equal(client.link.value.kind, "connecting");
+  assert.equal(client.state.value?.seq, snapshot.seq);
+  env.source.emit("snapshot", { ...snapshot, seq: snapshot.seq + 10, updateTime: iso(t0 + 10 * 60_000) });
+  assert.equal(client.link.value.kind, "live");
+  assert.equal(client.state.value?.seq, snapshot.seq + 10);
+  assert.ok(!links.includes("lost"));
+  unsubscribe();
+});
+
+test("a resumed stream failure is classified and backs off, and hiding cancels its retry", async () => {
+  const { env, client } = await live();
+  client.setVisible(false);
+  client.setVisible(true);
+  env.source.emit("snapshot", snapshot);
+  env.source.fail();
+  await flush();
+  assert.equal(client.link.value.kind, "lost");
+  assert.deepEqual(pendingDelays(env), [1000]);
+  client.setVisible(false);
+  assert.deepEqual(pendingDelays(env), []);
+  client.setVisible(true);
+  assert.equal(client.link.value.kind, "connecting");
+  assert.equal(env.sources.length, 3);
+  assert.deepEqual(pendingDelays(env), []);
+});
+
+test("a superseded failure probe cannot revoke or mark the resumed stream lost", async () => {
+  for (const revoked of [false, true]) {
+    const { env, client } = await live();
+    const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+    env.responses.set(PATHS.getSession, promise);
+    env.source.fail();
+    client.setVisible(false);
+    client.setVisible(true);
+    env.source.emit("snapshot", { ...snapshot, seq: snapshot.seq + 1 });
+    if (revoked) reject(new HttpError(403));
+    else resolve(defaultSession);
+    await flush();
+    assert.equal(client.link.value.kind, "live");
+    assert.equal(client.state.value?.seq, snapshot.seq + 1);
+    assert.equal(env.sources.length, 2);
+    assert.deepEqual(pendingDelays(env), []);
+  }
+});
+
+test("hidden initial admission waits for visibility and stop prevents reopening", async () => {
+  const env = new FakeEnvironment();
+  const client = new StateClient(env);
+  client.setVisible(false);
+  await client.start();
+  assert.equal(env.sources.length, 0);
+  assert.equal(client.session.value?.principal, defaultSession.principal);
+  client.setVisible(true);
+  assert.equal(env.sources.length, 1);
+  client.stop();
+  assert.equal(env.source.closed, true);
+  client.setVisible(false);
+  client.setVisible(true);
+  assert.equal(env.sources.length, 1);
+  assert.deepEqual(pendingDelays(env), []);
+});
+
+test("visibility resumes a failed initial admission without retaining its retry", async () => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, new Error("offline"));
+  const client = new StateClient(env);
+  await client.start();
+  assert.deepEqual(pendingDelays(env), [1000]);
+  client.setVisible(false);
+  assert.deepEqual(pendingDelays(env), []);
+  env.responses.set(PATHS.getSession, defaultSession);
+  client.setVisible(true);
+  await flush();
+  assert.equal(env.sources.length, 1);
+  assert.equal(client.link.value.kind, "connecting");
+});
+
+test("visibility changes do not bypass signed-out, forbidden or revoked admissions", async () => {
+  for (const [response, kind] of [
+    [anonymous, "signed_out"],
+    [{ ...defaultSession, permissions: [] }, "forbidden"],
+    [new HttpError(403), "revoked"],
+  ] as const) {
+    const env = new FakeEnvironment();
+    env.responses.set(PATHS.getSession, response);
+    const client = new StateClient(env);
+    await client.start();
+    client.setVisible(false);
+    client.setVisible(true);
+    await flush();
+    assert.equal(client.link.value.kind, kind);
+    assert.equal(env.sources.length, 0);
+    assert.equal(probes(env), 1);
+    assert.deepEqual(pendingDelays(env), []);
+  }
+});
+
+test("hiding retains session renewal and its retry", async () => {
+  const env = new FakeEnvironment();
+  env.responses.set(PATHS.getSession, { ...defaultSession, ...EXPIRING });
+  const client = new StateClient(env);
+  await client.start();
+  env.source.emit("snapshot", snapshot);
+  client.setVisible(false);
+  assert.deepEqual(pendingDelays(env), [RENEWAL_MS]);
+  env.postResults.push(503);
+  env.scheduled.find((entry) => entry.delay === RENEWAL_MS)?.run();
+  await flush();
+  assert.equal(client.link.value.kind, "live");
+  assert.deepEqual(pendingDelays(env), [1000]);
+  client.setVisible(true);
+  assert.equal(env.sources.length, 2);
+  assert.deepEqual(pendingDelays(env), [1000]);
+});
+
 test("a failed stream without a principal renews before signing in", async () => {
   const { env } = await live();
   env.responses.set(PATHS.getSession, { ...anonymous, login: session.login });

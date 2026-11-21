@@ -784,6 +784,7 @@ Termination orders remain keyed by fleet and physical instance until reflected, 
 The dashboard is a read-only view of what the control pass and build recorder hold. The state is rebuilt on every pass and never feeds back into a decision; the recent window and builds are kept in the server's memory and lost on restart (§5). Decision and rejected alternatives: ADR-25, ADR-27 and ADR-42; the recent window supersedes ADR-25's browser-side history.
 
 Dashboard pages share named, equal-width columns that collapse to one column on narrow screens. Sections reserve a title and tools row and share the page columns through their bodies. Readout tiles share five aligned slots, and chart frames use fixed plot-size tokens so titled charts align even when a legend is absent.
+Shared readout grids enclose every row with continuous hairline borders. The last tile spans any remaining columns, including an odd final tile at the two-column phone breakpoint; slot alignment remains shared within each row.
 
 **Schema** (`gang-wire`, modules `state` and `frame`; JSON in the conventions of [docs/API.md](API.md): lowerCamelCase keys, RFC 3339 `*Time` timestamps, Google `Duration` strings for durations, `UPPER_SNAKE` enums, absent optional parts rather than `null`). Sizes are bytes and counts are integers. Every embedded resource has a `name` (`fleets/{fleet}`, `workers/{worker}`, `instances/{instance}`, `actions/{op}`), and a reference to one is its full name. [docs/API.md](API.md#state) holds the examples.
 
@@ -844,6 +845,7 @@ A frame carries timestamps, never durations, so rows do not change on every pass
 - `seq` advances only when a delta is broadcast; the snapshot carries the current `seq` and every `tick` carries it without advancing it. An unchanged pass sends no delta, and with no viewer connected the hub only builds the state (no diff, no encode), so `seq` advances only while someone watches. Every completed or skipped pass changes the step in progress of `recent`, so a watched pass always sends a delta.
 - When `actions` goes from absent to its first sample, the `ActionsDelta` carries every field and all rows in `running.upsert`.
 - A client reconnects when a delta's `base` differs from its `seq`, or when a tick's `seq` is behind its own state. A tick whose `seq` equals the client's is normal. There is no replay and no `Last-Event-ID` logic: a reconnect starts with a snapshot.
+- The browser suspends its stream while the tab is hidden, retaining the last snapshot and session renewal. Becoming visible opens a fresh stream immediately without a lost-stream banner; a failed visible connection still shows the banner and retries with the existing backoff. Failure classification from a superseded stream cannot change the resumed connection.
 - `closed` is sent in this form: `retry: <ms>` (only with `retryDelay`), `event: closed`, `data: {"reason":…,"retryDelay":…}`. The `retry:` line carries the same delay in milliseconds, because that is the SSE protocol; `retryDelay` is a Google `Duration` string.
 
 | `reason` | When | `retryDelay` |

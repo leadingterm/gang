@@ -181,11 +181,15 @@ export class StateClient {
   readonly now = signal<UnixMs>(0);
 
   #source: StreamSource | null = null;
+  #visible = true;
+  #running = false;
+  #streamGeneration = 0;
   #offset = 0;
   /** Server clock of the last frame. */
   #lastFrame: UnixMs | null = null;
   #failures = 0;
   #cancelRetry: (() => void) | null = null;
+  #retryIsStream = false;
   #cancelRenewal: (() => void) | null = null;
   /** The renewal in flight, which every renewal requested meanwhile joins; `stop` drops it. */
   #renewal: Promise<void> | null = null;
@@ -216,6 +220,7 @@ export class StateClient {
   }
 
   async start(): Promise<void> {
+    this.#running = true;
     const generation = this.#sessionGeneration;
     const session = await this.#probe();
     if (generation !== this.#sessionGeneration) return;
@@ -226,7 +231,32 @@ export class StateClient {
     this.#admit(session);
   }
 
+  /** Suspends the stream while hidden without interrupting the session. */
+  setVisible(visible: boolean): void {
+    if (this.#visible === visible) return;
+    this.#visible = visible;
+    if (!visible) {
+      this.#closeSource();
+      if (this.#retryIsStream) {
+        this.#cancelRetry?.();
+        this.#cancelRetry = null;
+        this.#retryIsStream = false;
+      }
+      return;
+    }
+    if (!this.#running || this.link.value.kind === "revoked") return;
+    const session = this.session.value;
+    if (session?.principal !== undefined && session.permissions.includes("state.read")) {
+      this.link.value = { kind: "connecting" };
+      this.#connect();
+    } else if (!session && this.link.value.kind !== "signed_out" && this.link.value.kind !== "forbidden") {
+      this.link.value = { kind: "connecting" };
+      void this.start();
+    }
+  }
+
   stop(): void {
+    this.#running = false;
     this.#closeSource();
     this.#cancelRetry?.();
     this.#cancelRenewal?.();
@@ -566,6 +596,7 @@ export class StateClient {
 
   #connect(): void {
     this.#closeSource();
+    if (!this.#visible || !this.#running) return;
     const source = this.#env.openStream(PATHS.watchState);
     this.#source = source;
     const handlers = {
@@ -685,8 +716,9 @@ export class StateClient {
   async #onFailure(): Promise<void> {
     this.#closeSource();
     const generation = this.#sessionGeneration;
-    const session = await this.#probe();
-    if (generation !== this.#sessionGeneration || this.link.value.kind === "revoked") return;
+    const streamGeneration = this.#streamGeneration;
+    const session = await this.#probe(streamGeneration);
+    if (generation !== this.#sessionGeneration || streamGeneration !== this.#streamGeneration || this.link.value.kind === "revoked") return;
     if (!session || (session.principal !== undefined && session.permissions.includes("state.read"))) {
       return this.#retry(null);
     }
@@ -723,16 +755,16 @@ export class StateClient {
       this.#freeze(this.serverNow());
       this.#env.navigate(loginUrl(this.#env.here()));
     } else {
-      this.#retry(null, () => this.#renew());
+      this.#retry(null, () => this.#renew(), false);
     }
   }
 
-  async #probe(): Promise<Session | null> {
+  async #probe(streamGeneration?: number): Promise<Session | null> {
     const generation = this.#sessionGeneration;
     try {
       return (await this.#env.fetchJson(PATHS.getSession)) as Session;
     } catch (error) {
-      if (generation === this.#sessionGeneration && error instanceof HttpError && error.status === 403) {
+      if (generation === this.#sessionGeneration && (streamGeneration === undefined || streamGeneration === this.#streamGeneration) && error instanceof HttpError && error.status === 403) {
         this.stop();
         this.link.value = { kind: "revoked" };
       }
@@ -741,20 +773,27 @@ export class StateClient {
   }
 
   /** Runs `attempt` again after `retryMs`, or after the next backoff step when it is null. */
-  #retry(retryMs: number | null, attempt: () => Promise<void> = () => this.start()): void {
+  #retry(retryMs: number | null, attempt: () => Promise<void> = () => this.start(), streamRetry = true): void {
     const delay = retryMs ?? Math.min(BACKOFF_MAX_MS, BACKOFF_FIRST_MS * 2 ** this.#failures);
     this.#failures += 1;
     this.#freeze(this.serverNow() + delay);
     this.#cancelRetry?.();
+    this.#retryIsStream = streamRetry;
+    if (streamRetry && !this.#visible) {
+      this.#cancelRetry = null;
+      this.#retryIsStream = false;
+      return;
+    }
     this.#cancelRetry = this.#env.schedule(() => {
       this.#cancelRetry = null;
+      this.#retryIsStream = false;
       void attempt();
     }, delay);
   }
 
   /** Freezes streamed rows without replacing a build-only or revoked link. */
   #freeze(retryAt: UnixMs): void {
-    if (this.link.value.kind === "forbidden" || this.link.value.kind === "revoked") return;
+    if (!this.#visible || this.link.value.kind === "forbidden" || this.link.value.kind === "revoked") return;
     this.#streamDown({ kind: "lost", frozenAt: this.#lastFrame, retryAt });
   }
 
@@ -764,6 +803,7 @@ export class StateClient {
   }
 
   #closeSource(): void {
+    this.#streamGeneration += 1;
     this.#source?.close();
     this.#source = null;
   }

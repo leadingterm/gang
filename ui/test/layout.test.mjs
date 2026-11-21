@@ -641,3 +641,126 @@ test("dashboard layouts", { timeout: 240000 }, async () => {
     rmSync(profile, { recursive: true, force: true });
   }
 });
+
+test("visibility resumes the stream without a lost banner", { timeout: 60000 }, async () => {
+  const server = previewServer({ dist: "dist", replay: "instant" });
+  const profile = mkdtempSync(join(process.env.TEST_TMPDIR ?? tmpdir(), "layout-chromium-"));
+  let browser;
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const frame = load("live")[0];
+    assert.equal(frame.event.event, "snapshot");
+    browser = await launch(join(process.env.JS_BINARY__RUNFILES, process.env.CHROMIUM), { profile });
+    const page = await browser.newPage();
+    await page.send("Page.enable");
+    await page.send("Runtime.enable");
+    await page.send("Page.addScriptToEvaluateOnNewDocument", { source: `{
+      let now = ${frame.at};
+      Date.now = () => now;
+      let visibility = "visible";
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => visibility });
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => visibility === "hidden" });
+      const sources = [];
+      let opened;
+      const firstOpen = new Promise((resolve) => { opened = resolve; });
+      class ControlledEventSource extends EventTarget {
+        constructor(url) {
+          super();
+          this.url = url;
+          this.closed = false;
+          this.onerror = null;
+          this.addEventListener("error", (event) => this.onerror?.(event));
+          sources.push(this);
+          opened();
+        }
+        close() { this.closed = true; }
+      }
+      window.EventSource = ControlledEventSource;
+      const banners = [];
+      const collect = (node) => {
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        if (node.matches(".banner")) banners.push(node.textContent);
+        for (const banner of node.querySelectorAll(".banner")) banners.push(banner.textContent);
+      };
+      new MutationObserver((records) => {
+        for (const record of records) {
+          for (const node of record.addedNodes) collect(node);
+          for (const node of record.removedNodes) collect(node);
+          const element = record.target.nodeType === Node.ELEMENT_NODE ? record.target : record.target.parentElement;
+          const banner = element?.closest(".banner");
+          if (banner) banners.push(banner.textContent);
+        }
+      }).observe(document, { subtree: true, childList: true, characterData: true });
+      window.visibilityTest = {
+        sources, firstOpen, banners,
+        setVisibility(value) { visibility = value; document.dispatchEvent(new Event("visibilitychange")); },
+        advance(ms) { now += ms; },
+        snapshot(source, data) { source.dispatchEvent(new MessageEvent("snapshot", { data: JSON.stringify(data) })); },
+        waitFor(predicate) {
+          return new Promise((resolve) => {
+            const observer = new MutationObserver(check);
+            function check() {
+              if (predicate()) { observer.disconnect(); resolve(); }
+            }
+            observer.observe(document, { subtree: true, childList: true, characterData: true, attributes: true });
+            check();
+          });
+        },
+      };
+    }` });
+    const loaded = page.once("Page.loadEventFired");
+    await page.send("Page.navigate", { url: `${origin}/ui/` });
+    await Promise.race([loaded, browser.closed]);
+    const evaluate = async (expression) => {
+      const result = await Promise.race([page.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }), browser.closed]);
+      if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+      return result.result.value;
+    };
+    await evaluate("window.visibilityTest.firstOpen");
+    await evaluate(`(async () => {
+      const t = window.visibilityTest;
+      t.snapshot(t.sources[0], ${JSON.stringify(frame.event.data)});
+      await t.waitFor(() => document.querySelector('.ann--stream')?.dataset.level === 'live'
+        && document.querySelector('.ann--queue')?.textContent.includes('3 unplaceable'));
+    })()`);
+    const transition = await evaluate(`(() => {
+      const t = window.visibilityTest;
+      t.setVisibility("hidden");
+      const closed = t.sources[0].closed;
+      t.advance(60000);
+      t.setVisibility("visible");
+      return { closed, count: t.sources.length, newClosed: t.sources[1]?.closed };
+    })()`);
+    assert.deepEqual(transition, { closed: true, count: 2, newClosed: false });
+    const refreshed = { ...frame.event.data, queue: { ...frame.event.data.queue, unplaceable: 17 } };
+    await evaluate(`(async () => {
+      const t = window.visibilityTest;
+      t.snapshot(t.sources[1], ${JSON.stringify(refreshed)});
+      await t.waitFor(() => document.querySelector('.ann--stream')?.dataset.level === 'live'
+        && document.querySelector('.ann--queue')?.textContent.includes('17 unplaceable'));
+    })()`);
+    const beforeFailure = await evaluate(`({
+      banners: window.visibilityTest.banners,
+      current: document.querySelector(".banner")?.textContent ?? ""
+    })`);
+    assert.equal(beforeFailure.banners.some((text) => text.includes("Stream lost")), false);
+    assert.doesNotMatch(beforeFailure.current, /Stream lost/);
+    const lost = await evaluate(`(async () => {
+      const t = window.visibilityTest;
+      const appeared = t.waitFor(() => document.querySelector(".banner")?.textContent.includes("Stream lost"));
+      t.sources[1].dispatchEvent(new Event("error"));
+      await appeared;
+      return document.querySelector(".banner").textContent;
+    })()`);
+    assert.match(lost, /Stream lost/);
+  } finally {
+    if (browser) await browser.close();
+    server.closeAllConnections();
+    if (server.listening) await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    rmSync(profile, { recursive: true, force: true });
+  }
+});

@@ -10,6 +10,8 @@ let started = false;
 route.subscribe((current) => {
   if (!startsClient(current) || started) return;
   started = true;
+  client.setVisible(document.visibilityState === "visible");
+  document.addEventListener("visibilitychange", () => client.setVisible(document.visibilityState === "visible"));
   setInterval(() => client.tick(), 1000);
   void client.start();
 });
