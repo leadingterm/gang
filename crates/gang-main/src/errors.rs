@@ -31,6 +31,9 @@ pub(crate) const fn listen_key(role: ListenerRole) -> &'static str {
 /// Any failure a `gang` command can report to the operator.
 #[derive(Debug, thiserror::Error, gang_types::Fix)]
 pub(crate) enum MainError {
+    /// The privileged action-egress policy installation failed.
+    #[error("cannot prepare host action egress")]
+    HostEgress(#[source] io::Error),
     /// The reset trampoline was not given a program.
     #[error("a program is required")]
     ResetUsage,
@@ -43,9 +46,6 @@ pub(crate) enum MainError {
     /// The reset trampoline could not execute the action.
     #[error("cannot execute the action")]
     ResetExec(#[source] io::Error),
-    /// The execution gate or its environment was invalid.
-    #[error("cannot release the execution gate")]
-    ResetGate(#[source] io::Error),
 
     /// The configuration file could not be read.
     #[error("cannot read the configuration `{}`", path.display())]

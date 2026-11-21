@@ -95,8 +95,10 @@ pub async fn execute<S: ActionIsolationPort, L: ActionLimitsPort>(
         .await
         .map_err(ExecError::Limits)?;
     publish_cgroup(scope.memory_cgroup());
+    let memory_cgroup = scope.memory_cgroup();
     let spec = ActionExecutionSpec {
         launcher: scope.launcher(),
+        memory_cgroup: memory_cgroup.as_deref(),
         ..action.spec
     };
     let outcome = start_and_wait(sandbox, &spec, terminations, leave_action_group).await;

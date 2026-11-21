@@ -457,7 +457,6 @@ mod tests {
             bwrap: Some("/bin/bwrap".into()),
             glibc_tool: None,
             action_rootfs: Some(dir.path().to_path_buf()),
-            egress: None,
         };
         let rendered = kept_worker(&document.to_toml().expect("config renders"), &tools)
             .expect("worker configuration");

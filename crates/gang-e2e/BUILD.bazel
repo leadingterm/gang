@@ -115,7 +115,7 @@ workspace_rust_library(
 workspace_rust_binary(
     name = "local",
     src = "src/main.rs",
-    # The glibc-toolchain and egress scenario helpers are Linux only.
+    # The glibc-toolchain helper and upgrade inputs are Linux only.
     data = [
         ":bazel",
         "//:tools/e2e-gate.sh",
@@ -124,8 +124,6 @@ workspace_rust_binary(
     ] + select({
         "@platforms//os:linux": [
             ":candidate_fixture",
-            ":egress_peer",
-            ":egress_probe",
             ":previous_fixture",
             ":previous_gang",
             "//crates/gang-main/tests/preload:loaded_probe",
@@ -138,8 +136,6 @@ workspace_rust_binary(
             "GANG_E2E_CANDIDATE_FIXTURE": "$(rootpath :candidate_fixture)",
             "GANG_E2E_PREVIOUS_FIXTURE": "$(rootpath :previous_fixture)",
             "GANG_E2E_PREVIOUS_GANG": "$(rootpath :previous_gang)",
-            "GANG_E2E_EGRESS_PEER": "$(rootpath :egress_peer)",
-            "GANG_E2E_EGRESS_PROBE": "$(rootpath :egress_probe)",
             "GANG_E2E_GANG": "$(rootpath //crates/gang-main:gang)",
             "GANG_E2E_GATE_SCRIPT": "$(rootpath //:tools/e2e-gate.sh)",
             "GANG_E2E_GLIBC_TOOL": "$(rootpath //crates/gang-main/tests/preload:loaded_probe)",
@@ -157,14 +153,12 @@ workspace_rust_binary(
     ],
 )
 
-# The harness with Gang, pinned Bazel, PostgreSQL archive, glibc and egress probes as plain files,
+# The harness with Gang, pinned Bazel, PostgreSQL archive and glibc probe as plain files,
 # for a job that runs the harness without Bazel (CI's e2e gates pass them by flag).
 e2e_bundle(
     name = "bundle",
     bazel = ":bazel",
     candidate_fixture = ":candidate_fixture",
-    egress_peer = ":egress_peer",
-    egress_probe = ":egress_probe",
     gang = "//crates/gang-main:gang",
     harness = ":local",
     loaded_probe = "//crates/gang-main/tests/preload:loaded_probe",
@@ -175,13 +169,7 @@ e2e_bundle(
 )
 
 workspace_rust_binary(
-    name = "egress_probe",
-    src = "src/egress_probe_main.rs",
-    deps = [":gang_e2e"],
-)
-
-workspace_rust_binary(
-    name = "egress_peer",
-    src = "src/egress_peer_main.rs",
+    name = "action_network",
+    src = "src/action_network_main.rs",
     deps = [":gang_e2e"],
 )

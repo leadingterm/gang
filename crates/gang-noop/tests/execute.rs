@@ -116,6 +116,7 @@ fn host() -> Result<(), Box<dyn Error>> {
         action_directory: &working_directory,
         working_directory: &working_directory,
         network: NetworkAccess::Offline,
+        memory_cgroup: None,
     };
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -196,6 +197,7 @@ async fn spec_run(
         action_directory: working_directory,
         working_directory,
         network: NetworkAccess::Offline,
+        memory_cgroup: None,
     };
     let mut running = noop.start(&spec).await?;
     Ok(running.wait().await?)
@@ -372,6 +374,7 @@ async fn dropping_the_running_action_kills_it() -> Result<(), Box<dyn Error>> {
         action_directory: dir.path(),
         working_directory: dir.path(),
         network: NetworkAccess::Offline,
+        memory_cgroup: None,
     };
     let running = noop.start(&spec).await?;
 
