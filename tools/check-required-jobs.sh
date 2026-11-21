@@ -46,8 +46,14 @@ yq -o=json '.' "$workflow" | jq -e '
     error("workflow must contain a changes job")
   else . end
   | if ([$jobs.changes.steps[]? | select(.id == "filter") | .env.BASE]
-        == ["${{ github.event_name == '\''pull_request'\'' && github.event.pull_request.base.sha || github.event_name == '\''merge_group'\'' && github.event.merge_group.base_sha || '\''0000000000000000000000000000000000000000'\'' }}"]) then .
-    else error("change classification must use the PR or merge group base") end
+        == ["${{ github.event_name == '\''pull_request'\'' && github.event.pull_request.base.sha || '\''0000000000000000000000000000000000000000'\'' }}"]) then .
+    else error("change classification must use the PR base or zero fallback") end
+  | if ([$jobs.changes.steps[]? | select(.id == "filter") | .env.EVENT] == ["${{ github.event_name }}"])
+       and ([$jobs.changes.steps[]? | select(.id == "filter") | .env.REF] == ["${{ github.ref }}"]) then .
+    else error("change classification must use the event name and queue ref") end
+  | if ([$jobs.changes.steps[]? | select(.id == "filter") | .run]
+        == ["if [[ \"$EVENT\" == merge_group ]]; then\n  tools/ci-changes.sh --merge-group \"$REF\" \"$HEAD\"\nelse\n  tools/ci-changes.sh \"$BASE\" \"$HEAD\"\nfi >> \"$GITHUB_OUTPUT\"\n"]) then .
+    else error("change classification must dispatch merge groups and ordinary events correctly") end
   | if ([$jobs[].steps[]? | select((.uses // "") | startswith("actions/checkout@"))
          | select(.with.ref != release_checkout)] | length) == 0
        and ([$jobs.changes.steps[]? | select(.id == "filter") | .env.HEAD] == [release_checkout]) then .

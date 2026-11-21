@@ -38,9 +38,16 @@ jobs:
       - id: filter
         shell: bash
         env:
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || '0000000000000000000000000000000000000000' }}
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '0000000000000000000000000000000000000000' }}
           HEAD: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
-        run: tools/ci-changes.sh "$BASE" "$HEAD" >> "$GITHUB_OUTPUT"
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          if [[ "$EVENT" == merge_group ]]; then
+            tools/ci-changes.sh --merge-group "$REF" "$HEAD"
+          else
+            tools/ci-changes.sh "$BASE" "$HEAD"
+          fi >> "$GITHUB_OUTPUT"
 
   nativelink-memory-tests:
     needs: changes
