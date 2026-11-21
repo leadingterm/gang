@@ -565,3 +565,58 @@ fn observation_reuses_instance_buffers_across_identity_churn() -> TestResult {
     assert_eq!(info.bytes_total, 0, "identity churn allocated bytes");
     Ok(())
 }
+
+#[test]
+fn observation_reuses_worker_buffers_across_generation_churn() -> TestResult {
+    let world = world()?;
+    let supplies = vec![true; world.passes.len()];
+    let mut snapshot = world.hosted.snapshot().clone();
+    let id = instance_id(0)?;
+    let replacement = gang_types::WorkerId::try_new(format!(
+        "{}6c5e4f3a-9b1d-4e2a-8f7c-000000000002",
+        id.worker_name()
+    ))?;
+    let original = worker_on(&id)?;
+    let worker = snapshot
+        .workers
+        .iter_mut()
+        .find(|worker| worker.id == original)
+        .ok_or("fixture worker")?;
+    worker.id = replacement;
+    snapshot.workers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+    let mut changed_hosted = HostedSnapshot::default();
+    changed_hosted.replace(&mut snapshot);
+    let view = Inputs {
+        pass: PassStatus::Observed {
+            hosted: Some(&world.hosted),
+            supplies: &supplies,
+        },
+        actions: None,
+        ..inputs(&world)
+    };
+    let changed = Inputs {
+        pass: PassStatus::Observed {
+            hosted: Some(&changed_hosted),
+            supplies: &supplies,
+        },
+        actions: None,
+        ..inputs(&world)
+    };
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut cur = blank();
+    let mut prev = blank();
+    for seq in 1..=WARM_UP_PASSES as u64 {
+        let input = if seq % 2 == 0 { &changed } else { &view };
+        builder.fill(&mut cur, &prev, seq, input);
+        std::mem::swap(&mut cur, &mut prev);
+    }
+    let info = allocation_counter::measure(|| {
+        builder.fill(&mut cur, &prev, WARM_UP_PASSES as u64 + 1, &view);
+    });
+    assert_eq!(info.count_total, 0, "worker generation churn allocated");
+    assert_eq!(
+        info.bytes_total, 0,
+        "worker generation churn allocated bytes"
+    );
+    Ok(())
+}

@@ -270,8 +270,8 @@ impl Builder {
         self.scratch.physical_order.clear();
         self.scratch.physical_order.extend(0..prev.workers.len());
         self.scratch.physical_order.sort_unstable_by(|&a, &b| {
-            (&prev.workers[a].fleet, &prev.workers[a].instance)
-                .cmp(&(&prev.workers[b].fleet, &prev.workers[b].instance))
+            (&prev.workers[a].fleet, &prev.workers[a].instance, a)
+                .cmp(&(&prev.workers[b].fleet, &prev.workers[b].instance, b))
         });
         self.scratch.hosted_order.clear();
         if let Some(hosted) = hosted {
@@ -871,10 +871,14 @@ fn physical_worker<'a>(
     fleet: &str,
     instance: &str,
 ) -> Option<&'a Worker> {
-    order.binary_search_by(|&index| {
+    let index = order.partition_point(|&index| {
         let worker = &prev.workers[index];
-        (worker.fleet.as_str(), worker.instance.as_str()).cmp(&(fleet, instance))
-    }).ok().map(|index| &prev.workers[order[index]])
+        (worker.fleet.as_str(), worker.instance.as_str()) < (fleet, instance)
+    });
+    order
+        .get(index)
+        .map(|&index| &prev.workers[index])
+        .filter(|worker| worker.fleet == fleet && worker.instance == instance)
 }
 
 /// Overwrites one fleet row from its policy, supply, and outlook. The properties are rebuilt only

@@ -3544,6 +3544,73 @@ mod repeated_rebalance {
         Ok(())
     }
 
+    fn assert_healthy_worker_is_authoritative(
+        builder: &mut Builder,
+        connected: &State,
+        world: &World,
+    ) -> TestResult {
+        // A matching healthy worker remains authoritative even if another generation
+        // on the same physical instance has an old infrastructure status.
+        let mut mixed = connected.clone();
+        mixed.workers[0].infrastructure = None;
+        let mut other = connected.workers[0].clone();
+        other.name.push('z');
+        mixed.workers.push(other);
+        mixed.workers.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        let healthy = fill(
+            builder,
+            &mixed,
+            3,
+            world,
+            12,
+            super::Outcome::Observed {
+                known: true,
+                supplies: vec![true],
+            },
+        )?;
+        assert!(healthy.workers[0].infrastructure.is_none());
+        Ok(())
+    }
+
+    fn assert_healthy_instance_is_authoritative(
+        builder: &mut Builder,
+        disconnected: &State,
+        rotated: &State,
+        world: &World,
+        new: &InstanceId,
+    ) -> TestResult {
+        // An existing healthy instance is authoritative over a stale worker row.
+        let mut mixed = disconnected.clone();
+        mixed
+            .instances
+            .iter_mut()
+            .find(|row| row.name == instance_name(new))
+            .ok_or("healthy instance")?
+            .infrastructure = None;
+        mixed.workers.push(rotated.workers[0].clone());
+        let healthy = fill(
+            builder,
+            &mixed,
+            5,
+            world,
+            14,
+            super::Outcome::Observed {
+                known: true,
+                supplies: vec![true],
+            },
+        )?;
+        assert!(
+            healthy
+                .instances
+                .iter()
+                .find(|row| row.name == instance_name(new))
+                .ok_or("healthy instance")?
+                .infrastructure
+                .is_none()
+        );
+        Ok(())
+    }
+
     #[test]
     fn replacement_status_follows_physical_instance_across_worker_generations() -> TestResult {
         let old = instance_id(1)?;
@@ -3580,6 +3647,25 @@ mod repeated_rebalance {
             },
         )?;
         assert_eq!(connected.workers[0].infrastructure.as_ref(), Some(&status));
+        assert_healthy_worker_is_authoritative(&mut builder, &connected, &world)?;
+        let outage = fill(
+            &mut builder,
+            &connected,
+            3,
+            &world,
+            12,
+            super::Outcome::Observed {
+                known: false,
+                supplies: vec![true],
+            },
+        )?;
+        assert!(
+            outage
+                .instances
+                .iter()
+                .all(|row| row.name != instance_name(&new))
+        );
+        assert_eq!(outage.workers[0].infrastructure.as_ref(), Some(&status));
         let second_id = gang_types::WorkerId::try_new(format!(
             "{}6c5e4f3a-9b1d-4e2a-8f7c-000000000002",
             new.worker_name()
@@ -3597,6 +3683,31 @@ mod repeated_rebalance {
             },
         )?;
         assert_eq!(rotated.workers[0].infrastructure.as_ref(), Some(&status));
+        world.snapshot.workers.clear();
+        let disconnected = fill(
+            &mut builder,
+            &rotated,
+            4,
+            &world,
+            13,
+            super::Outcome::Observed {
+                known: true,
+                supplies: vec![true],
+            },
+        )?;
+        let row = disconnected
+            .instances
+            .iter()
+            .find(|row| row.name == instance_name(&new))
+            .ok_or("disconnected instance")?;
+        assert_eq!(row.infrastructure.as_ref(), Some(&status));
+        assert_healthy_instance_is_authoritative(
+            &mut builder,
+            &disconnected,
+            &rotated,
+            &world,
+            &new,
+        )?;
         Ok(())
     }
 }
