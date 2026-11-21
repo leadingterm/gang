@@ -120,6 +120,14 @@ impl DispatchInstance {
         let index = self
             .events
             .partition_point(|entry| (entry.at, entry.reserve) <= key);
+        if let Some(existing) = index
+            .checked_sub(1)
+            .and_then(|previous| self.events.get_mut(previous))
+            && (existing.at, existing.reserve) == key
+        {
+            existing.resources = existing.resources.add(event.resources);
+            return;
+        }
         self.events.insert(index, event);
     }
 
@@ -1003,6 +1011,59 @@ mod tests {
     }
 
     #[test]
+    fn matching_event_boundaries_coalesce_and_preserve_order() {
+        let capacity = Reservation {
+            cpu: 1000,
+            memory: 1000,
+            ..Reservation::default()
+        };
+        let mut worker = DispatchInstance {
+            fleet: 0,
+            ready_after: Duration::ZERO,
+            enabled: true,
+            capacity,
+            events: Vec::new(),
+        };
+        let first = Reservation {
+            cpu: 100,
+            memory: 100,
+            ..Reservation::default()
+        };
+        let second = Reservation {
+            cpu: 200,
+            memory: 200,
+            ..Reservation::default()
+        };
+        let end = Duration::from_secs(10);
+        worker.reserve(Duration::ZERO, end, first);
+        worker.reserve(Duration::ZERO, end, second);
+        assert_eq!(worker.events.len(), 2);
+        assert_eq!(worker.events[0].resources, first.add(second));
+        assert_eq!(worker.events[1].resources, first.add(second));
+
+        let fits = Reservation {
+            cpu: 700,
+            ..Reservation::default()
+        };
+        let exceeds = Reservation {
+            cpu: 701,
+            ..Reservation::default()
+        };
+        assert_eq!(worker.earliest(fits, end), Some(Duration::ZERO));
+        assert_eq!(worker.earliest(exceeds, end), Some(end));
+
+        let next_end = Duration::from_secs(20);
+        worker.reserve(end, next_end, capacity);
+        assert_eq!(worker.events.len(), 4);
+        assert_eq!(worker.events[1].at, end);
+        assert!(!worker.events[1].reserve);
+        assert_eq!(worker.events[2].at, end);
+        assert!(worker.events[2].reserve);
+        assert_eq!(worker.earliest(fits, end), Some(Duration::ZERO));
+        assert_eq!(worker.earliest(exceeds, end), Some(next_end));
+    }
+
+    #[test]
     fn resource_timeline_releases_complementary_reservations() {
         let p = policy("workers");
         let mut dispatch = Dispatch::new(std::slice::from_ref(&p));
@@ -1478,7 +1539,8 @@ mod tests {
 
     #[test]
     fn warmed_planner_reuses_projection_buffers() {
-        let p = policy("workers");
+        let mut p = policy("workers");
+        p.vcpus_per_instance = nonzero_u32(16);
         let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
         scene.member(0, "busy", InstanceLifecycle::InService, true);
         let mut running = executing(0, Some(Duration::from_secs(100)));
