@@ -127,8 +127,9 @@ impl ProvisionerPort for DiagnosticProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        mode: TerminationMode,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance).await
+        self.inner.terminate(held, fleet, instance, mode).await
     }
 
     fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
@@ -175,8 +176,9 @@ impl ProvisionerPort for PausedSupplyProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        mode: TerminationMode,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance).await
+        self.inner.terminate(held, fleet, instance, mode).await
     }
 
     fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
@@ -250,8 +252,9 @@ impl ProvisionerPort for RegistrationProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        mode: TerminationMode,
     ) -> Result<(), PortError> {
-        self.inner.terminate(held, fleet, instance).await
+        self.inner.terminate(held, fleet, instance, mode).await
     }
 
     fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
@@ -3134,6 +3137,7 @@ async fn failed_partial_supply_is_skipped_and_recovery_uses_fresh_supply() -> Te
         gang_state::PassStatus::Observed {
             hosted: None,
             supplies: &[],
+            fresh_supplies: &[],
         },
         &[],
         fleets.catalog(),

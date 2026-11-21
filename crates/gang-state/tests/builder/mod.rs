@@ -2124,6 +2124,7 @@ fn history_control(
         pass: PassStatus::Ok {
             applied: 0,
             failed: 0,
+            error: None,
         },
         fleets: &passes,
         catalog: &catalog,
