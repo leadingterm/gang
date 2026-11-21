@@ -29,6 +29,15 @@ expect() {
 
 jobs=$(yq -o=json '.jobs' "$workflow")
 expect success 'current workflow coverage' "$guard" "$workflow"
+cp "$workflow" "$fixture"
+yq -i 'del(.on.merge_group)' "$fixture"
+expect failure 'merge group trigger is required' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '.on.merge_group.types = ["destroyed"]' "$fixture"
+expect failure 'merge group trigger must request checks' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '(.jobs.changes.steps[] | select(.id == "filter") | .env.BASE) = "${{ github.event_name == '\''pull_request'\'' && github.event.pull_request.base.sha || '\''0000000000000000000000000000000000000000'\'' }}"' "$fixture"
+expect failure 'change classification must use the merge group base' "$guard" "$fixture"
 # Follow the real dependency graph, not just required.needs: optional architectures
 # must not sneak into the PR critical path through an intermediate dependency.
 expect success 'PR graph excludes optional architectures and cache fan-in' jq -e "
@@ -76,6 +85,9 @@ for job in linux-arm64-bundle linux-arm64-checks linux-arm64 cross release-valid
   cp "$workflow" "$fixture"
   job="$job" yq -i '.jobs[strenv(job)].if |= sub("startsWith[(]github.event.pull_request.head.ref, '\''release/'\''[)]", "true")' "$fixture"
   expect failure "$job cannot accept ordinary same-repository PRs" "$guard" "$fixture"
+  cp "$workflow" "$fixture"
+  job="$job" yq -i '.jobs[strenv(job)].if |= sub("github.event_name == '\''merge_group'\'' [|][|] ", "")' "$fixture"
+  expect failure "$job must include merge groups" "$guard" "$fixture"
 done
 cp "$workflow" "$fixture"
 yq -i 'del(.jobs.linux-x86_64-bundle.steps[0].with.ref)' "$fixture"
@@ -114,6 +126,9 @@ expect failure 'portable lint cannot exceed three minutes' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i '.jobs.release-validation.steps[0].env.ARM_RESULT = "success"' "$fixture"
 expect failure 'release results cannot omit ARM validation' "$guard" "$fixture"
+cp "$workflow" "$fixture"
+yq -i '(.jobs.release-validation.steps[] | select(.env.REQUIRED_RESULT != null) | .env.HEAVY) = "true"' "$fixture"
+expect failure 'release validation must use changes heavy output' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i '.jobs.linux-x86_64-shards.needs = ["changes", "linux-arm64"]' "$fixture"
 expect failure 'x86 shards cannot transitively require optional ARM jobs' "$guard" "$fixture"
@@ -337,6 +352,13 @@ for job in linux-arm64-bundle linux-arm64-checks linux-arm64 cross macos release
   if [[ $job == linux-arm64 || $job == release-validation ]]; then expected=success; else expected=failure; fi
   expect_condition "$expected" "$job docs-only release PR preserves intentional skips" "$condition"
   HEAD_REF=feature HEAVY=true
+  EVENT=merge_group REF=refs/heads/gh-readonly-queue/main/fixture
+  if [[ $job == macos ]]; then expected=failure; else expected=success; fi
+  expect_condition "$expected" "$job scopes merge groups" "$condition"
+  HEAVY=false
+  if [[ $job == linux-arm64 || $job == release-validation ]]; then expected=success; else expected=failure; fi
+  expect_condition "$expected" "$job docs-only merge group preserves intentional skips" "$condition"
+  HEAVY=true
   EVENT=push
   for REF in refs/heads/main refs/heads/master refs/tags/v0.3.2; do
     expect_condition success "$job runs on push $REF" "$condition"
@@ -409,20 +431,36 @@ done
 
 release_body="$scratch/release-validation.sh"
 jq -er '.["release-validation"].steps[] | select(.env.REQUIRED_RESULT != null) | .run' <<<"$jobs" >"$release_body"
-unset HEAVY
-export CHANGES_RESULT=success REQUIRED_RESULT=success ARM_RESULT=success CROSS_RESULT=success
+export HEAVY=true CHANGES_RESULT=success REQUIRED_RESULT=success ARM_RESULT=success CROSS_RESULT=success
 expect success 'release validation requires mandatory platforms' bash --noprofile --norc -e -u -o pipefail <"$release_body"
 for PRIVATE in false true; do
   for variable in CHANGES_RESULT REQUIRED_RESULT ARM_RESULT CROSS_RESULT; do
     for status in failure cancelled skipped ''; do
+      expect failure "release: heavy=true private=$PRIVATE $variable=$status" env "$variable=$status" bash --noprofile --norc -e -u -o pipefail <"$release_body"
+    done
+    expect failure "release: heavy=true private=$PRIVATE missing $variable" env -u "$variable" bash --noprofile --norc -e -u -o pipefail <"$release_body"
+  done
+  for variable in CHANGES_RESULT REQUIRED_RESULT ARM_RESULT; do
+    for status in failure cancelled skipped ''; do
       expect failure "release: heavy=false private=$PRIVATE $variable=$status" env HEAVY=false "$variable=$status" bash --noprofile --norc -e -u -o pipefail <"$release_body"
     done
+    expect failure "release: heavy=false private=$PRIVATE missing $variable" env -u "$variable" HEAVY=false bash --noprofile --norc -e -u -o pipefail <"$release_body"
   done
+  expect success "release: heavy=false private=$PRIVATE cross skipped" env HEAVY=false CROSS_RESULT=skipped bash --noprofile --norc -e -u -o pipefail <"$release_body"
+  expect success "release: heavy=false private=$PRIVATE cross success" env HEAVY=false bash --noprofile --norc -e -u -o pipefail <"$release_body"
+  for status in failure cancelled ''; do
+    expect failure "release: heavy=false private=$PRIVATE cross=$status" env HEAVY=false CROSS_RESULT="$status" bash --noprofile --norc -e -u -o pipefail <"$release_body"
+  done
+  expect failure "release: heavy=false private=$PRIVATE missing cross" env -u CROSS_RESULT HEAVY=false bash --noprofile --norc -e -u -o pipefail <"$release_body"
   for status in success failure cancelled skipped in_progress ''; do
     expect success "release: private=$PRIVATE macos=$status" env MACOS_RESULT="$status" bash --noprofile --norc -e -u -o pipefail <"$release_body"
   done
   expect success "release: private=$PRIVATE macos unset" env -u MACOS_RESULT bash --noprofile --norc -e -u -o pipefail <"$release_body"
   expect failure 'release: heavy=false cannot bypass architecture validation' env HEAVY=false ARM_RESULT=skipped CROSS_RESULT=skipped bash --noprofile --norc -e -u -o pipefail <"$release_body"
+done
+expect failure 'release: missing heavy output' env -u HEAVY bash --noprofile --norc -e -u -o pipefail <"$release_body"
+for heavy in '' invalid; do
+  expect failure "release: malformed heavy output '$heavy'" env HEAVY="$heavy" bash --noprofile --norc -e -u -o pipefail <"$release_body"
 done
 
 printf '%d cases, %d failures\n' "$cases" "$failures"

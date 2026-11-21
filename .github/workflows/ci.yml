@@ -3,6 +3,8 @@ name: CI
 on:
   # PRs (including drafts) validate branch updates; main and master are supported default-branch conventions.
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, master]
     tags: ['v*']
@@ -36,7 +38,7 @@ jobs:
       - id: filter
         shell: bash
         env:
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '0000000000000000000000000000000000000000' }}
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || '0000000000000000000000000000000000000000' }}
           HEAD: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
         run: tools/ci-changes.sh "$BASE" "$HEAD" >> "$GITHUB_OUTPUT"
 
@@ -263,7 +265,7 @@ jobs:
 
   cross:
     needs: changes
-    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository) && needs.changes.outputs.heavy == 'true'
+    if: (github.event_name == 'merge_group' || github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository) && needs.changes.outputs.heavy == 'true'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64', github.run_id) || 'ubuntu-24.04-arm' }}
     timeout-minutes: 50
     steps:
@@ -314,7 +316,7 @@ jobs:
 
   linux-arm64-bundle:
     needs: changes
-    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository) && needs.changes.outputs.heavy == 'true'
+    if: (github.event_name == 'merge_group' || github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository) && needs.changes.outputs.heavy == 'true'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64', github.run_id) || 'ubuntu-24.04-arm' }}
     timeout-minutes: 65
     steps:
@@ -351,7 +353,7 @@ jobs:
 
   linux-arm64-checks:
     needs: [changes, linux-arm64-bundle]
-    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository) && needs.changes.outputs.heavy == 'true'
+    if: (github.event_name == 'merge_group' || github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository) && needs.changes.outputs.heavy == 'true'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64', github.run_id) || 'ubuntu-24.04-arm' }}
     timeout-minutes: 65
     steps:
@@ -378,7 +380,7 @@ jobs:
 
   linux-arm64:
     needs: [changes, linux-arm64-bundle, linux-arm64-checks]
-    if: always() && (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository)
+    if: always() && (github.event_name == 'merge_group' || github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
@@ -522,7 +524,7 @@ jobs:
   release-validation:
     # macOS remains a standalone advisory; omitting it avoids waiting for it or gating releases.
     needs: [changes, required, linux-arm64, cross]
-    if: always() && (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository)
+    if: always() && (github.event_name == 'merge_group' || github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
@@ -533,8 +535,17 @@ jobs:
           REQUIRED_RESULT: ${{ needs.required.result }}
           ARM_RESULT: ${{ needs.linux-arm64.result }}
           CROSS_RESULT: ${{ needs.cross.result }}
+          HEAVY: ${{ needs.changes.outputs.heavy }}
         run: |
           test "$CHANGES_RESULT" = success
           test "$REQUIRED_RESULT" = success
           test "$ARM_RESULT" = success
-          test "$CROSS_RESULT" = success
+          case "$HEAVY" in
+            true|false) ;;
+            *) exit 1 ;;
+          esac
+          case "$CROSS_RESULT" in
+            success) ;;
+            skipped) test "$HEAVY" = false ;;
+            *) exit 1 ;;
+          esac
