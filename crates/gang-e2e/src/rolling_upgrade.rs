@@ -1,16 +1,16 @@
 //! Mixed-release controller handoff with an old client and an enrolled old worker.
+//! The held build keeps the old release's rendered rc byte-for-byte; fresh work uses
+//! a separately rendered candidate rc, and the retired old client must require setup.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
-use gang_types::{ActionEnvironment, Url};
+use gang_types::Url;
 
 use crate::bazel::Bazel;
 use crate::build_output::BuildOutcome;
@@ -54,10 +54,6 @@ fn version(binary: &Path, timeout: Duration) -> Result<String> {
         )));
     }
     Ok(output.stdout.trim().to_owned())
-}
-
-fn version_is(actual: &str, expected: &str) -> bool {
-    actual.split_whitespace().any(|part| part == expected)
 }
 
 fn executor(rc: &Path) -> Result<Url> {
@@ -119,6 +115,9 @@ fn capture_in_flight(attempts: &Attempts) -> InFlight {
 
 fn uninterrupted(frozen: &InFlight, final_attempts: &Attempts) -> bool {
     !frozen.is_empty()
+        && final_attempts
+            .values()
+            .all(|attempt| frozen.values().any(|&(worker, _)| worker == attempt.worker))
         && frozen.iter().all(|(key, &(worker, start))| {
             final_attempts.get(key).is_some_and(|attempt| {
                 attempt.worker == worker && attempt.start == start && attempt.end.is_some()
@@ -150,34 +149,6 @@ fn build_ok(outcome: &BuildOutcome, evidence: &BuildEvidence, expected: usize) -
 
 fn availability_ok(gap: Duration, limit: Duration) -> bool {
     gap <= limit
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Calibration {
-    None,
-    RemovedPort,
-    AliveDrain,
-}
-
-// Calibration is deliberately narrower than an arbitrary post-apply failure.
-#[derive(Clone, Copy)]
-enum Continuity {
-    None,
-    RemovedPortGap,
-    AliveDrainGap,
-}
-
-fn calibrated(phase0: bool, continuity: Continuity) -> bool {
-    phase0 && !matches!(continuity, Continuity::None)
-}
-
-fn calibration_sample_eligible(calibration: Calibration, applied: bool, draining: bool) -> bool {
-    applied
-        && match calibration {
-            Calibration::None => false,
-            Calibration::RemovedPort => true,
-            Calibration::AliveDrain => draining,
-        }
 }
 
 fn detail(name: &str, ok: bool, metrics: String) -> Check {
@@ -313,8 +284,8 @@ impl HeldDrainWitness {
     }
 }
 
-fn requires_drain_credentials(procedure: UpgradeProcedure, calibration: Calibration) -> bool {
-    procedure == UpgradeProcedure::InstanceRefresh && calibration == Calibration::None
+fn requires_drain_credentials(procedure: UpgradeProcedure) -> bool {
+    procedure == UpgradeProcedure::InstanceRefresh
 }
 
 fn drain_credentials_ok(drain: &DrainWitness, required: bool, gap_limit: Duration) -> bool {
@@ -349,14 +320,12 @@ struct Handoff<'a> {
     old_identity: Option<(DirectTarget, u32, PathBuf)>,
     applied: Instant,
     continuity_observed: bool,
-    verified_gap: bool,
 }
 
 impl Handoff<'_> {
     fn observe_held(&self, cluster: &Cluster<'_>) -> Result<(DirectTarget, HeldState)> {
-        let (build_unfinished, hold_unreleased) = (self.original_held)()?;
         let target = cluster.controller_public_target(0)?;
-        let (original_target, worker_pid, executable) = self
+        let (original_target, _, _) = self
             .old_identity
             .as_ref()
             .ok_or_else(|| E2eError::system("original held identity missing"))?;
@@ -367,6 +336,15 @@ impl Handoff<'_> {
                 "original controller public target changed",
             ));
         }
+        Ok((target, self.observe_worker()?))
+    }
+
+    fn observe_worker(&self) -> Result<HeldState> {
+        let (build_unfinished, hold_unreleased) = (self.original_held)()?;
+        let (_, worker_pid, executable) = self
+            .old_identity
+            .as_ref()
+            .ok_or_else(|| E2eError::system("original held identity missing"))?;
         if worker_executable(*worker_pid)? != *executable {
             return Err(E2eError::system("original held worker process changed"));
         }
@@ -380,7 +358,7 @@ impl Handoff<'_> {
                 "drain witness requires original unfinished held build",
             ));
         }
-        Ok((target, state))
+        Ok(state)
     }
 }
 
@@ -395,7 +373,6 @@ fn remaining_budget(start: Instant, budget: Duration) -> Result<Duration> {
 fn held_drain(
     cluster: &Cluster<'_>,
     releases: &Releases<'_>,
-    monitor: &RunningMonitor<'_>,
     next: usize,
     handoff: &mut Handoff<'_>,
 ) -> Result<(DrainWitness, PromotionTiming)> {
@@ -406,7 +383,6 @@ fn held_drain(
     let drain_started = start.duration_since(handoff.applied);
     let deadline = drain_started + budget;
     let old_leader_before = cluster.controller_is_leader(0)?;
-    monitor.draining.store(true, Ordering::SeqCst);
     let observed = (|| {
         remaining_budget(start, budget)?;
         let promotion = confirm_promotion(cluster, next, handoff.client, start, Some(budget))?;
@@ -448,8 +424,8 @@ fn held_drain(
         }
         Ok((credentials, promotion))
     })();
-    let result = observed.and_then(|(credentials, promotion)| {
-        while start.elapsed() < window && !monitor.failed() {
+    observed.and_then(|(credentials, promotion)| {
+        while start.elapsed() < window {
             std::thread::sleep(
                 window
                     .saturating_sub(start.elapsed())
@@ -466,9 +442,7 @@ fn held_drain(
             },
             promotion,
         ))
-    });
-    monitor.draining.store(false, Ordering::SeqCst);
-    result
+    })
 }
 
 fn scaled_window(actual_seconds: u64, cap: Duration) -> Duration {
@@ -517,37 +491,6 @@ fn post_exit_refresh(
     Ok(())
 }
 
-fn alive_drain(
-    cluster: &Cluster<'_>,
-    releases: &Releases<'_>,
-    monitor: &RunningMonitor<'_>,
-) -> Result<DrainWitness> {
-    let old_leader_before = cluster.controller_is_leader(0)?;
-    if releases.calibration == Calibration::AliveDrain && !old_leader_before {
-        return Err(E2eError::system(
-            "old controller was not leader at drain start",
-        ));
-    }
-    monitor.draining.store(true, Ordering::SeqCst);
-    let start = Instant::now();
-    let window = drain_window(releases, cluster.stack().settings());
-    while start.elapsed() < window && !monitor.failed() {
-        std::thread::sleep(
-            window
-                .saturating_sub(start.elapsed())
-                .min(Duration::from_millis(100)),
-        );
-    }
-    monitor.draining.store(false, Ordering::SeqCst);
-    let witness = DrainWitness {
-        elapsed: start.elapsed(),
-        old_leader_before,
-        old_leader_after: cluster.controller_is_leader(0)?,
-        ..DrainWitness::default()
-    };
-    Ok(witness)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminationStep {
     Stop,
@@ -576,7 +519,6 @@ struct Terminated {
 fn terminate_old(
     cluster: &Cluster<'_>,
     releases: &Releases<'_>,
-    monitor: &RunningMonitor<'_>,
     next: usize,
     handoff: &mut Handoff<'_>,
 ) -> Result<Terminated> {
@@ -584,7 +526,7 @@ fn terminate_old(
     let mut stop_started = None;
     let mut witness = DrainWitness::default();
     let mut promotion = None;
-    let required = requires_drain_credentials(releases.procedure, releases.calibration);
+    let required = requires_drain_credentials(releases.procedure);
     for step in termination_steps(releases.procedure) {
         match step {
             TerminationStep::Stop => {
@@ -598,9 +540,7 @@ fn terminate_old(
                         "required pre-stop drain witness missing or invalid",
                     ));
                 }
-                if required {
-                    handoff.observe_held(cluster)?;
-                }
+                handoff.observe_held(cluster)?;
                 stop_started = Some(Instant::now());
                 retiring = Some(cluster.begin_retire(0)?);
                 handoff.continuity_observed = true;
@@ -610,31 +550,9 @@ fn terminate_old(
                 handoff.continuity_observed = true;
             }
             TerminationStep::Drain => {
-                let drained = if required {
-                    held_drain(cluster, releases, monitor, next, handoff).map(
-                        |(witness, timing)| {
-                            promotion = Some(timing);
-                            witness
-                        },
-                    )
-                } else {
-                    alive_drain(cluster, releases, monitor)
-                };
-                if drained.is_err() && releases.calibration == Calibration::AliveDrain {
-                    handoff.continuity_observed = false;
-                }
-                witness = drained?;
-                if monitor.failed() {
-                    if releases.calibration == Calibration::AliveDrain && !witness.old_leader_after
-                    {
-                        handoff.continuity_observed = false;
-                    } else {
-                        handoff.verified_gap = true;
-                    }
-                    return Err(E2eError::system(format!(
-                        "measured continuity failure; alive drain witness: {witness:?}"
-                    )));
-                }
+                let (drain, timing) = held_drain(cluster, releases, next, handoff)?;
+                witness = drain;
+                promotion = Some(timing);
             }
         }
     }
@@ -715,7 +633,6 @@ fn plain_warmup(
     window: Duration,
     monitor: &RunningMonitor<'_>,
     client: &OldClient,
-    calibration: Calibration,
 ) -> Result<()> {
     let start = Instant::now();
     let mut minted = false;
@@ -738,7 +655,7 @@ fn plain_warmup(
                 .min(Duration::from_millis(100)),
         );
     }
-    if !minted && calibration == Calibration::None {
+    if !minted {
         return Err(E2eError::system(
             "candidate did not become NLB healthy during warmup for cold mints",
         ));
@@ -754,7 +671,6 @@ fn handoff<K: Fn(Option<&str>) -> Result<()>>(
     hold: &Hold<'_, K>,
 ) -> Result<(usize, Retiring, PromotionTiming, DrainWitness)> {
     cluster.apply_release(&releases.candidate)?;
-    monitor.applied.store(true, Ordering::SeqCst);
     let startup = cluster.stack().settings().startup_timeout;
     let startup_started = Instant::now();
     let next = cluster.start_controller_release_within(
@@ -774,20 +690,15 @@ fn handoff<K: Fn(Option<&str>) -> Result<()>>(
         cluster.wait_for_controller_health_within(next, deadline)?;
         mint_warm_pair(cluster, next, monitor, context.client)?;
     } else {
-        plain_warmup(
-            cluster,
-            next,
-            warmup,
-            monitor,
-            context.client,
-            releases.calibration,
-        )?;
+        plain_warmup(cluster, next, warmup, monitor, context.client)?;
     }
-    let terminated = terminate_old(cluster, releases, monitor, next, context)?;
+    let terminated = terminate_old(cluster, releases, next, context)?;
     let promotion = match terminated.promotion {
         Some(promotion) => Ok(promotion),
         None => confirm_promotion(cluster, next, context.client, terminated.stop_started, None),
     };
+    context.observe_worker()?;
+    context.client.assert_original_rc()?;
     hold.release()?;
     Ok((next, terminated.retiring, promotion?, terminated.witness))
 }
@@ -869,30 +780,21 @@ fn verify_cold_pair(
     Ok(())
 }
 
-struct MonitorArgs<'a, K: Fn(Option<&str>) -> Result<()>> {
+struct MonitorArgs<'a> {
     endpoint: Url,
     credentials: Credentials,
     settings: &'a crate::settings::Settings,
     ready: mpsc::SyncSender<bool>,
-    gap_send: mpsc::SyncSender<()>,
     commands: mpsc::Receiver<MonitorCommand>,
     cold: ColdHelpers,
-    applied: Arc<AtomicBool>,
-    draining: Arc<AtomicBool>,
-    gap_failed: Arc<AtomicBool>,
-    hold: Arc<Hold<'a, K>>,
-    calibration: Calibration,
 }
 
-fn monitor_availability<K: Fn(Option<&str>) -> Result<()>>(
-    args: MonitorArgs<'_, K>,
-) -> (Availability, Duration, usize, usize) {
+fn monitor_availability(args: MonitorArgs<'_>) -> (Availability, Duration, usize, usize) {
     let start = Instant::now();
     let mut availability = Availability::default();
     let mut first = Some(args.ready);
     let mut previous_failed = false;
     let mut retries = 0;
-    let mut last_success = Duration::ZERO;
     let mut cold = Some(args.cold);
     let mut cold_mints = 0;
     loop {
@@ -907,20 +809,6 @@ fn monitor_availability<K: Fn(Option<&str>) -> Result<()>>(
         }
         previous_failed = !success;
         availability.sample(start.elapsed(), success);
-        let elapsed = start.elapsed();
-        if success {
-            last_success = elapsed;
-        } else if calibration_sample_eligible(
-            args.calibration,
-            args.applied.load(Ordering::SeqCst),
-            args.draining.load(Ordering::SeqCst),
-        ) && elapsed.saturating_sub(last_success) > args.settings.upgrade_gap_limit
-            && !args.gap_failed.swap(true, Ordering::SeqCst)
-        {
-            let _ = args.gap_send.try_send(());
-            let _ = args.hold.release();
-            args.hold.cancel("old executor availability gap exceeded");
-        }
         if let Some(ready) = first.take() {
             let _ = ready.send(success);
         }
@@ -976,7 +864,6 @@ struct VerdictInputs<'a> {
     old_version: &'a str,
     candidate_version: &'a str,
     elapsed: Duration,
-    negative_control: bool,
 }
 
 fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
@@ -998,11 +885,10 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         && input.cold_mints == 2
         && drain_credentials_ok(
             input.drain,
-            input.procedure == UpgradeProcedure::InstanceRefresh && !input.negative_control,
+            input.procedure == UpgradeProcedure::InstanceRefresh,
             input.gap_limit,
         )
         && (input.procedure != UpgradeProcedure::InstanceRefresh
-            || input.negative_control
             || drain_policy_ok(input.drain, input.warmup_policy.1, input.drain_policy.1))
         && input.timing.lease <= input.gap_limit
         && availability_ok(input.gap, input.gap_limit);
@@ -1055,15 +941,15 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         input.elapsed,
         input.drain.stop_started,
     );
-    vec![detail(
-        if input.negative_control {
-            "upgrade negative control"
-        } else {
-            "rolling upgrade"
-        },
-        !input.negative_control && ok,
-        metrics,
-    )]
+    let mut checks = vec![detail("rolling upgrade", ok, metrics)];
+    if !build_ok(input.initial_outcome, input.initial_evidence, 8) {
+        checks.push(detail(
+            "initial held build completion after handoff",
+            false,
+            input.initial_outcome.exit_summary(),
+        ));
+    }
+    checks
 }
 
 struct Releases<'a> {
@@ -1073,16 +959,31 @@ struct Releases<'a> {
     candidate_version: String,
     old_fixture: ReleaseFixture,
     candidate: ReleaseFixture,
-    negative_control: bool,
-    calibration: Calibration,
     procedure: UpgradeProcedure,
-    settings: &'a Settings,
 }
 
 struct OldClient {
     remote: Remote,
     credentials: Credentials,
     endpoint: Url,
+    original_rc: Vec<u8>,
+}
+
+impl OldClient {
+    fn assert_original_rc(&self) -> Result<()> {
+        let current = fs::read(self.remote.bazelrc())
+            .map_err(E2eError::io("reading original old client bazelrc"))?;
+        if current != self.original_rc {
+            return Err(E2eError::system(
+                "original old client bazelrc bytes changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn old_client_rejected(outcome: &BuildOutcome) -> bool {
+    outcome.exit_code.is_some_and(|code| code != 0) && outcome.stderr.contains("run gang setup")
 }
 
 struct LoggedBuild {
@@ -1124,57 +1025,36 @@ type MonitorOutcome = (Availability, Duration, usize, usize);
 
 struct RunningMonitor<'scope> {
     commands: mpsc::Sender<MonitorCommand>,
-    gap: mpsc::Receiver<()>,
     first: mpsc::Receiver<bool>,
-    applied: Arc<AtomicBool>,
-    draining: Arc<AtomicBool>,
-    gap_failed: Arc<AtomicBool>,
     join: Option<ScopedJoinHandle<'scope, MonitorOutcome>>,
 }
 
-struct MonitorStart<'a, K: Fn(Option<&str>) -> Result<()>> {
+struct MonitorStart<'a> {
     endpoint: Url,
     credentials: Credentials,
     settings: &'a Settings,
-    hold: Arc<Hold<'a, K>>,
-    calibration: Calibration,
     cold: ColdHelpers,
 }
 
 impl<'scope> RunningMonitor<'scope> {
-    fn start<'env, K>(scope: &'scope Scope<'scope, 'env>, start: MonitorStart<'env, K>) -> Self
+    fn start<'env>(scope: &'scope Scope<'scope, 'env>, start: MonitorStart<'env>) -> Self
     where
         'env: 'scope,
-        K: Fn(Option<&str>) -> Result<()> + Send + Sync + 'env,
     {
         let (commands, monitor_commands) = mpsc::channel();
         let (ready, first) = mpsc::sync_channel(1);
-        let (gap_send, gap) = mpsc::sync_channel(1);
-        let applied = Arc::new(AtomicBool::new(false));
-        let gap_failed = Arc::new(AtomicBool::new(false));
-        let draining = Arc::new(AtomicBool::new(false));
         let args = MonitorArgs {
             endpoint: start.endpoint,
             credentials: start.credentials,
             settings: start.settings,
             ready,
-            gap_send,
             commands: monitor_commands,
             cold: start.cold,
-            applied: Arc::clone(&applied),
-            draining: Arc::clone(&draining),
-            gap_failed: Arc::clone(&gap_failed),
-            hold: start.hold,
-            calibration: start.calibration,
         };
         let join = scope.spawn(move || monitor_availability(args));
         Self {
             commands,
-            gap,
             first,
-            applied,
-            draining,
-            gap_failed,
             join: Some(join),
         }
     }
@@ -1197,17 +1077,6 @@ impl<'scope> RunningMonitor<'scope> {
             .recv()
             .map_err(|_| E2eError::system("availability monitor stopped during cold mints"))?
     }
-
-    fn failed(&self) -> bool {
-        self.gap_failed.load(Ordering::SeqCst)
-    }
-
-    fn wait_gap(&self, settings: &Settings, applied: Instant) {
-        let remaining = settings.upgrade_gap_limit.saturating_sub(applied.elapsed())
-            + settings.upgrade_probe_timeout
-            + settings.upgrade_probe_interval;
-        let _ = self.gap.recv_timeout(remaining);
-    }
 }
 
 impl Drop for RunningMonitor<'_> {
@@ -1219,38 +1088,16 @@ impl Drop for RunningMonitor<'_> {
     }
 }
 
-fn select_releases(
-    invocation: &DeploymentInputs,
-    calibration: Calibration,
-) -> Result<Releases<'_>> {
+fn select_releases(invocation: &DeploymentInputs) -> Result<Releases<'_>> {
     let inputs = invocation
         .upgrade
         .as_ref()
         .ok_or_else(|| E2eError::system("upgrade inputs missing"))?;
-    let old = match calibration {
-        Calibration::RemovedPort => &inputs.historical,
-        Calibration::AliveDrain => &inputs.calibration,
-        Calibration::None => &inputs.previous,
-    };
-    let (binary, fixture) = if calibration == Calibration::None {
-        (&invocation.gang, &inputs.candidate_fixture)
-    } else {
-        (&inputs.calibration.binary, &inputs.calibration.fixture)
-    };
+    let old = &inputs.previous;
+    let binary = &invocation.gang;
+    let fixture = &inputs.candidate_fixture;
     let old_version = version(&old.binary, invocation.settings.command_timeout)?;
     let candidate_version = version(binary, invocation.settings.command_timeout)?;
-    let expected_old = match calibration {
-        Calibration::RemovedPort => Some("0.3.1"),
-        Calibration::AliveDrain => Some("0.3.2"),
-        Calibration::None => None,
-    };
-    if let Some(expected) = expected_old
-        && (!version_is(&old_version, expected) || !version_is(&candidate_version, "0.3.2"))
-    {
-        return Err(E2eError::system(format!(
-            "negative control requires {expected} -> 0.3.2, got {old_version:?} -> {candidate_version:?}"
-        )));
-    }
     Ok(Releases {
         old,
         candidate_binary: binary,
@@ -1258,81 +1105,16 @@ fn select_releases(
         candidate_version,
         old_fixture: ReleaseFixture::read(&old.fixture)?,
         candidate: ReleaseFixture::read(fixture)?,
-        settings: &invocation.settings,
-        negative_control: calibration != Calibration::None,
-        calibration,
-        procedure: if calibration == Calibration::None {
-            invocation.settings.upgrade_procedure
-        } else {
-            UpgradeProcedure::InstanceRefresh
-        },
+        procedure: invocation.settings.upgrade_procedure,
     })
-}
-
-fn is_environment_assignment(line: &str) -> bool {
-    let mut words = line.split_whitespace();
-    let Some(scope) = words.next() else {
-        return false;
-    };
-    if scope != "build" && scope != "common" {
-        return false;
-    }
-    let Some(option) = words.next() else {
-        return false;
-    };
-    if words.next().is_some() {
-        return false;
-    }
-    let matches_key = |prefix: &str, key: &str| {
-        option
-            .strip_prefix(prefix)
-            .map(|value| value.trim_start_matches(['\'', '"']))
-            .and_then(|value| value.strip_prefix(key))
-            .is_some_and(|suffix| suffix.starts_with('='))
-    };
-    matches_key("--repo_env=", "GANG_ACTION_ENVIRONMENT")
-        || matches_key(
-            "--remote_default_exec_properties=",
-            gang_types::property::ACTION_ENVIRONMENT,
-        )
-}
-
-fn configure_upgrade_client(config: &Path, bazelrc: &Path) -> Result<()> {
-    let config = fs::read_to_string(config)
-        .map_err(E2eError::io("reading candidate local configuration"))?;
-    let config: toml::Value = toml::from_str(&config).map_err(crate::template::template_error)?;
-    let environment: ActionEnvironment = config
-        .get("fleets")
-        .and_then(toml::Value::as_array)
-        .and_then(|fleets| fleets.first())
-        .and_then(|fleet| fleet.get("action_environment"))
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| E2eError::system("candidate local fleet has no action environment"))?
-        .parse()
-        .map_err(E2eError::system_from(
-            "parsing candidate action environment",
-        ))?;
-    let rc = fs::read_to_string(bazelrc).map_err(E2eError::io("reading old client bazelrc"))?;
-    let mut updated: String = rc
-        .split_inclusive('\n')
-        .filter(|line| !is_environment_assignment(line))
-        .collect();
-    if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    let _ = write!(
-        updated,
-        "common --repo_env=GANG_ACTION_ENVIRONMENT={environment}\nbuild --remote_default_exec_properties={}={environment}\n",
-        gang_types::property::ACTION_ENVIRONMENT
-    );
-    fs::write(bazelrc, updated).map_err(E2eError::io("writing upgrade client bazelrc"))
 }
 
 fn prepare_client(cluster: &Cluster<'_>) -> Result<OldClient> {
     let stack = cluster.stack();
     let credentials = stack.administrator()?.credentials(&stack.ca_pin()?)?;
     let remote = stack.administrator_remote(&credentials)?;
-    configure_upgrade_client(&stack.placement().config_file(), remote.bazelrc())?;
+    let original_rc = fs::read(remote.bazelrc())
+        .map_err(E2eError::io("capturing original old client bazelrc"))?;
     let endpoint = executor(remote.bazelrc())?;
     probe_capabilities(
         &endpoint,
@@ -1347,6 +1129,7 @@ fn prepare_client(cluster: &Cluster<'_>) -> Result<OldClient> {
         remote,
         credentials,
         endpoint,
+        original_rc,
     })
 }
 
@@ -1387,28 +1170,8 @@ pub(crate) fn rolling_upgrade<'a>(
     invocation: &'a DeploymentInputs,
     variant: &Variant,
     issuer: &'a TestIssuer,
-    negative_control: bool,
 ) -> Result<Vec<Check>> {
-    if negative_control {
-        let mut checks = run_upgrade(invocation, variant, issuer, Calibration::RemovedPort)?;
-        checks.extend(run_upgrade(
-            invocation,
-            variant,
-            issuer,
-            Calibration::AliveDrain,
-        )?);
-        return Ok(checks);
-    }
-    run_upgrade(invocation, variant, issuer, Calibration::None)
-}
-
-fn run_upgrade<'a>(
-    invocation: &'a DeploymentInputs,
-    variant: &Variant,
-    issuer: &'a TestIssuer,
-    calibration: Calibration,
-) -> Result<Vec<Check>> {
-    let releases = select_releases(invocation, calibration)?;
+    let releases = select_releases(invocation)?;
     let cluster = Cluster::start_release(
         invocation,
         variant,
@@ -1439,35 +1202,6 @@ struct InitialObservation {
     attempts: Attempts,
     in_flight: InFlight,
     continuity_observed: bool,
-    verified_gap: bool,
-    applied: Instant,
-    removed: bool,
-}
-
-fn calibration_check(
-    outcome: &MonitorOutcome,
-    explanation: &str,
-    releases: &Releases<'_>,
-) -> Check {
-    detail(
-        "upgrade negative control",
-        true,
-        format!(
-            "control={:?}, procedure={:?}, warmup actual/scaled={:?}/{:?}, drain actual/scaled={:?}/{:?}, versions={:?}->{:?}; {explanation}; cleanup cancellation is not a modeled lifecycle signal; cold mints={}, probe failures={}, probe retries={}, longest gap={:?}; build evidence unavailable after cancellation",
-            releases.calibration,
-            releases.procedure,
-            Duration::from_secs(releases.candidate.controller.warmup_seconds),
-            warmup_window(releases, releases.settings),
-            Duration::from_secs(releases.candidate.controller.deregistration_delay_seconds),
-            drain_window(releases, releases.settings),
-            releases.old_version,
-            releases.candidate_version,
-            outcome.3,
-            outcome.0.failures,
-            outcome.2,
-            outcome.1
-        ),
-    )
 }
 
 impl Upgrade<'_> {
@@ -1492,9 +1226,6 @@ impl Upgrade<'_> {
         &self,
         attempts: &Attempts,
     ) -> Result<Option<(DirectTarget, u32, PathBuf)>> {
-        if !requires_drain_credentials(self.releases.procedure, self.releases.calibration) {
-            return Ok(None);
-        }
         let worker = attempts
             .values()
             .next()
@@ -1522,6 +1253,7 @@ impl Upgrade<'_> {
         'env: 'scope,
         K: Fn(Option<&str>) -> Result<()> + Send + Sync + 'env,
     {
+        self.client.assert_original_rc()?;
         let initial = hold.build(scope, None, |_, stop| {
             let result = self.builds.initial.driver.build_until(
                 &self.client.remote,
@@ -1541,9 +1273,7 @@ impl Upgrade<'_> {
             &mut attempts,
         )?;
         let in_flight = capture_in_flight(&attempts);
-        let removed = self.releases.old_fixture.execution.is_some()
-            && self.releases.candidate.execution.is_none();
-        let mut monitor = self.start_monitor(scope, hold, removed)?;
+        let mut monitor = self.start_monitor(scope)?;
         if !monitor.first.recv().unwrap_or(false) {
             return Err(E2eError::system("pre-apply capability monitor failed"));
         }
@@ -1557,7 +1287,6 @@ impl Upgrade<'_> {
             old_identity,
             applied: Instant::now(),
             continuity_observed: false,
-            verified_gap: false,
         };
         if context.old_identity.is_some() {
             context.observe_held(&self.cluster)?;
@@ -1566,24 +1295,8 @@ impl Upgrade<'_> {
         context.applied = applied;
         let promotion = handoff(&self.cluster, &self.releases, &mut context, &monitor, hold);
         let mut continuity_observed = context.continuity_observed;
-        let verified_gap = context.verified_gap;
         let promotion = match promotion {
             Ok((next, retiring, timing, mut witness)) => {
-                if self.releases.negative_control && removed {
-                    monitor.wait_gap(self.cluster.stack().settings(), applied);
-                    if monitor.failed() {
-                        let _ = hold.release();
-                        hold.cancel("old executor availability gap exceeded");
-                        drop(retiring);
-                        let _ = joined(initial);
-                        let outcome = monitor.finish()?;
-                        return Ok(vec![calibration_check(
-                            &outcome,
-                            "removed executor",
-                            &self.releases,
-                        )]);
-                    }
-                }
                 continuity_observed = false;
                 self.cluster.finish_retire(retiring).and_then(|status| {
                     post_exit_refresh(&self.cluster, &self.releases, &mut witness)?;
@@ -1605,9 +1318,6 @@ impl Upgrade<'_> {
             attempts,
             in_flight,
             continuity_observed,
-            verified_gap,
-            applied,
-            removed,
         };
         self.finish_upgrade(scope, hold, observation, &mut monitor)
     }
@@ -1623,7 +1333,6 @@ impl Upgrade<'_> {
         'env: 'scope,
         K: Fn(Option<&str>) -> Result<()> + Send + Sync + 'env,
     {
-        let (removed, applied) = (observation.removed, observation.applied);
         let promotion = match observation.handoff {
             Ok((index, status, timing, drain)) => Promotion {
                 index,
@@ -1632,51 +1341,29 @@ impl Upgrade<'_> {
                 drain,
             },
             Err(error) => {
-                return self.handoff_failure(
-                    error,
-                    monitor,
-                    observation.verified_gap,
-                    removed,
-                    observation.continuity_observed,
-                );
+                return self.handoff_failure(error, monitor, observation.continuity_observed);
             }
         };
-        if self.releases.negative_control && monitor.failed() {
-            let outcome = monitor.finish()?;
-            return Ok(vec![calibration_check(
-                &outcome,
-                "removed executor",
-                &self.releases,
-            )]);
-        }
         let (initial, promotion) =
-            match self.finish_initial(observation.build, observation.attempts, promotion) {
-                Ok(complete) => complete,
-                Err(error) => return self.initial_build_failure(error, monitor, removed, applied),
-            };
+            self.finish_initial(observation.build, observation.attempts, promotion)?;
+        self.client.assert_original_rc()?;
+        let rejected = self.reject_old_client(scope, hold, &initial.attempts)?;
         let post = self.post_build(scope, hold);
-        if self.releases.negative_control && removed {
-            monitor.wait_gap(self.cluster.stack().settings(), applied);
-        }
         let outcome = monitor.finish()?;
-        if self.releases.negative_control && monitor.failed() {
-            return Ok(vec![calibration_check(
-                &outcome,
-                "removed executor",
-                &self.releases,
-            )]);
-        }
-        self.report(
+        let mut checks = self.report(
             &initial,
             &observation.in_flight,
             &promotion,
             &post?,
             &outcome,
-        )
+        )?;
+        self.client.assert_original_rc()?;
+        checks.push(rejected);
+        Ok(checks)
     }
 
     fn prepare_drain_credentials(&self) -> Result<Option<DrainCredentials>> {
-        if !requires_drain_credentials(self.releases.procedure, self.releases.calibration) {
+        if !requires_drain_credentials(self.releases.procedure) {
             return Ok(None);
         }
         let stack = self.cluster.stack();
@@ -1689,15 +1376,12 @@ impl Upgrade<'_> {
         .map(Some)
     }
 
-    fn start_monitor<'scope, 'env, K>(
+    fn start_monitor<'scope, 'env>(
         &'env self,
         scope: &'scope Scope<'scope, 'env>,
-        hold: &Arc<Hold<'env, K>>,
-        removed: bool,
     ) -> Result<RunningMonitor<'scope>>
     where
         'env: 'scope,
-        K: Fn(Option<&str>) -> Result<()> + Send + Sync + 'env,
     {
         let stack = self.cluster.stack();
         let cold = ColdHelpers::prepare(
@@ -1713,12 +1397,6 @@ impl Upgrade<'_> {
                 credentials: self.client.credentials.clone(),
                 settings: self.cluster.stack().settings(),
                 cold,
-                hold: Arc::clone(hold),
-                calibration: if self.releases.calibration == Calibration::RemovedPort && !removed {
-                    Calibration::None
-                } else {
-                    self.releases.calibration
-                },
             },
         ))
     }
@@ -1745,32 +1423,10 @@ impl Upgrade<'_> {
         &self,
         error: E2eError,
         monitor: &mut RunningMonitor<'_>,
-        verified_gap: bool,
-        removed: bool,
         continuity_observed: bool,
     ) -> Result<Vec<Check>> {
         let outcome = monitor.finish()?;
-        let continuity = if verified_gap && monitor.failed() {
-            match self.releases.calibration {
-                Calibration::RemovedPort if removed => Continuity::RemovedPortGap,
-                Calibration::AliveDrain => Continuity::AliveDrainGap,
-                _ => Continuity::None,
-            }
-        } else {
-            Continuity::None
-        };
-        let accepted = calibrated(true, continuity);
-        if self.releases.negative_control && accepted {
-            return Ok(vec![calibration_check(
-                &outcome,
-                &format!("handoff: {error}"),
-                &self.releases,
-            )]);
-        }
-        if !self.releases.negative_control
-            && continuity_observed
-            && matches!(error, E2eError::Timeout { .. })
-        {
+        if continuity_observed && matches!(error, E2eError::Timeout { .. }) {
             return Ok(vec![detail(
                 "rolling upgrade",
                 false,
@@ -1783,25 +1439,82 @@ impl Upgrade<'_> {
         Err(error)
     }
 
-    fn initial_build_failure(
-        &self,
-        error: E2eError,
-        monitor: &mut RunningMonitor<'_>,
-        removed: bool,
-        applied: Instant,
-    ) -> Result<Vec<Check>> {
-        if self.releases.negative_control && removed {
-            monitor.wait_gap(self.cluster.stack().settings(), applied);
+    fn reject_old_client<'scope, 'env, K>(
+        &'env self,
+        scope: &'scope Scope<'scope, 'env>,
+        hold: &Hold<'env, K>,
+        attempts: &Attempts,
+    ) -> Result<Check>
+    where
+        'env: 'scope,
+        K: Fn(Option<&str>) -> Result<()>,
+    {
+        let stack = self.cluster.stack();
+        let workers: BTreeSet<_> = attempts.values().map(|attempt| attempt.worker).collect();
+        let started = Instant::now();
+        let timeout = stack.settings().startup_timeout;
+        for worker in &workers {
+            if !process::await_gone(*worker, timeout.saturating_sub(started.elapsed()))? {
+                return Err(E2eError::timeout("original old workers to exit", timeout));
+            }
         }
-        let outcome = monitor.finish()?;
-        if self.releases.negative_control && monitor.failed() {
-            return Ok(vec![calibration_check(
-                &outcome,
-                &format!("initial build evidence unavailable: {error}"),
-                &self.releases,
-            )]);
+        let config = self.cluster.release_config_path(0)?;
+        if !process::workers_of(&process::snapshot(), &config).is_empty() {
+            return Err(E2eError::system(
+                "old release workers remain after retirement",
+            ));
         }
-        Err(error)
+        self.client.assert_original_rc()?;
+        // A fresh run changes the action digest, so an old cache hit cannot hide rejection.
+        let run = Run::fresh()?;
+        self.builds
+            .journal
+            .prepare_attempts(run.as_ref(), [Probe::ControllerLoss0.as_str()])?;
+        let build = hold.build(scope, None, move |_, stop| {
+            stack.bazel().build_until(
+                &self.client.remote,
+                &[Probe::ControllerLoss0],
+                Some(&run),
+                stop,
+            )
+        });
+        let outcome = joined(build)?;
+        self.client.assert_original_rc()?;
+        Ok(detail(
+            "retired old client requires setup",
+            old_client_rejected(&outcome),
+            format!(
+                "old workers gone={workers:?}, original rc unchanged={} bytes, {}",
+                self.client.original_rc.len(),
+                outcome.exit_summary()
+            ),
+        ))
+    }
+
+    fn candidate_remote(&self) -> Result<Remote> {
+        let stack = self.cluster.stack();
+        let home = stack.placement().root().join("upgrade-candidate-client");
+        fs::create_dir_all(&home).map_err(E2eError::io("creating candidate rc home"))?;
+        let endpoint = stack.endpoint()?;
+        let bazelrc = crate::secured::render_deployment_bazelrc(
+            self.releases.candidate_binary,
+            &stack.placement().config_file(),
+            &endpoint,
+            Some(stack.ca_pin()?),
+            &stack.placement().workspace(),
+            &home,
+            stack.settings().command_timeout,
+        )?;
+        self.client.assert_original_rc()?;
+        Ok(Remote::Gang {
+            host: endpoint
+                .host_str()
+                .ok_or_else(|| E2eError::system("candidate endpoint has no host"))?
+                .to_owned(),
+            bazelrc,
+            home: self.client.credentials.home.clone(),
+            helper: self.releases.candidate_binary.to_path_buf(),
+        })
     }
 
     fn post_build<'scope, 'env, K>(
@@ -1813,10 +1526,11 @@ impl Upgrade<'_> {
         'env: 'scope,
         K: Fn(Option<&str>) -> Result<()>,
     {
+        let remote = self.candidate_remote()?;
         let mut attempts = Attempts::new();
-        let post = hold.build(scope, None, |_, stop| {
+        let post = hold.build(scope, None, move |_, stop| {
             let result = self.builds.post.driver.build_until(
-                &self.client.remote,
+                &remote,
                 &[Probe::ControllerLoss0],
                 Some(&self.builds.post.run),
                 stop,
@@ -1880,7 +1594,6 @@ impl Upgrade<'_> {
             old_version: &self.releases.old_version,
             candidate_version: &self.releases.candidate_version,
             elapsed: self.started.elapsed(),
-            negative_control: self.releases.negative_control,
         }))
     }
 }
@@ -1891,31 +1604,49 @@ mod tests {
     use crate::upgrade_credentials::SharedCredentialWitness;
 
     #[test]
-    fn upgrade_client_uses_candidate_identity_for_default_and_explicit_platforms()
-    -> gang_testkit::TestResult {
+    fn old_rc_witness_preserves_exact_rendered_bytes() -> gang_testkit::TestResult {
         let root = tempfile::tempdir()?;
-        let config = root.path().join("candidate.toml");
         let rc = root.path().join("old-client.bazelrc");
-        fs::write(&config, "[[fleets]]\naction_environment = 'host:e2e'\n")?;
-        let preserved = "build --remote_executor=grpcs://127.0.0.1:1234\nbuild --remote_default_exec_properties=ISA=x86-64\ncommon --repo_env=OTHER=value\n";
-        fs::write(
-            &rc,
-            format!(
-                "{preserved}build --remote_default_exec_properties=gang_action_environment=identity-roots-v1\ncommon --repo_env=\"GANG_ACTION_ENVIRONMENT=host:stale\"\n"
-            ),
-        )?;
-        configure_upgrade_client(&config, &rc)?;
-        let rendered = fs::read_to_string(&rc)?;
-        assert_eq!(
-            rendered,
-            format!(
-                "{preserved}common --repo_env=GANG_ACTION_ENVIRONMENT=host:e2e\nbuild --remote_default_exec_properties=gang_action_environment=host:e2e\n"
-            )
-        );
-        fs::write(&config, "[[fleets]]\naction_environment = 'invalid'\n")?;
-        assert!(configure_upgrade_client(&config, &rc).is_err());
-        assert_eq!(fs::read_to_string(&rc)?, rendered);
+        let original = b"build --remote_default_exec_properties=gang_action_environment=identity-roots-v1\r\ncommon --repo_env='GANG_ACTION_ENVIRONMENT=identity-roots-v1'";
+        fs::write(&rc, original)?;
+        let client = OldClient {
+            remote: Remote::Plain {
+                bazelrc: rc.clone(),
+                home: root.path().to_path_buf(),
+            },
+            credentials: Credentials {
+                principal: "old".to_owned(),
+                home: root.path().to_path_buf(),
+                token: "old".to_owned(),
+                authority: None,
+            },
+            endpoint: Url::parse("https://127.0.0.1:1234")?,
+            original_rc: original.to_vec(),
+        };
+        client.assert_original_rc()?;
+        fs::write(&rc, String::from_utf8_lossy(original).replace("\r\n", "\n"))?;
+        assert!(client.assert_original_rc().is_err());
+        fs::write(&rc, original)?;
+        client.assert_original_rc()?;
         Ok(())
+    }
+
+    #[test]
+    fn retired_old_client_requires_nonzero_exit_and_setup_guidance() {
+        assert!(old_client_rejected(&BuildOutcome::new(
+            Some(1),
+            "unsupported action environment; run gang setup".to_owned(),
+        )));
+        for (code, text) in [
+            (Some(0), "run gang setup"),
+            (None, "run gang setup"),
+            (Some(1), "no fleet accepts this action"),
+        ] {
+            assert!(!old_client_rejected(&BuildOutcome::new(
+                code,
+                text.to_owned()
+            )));
+        }
     }
 
     #[test]
@@ -1956,7 +1687,7 @@ mod tests {
         for (index, probe) in PROBES.iter().enumerate() {
             let pid = index + 100;
             let action = probe.as_str();
-            let worker = if index < 2 { 42 } else { 43 };
+            let worker = 42;
             if index >= 2 {
                 record_attempt(
                     &format!("run loss start {action} {worker} {pid} 10 exclusive"),
@@ -2015,6 +1746,10 @@ mod tests {
         assert!(!uninterrupted(&frozen, &initial));
         initial.insert(key.clone(), removed);
         assert!(uninterrupted(&frozen, &initial));
+        let queued = (PROBES[2].as_str().to_owned(), 102);
+        initial.get_mut(&queued).expect("queued action").worker = 43;
+        assert!(!uninterrupted(&frozen, &initial));
+        initial.get_mut(&queued).expect("queued action").worker = 42;
 
         record_attempt(
             &format!("run loss start {} 43 999 30 exclusive", key.0),
@@ -2028,7 +1763,7 @@ mod tests {
             &mut initial,
         )
         .expect("reexecution end");
-        assert!(uninterrupted(&frozen, &initial));
+        assert!(!uninterrupted(&frozen, &initial));
         assert!(!exact_attempts(&initial, PROBES.len()));
     }
 
@@ -2079,7 +1814,6 @@ mod tests {
             old_version: "0.3.2",
             candidate_version: "candidate",
             elapsed: Duration::ZERO,
-            negative_control: false,
         };
         input.procedure = UpgradeProcedure::InstanceRefresh;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
@@ -2124,44 +1858,6 @@ mod tests {
             input.cold_mints = count;
             assert!(final_verdict(&input).iter().any(Check::is_failure));
         }
-    }
-
-    #[test]
-    fn preflight_failure_never_calibrates() {
-        assert!(!calibrated(false, Continuity::RemovedPortGap));
-        assert!(!calibrated(false, Continuity::AliveDrainGap));
-    }
-
-    #[test]
-    fn historical_continuity_failure_calibrates() {
-        assert!(calibrated(true, Continuity::RemovedPortGap));
-        assert!(calibrated(true, Continuity::AliveDrainGap));
-        assert!(!calibrated(true, Continuity::None));
-    }
-
-    #[test]
-    fn drain_calibration_requires_an_applied_during_drain_sample() {
-        assert!(!calibration_sample_eligible(
-            Calibration::AliveDrain,
-            false,
-            true
-        ));
-        assert!(!calibration_sample_eligible(
-            Calibration::AliveDrain,
-            true,
-            false
-        ));
-        assert!(calibration_sample_eligible(
-            Calibration::AliveDrain,
-            true,
-            true
-        ));
-        assert!(calibration_sample_eligible(
-            Calibration::RemovedPort,
-            true,
-            false
-        ));
-        assert!(!calibration_sample_eligible(Calibration::None, true, true));
     }
 
     #[test]
@@ -2242,19 +1938,9 @@ mod tests {
     #[test]
     fn every_ordinary_plain_refresh_requires_a_prepared_drain_witness() {
         assert!(requires_drain_credentials(
-            UpgradeProcedure::InstanceRefresh,
-            Calibration::None
+            UpgradeProcedure::InstanceRefresh
         ));
-        for calibration in [Calibration::RemovedPort, Calibration::AliveDrain] {
-            assert!(!requires_drain_credentials(
-                UpgradeProcedure::InstanceRefresh,
-                calibration
-            ));
-        }
-        assert!(!requires_drain_credentials(
-            UpgradeProcedure::PreStop,
-            Calibration::None
-        ));
+        assert!(!requires_drain_credentials(UpgradeProcedure::PreStop));
         let mut drain = credential_drain();
         let gap = Duration::from_secs(4);
         assert!(drain_credentials_ok(&drain, true, gap));

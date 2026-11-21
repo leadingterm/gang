@@ -138,12 +138,6 @@ override_resource {
   }
 }
 
-override_resource {
-  target = aws_ssm_parameter.config
-  values = {
-    arn = "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml"
-  }
-}
 
 override_resource {
   target = aws_sqs_queue.events
@@ -255,8 +249,8 @@ run "accepts_maximum_config_name_length" {
   command = plan
   variables { config_parameter_name = "/${join("", [for i in range(916) : "a"])}" }
   assert {
-    condition     = length(aws_ssm_parameter.config.name) == 917
-    error_message = "A 917-character legacy name must fit the standard partition and eu-north-1 generation ARN budget."
+    condition     = length(local.config_parameter_name) == 917
+    error_message = "A 917-character namespace must fit the standard partition and eu-north-1 generation ARN budget."
   }
 }
 
@@ -277,8 +271,8 @@ run "accepts_govcloud_maximum_config_name_length" {
     values = { partition = "aws-us-gov" }
   }
   assert {
-    condition     = length(aws_ssm_parameter.config.name) == 907
-    error_message = "A 907-character legacy name must fit the GovCloud generation ARN budget."
+    condition     = length(local.config_parameter_name) == 907
+    error_message = "A 907-character namespace must fit the GovCloud generation ARN budget."
   }
 }
 
@@ -301,52 +295,28 @@ run "rejects_oversized_config_name" {
   expect_failures = [var.config_parameter_name]
 }
 
-run "rejects_managed_password_overlap" {
-  command = plan
-  variables {
-    config_parameter_name = "/gang/database-password"
-    database              = { engine = "postgres", postgres = { rds = {} } }
-    hostname              = "gang.example.com"
-    load_balancer         = {}
-    network               = { availability_zone_count = 2 }
-  }
-  expect_failures = [terraform_data.input_checks]
-}
 
 run "applyA" {
   command = apply
   assert {
-    condition     = aws_ssm_parameter.config.value == output.gang_toml && aws_ssm_parameter.config_generation.value == output.gang_toml && aws_ssm_parameter.config_generation.overwrite == false
-    error_message = "The legacy baseline and first immutable generation must contain the rendered configuration."
+    condition     = aws_ssm_parameter.config_generation.value == output.gang_toml && aws_ssm_parameter.config_generation.overwrite == false
+    error_message = "The immutable generation must contain the rendered configuration."
   }
   assert {
-    condition     = aws_ssm_parameter.config.tags["Environment"] == "test" && aws_ssm_parameter.config_generation.tags["Environment"] == "test" && aws_ssm_parameter.config_generation.tags["Name"] == "gang-config-generation"
-    error_message = "Caller tags must reach both parameters and the generation must carry its own Name tag."
+    condition     = aws_ssm_parameter.config_generation.tags["Environment"] == "test" && aws_ssm_parameter.config_generation.tags["Name"] == "gang-config-generation"
+    error_message = "Caller tags must reach the generation with its own Name tag."
   }
   assert {
-    condition     = output.config_parameter_reference == "${output.config_parameter_name}:1" && startswith(output.config_parameter_name, "${output.legacy_config_parameter_name}/generations/") && local.config_parameter_arns == ["arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml", "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml/generations/*"]
+    condition     = output.config_parameter_reference == "${output.config_parameter_name}:1" && startswith(output.config_parameter_name, "${local.config_parameter_name}/generations/") && local.config_parameter_arns == ["arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml/generations/*"]
     error_message = "The pinned generation and readable namespace must be exact."
   }
-}
-
-run "rejects_legacy_namespace_rename" {
-  command = plan
-  variables { config_parameter_name = "/gang/renamed.toml" }
-  expect_failures = [aws_ssm_parameter.config]
 }
 
 run "planUnchanged" {
   command = plan
   assert {
-    condition     = aws_ssm_parameter.config.value == output.gang_toml && aws_ssm_parameter.config_generation.value == output.gang_toml
-    error_message = "Unchanged configuration must retain the rendered legacy and generation bytes."
-  }
-}
-
-run "planLegacyRetention" {
-  command = plan
-  plan_options {
-    replace = [aws_ssm_parameter.config]
+    condition     = aws_ssm_parameter.config_generation.value == output.gang_toml
+    error_message = "Unchanged configuration must retain the rendered generation bytes."
   }
 }
 
@@ -359,8 +329,12 @@ run "applyB" {
   command = apply
   variables { gang_settings = { poll_interval = "2s" } }
   assert {
-    condition     = aws_ssm_parameter.config_generation.value == output.gang_toml && aws_ssm_parameter.config_generation.name == output.config_parameter_name && startswith(output.config_parameter_name, "${output.legacy_config_parameter_name}/generations/") && output.config_parameter_reference == "${output.config_parameter_name}:1" && aws_ssm_parameter.config_generation.overwrite == false
-    error_message = "B must publish its rendered bytes at an immutable pinned generation in the legacy namespace."
+    condition     = aws_ssm_parameter.config_generation.value == output.gang_toml && aws_ssm_parameter.config_generation.name == output.config_parameter_name && startswith(output.config_parameter_name, "${local.config_parameter_name}/generations/") && output.config_parameter_reference == "${output.config_parameter_name}:1" && aws_ssm_parameter.config_generation.overwrite == false
+    error_message = "B must publish its rendered bytes at an immutable pinned generation."
+  }
+  assert {
+    condition     = local.config_parameter_arns == ["arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml/generations/*"]
+    error_message = "The previous pinned selector must remain covered by the generation IAM grant."
   }
 }
 
@@ -371,7 +345,7 @@ run "planRollbackA" {
 run "applyRollbackA" {
   command = apply
   assert {
-    condition     = aws_ssm_parameter.config_generation.value == output.gang_toml && aws_ssm_parameter.config_generation.name == output.config_parameter_name && startswith(output.config_parameter_name, "${output.legacy_config_parameter_name}/generations/") && output.config_parameter_reference == "${output.config_parameter_name}:1" && aws_ssm_parameter.config_generation.overwrite == false
-    error_message = "Rollback must publish its rendered bytes at an immutable pinned generation in the legacy namespace."
+    condition     = aws_ssm_parameter.config_generation.value == output.gang_toml && aws_ssm_parameter.config_generation.name == output.config_parameter_name && startswith(output.config_parameter_name, "${local.config_parameter_name}/generations/") && output.config_parameter_reference == "${output.config_parameter_name}:1" && aws_ssm_parameter.config_generation.overwrite == false
+    error_message = "Rollback must publish its rendered bytes at an immutable pinned generation."
   }
 }

@@ -120,7 +120,7 @@ pub fn queued(since: u64, candidates: FleetSet) -> Result<QueuedDemand, Box<dyn 
     Ok(QueuedDemand {
         source: None,
         candidates,
-        environment: "host:test".parse()?,
+        environment: Some("host:test".parse()?),
         resources: ActionResources::default(),
         queued_since: ts(since),
         priority: 0,

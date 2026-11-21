@@ -190,12 +190,6 @@ const DEPLOY_CONFIGURATION_EXAMPLES: &str = examples! {
         "gang deploy configuration < infra-plan.json > planned-gang.toml",
     ];
 };
-/// The `after_help` of `gang deploy restart-needed`.
-const DEPLOY_RESTART_NEEDED_EXAMPLES: &str = examples! {
-    "an apply job: does the controller reload its configuration?" => [
-        "gang deploy restart-needed < infra-plan.json",
-    ];
-};
 /// The `after_help` of `gang deploy store-request`.
 const DEPLOY_STORE_REQUEST_EXAMPLES: &str = examples! {
     "a plan job: the key and metadata of the plan to upload" => [
@@ -867,9 +861,6 @@ pub enum DeployCommand {
     /// Print `has_changes=` and `blocked=` for a `tofu show -json` plan; exit 3 when it is blocked.
     #[command(after_help = DEPLOY_POLICY_EXAMPLES)]
     Policy,
-    /// Print whether applying a `tofu show -json` plan needs the controller to reload its configuration.
-    #[command(after_help = DEPLOY_RESTART_NEEDED_EXAMPLES)]
-    RestartNeeded,
     /// Print the exact planned immutable configuration bytes from plan JSON on standard input.
     #[command(after_help = DEPLOY_CONFIGURATION_EXAMPLES)]
     Configuration,
@@ -913,7 +904,6 @@ impl DeployCommand {
     pub(crate) fn subject(&self) -> &'static str {
         match self {
             Self::Policy => "gang deploy policy",
-            Self::RestartNeeded => "gang deploy restart-needed",
             Self::Configuration => "gang deploy configuration",
             Self::StoreRequest(_) => "gang deploy store-request",
             Self::Manifest(_) => "gang deploy manifest",
@@ -1964,14 +1954,10 @@ mod tests {
     }
 
     #[test]
-    fn deploy_policy_and_restart_needed_take_no_arguments() {
+    fn deploy_policy_takes_no_arguments() {
         assert!(matches!(
             command(&["gang", "deploy", "policy"]),
             Command::Deploy(DeployCommand::Policy)
-        ));
-        assert!(matches!(
-            command(&["gang", "deploy", "restart-needed"]),
-            Command::Deploy(DeployCommand::RestartNeeded)
         ));
         assert_eq!(
             rejection(&["gang", "deploy", "policy", "plan.json"]),

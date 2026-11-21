@@ -40,7 +40,7 @@ nix develop -c bazel test //...
 
 CI is the merge gate: `ci.yml` runs on every pull request, including drafts and updates, pushes to `main` and `master` and `v*` tags, and manual dispatch. Only documentation-only pull requests skip heavy jobs; `docs/API.md` and `docs/PLAN.md` are live test inputs and do not qualify. The PR critical path is exclusively x86-64: portable lint, Nix VM checks, the complete partitioned Linux test suite, a parallel binary and harness bundle build, and parallel end-to-end gates. ARM and cross validation run on default-branch pushes and version tags and gate release artifact reuse through `release-validation`. macOS runs as a standalone advisory on public release events; it neither delays nor gates releases, and private RunsOn repositories skip it. Superseded PR and branch runs are cancelled. Public CI uses GitHub's free standard runners; private CI uses ephemeral RunsOn Linux runners with 4 CPUs and 16 GB RAM. Require a successful `required` check on the latest PR revision before merging. CI uses read-only contents permission, no secrets, no OIDC and no Gang farm. See [specification §7.1](docs/SPECIFICATION.md#71-continuous-integration) for exact checks, skip policy, runners and cache budgets.
 
-The complete x86 test suite uses four shards. Each end-to-end gate uses eight deterministic, warm-timing-balanced shards with four parallel scenarios per harness: all 28 Gate 1 scenarios and the 21 Gate 2 additions run without reduced checks or repeated Gate 1 coverage. The binary and harness still build from source and upload separately; only their redundant cache working-set export is removed, with build BEP/profile artifacts retained even on failure. The nonrequired cache fan-in merges the four test-shard exports plus lint. Five-minute warm CI and two-minute whole E2E jobs remain targets pending real workflow measurements.
+The complete x86 test suite uses four shards. Each end-to-end gate uses eight deterministic, warm-timing-balanced shards with four parallel scenarios per harness: every Gate 1 scenario and Gate 2 addition runs without reduced checks or repeated Gate 1 coverage. The binary and harness still build from source and upload separately; only their redundant cache working-set export is removed, with build BEP/profile artifacts retained even on failure. The nonrequired cache fan-in merges the four test-shard exports plus lint. Five-minute warm CI and two-minute whole E2E jobs remain targets pending real workflow measurements.
 
 Portable lint runs `bazel run //:gazelle.check`, infrastructure and workflow validation, and the behavioral guards, including `tools/check-required-jobs_test.sh`. Rustfmt and Clippy for every x86 Rust target, tests included, run in the full test shards rather than recompiling the workspace in lint; portable lint has a three-minute budget. Darwin all-target Clippy belongs to macOS release validation, not the PR gate. `tools/lint.sh --portable` and `tools/lint.sh --nix-vm` select the two local lint partitions; on x86 Linux, `tools/lint.sh` runs both. The required-jobs guard checks fail-closed status aggregation and dependency coverage. Run it locally with `nix develop -c tools/check-required-jobs_test.sh`. Cross-target toolchains are described in [specification §8.4](docs/SPECIFICATION.md#84-nixos-images).
 
@@ -102,7 +102,7 @@ defaults.
 
 ```hcl
 module "gang" {
-  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.3.3"
+  source = "git::https://github.com/example-org/gang//infra/terraform/modules/deployment?ref=v0.3.4"
   # variables as in the example root
 }
 ```
@@ -134,7 +134,7 @@ time_zone = "Europe/Paris"
 
 ## Action capabilities
 
-Actions have no network grant by default. Unknown platform properties (except the harmless `supports-workers` marker), network requests without an eligible fleet grant, and requests exceeding action ceilings are rejected at admission. The required `gang_action_environment` identifies the action environment and must match exactly. To grant public egress, extend an existing `bwrap` fleet in `gang.toml`:
+Actions have no network grant by default. Unknown platform properties, network requests without an eligible fleet grant, and requests exceeding action ceilings are rejected at admission. The harmless `supports-workers` marker, `gang_action_environment` cache label and old `network` hint are ignored for matching; neither label nor hint asserts an execution identity or grants network access. When present, `gang_execution_environment` identifies the action environment and must match exactly. Genuine absence matches only genuinely unscoped live workers, never current scoped workers. To grant public egress, extend an existing `bwrap` fleet in `gang.toml`:
 
 ```toml
 [fleets.actions]
@@ -158,10 +158,12 @@ The resource ceilings are optional per-action request ceilings, not total worker
 ```starlark
 load("@gang_env//:defs.bzl", "EXEC_PROPERTIES")
 
-exec_properties = dict(EXEC_PROPERTIES, ISA = "x86-64", network = "requested")
+exec_properties = dict(EXEC_PROPERTIES, ISA = "x86-64", gang_network_access = "requested")
 ```
 
 Explicit execution properties may override defaults, so retain both the exact action environment identity from `EXEC_PROPERTIES` and the ISA of your selected execution platform. Bazel may not apply the `gang bazelrc` default ISA when explicit execution properties are present.
+
+Current `gang setup` and `gang bazelrc` use `GANG_EXECUTION_ENVIRONMENT` to supply `EXEC_PROPERTIES`. The old `GANG_ACTION_ENVIRONMENT` repository variable remains cache-only and is never promoted into an execution identity by the current repository rule.
 
 The `requires-network` tag alone does not transmit that remote request. See the [specification](docs/SPECIFICATION.md#34-sandboxes-gang-noop-gang-bwrap) for the complete policy, resolver and sandbox contract.
 

@@ -196,8 +196,8 @@ pub struct ServerConfig {
     /// Limits on the routes that are open to anyone. Defaults to the bucket and tracking values
     /// documented on `RateLimitConfig`.
     pub rate_limit: RateLimitConfig,
-    /// Trusted PROXY v2 listener settings; all listeners default to off.
-    pub proxy_protocol: ProxyProtocolConfig,
+    /// When present, require trusted PROXY v2 headers on all configured listeners.
+    pub proxy_protocol: Option<ProxyProtocolConfig>,
     /// Controller leadership timing. Defaults to the values on [`LeadershipConfig`].
     pub leadership: LeadershipConfig,
     /// Time a newer standby must be routable before requesting handover. Defaults to zero.
@@ -242,7 +242,7 @@ struct RawServer {
     max_request_size: Bytes,
     request_timeout: NonZeroDuration,
     rate_limit: RateLimitConfig,
-    proxy_protocol: ProxyProtocolConfig,
+    proxy_protocol: Option<ProxyProtocolConfig>,
     leadership: LeadershipConfig,
     #[serde(with = "gang_types::duration")]
     standby_routability_delay: Duration,
@@ -274,7 +274,7 @@ impl Default for RawServer {
             max_request_size: DEFAULT_MAX_REQUEST_SIZE,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             rate_limit: RateLimitConfig::default(),
-            proxy_protocol: ProxyProtocolConfig::default(),
+            proxy_protocol: None,
             leadership: LeadershipConfig::default(),
             standby_routability_delay: Duration::ZERO,
             revocation_refresh_interval: DEFAULT_REVOCATION_REFRESH_INTERVAL,

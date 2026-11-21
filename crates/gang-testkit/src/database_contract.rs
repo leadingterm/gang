@@ -46,8 +46,8 @@ impl<D> Fixture<D> {
 /// `database_contract!($fresh, exclusive)` leaves out the shared-lease cases, for a backend that
 /// admits one controller and whose lease is that exclusivity; the backend tests its lease itself.
 ///
-/// `database_contract!($fresh, schema: $supported, $stamped)` also runs schema compatibility
-/// cases. `$supported` is the backend's schema version, and `$stamped` builds a fresh, migrated
+/// `database_contract!($fresh, schema: $supported, $stamped)` also runs exact-version schema
+/// cases. `$supported` is the backend's schema version, and `$stamped` builds a fresh, initialized
 /// fixture with the supplied stored version. The schema cases can likewise be combined with
 /// `exclusive`: `database_contract!($fresh, exclusive, schema: $supported, $stamped)`.
 #[macro_export]
@@ -82,13 +82,13 @@ macro_rules! database_contract {
     };
     (@schema $supported:expr, $stamped:expr) => {
         #[tokio::test]
-        async fn a_newer_compatible_schema_is_used() -> $crate::TestResult {
-            $crate::schema_contract::a_newer_compatible_schema_is_used($supported, $stamped).await
+        async fn a_newer_schema_is_refused() -> $crate::TestResult {
+            $crate::schema_contract::a_newer_schema_is_refused($supported, $stamped).await
         }
 
         #[tokio::test]
-        async fn a_newer_incompatible_schema_is_refused() -> $crate::TestResult {
-            $crate::schema_contract::a_newer_incompatible_schema_is_refused($supported, $stamped).await
+        async fn an_older_schema_is_refused() -> $crate::TestResult {
+            $crate::schema_contract::an_older_schema_is_refused($supported, $stamped).await
         }
     };
     ($fresh:expr, schema: $supported:expr, $stamped:expr) => {

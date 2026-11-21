@@ -54,7 +54,7 @@ probe(
     name = "network_requested",
     srcs = ["egress-probe", "egress-targets.json"],
     script = "./egress-probe egress-targets.json",
-    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, network = "requested"),
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, gang_network_access = "requested"),
 )
 
 probe(
@@ -94,7 +94,7 @@ probe(
     name = "sandbox_requested",
     host = True,
     script = NAMESPACES,
-    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, sandbox = REQUESTED_SANDBOX, gang_action_environment = "host:e2e"),
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA, sandbox = REQUESTED_SANDBOX, gang_execution_environment = "host:e2e"),
 )
 
 # Built together while the harness holds every pass until both are queued (crates/gang-e2e/src/fleets.rs), so

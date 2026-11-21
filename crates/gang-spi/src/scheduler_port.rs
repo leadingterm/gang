@@ -266,7 +266,7 @@ pub struct WorkerState {
     pub id: WorkerId,
     /// The fleet the worker registered.
     pub fleet: FleetName,
-    /// The action environment actually served, if the worker reported a valid identity.
+    /// The exact action environment served, or `None` for genuinely unscoped workers.
     pub environment: Option<ActionEnvironment>,
     /// Actions it is running.
     pub running_actions: u32,
@@ -289,8 +289,8 @@ pub struct QueuedDemand {
     /// The fleets that accept the action, as indices into [`ControllerSpec::fleets`], in
     /// preference order; empty when none accepts it.
     pub candidates: FleetSet,
-    /// The exact action environment required by this action.
-    pub environment: ActionEnvironment,
+    /// The exact action environment required, or `None` for genuinely unscoped work.
+    pub environment: Option<ActionEnvironment>,
     /// The resources the action requests, each dimension zero when the action does not request it.
     pub resources: ActionResources,
     /// When it was queued.

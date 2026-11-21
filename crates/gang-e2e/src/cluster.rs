@@ -5,7 +5,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -51,13 +50,11 @@ const CAPABILITIES_PATH: &str = "/build.bazel.remote.execution.v2.Capabilities/G
 const DIAGNOSTIC_S3_KEYS: usize = 20;
 const DIAGNOSTIC_S3_REQUESTS: usize = 30;
 const LEASE_POLL_INTERVAL: Duration = Duration::from_millis(50);
-// Keep the observer compatible with binaries predating this wire contract.
 const LEADING_HEADER: &str = "gang-leading";
 
 #[derive(Clone, Copy, Debug)]
 struct LeadershipHealth {
     leading: bool,
-    header_present: bool,
 }
 
 async fn probe_leadership(
@@ -86,17 +83,12 @@ async fn probe_leadership(
         let response = sender.send_request(request).await.ok()?;
         let values = response.headers().get_all(LEADING_HEADER);
         let mut values = values.iter();
-        let first = values.next();
-        let header_present = first.is_some();
         let leading = response.status() == StatusCode::OK
-            && match first {
-                None => true,
-                Some(value) => value.as_bytes() == b"true" && values.next().is_none(),
-            };
-        Some(LeadershipHealth {
-            leading,
-            header_present,
-        })
+            && values
+                .next()
+                .is_some_and(|value| value.as_bytes() == b"true")
+            && values.next().is_none();
+        Some(LeadershipHealth { leading })
     })
     .await
     .ok()
@@ -110,13 +102,13 @@ fn observed_leaders(observations: &[Option<LeadershipHealth>]) -> impl Iterator<
         .filter_map(|(index, health)| health.is_some_and(|health| health.leading).then_some(index))
 }
 
-fn initial_leader(observations: &[Option<LeadershipHealth>], modern: bool) -> Option<usize> {
+fn initial_leader(observations: &[Option<LeadershipHealth>]) -> Option<usize> {
     if observations.iter().any(Option::is_none) {
         return None;
     }
     let mut leaders = observed_leaders(observations);
     let leader = leaders.next()?;
-    if leaders.next().is_some() || (modern && Some(leader) != observations.len().checked_sub(1)) {
+    if leaders.next().is_some() || Some(leader) != observations.len().checked_sub(1) {
         return None;
     }
     Some(leader)
@@ -302,14 +294,12 @@ impl Drop for DatabaseLink {
 #[derive(Clone, Copy)]
 struct ControllerAddresses {
     public: SocketAddr,
-    execute: SocketAddr,
     worker: SocketAddr,
     health: SocketAddr,
 }
 
 struct ReleaseServices<'a> {
     public: &'a Url,
-    execute: &'a Url,
     worker: &'a Url,
     database: SocketAddr,
     s3: &'a str,
@@ -319,7 +309,6 @@ struct Controller {
     public: SocketAddr,
     public_proxy_protocol_v2: bool,
     direct_endpoint: Url,
-    execute: SocketAddr,
     worker: SocketAddr,
     health: SocketAddr,
     health_policy: Arc<Policy>,
@@ -344,7 +333,6 @@ pub struct Cluster<'a> {
     database: ClusterDatabase,
     s3: FakeS3,
     runtime: tokio::runtime::Runtime,
-    execution_listener: AtomicBool,
     release_evidence: Mutex<Vec<String>>,
 }
 
@@ -401,7 +389,6 @@ impl<'a> Cluster<'a> {
             balancer,
             database,
             s3,
-            execution_listener: AtomicBool::new(false),
             release_evidence: Mutex::new(Vec::new()),
             runtime,
         };
@@ -434,12 +421,8 @@ impl<'a> Cluster<'a> {
             .build()
             .map_err(E2eError::io("starting the cluster runtime"))?;
         let (balancer, database, s3) = runtime.block_on(async {
-            let balancer = Balancer::start_release(
-                Arc::new(SystemClock::new()),
-                HealthProbe::default(),
-                fixture.execution.is_some(),
-            )
-            .await?;
+            let balancer =
+                Balancer::start(Arc::new(SystemClock::new()), HealthProbe::default()).await?;
             let database = FakeDynamoDb::start()
                 .await
                 .map_err(E2eError::system_from("starting fake dynamodb"))?;
@@ -456,7 +439,6 @@ impl<'a> Cluster<'a> {
             database,
             s3,
             runtime,
-            execution_listener: AtomicBool::new(fixture.execution.is_some()),
             release_evidence: Mutex::new(Vec::new()),
         };
         cluster.set_release_policies(fixture)?;
@@ -485,12 +467,8 @@ impl<'a> Cluster<'a> {
             )
         };
         self.release_evidence.lock().push(format!(
-            "public={}; execution={}; workers={}; controllers={}, health={}, min={}%, max={}%",
+            "public={}; workers={}; controllers={}, health={}, min={}%, max={}%",
             plan(&fixture.public),
-            fixture
-                .execution
-                .as_ref()
-                .map_or_else(|| "absent".to_owned(), plan),
             plan(&fixture.workers),
             fixture.controller.instances,
             fixture.controller.health_check_type,
@@ -503,24 +481,11 @@ impl<'a> Cluster<'a> {
         ] {
             self.balancer.set_policy(frontend, release_policy(plan)?);
         }
-        if let (Some(listener), Some(execution)) =
-            (self.balancer.legacy_execution(), fixture.execution.as_ref())
-        {
-            listener.set_policy(release_policy(execution)?);
-        }
         Ok(())
     }
 
     pub(crate) fn apply_release(&self, fixture: &ReleaseFixture) -> Result<()> {
-        self.set_release_policies(fixture)?;
-        self.execution_listener
-            .store(fixture.execution.is_some(), Ordering::SeqCst);
-        if fixture.execution.is_none()
-            && let Some(listener) = self.balancer.legacy_execution()
-        {
-            listener.remove();
-        }
-        Ok(())
+        self.set_release_policies(fixture)
     }
 
     pub(crate) fn wait_for_controller_serve(&self, index: usize) -> Result<()> {
@@ -556,9 +521,6 @@ impl<'a> Cluster<'a> {
         self.balancer.deregister(Frontend::Serve, controller.public);
         self.balancer
             .deregister(Frontend::Workers, controller.worker);
-        if let Some(listener) = self.balancer.legacy_execution() {
-            listener.deregister(controller.execute);
-        }
         Ok(())
     }
 
@@ -637,12 +599,7 @@ impl<'a> Cluster<'a> {
             && self
                 .balancer
                 .healthy(Frontend::Workers)
-                .contains(&controller.worker)
-            && (!self.execution_listener.load(Ordering::SeqCst)
-                || self
-                    .balancer
-                    .legacy_execution()
-                    .is_some_and(|listener| listener.healthy().contains(&controller.execute))))
+                .contains(&controller.worker))
     }
 
     pub(crate) fn wait_for_controller_health_within(
@@ -719,8 +676,7 @@ impl<'a> Cluster<'a> {
 
     /// All unpaused controllers reporting active, fenced leadership, in controller order.
     ///
-    /// Probes each controller directly, including deregistered controllers. Older
-    /// health endpoints without `gang-leading` retain their leader-only HTTP 200 contract.
+    /// Probes each controller directly, including deregistered controllers.
     #[must_use]
     pub fn leaders(&self) -> Vec<usize> {
         observed_leaders(&self.observe_leadership(Duration::MAX)).collect()
@@ -761,14 +717,9 @@ impl<'a> Cluster<'a> {
     fn wait_for_initial_leader(&self) -> Result<()> {
         let timeout = self.stack.settings().startup_timeout;
         let start = Instant::now();
-        let mut modern = false;
         loop {
             let observations = self.observe_leadership(timeout.saturating_sub(start.elapsed()));
-            modern |= observations
-                .iter()
-                .flatten()
-                .any(|health| health.header_present);
-            if let Some(index) = initial_leader(&observations, modern)
+            if let Some(index) = initial_leader(&observations)
                 && self.only_healthy_controller(index)?
             {
                 return Ok(());
@@ -777,7 +728,7 @@ impl<'a> Cluster<'a> {
             if remaining.is_zero() {
                 return Err(E2eError::timeout(
                     format!(
-                        "initial single leader and healthy routes; modern={modern}; observations={observations:?}\n{}",
+                        "initial single leader and healthy routes; observations={observations:?}\n{}",
                         self.diagnostics()
                     ),
                     timeout,
@@ -794,12 +745,7 @@ impl<'a> Cluster<'a> {
             .ok_or_else(|| E2eError::system("unknown controller"))?;
         Ok(
             self.balancer.healthy(Frontend::Serve) == [controller.public]
-                && self.balancer.healthy(Frontend::Workers) == [controller.worker]
-                && (!self.execution_listener.load(Ordering::SeqCst)
-                    || self
-                        .balancer
-                        .legacy_execution()
-                        .is_some_and(|listener| listener.healthy() == [controller.execute])),
+                && self.balancer.healthy(Frontend::Workers) == [controller.worker],
         )
     }
 
@@ -902,11 +848,6 @@ impl<'a> Cluster<'a> {
         let addr =
             || -> Result<SocketAddr> { Ok(SocketAddr::from(([127, 0, 0, 1], ports::reserve()?))) };
         let (public, worker, health) = (addr()?, addr()?, addr()?);
-        let execute = if fixture.is_some_and(|fixture| fixture.execution.is_some()) {
-            addr()?
-        } else {
-            public
-        };
         let direct_endpoint = Url::parse(&format!("https://{public}"))
             .map_err(E2eError::system_from("forming controller endpoint"))?;
         let database_link = self.start_database_link()?;
@@ -921,7 +862,6 @@ impl<'a> Cluster<'a> {
                 &config,
                 ControllerAddresses {
                     public,
-                    execute,
                     worker,
                     health,
                 },
@@ -943,14 +883,6 @@ impl<'a> Cluster<'a> {
                 },
             );
         }
-        if fixture.is_some_and(|fixture| fixture.execution.is_some())
-            && let Some(listener) = self.balancer.legacy_execution()
-        {
-            listener.register(Target {
-                traffic: execute,
-                health,
-            });
-        }
         let startup = await_controller_start(&mut child, &log, log_start, timeout);
         let identity = match startup {
             Ok(identity) => identity,
@@ -958,9 +890,6 @@ impl<'a> Cluster<'a> {
                 for (frontend, address) in [(Frontend::Serve, public), (Frontend::Workers, worker)]
                 {
                     self.balancer.deregister(frontend, address);
-                }
-                if let Some(listener) = self.balancer.legacy_execution() {
-                    listener.deregister(execute);
                 }
                 drop(controllers);
                 return Err(self.controller_start_error(
@@ -976,7 +905,6 @@ impl<'a> Cluster<'a> {
             public,
             public_proxy_protocol_v2,
             direct_endpoint,
-            execute,
             identity,
             worker,
             health,
@@ -1086,19 +1014,10 @@ impl<'a> Cluster<'a> {
             addresses,
             &ReleaseServices {
                 public: &self.frontend_url(Frontend::Serve, "https")?,
-                execute: &Url::parse(&format!(
-                    "https://{}",
-                    self.balancer.legacy_execution().map_or(
-                        self.balancer.address(Frontend::Serve),
-                        crate::balancer::Listener::address,
-                    ),
-                ))
-                .map_err(E2eError::system_from("forming legacy execution endpoint"))?,
                 worker: &self.frontend_url(Frontend::Workers, "grpcs")?,
                 database: database_link.address,
                 s3: self.s3.endpoint().as_str(),
             },
-            fixture.execution.is_some(),
         )?;
         toml::to_string(&doc).map_err(crate::template::template_error)
     }
@@ -1125,7 +1044,6 @@ impl<'a> Cluster<'a> {
         self.render_release_config(
             ControllerAddresses {
                 public: controller.public,
-                execute: controller.execute,
                 worker: controller.worker,
                 health: controller.health,
             },
@@ -1742,18 +1660,16 @@ impl<'a> Cluster<'a> {
 fn controller_public_proxy_protocol(config: &Path) -> Result<bool> {
     let source = fs::read_to_string(config)
         .map_err(E2eError::io("reading original controller public policy"))?;
-    let mut doc: toml::Value = toml::from_str(&source).map_err(crate::template::template_error)?;
+    let doc: toml::Value = toml::from_str(&source).map_err(crate::template::template_error)?;
     let server = doc
-        .get_mut("server")
-        .and_then(toml::Value::as_table_mut)
+        .get("server")
+        .and_then(toml::Value::as_table)
         .ok_or_else(|| E2eError::system("original controller has no server policy"))?;
-    let Some(proxy) = server.remove("proxy_protocol") else {
-        // The product schema defaults an omitted PROXY configuration to Off.
-        return Ok(false);
-    };
-    let policy: gang_config::ProxyProtocolConfig =
-        proxy.try_into().map_err(crate::template::template_error)?;
-    Ok(policy.public == gang_config::ProxyProtocol::Require)
+    match server.get("proxy_protocol") {
+        None => Ok(false),
+        Some(toml::Value::Table(_)) => Ok(true),
+        Some(_) => Err(E2eError::system("server.proxy_protocol is not a table")),
+    }
 }
 
 fn controller_health_policy(fixture: Option<&ReleaseFixture>) -> Result<Policy> {
@@ -1977,13 +1893,12 @@ fn adapt_release_config(
     staged: &toml::Value,
     addresses: ControllerAddresses,
     services: &ReleaseServices<'_>,
-    split: bool,
 ) -> Result<()> {
     adapt_local_plugins(doc, local, staged)?;
     let root = doc
         .as_table_mut()
         .ok_or_else(|| E2eError::system("configuration is not a table"))?;
-    adapt_addresses(root, addresses, services, split);
+    adapt_addresses(root, addresses, services);
     adapt_fleet(root, local, staged)?;
     adapt_server(root, local, staged)?;
     adapt_backends(root, services)
@@ -2072,7 +1987,6 @@ fn adapt_addresses(
     root: &mut toml::map::Map<String, toml::Value>,
     addresses: ControllerAddresses,
     services: &ReleaseServices<'_>,
-    split: bool,
 ) {
     for (key, value) in [
         ("listen", addresses.public.to_string()),
@@ -2081,19 +1995,6 @@ fn adapt_addresses(
         ("endpoint", services.public.to_string()),
     ] {
         root.insert(key.into(), toml::Value::String(value));
-    }
-    if split {
-        root.insert(
-            "execution_listen".into(),
-            toml::Value::String(addresses.execute.to_string()),
-        );
-        root.insert(
-            "execution_endpoint".into(),
-            toml::Value::String(services.execute.to_string()),
-        );
-    } else {
-        root.remove("execution_listen");
-        root.remove("execution_endpoint");
     }
 }
 
@@ -2190,25 +2091,10 @@ fn adapt_backends(
     root: &mut toml::map::Map<String, toml::Value>,
     services: &ReleaseServices<'_>,
 ) -> Result<()> {
-    if root.contains_key("worker_endpoint") {
-        root.insert(
-            "worker_endpoint".into(),
-            toml::Value::String(services.worker.to_string()),
-        );
-    } else {
-        let scheduler = root
-            .get_mut("scheduler")
-            .and_then(|v| v.get_mut("nativelink"))
-            .and_then(toml::Value::as_table_mut)
-            .ok_or_else(|| E2eError::system("missing versioned worker endpoint"))?;
-        if !scheduler.contains_key("worker_endpoint") {
-            return Err(E2eError::system("missing versioned worker endpoint"));
-        }
-        scheduler.insert(
-            "worker_endpoint".into(),
-            toml::Value::String(services.worker.to_string()),
-        );
-    }
+    root.insert(
+        "worker_endpoint".into(),
+        toml::Value::String(services.worker.to_string()),
+    );
     root.insert(
         "database".into(),
         toml::from_str(&format!(
@@ -2369,6 +2255,7 @@ mod tests {
         let address = listener.local_addr()?;
         let policy = leadership_policy("/ready");
         for (response, leading) in [
+            (&b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"[..], false),
             (&b"HTTP/1.1 200 OK\r\ngang-leading: false\r\ncontent-length: 0\r\n\r\n"[..], false),
             (&b"HTTP/1.1 200 OK\r\ngang-leading: true\r\ncontent-length: 0\r\n\r\n"[..], true),
             (&b"HTTP/1.1 503 Unavailable\r\ngang-leading: false\r\ncontent-length: 0\r\n\r\n"[..], false),
@@ -2385,31 +2272,6 @@ mod tests {
             served?;
             let health = health.ok_or("missing health response")?;
             assert_eq!(health.leading, leading);
-            assert!(health.header_present);
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn legacy_leadership_uses_its_own_path_and_status_without_header() -> TestResult {
-        let listener = TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-        let address = listener.local_addr()?;
-        let policy = leadership_policy("/leader");
-        for (response, leading) in [
-            (&b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"[..], true),
-            (
-                &b"HTTP/1.1 503 Unavailable\r\ncontent-length: 0\r\n\r\n"[..],
-                false,
-            ),
-        ] {
-            let (health, served) = tokio::join!(
-                super::probe_leadership(address, &policy, DEADLINE),
-                answer_health(&listener, "/leader", response, false),
-            );
-            served?;
-            let health = health.ok_or("missing health response")?;
-            assert_eq!(health.leading, leading);
-            assert!(!health.header_present);
         }
         Ok(())
     }
@@ -2469,7 +2331,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_health_source_is_never_legacy_leadership() -> TestResult {
+    async fn failed_health_source_is_never_leadership() -> TestResult {
         let listener = TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let address = listener.local_addr()?;
         let policy = leadership_policy("/leader");
@@ -2490,41 +2352,19 @@ mod tests {
 
     #[test]
     fn initial_newest_selection_does_not_pin_later_leadership() {
-        let warm = Some(super::LeadershipHealth {
-            leading: false,
-            header_present: true,
-        });
-        let active = Some(super::LeadershipHealth {
-            leading: true,
-            header_present: true,
-        });
-        assert_eq!(super::initial_leader(&[active, warm, warm], true), None);
-        assert_eq!(super::initial_leader(&[warm, active, warm], true), None);
-        assert_eq!(super::initial_leader(&[warm, warm, active], true), Some(2));
-        assert_eq!(super::initial_leader(&[warm, active, active], true), None);
-        assert_eq!(super::initial_leader(&[None, warm, active], true), None);
-        assert_eq!(super::initial_leader(&[], false), None);
-        assert_eq!(super::initial_leader(&[active], true), Some(0));
+        let warm = Some(super::LeadershipHealth { leading: false });
+        let active = Some(super::LeadershipHealth { leading: true });
+        assert_eq!(super::initial_leader(&[active, warm, warm]), None);
+        assert_eq!(super::initial_leader(&[warm, active, warm]), None);
+        assert_eq!(super::initial_leader(&[warm, warm, active]), Some(2));
+        assert_eq!(super::initial_leader(&[warm, active, active]), None);
+        assert_eq!(super::initial_leader(&[None, warm, active]), None);
+        assert_eq!(super::initial_leader(&[]), None);
+        assert_eq!(super::initial_leader(&[active]), Some(0));
         // Later failover observation never invokes the startup-only newest selection.
         assert_eq!(
             super::observed_leaders(&[active, warm, warm]).collect::<Vec<_>>(),
             [0]
-        );
-        let legacy_active = Some(super::LeadershipHealth {
-            leading: true,
-            header_present: false,
-        });
-        let legacy_passive = Some(super::LeadershipHealth {
-            leading: false,
-            header_present: false,
-        });
-        assert_eq!(
-            super::initial_leader(&[legacy_active, legacy_passive], false),
-            Some(0)
-        );
-        assert_eq!(
-            super::initial_leader(&[legacy_active, legacy_active], false),
-            None
         );
     }
 
@@ -2625,20 +2465,16 @@ mod tests {
     fn direct_target_policy_uses_original_public_listener_not_health_or_nlb() -> TestResult {
         let root = tempfile::tempdir()?;
         let config = root.path().join("controller.toml");
-        for (public, required) in [("off", false), ("accept", false), ("require", true)] {
-            for other in ["off", "accept", "require"] {
-                fs::write(
-                    &config,
-                    format!(
-                        "[server.proxy_protocol]\npublic = '{public}'\nworker = '{other}'\nhealth = '{other}'\ntrusted_cidrs = ['127.0.0.1/32']\n"
-                    ),
-                )?;
-                assert_eq!(super::controller_public_proxy_protocol(&config)?, required);
-            }
+        for source in [
+            "[server.proxy_protocol]\ntrusted_cidrs = ['127.0.0.1/32']\n",
+            "[server.proxy_protocol]\npublic = 'accept'\nworker = 'require'\nhealth = 'off'\ntrusted_cidrs = ['127.0.0.1/32']\n",
+        ] {
+            fs::write(&config, source)?;
+            assert!(super::controller_public_proxy_protocol(&config)?);
         }
         fs::write(&config, "[server]\n")?;
         assert!(!super::controller_public_proxy_protocol(&config)?);
-        for invalid in ["", "[server.proxy_protocol]\npublic = 'invalid'\n"] {
+        for invalid in ["", "[server]\nproxy_protocol = 'invalid'\n"] {
             fs::write(&config, invalid)?;
             assert!(super::controller_public_proxy_protocol(&config).is_err());
         }
@@ -2730,7 +2566,7 @@ mod tests {
     }
 
     #[test]
-    fn versioned_topology_preserves_combined_and_split_execution() -> TestResult {
+    fn release_topology_preserves_combined_frontend() -> TestResult {
         let local: toml::Value = toml::from_str(
             r#"
 [[fleets]]
@@ -2768,22 +2604,12 @@ providers = ["local-workers"]
         let address = "127.0.0.1:1234".parse()?;
         let public = gang_types::Url::parse("https://127.0.0.1:1234")?;
         let worker = gang_types::Url::parse("grpcs://127.0.0.1:1234")?;
-        for (split, source, modern) in [
-            (
-                true,
-                "[server]\n[scheduler.nativelink]\nworker_endpoint = 'grpcs://old:1'\n",
-                false,
-            ),
-            (
-                false,
-                "worker_endpoint = 'grpcs://old:1'\n[server]\n[server.http2]\n",
-                true,
-            ),
-        ] {
+        for modern in [false, true] {
             let mut local = local.clone();
             if !modern {
                 old_local_schema(&mut local)?;
             }
+            let source = "worker_endpoint = 'grpcs://old:1'\n[server]\n[server.http2]\n";
             let mut doc: toml::Value = toml::from_str(&format!(
                 "{source}\n[[fleets]]\nname = 'production'\nvcpus_per_instance = 2\ntarget_actions_per_instance = 2\n[fleets.options]\ncapacity = 'spot'\n[limits.cgroup]\n"
             ))?;
@@ -2793,37 +2619,24 @@ providers = ["local-workers"]
                 &staged,
                 super::ControllerAddresses {
                     public: address,
-                    execute: address,
                     worker: address,
                     health: address,
                 },
                 &super::ReleaseServices {
                     public: &public,
-                    execute: &public,
                     worker: &worker,
                     database: address,
                     s3: "http://127.0.0.1:1",
                 },
-                split,
             )?;
-            assert_eq!(doc.get("execution_listen").is_some(), split);
-            assert_eq!(doc.get("execution_endpoint").is_some(), split);
             let fleet = &doc["fleets"][0];
             assert_eq!(fleet["vcpus_per_instance"].as_integer(), Some(2));
             assert_eq!(fleet["target_actions_per_instance"].as_integer(), Some(2));
             assert_environment_schema(&doc, modern);
             assert!(fleet.get("options").is_none());
             assert!(doc.get("limits").is_none());
-            if split {
-                assert_eq!(
-                    doc["scheduler"]["nativelink"]["worker_endpoint"].as_str(),
-                    Some(worker.as_str())
-                );
-                assert!(doc.get("worker_endpoint").is_none());
-            } else {
-                assert_eq!(doc["worker_endpoint"].as_str(), Some(worker.as_str()));
-                assert!(doc.get("scheduler").is_none());
-            }
+            assert_eq!(doc["worker_endpoint"].as_str(), Some(worker.as_str()));
+            assert!(doc.get("scheduler").is_none());
         }
         Ok(())
     }

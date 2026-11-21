@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use futures::{FutureExt, Stream, StreamExt, stream::BoxStream};
 use gang_clock::{Clock, Tick};
-use gang_config::{ProxyProtocol, ProxyProtocolConfig};
+use gang_config::ProxyProtocolConfig;
 use gang_mtls::{CertificateAuthority, KeyPair, ServerCertificateRequest, SubjectName};
 use gang_spi::{Accepted, CertificateSignerPort, Peer};
 use gang_tls::{
@@ -45,8 +45,7 @@ pub(crate) struct TlsPolicy {
     pub(crate) accept_error_backoff: NonZeroDuration,
     /// The application protocols the listener offers during the handshake.
     pub(crate) alpn: Alpn,
-    pub(crate) proxy_mode: ProxyProtocol,
-    pub(crate) proxy_protocol: Arc<ProxyProtocolConfig>,
+    pub(crate) proxy_protocol: Option<Arc<ProxyProtocolConfig>>,
 }
 
 /// A listener that accepts connections: plain TCP, or TLS under the certificate authority.
@@ -79,11 +78,10 @@ impl<L: Listener, S: CertificateSignerPort, C: Clock + 'static> Accepting<L, S, 
         listener: L,
         accept_error_backoff: NonZeroDuration,
         clock: Arc<C>,
-        mode: ProxyProtocol,
-        config: Arc<ProxyProtocolConfig>,
+        config: Option<Arc<ProxyProtocolConfig>>,
     ) -> Self {
         Self(Arc::new(Mutex::new(Endpoint::Plain {
-            listener: ProxyListener::new(listener, Arc::clone(&clock), mode, config),
+            listener: ProxyListener::new(listener, Arc::clone(&clock), config),
             backoff: accept_error_backoff,
             clock,
         })))
@@ -104,8 +102,7 @@ impl<L: Listener, S: CertificateSignerPort, C: Clock + 'static> Accepting<L, S, 
         let listener = Arc::new(Mutex::new(ProxyListener::new(
             listener,
             Arc::clone(&clock),
-            policy.proxy_mode,
-            Arc::clone(&policy.proxy_protocol),
+            policy.proxy_protocol.clone(),
         )));
         let reissue_after = policy
             .reissue_at_percent
@@ -448,8 +445,7 @@ mod tests {
                 refusal_linger: NonZeroDuration::from_secs(2),
             },
             accept_error_backoff: NonZeroDuration::from_millis(100),
-            proxy_mode: gang_config::ProxyProtocol::Off,
-            proxy_protocol: Arc::default(),
+            proxy_protocol: None,
         };
         let accepting = Accepting::<MemoryListener, TestSigner, TestClock>::secured(
             listener,
@@ -483,8 +479,7 @@ mod tests {
             listener,
             NonZeroDuration::from_millis(100),
             start_clock(),
-            gang_config::ProxyProtocol::Off,
-            Arc::default(),
+            None,
         );
         let (ended, _) = oneshot::channel();
         let mut first = accepting.clone().into_stream(ended);
@@ -515,8 +510,7 @@ mod tests {
                 refusal_linger: NonZeroDuration::from_secs(2),
             },
             accept_error_backoff: NonZeroDuration::from_millis(100),
-            proxy_mode: gang_config::ProxyProtocol::Off,
-            proxy_protocol: Arc::default(),
+            proxy_protocol: None,
         };
         let accepting = Accepting::<MemoryListener, TestSigner, TestClock>::secured(
             listener,

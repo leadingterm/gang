@@ -118,7 +118,7 @@ pub use scheduler_port::{
     RequestGate, RequestScope, RunningActionView, SchedulerPort, SchedulerSnapshot, Slots,
     StoreAccess, StoreKind, WorkerSpec, WorkerState, WorkerTls, full_body,
 };
-pub use schema::{SchemaPlan, SchemaTooNew, SchemaVersion};
+pub use schema::SchemaMismatch;
 pub use scratch_port::{MountedScratchVolume, ScratchVolumePort};
 pub use signer_port::{CertificateSignerPort, SignatureAlgorithm};
 pub use stored_scaling::{StoredScalingKind, StoredScalingKindError};

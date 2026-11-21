@@ -12,31 +12,11 @@ const DEFAULT_MAX_HEADER_SIZE: Bytes = Bytes::kib(4);
 const MIN_HEADER_SIZE: u64 = 16;
 const MAX_HEADER_SIZE: u64 = 65_551;
 
-/// How a listener handles PROXY v2 headers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProxyProtocol {
-    /// Never parse a PROXY header.
-    #[default]
-    Off,
-    /// Detect a PROXY v2 header from a trusted peer; otherwise accept a direct connection.
-    Accept,
-    /// Require a PROXY v2 header from a trusted peer.
-    Require,
-}
-
-/// The `[server.proxy_protocol]` table. All listeners default to `off`.
+/// The `[server.proxy_protocol]` table requires PROXY v2 on all listeners.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawProxyProtocolConfig", into = "RawProxyProtocolConfig")]
 pub struct ProxyProtocolConfig {
-    /// Public listener mode. Defaults to `off`.
-    pub public: ProxyProtocol,
-    /// Worker listener mode. Defaults to `off`.
-    pub worker: ProxyProtocol,
-    /// Health listener mode. Defaults to `off`.
-    pub health: ProxyProtocol,
-    /// Networks of direct socket peers allowed to send headers; empty by default and required
-    /// when any listener enables PROXY. Trust only the actual proxy addresses, not broad networks.
+    /// Networks of direct socket peers allowed to send headers. Trust only actual proxy addresses.
     pub trusted_cidrs: Vec<IpNet>,
     /// Maximum time to read a header. Defaults to ten seconds; must be nonzero.
     pub header_timeout: NonZeroDuration,
@@ -49,9 +29,6 @@ pub struct ProxyProtocolConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawProxyProtocolConfig {
-    public: ProxyProtocol,
-    worker: ProxyProtocol,
-    health: ProxyProtocol,
     trusted_cidrs: Vec<IpNet>,
     header_timeout: NonZeroDuration,
     max_pending_headers: NonZeroUsize,
@@ -61,9 +38,6 @@ struct RawProxyProtocolConfig {
 impl Default for RawProxyProtocolConfig {
     fn default() -> Self {
         Self {
-            public: ProxyProtocol::Off,
-            worker: ProxyProtocol::Off,
-            health: ProxyProtocol::Off,
             trusted_cidrs: Vec::new(),
             header_timeout: DEFAULT_HEADER_TIMEOUT,
             max_pending_headers: DEFAULT_MAX_PENDING_HEADERS,
@@ -76,9 +50,6 @@ impl Default for ProxyProtocolConfig {
     fn default() -> Self {
         let raw = RawProxyProtocolConfig::default();
         Self {
-            public: raw.public,
-            worker: raw.worker,
-            health: raw.health,
             trusted_cidrs: raw.trusted_cidrs,
             header_timeout: raw.header_timeout,
             max_pending_headers: raw.max_pending_headers,
@@ -99,11 +70,7 @@ impl TryFrom<RawProxyProtocolConfig> for ProxyProtocolConfig {
     type Error = InvalidProxyProtocolConfig;
 
     fn try_from(raw: RawProxyProtocolConfig) -> Result<Self, Self::Error> {
-        if [raw.public, raw.worker, raw.health]
-            .iter()
-            .any(|mode| *mode != ProxyProtocol::Off)
-            && raw.trusted_cidrs.is_empty()
-        {
+        if raw.trusted_cidrs.is_empty() {
             return Err(InvalidProxyProtocolConfig::MissingTrustedCidrs);
         }
         let size = raw.max_header_size.get();
@@ -113,9 +80,6 @@ impl TryFrom<RawProxyProtocolConfig> for ProxyProtocolConfig {
             ));
         }
         Ok(Self {
-            public: raw.public,
-            worker: raw.worker,
-            health: raw.health,
             trusted_cidrs: raw.trusted_cidrs,
             header_timeout: raw.header_timeout,
             max_pending_headers: raw.max_pending_headers,
@@ -127,9 +91,6 @@ impl TryFrom<RawProxyProtocolConfig> for ProxyProtocolConfig {
 impl From<ProxyProtocolConfig> for RawProxyProtocolConfig {
     fn from(config: ProxyProtocolConfig) -> Self {
         Self {
-            public: config.public,
-            worker: config.worker,
-            health: config.health,
             trusted_cidrs: config.trusted_cidrs,
             header_timeout: config.header_timeout,
             max_pending_headers: config.max_pending_headers,

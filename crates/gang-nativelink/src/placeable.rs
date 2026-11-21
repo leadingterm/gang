@@ -1,7 +1,7 @@
-//! Rejects actions no declared fleet can run before they enter the scheduler.
+//! Admits actions against a launchable profile or an exact live-worker profile.
 //!
-//! Gang scales from zero, so `NativeLink`'s worker-based unsatisfiable check cannot see fleets
-//! whose workers have not connected yet.
+//! Current profiles support scaling from zero. Unscoped and noncurrent profiles require
+//! an actual registered worker, without borrowing the current launch profile's capabilities.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,6 +24,8 @@ use nativelink_util::operation_state_manager::{
     ActionStateResult, ActionStateResultStream, ClientStateManager, OperationFilter,
 };
 use parking_lot::Mutex;
+
+use crate::cordons::InstanceCordons;
 
 type AdmissionMap = HashMap<OperationId, (FleetSet, Option<FleetCatalog>)>;
 
@@ -95,7 +97,7 @@ pub(crate) struct PlaceableActions {
     inner: Arc<dyn KnownPlatformPropertyProvider>,
     fleets: FleetCatalog,
     admitted: AdmittedFleets,
-    workers: Option<Arc<dyn WorkerScheduler>>,
+    workers: Option<(Arc<dyn WorkerScheduler>, Arc<InstanceCordons>)>,
     reconnect: Option<(Arc<dyn Clock>, Tick)>,
 }
 
@@ -118,13 +120,74 @@ impl PlaceableActions {
     pub(crate) fn with_workers(
         mut self,
         workers: Arc<dyn WorkerScheduler>,
+        cordons: Arc<InstanceCordons>,
         clock: Arc<dyn Clock>,
         timeout: Duration,
     ) -> Self {
         let deadline = clock.monotonic() + timeout;
-        self.workers = Some(workers);
+        self.workers = Some((workers, cordons));
         self.reconnect = Some((clock, deadline));
         self
+    }
+
+    fn configured_admission(
+        &self,
+        action_info: &ActionInfo,
+        environment: Option<&ActionEnvironment>,
+    ) -> Result<(FleetSet, FleetSet), Error> {
+        let raw_properties =
+            |key: &str| action_info.platform_properties.get(key).map(String::as_str);
+        let properties = |key: &str| {
+            if key == property::ACTION_ENVIRONMENT {
+                Some(environment.map_or("", ActionEnvironment::as_str))
+            } else {
+                raw_properties(key)
+            }
+        };
+        let configured = self.fleets.admit(
+            action_info
+                .platform_properties
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
+        if let Err(refusal) = &configured
+            && matches!(
+                refusal,
+                Refusal::Unknown { .. }
+                    | Refusal::InvalidMinimum { .. }
+                    | Refusal::InvalidCapability { .. }
+            )
+        {
+            return Err(refused(refusal));
+        }
+        // Logical fleet ownership is stable; a live worker's other selectors are its own.
+        let base = self.fleets.accepting_base(|key| {
+            if key == property::FLEET {
+                raw_properties(key)
+            } else {
+                None
+            }
+        });
+        let launchable = environment.is_some()
+            && !self
+                .fleets
+                .accepting(|key| {
+                    self.fleets
+                        .declared()
+                        .iter()
+                        .find(|(known, _)| *known == key)
+                        .filter(|(_, kind)| {
+                            !matches!(kind, MatchKind::Minimum | MatchKind::Capability)
+                        })
+                        .and_then(|_| properties(key))
+                })
+                .is_empty();
+        let admitted = if launchable {
+            configured.map_err(|refusal| refused(&refusal))?
+        } else {
+            FleetSet::EMPTY
+        };
+        Ok((base, admitted))
     }
 }
 
@@ -134,12 +197,13 @@ type SelectedWorker<'a> = (&'a WorkerSummary, Resources, WorkerProfile);
 /// Reads the registered capacity, rather than the current launch image.
 fn worker_resources(worker: &WorkerSummary) -> Option<(Resources, WorkerProfile)> {
     let p = &worker.platform_properties;
+    let cores = p.get(property::CPU_COUNT)?.parse::<u64>().ok()?;
     let cpu = p.get(property::CPU_MILLICORES)?.parse::<u64>().ok()?;
     let memory = p.get(property::MEMORY_KB)?.parse::<u64>().ok()?;
     let disk = p.get(property::DISK_KB)?.parse::<u64>().ok()?;
     Some((
         Resources {
-            vcpus: u32::try_from(cpu / property::MILLICORES_PER_CORE).ok()?,
+            vcpus: u32::try_from(cores.min(cpu / property::MILLICORES_PER_CORE)).ok()?,
             memory: Bytes::new(memory.saturating_mul(1024)),
             disk: Bytes::new(disk.saturating_mul(1024)),
         },
@@ -155,7 +219,19 @@ fn worker_properties(
     let p = &worker.platform_properties;
     let name = FleetName::try_new(p.get(property::FLEET)?.as_str()).ok()?;
     let isa: Isa = p.get(property::ISA)?.parse().ok()?;
-    let environment: ActionEnvironment = p.get(property::ACTION_ENVIRONMENT)?.parse().ok()?;
+    let environment = p
+        .get(property::ACTION_ENVIRONMENT)
+        .map(|value| value.parse::<ActionEnvironment>())
+        .transpose()
+        .ok()?;
+    let mut actions = gang_types::FleetActionPolicy::default();
+    for capability in gang_types::Capability::ALL {
+        if p.get(capability.property())
+            .is_some_and(|value| value == "requested")
+        {
+            actions.grants.insert(capability);
+        }
+    }
     let options = base
         .options()
         .filter_map(|(key, _)| p.get(key).map(|value| (key, value.clone())));
@@ -163,9 +239,9 @@ fn worker_properties(
         &name,
         isa,
         p.get(property::SANDBOX)?,
-        &environment,
+        environment.as_ref(),
         resources,
-        base.actions(),
+        &actions,
         options,
     ))
 }
@@ -192,10 +268,14 @@ fn worker_accepts<'a>(
         }
         match kind {
             MatchKind::Ignored => true,
-            MatchKind::Exact => worker
-                .platform_properties
-                .get(key)
-                .is_some_and(|actual| actual == requested),
+            MatchKind::Exact => {
+                worker
+                    .platform_properties
+                    .get(key)
+                    .map(String::as_str)
+                    .or_else(|| (key == property::ACTION_ENVIRONMENT).then_some(""))
+                    == Some(requested)
+            }
             MatchKind::Capability => {
                 requested.is_empty()
                     || requested == "not-requested"
@@ -215,23 +295,25 @@ fn worker_accepts<'a>(
     })
 }
 
-/// Selects one actual compatible worker per configured fleet, in fleet preference order.
+/// Selects one actual compatible worker per logical fleet, in fleet preference order.
 fn live_catalog<'a>(
     workers: &[WorkerSummary],
+    resumable: &[&str],
     fleets: &FleetCatalog,
     base: FleetSet,
-    environment: &ActionEnvironment,
+    environment: Option<&ActionEnvironment>,
     request: impl Fn(&str) -> Option<&'a str> + Copy,
 ) -> Option<FleetCatalog> {
     let mut selected: Vec<Option<SelectedWorker<'_>>> = vec![None; fleets.len()];
     for worker in workers {
         let p = &worker.platform_properties;
-        if worker.is_draining
+        if (worker.is_draining && !resumable.contains(&worker.id.as_str()))
             || p.get(property::ISA)
                 .and_then(|value| value.parse::<Isa>().ok())
                 .is_none()
             || p.get(property::SANDBOX).is_none()
-            || p.get(property::ACTION_ENVIRONMENT).map(String::as_str) != Some(environment.as_str())
+            || p.get(property::ACTION_ENVIRONMENT).map(String::as_str)
+                != environment.map(ActionEnvironment::as_str)
             || !worker_accepts(worker, fleets, request)
         {
             continue;
@@ -324,7 +406,8 @@ impl ClientStateManager for PlaceableActions {
                 .platform_properties
                 .remove(property::NETWORK);
         }
-        let properties = |key: &str| action_info.platform_properties.get(key).map(String::as_str);
+        let raw_properties =
+            |key: &str| action_info.platform_properties.get(key).map(String::as_str);
         let served = || {
             self.fleets
                 .fleets()
@@ -333,43 +416,52 @@ impl ClientStateManager for PlaceableActions {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let Some(environment) = properties(property::ACTION_ENVIRONMENT)
-            .and_then(|value| value.parse::<ActionEnvironment>().ok())
-        else {
-            return Err(make_input_err!(
-                "missing or invalid action environment; run gang setup; served identities: {}",
-                served()
-            ));
+        let environment = raw_properties(property::ACTION_ENVIRONMENT)
+            .map(str::parse::<ActionEnvironment>)
+            .transpose()
+            .map_err(|_| {
+                make_input_err!(
+                    "invalid action environment; run gang setup; served identities: {}",
+                    served()
+                )
+            })?;
+        let properties = |key: &str| {
+            if key == property::ACTION_ENVIRONMENT {
+                Some(environment.as_ref().map_or("", ActionEnvironment::as_str))
+            } else {
+                raw_properties(key)
+            }
         };
-        let base = self
-            .fleets
-            .admit(
-                action_info
-                    .platform_properties
-                    .iter()
-                    .filter(|(key, _)| key.as_str() != property::ACTION_ENVIRONMENT)
-                    .map(|(key, value)| (key.as_str(), value.as_str())),
-            )
-            .map_err(|refusal| refused(&refusal))?;
-        let admitted = self.fleets.accepting(properties);
+        let (base, admitted) = self.configured_admission(&action_info, environment.as_ref())?;
         let mut live = None;
         if admitted.is_empty() {
-            if let Some(workers) = &self.workers {
+            if let Some((workers, cordons)) = &self.workers {
+                let workers = workers.worker_snapshot().await;
+                let resumable = cordons.resumable(&workers).await;
                 live = live_catalog(
-                    &workers.worker_snapshot().await,
+                    &workers,
+                    &resumable,
                     &self.fleets,
                     base,
-                    &environment,
+                    environment.as_ref(),
                     properties,
                 )
-                .filter(|catalog| !catalog.accepting(properties).is_empty());
+                .filter(|catalog| {
+                    catalog
+                        .admit(
+                            action_info
+                                .platform_properties
+                                .iter()
+                                .map(|(key, value)| (key.as_str(), value.as_str())),
+                        )
+                        .is_ok()
+                        && !catalog.accepting(properties).is_empty()
+                });
             }
             if live.is_none() {
-                if self
-                    .reconnect
-                    .as_ref()
-                    .is_some_and(|(clock, deadline)| clock.monotonic() < *deadline)
-                {
+                if self.reconnect.as_ref().is_some_and(|(clock, deadline)| {
+                    environment.is_some() && clock.monotonic() < *deadline
+                }) {
                     return Err(make_err!(
                         Code::Unavailable,
                         "action environment not yet served while workers reconnect; retry; served identities: {}",
@@ -389,6 +481,12 @@ impl ClientStateManager for PlaceableActions {
         } else {
             self.admitted.insert(client_operation_id.clone(), admitted)
         };
+        if environment.is_none() {
+            // NativeLink's exact matcher needs a constraint on both sides for absence.
+            Arc::make_mut(&mut action_info)
+                .platform_properties
+                .insert(property::ACTION_ENVIRONMENT.to_owned(), String::new());
+        }
         if let Some(millicores) = normalized_cpu_reservation(&action_info.platform_properties) {
             Arc::make_mut(&mut action_info)
                 .platform_properties
@@ -514,7 +612,7 @@ mod tests {
             &FleetName::try_new("fleet-a").expect("valid fleet"),
             Isa::X86_64,
             &"docker",
-            &"host:test".parse().expect("valid environment"),
+            Some(&"host:test".parse().expect("valid environment")),
             Resources {
                 vcpus: 15,
                 memory: Bytes::new(1024),
@@ -603,7 +701,7 @@ mod tests {
     async fn invalid_identity_is_refused_with_setup_guidance() {
         let fake = Arc::new(Fake::default());
         let wrapper = PlaceableActions::new(fake.clone(), catalog(), AdmittedFleets::default());
-        for value in ["", "legacy", "host:"] {
+        for value in ["", "legacy", "identity-roots-v1", "host:"] {
             let error = wrapper
                 .add_action(operation(), info(property::ACTION_ENVIRONMENT, value))
                 .await
@@ -615,6 +713,18 @@ mod tests {
             assert!(message.contains("host:test"));
         }
         assert!(fake.calls.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unchanged_scoped_properties_keep_the_original_action_arc() {
+        let fake = Arc::new(Fake::default());
+        let wrapper = PlaceableActions::new(fake.clone(), catalog(), AdmittedFleets::default());
+        let action = info(property::SANDBOX, "docker");
+        wrapper
+            .add_action(operation(), Arc::clone(&action))
+            .await
+            .expect("launchable without workers");
+        assert!(Arc::ptr_eq(&action, &fake.calls.lock()[0]));
     }
 
     #[tokio::test]
@@ -693,9 +803,10 @@ mod tests {
         };
         let live = live_catalog(
             &[worker],
+            &[],
             &fleets,
-            fleets.accepting(|_| None),
-            &"host:old".parse().expect("valid environment"),
+            fleets.accepting_base(|_| None),
+            Some(&"host:old".parse().expect("valid environment")),
             |_| None,
         )
         .expect("valid worker");
@@ -708,7 +819,7 @@ mod tests {
             DiskMinReservation::from_units(2048),
         );
         let _admission =
-            admitted.insert_with_catalog(operation(), live.accepting(|_| None), Some(live));
+            admitted.insert_with_catalog(operation(), live.accepting_base(|_| None), Some(live));
         let mut request = info(property::MEMORY_KB, "50000");
         Arc::make_mut(&mut request).platform_properties.insert(
             property::ACTION_ENVIRONMENT.to_owned(),
@@ -803,7 +914,7 @@ mod tests {
                         &FleetName::try_new(name).expect("fleet name"),
                         Isa::X86_64,
                         &"docker",
-                        &"host:new".parse().expect("environment"),
+                        Some(&"host:new".parse().expect("environment")),
                         Resources {
                             vcpus: 16,
                             memory: Bytes::gib(memory),
@@ -827,8 +938,8 @@ mod tests {
         let base = fleets.accepting_base(request);
         let mut previous = None;
         for _ in 0..2 {
-            let live =
-                live_catalog(&workers, &fleets, base, &environment, request).expect("live catalog");
+            let live = live_catalog(&workers, &[], &fleets, base, Some(&environment), request)
+                .expect("live catalog");
             assert_eq!(
                 live.fleets()
                     .iter()
@@ -873,9 +984,10 @@ mod tests {
         assert!(
             live_catalog(
                 &[live_test_worker("unknown", 64, 30, 4)],
+                &[],
                 &fleets,
                 base,
-                &environment,
+                Some(&environment),
                 request,
             )
             .is_none()
@@ -883,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn live_catalog_preserves_grants_and_action_ceilings() {
+    fn live_catalog_uses_actual_grants_and_capacity_not_current_action_policy() {
         let mut policy = gang_types::FleetActionPolicy::default();
         policy.grants.insert(gang_types::Capability::Network);
         policy.resources.memory = Some(gang_types::NonZeroBytes::gib(4));
@@ -891,7 +1003,7 @@ mod tests {
             &FleetName::try_new("small").expect("fleet"),
             Isa::X86_64,
             &"docker",
-            &"host:new".parse().expect("environment"),
+            Some(&"host:new".parse().expect("environment")),
             Resources {
                 vcpus: 8,
                 memory: Bytes::gib(8),
@@ -910,17 +1022,27 @@ mod tests {
         let request = |key: &str| client.platform_properties.get(key).map(String::as_str);
         let base = fleets.accepting_base(request);
         let environment = "host:old".parse().expect("environment");
-        assert!(live_catalog(&[worker.clone()], &fleets, base, &environment, request).is_none());
+        assert!(
+            live_catalog(
+                &[worker.clone()],
+                &[],
+                &fleets,
+                base,
+                Some(&environment),
+                request
+            )
+            .is_none()
+        );
         worker
             .platform_properties
             .insert(property::NETWORK.to_owned(), "requested".to_owned());
-        let live = live_catalog(&[worker], &fleets, base, &environment, request)
+        let live = live_catalog(&[worker], &[], &fleets, base, Some(&environment), request)
             .expect("granted worker is eligible");
         assert_eq!(
             live.fleets()[0].capacity(property::MEMORY_KB),
             Some(8 << 20)
         );
-        assert_eq!(live.fleets()[0].limit(property::MEMORY_KB), Some(4 << 20));
+        assert_eq!(live.fleets()[0].limit(property::MEMORY_KB), Some(8 << 20));
         assert!(!live.accepting(request).is_empty());
     }
 
@@ -935,7 +1057,7 @@ mod tests {
                         &FleetName::try_new(name).expect("valid fleet"),
                         Isa::X86_64,
                         &"docker",
-                        &"host:test".parse().expect("valid environment"),
+                        Some(&"host:test".parse().expect("valid environment")),
                         Resources {
                             vcpus,
                             memory: Bytes::new(gib << 30),
@@ -981,7 +1103,7 @@ mod tests {
             &FleetName::try_new("fleet-a").expect("valid fleet"),
             Isa::X86_64,
             &"docker",
-            &"host:test".parse().expect("valid environment"),
+            Some(&"host:test".parse().expect("valid environment")),
             Resources {
                 vcpus: 15,
                 memory: Bytes::gib(64),
@@ -1000,7 +1122,7 @@ mod tests {
             &FleetName::try_new("eight-gib").expect("fleet name"),
             Isa::X86_64,
             &"docker",
-            &"host:test".parse().expect("valid environment"),
+            Some(&"host:test".parse().expect("valid environment")),
             Resources {
                 vcpus: 6,
                 memory: Bytes::gib(8),
@@ -1044,7 +1166,7 @@ mod tests {
             &FleetName::try_new("limited").expect("fleet name"),
             Isa::X86_64,
             &"docker",
-            &"host:test".parse().expect("valid environment"),
+            Some(&"host:test".parse().expect("valid environment")),
             Resources {
                 vcpus: 6,
                 memory: Bytes::gib(8),
@@ -1148,7 +1270,7 @@ mod tests {
                         &FleetName::try_new(name).expect("fleet name"),
                         Isa::X86_64,
                         &"docker",
-                        &"host:test".parse().expect("valid environment"),
+                        Some(&"host:test".parse().expect("valid environment")),
                         Resources {
                             vcpus,
                             memory: Bytes::gib(memory),

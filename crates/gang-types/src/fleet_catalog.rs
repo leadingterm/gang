@@ -132,6 +132,9 @@ impl FleetCatalog {
         let mut declared: Vec<(&'static str, MatchKind)> = Vec::new();
         for fleet in &fleets {
             for (key, kind) in fleet.declarations() {
+                if property::HARMLESS_PROPERTIES.contains(&key) {
+                    continue;
+                }
                 if !declared.iter().any(|(known, _)| *known == key) {
                     declared.push((key, kind));
                 }
@@ -204,10 +207,26 @@ impl FleetCatalog {
     /// Returns fleets matching the declared properties supplied by `request`.
     ///
     /// Call [`Self::admit`] on the complete request to reject undeclared properties.
+    /// A missing execution environment matches only a fleet with no execution identity.
     pub fn accepting<'r>(&self, request: impl Fn(&str) -> Option<&'r str>) -> FleetSet {
+        self.accepting_columns(&request, false)
+    }
+
+    fn accepting_columns<'r>(
+        &self,
+        request: &dyn Fn(&str) -> Option<&'r str>,
+        base: bool,
+    ) -> FleetSet {
         let mut accepting = self.all;
         for column in &self.columns {
-            let Some(value) = request(column.key) else {
+            let value = if column.key == property::ACTION_ENVIRONMENT {
+                if base {
+                    continue;
+                }
+                request(column.key).unwrap_or_default()
+            } else if let Some(value) = request(column.key) {
+                value
+            } else {
                 continue;
             };
             if let ColumnRule::Capability(mask) = &column.rule {
@@ -233,16 +252,14 @@ impl FleetCatalog {
     ///
     /// Used when matching against live worker identities rather than launch identities.
     pub fn accepting_base<'r>(&self, request: impl Fn(&str) -> Option<&'r str>) -> FleetSet {
-        self.accepting(|key| {
-            if key == property::ACTION_ENVIRONMENT {
-                None
-            } else {
-                request(key)
-            }
-        })
+        self.accepting_columns(&request, true)
     }
 
     /// Validates every request property and returns the eligible fleets.
+    ///
+    /// Omitted properties are unconstrained here; use [`Self::accepting`] for complete
+    /// optional execution-identity matching. Empty execution values are internal absence
+    /// encodings, so public callers must validate present identities before normalization.
     ///
     /// # Errors
     /// Returns a deterministic refusal for an unknown, malformed or unsatisfied property.
@@ -399,7 +416,7 @@ mod tests {
             &FleetName::try_new(name).unwrap(),
             isa,
             &"bwrap",
-            &"host:test".parse().unwrap(),
+            Some(&"host:test".parse().unwrap()),
             Resources {
                 vcpus,
                 memory: Bytes::new(gib << 30),
@@ -466,6 +483,111 @@ mod tests {
     }
 
     #[test]
+    fn optional_environment_matches_only_the_same_identity() {
+        let unscoped = FleetProperties::new(
+            &FleetName::try_new("unscoped").unwrap(),
+            Isa::X86_64,
+            &"bwrap",
+            None,
+            Resources {
+                vcpus: 8,
+                memory: Bytes::new(16 << 30),
+                disk: Bytes::new(200 << 30),
+            },
+            &crate::FleetActionPolicy::default(),
+            [],
+        );
+        let catalog = FleetCatalog::try_new(vec![
+            fleet("current", Isa::X86_64, 8, 16, 200, &[]),
+            unscoped,
+        ])
+        .unwrap();
+        assert_eq!(catalog.accepting(request(&[])), set(&[1]));
+        assert_eq!(
+            catalog.accepting(request(&[(property::ACTION_ENVIRONMENT, "host:test")])),
+            set(&[0])
+        );
+        assert_eq!(
+            catalog.accepting(request(&[(property::ACTION_ENVIRONMENT, "host:other")])),
+            set(&[])
+        );
+        assert_eq!(
+            catalog.accepting(request(&[(property::ACTION_ENVIRONMENT, "invalid")])),
+            set(&[])
+        );
+        // Dispatch normalizes genuine absence only after validating public properties.
+        assert_eq!(
+            catalog.accepting(request(&[(property::ACTION_ENVIRONMENT, "")])),
+            set(&[1])
+        );
+        assert_eq!(catalog.accepting_base(request(&[])), set(&[0, 1]));
+        assert_eq!(
+            catalog.accepting_base(request(&[(property::ACTION_ENVIRONMENT, "host:other")])),
+            set(&[0, 1])
+        );
+        assert_eq!(
+            catalog.admit([(property::ACTION_ENVIRONMENT, "")]),
+            Ok(set(&[1]))
+        );
+    }
+
+    #[test]
+    fn cache_namespace_and_network_hint_do_not_constrain_execution() {
+        let catalog = catalog();
+        for value in ["", "host:other", "requested", "arbitrary cache label"] {
+            let pairs = [
+                (property::ACTION_ENVIRONMENT, "host:test"),
+                (property::CACHE_NAMESPACE, value),
+                (property::NETWORK_HINT, value),
+            ];
+            assert_eq!(catalog.admit(pairs), Ok(set(&[0, 1, 2])));
+            assert_eq!(catalog.accepting(request(&pairs)), set(&[0, 1, 2]));
+            assert_eq!(
+                catalog.accepting(request(&[(property::CACHE_NAMESPACE, value)])),
+                set(&[])
+            );
+            assert!(
+                catalog
+                    .admit([
+                        (property::NETWORK_HINT, value),
+                        (property::NETWORK, "requested"),
+                    ])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_cache_labels_and_network_hints_remain_harmless() {
+        let catalog = FleetCatalog::try_new(vec![fleet(
+            "labelled",
+            Isa::X86_64,
+            8,
+            16,
+            200,
+            &[
+                (property::CACHE_NAMESPACE, "worker cache label"),
+                (property::NETWORK_HINT, "requested"),
+            ],
+        )])
+        .unwrap();
+        let pairs = [
+            (property::ACTION_ENVIRONMENT, "host:test"),
+            (property::CACHE_NAMESPACE, "different action cache label"),
+            (property::NETWORK_HINT, "different hint"),
+        ];
+        assert_eq!(catalog.admit(pairs), Ok(set(&[0])));
+        assert_eq!(catalog.accepting(request(&pairs)), set(&[0]));
+        assert_eq!(
+            catalog.accepting(request(&[
+                (property::ACTION_ENVIRONMENT, "host:test"),
+                (property::NETWORK, "requested"),
+            ])),
+            set(&[])
+        );
+    }
+
+    #[test]
     fn empty_request_accepts_every_fleet() {
         assert_eq!(catalog().admit([]), Ok(set(&[0, 1, 2])));
     }
@@ -488,9 +610,11 @@ mod tests {
     #[test]
     fn action_policy_rejects_ungranted_network() {
         assert_eq!(
-            catalog().admit([("network", "requested")]).unwrap_err(),
+            catalog()
+                .admit([(property::NETWORK, "requested")])
+                .unwrap_err(),
             Refusal::Incompatible {
-                key: "network",
+                key: property::NETWORK,
                 requested: "requested".into(),
                 fleets: vec!["spot-x86".into(), "on-demand-x86".into(), "arm".into()]
             }
@@ -643,14 +767,16 @@ mod tests {
                 ("fleet", MatchKind::Exact),
                 ("ISA", MatchKind::Exact),
                 ("sandbox", MatchKind::Exact),
-                ("gang_action_environment", MatchKind::Exact),
+                ("gang_execution_environment", MatchKind::Exact),
                 ("cpu_count", MatchKind::Minimum),
                 ("cpu_millicores", MatchKind::Minimum),
                 ("memory_kb", MatchKind::Minimum),
                 ("disk_kb", MatchKind::Minimum),
                 ("capacity", MatchKind::Exact),
-                ("network", MatchKind::Capability),
+                ("gang_network_access", MatchKind::Capability),
                 ("supports-workers", MatchKind::Ignored),
+                ("gang_action_environment", MatchKind::Ignored),
+                ("network", MatchKind::Ignored),
             ]
         );
     }
@@ -676,15 +802,17 @@ mod tests {
                 "fleet",
                 "ISA",
                 "sandbox",
-                "gang_action_environment",
+                "gang_execution_environment",
                 "cpu_count",
                 "cpu_millicores",
                 "memory_kb",
                 "disk_kb",
                 "capacity",
                 "zone",
-                "network",
+                "gang_network_access",
                 "supports-workers",
+                "gang_action_environment",
+                "network",
             ]
         );
     }
@@ -735,10 +863,13 @@ mod tests {
     #[test]
     fn baseline_network_values_do_not_restrict_fleets() {
         for value in ["", "not-requested"] {
-            assert_eq!(catalog().admit([("network", value)]), Ok(set(&[0, 1, 2])));
+            assert_eq!(
+                catalog().admit([(property::NETWORK, value)]),
+                Ok(set(&[0, 1, 2]))
+            );
         }
         assert!(matches!(
-            catalog().admit([("network", "eth0")]),
+            catalog().admit([(property::NETWORK, "eth0")]),
             Err(Refusal::InvalidCapability { .. })
         ));
     }
@@ -756,7 +887,7 @@ mod tests {
             &FleetName::try_new("network-arm").unwrap(),
             Isa::Aarch64,
             &"bwrap",
-            &"host:test".parse().unwrap(),
+            Some(&"host:test".parse().unwrap()),
             Resources {
                 vcpus: 8,
                 memory: Bytes::new(16 << 30),
@@ -770,7 +901,7 @@ mod tests {
             network_fleet,
         ])
         .unwrap();
-        let admitted = catalog.admit([("network", "requested")]).unwrap();
+        let admitted = catalog.admit([(property::NETWORK, "requested")]).unwrap();
         assert_eq!(admitted, set(&[1]));
         let with_environment = [
             (property::NETWORK, "requested"),
@@ -793,23 +924,23 @@ mod tests {
             set(&[1])
         );
         assert_eq!(
-            catalog.admit([("ISA", "aarch64"), ("network", "requested")]),
+            catalog.admit([("ISA", "aarch64"), (property::NETWORK, "requested")]),
             Ok(set(&[1]))
         );
         let refusal = catalog
-            .admit([("network", "requested"), ("ISA", "x86-64")])
+            .admit([(property::NETWORK, "requested"), ("ISA", "x86-64")])
             .unwrap_err();
         assert_eq!(
             refusal,
             Refusal::Incompatible {
-                key: "network",
+                key: property::NETWORK,
                 requested: "requested".into(),
                 fleets: vec!["offline-x86".into()],
             }
         );
         assert!(
             catalog
-                .admit([("network", "requested"), ("cpu_count", "3")])
+                .admit([(property::NETWORK, "requested"), ("cpu_count", "3")])
                 .is_err()
         );
         assert_eq!(
@@ -829,7 +960,7 @@ mod tests {
             vec![
                 ("ISA", "x86-64"),
                 ("cpu_millicores", "1000"),
-                ("network", "not-requested"),
+                (property::NETWORK, "not-requested"),
             ],
         ] {
             assert!(catalog.admit(request).is_ok());

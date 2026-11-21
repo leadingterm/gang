@@ -33,10 +33,6 @@ pub struct ReleaseInput {
 pub struct UpgradeInputs {
     /// Release upgraded or restarted by the positive mixed-version scenarios.
     pub previous: ReleaseInput,
-    /// Historical release used by the negative control.
-    pub historical: ReleaseInput,
-    /// Fixed candidate release used by the negative control.
-    pub calibration: ReleaseInput,
     /// Rendered fixture for the candidate executable.
     pub candidate_fixture: PathBuf,
 }
@@ -396,8 +392,6 @@ mod tests {
                 },
                 upgrade: Some(UpgradeInputs {
                     previous: release("previous"),
-                    historical: release("historical"),
-                    calibration: release("calibration"),
                     candidate_fixture: "candidate-fixture".into(),
                 }),
             };
@@ -407,14 +401,8 @@ mod tests {
             assert_eq!(decoded.settings, inputs.settings);
             assert_eq!(decoded.action_tools, inputs.action_tools);
             let upgrade = decoded.upgrade.expect("upgrade inputs survive transport");
-            for (actual, name) in [
-                (upgrade.previous, "previous"),
-                (upgrade.historical, "historical"),
-                (upgrade.calibration, "calibration"),
-            ] {
-                assert_eq!(actual.binary, PathBuf::from(format!("{name}-binary")));
-                assert_eq!(actual.fixture, PathBuf::from(format!("{name}-fixture")));
-            }
+            assert_eq!(upgrade.previous.binary, PathBuf::from("previous-binary"));
+            assert_eq!(upgrade.previous.fixture, PathBuf::from("previous-fixture"));
             assert_eq!(
                 upgrade.candidate_fixture,
                 PathBuf::from("candidate-fixture")

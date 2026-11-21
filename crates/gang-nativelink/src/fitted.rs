@@ -78,7 +78,7 @@ impl ClientStateManager for FittedActions {
         let (admitted, live_catalog) = self
             .admitted
             .take(&operation)
-            .unwrap_or_else(|| (self.fleets.accepting(|_| None), None));
+            .unwrap_or_else(|| (self.fleets.accepting_base(|_| None), None));
         let fleets = live_catalog.as_ref().unwrap_or(&self.fleets);
         for (key, min_kb) in [
             (property::MEMORY_KB, self.min_reservation.as_units()),

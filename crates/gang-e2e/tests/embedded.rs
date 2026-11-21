@@ -165,7 +165,7 @@ fn fleet_with_disk(
         &FleetName::try_new(name)?,
         isa,
         &SANDBOX,
-        &"host:test".parse()?,
+        Some(&"host:test".parse()?),
         Resources {
             vcpus,
             memory: Bytes::new(memory),
@@ -1935,7 +1935,10 @@ async fn an_action_no_fleet_accepts_is_refused_when_submitted() -> TestResult {
 async fn network_grant_is_required_and_unknown_properties_are_refused() -> TestResult {
     let harness = Harness::start().await?;
     let channel = public_channel(harness.public_port).await?;
-    for (key, value) in [("network", "requested"), ("unknown-property", "value")] {
+    for (key, value) in [
+        ("gang_network_access", "requested"),
+        ("unknown-property", "value"),
+    ] {
         let action = build_action(&[(key, value)])?;
         upload_blobs(&channel, action.blobs).await?;
         let status = ExecutionClient::new(channel.clone())
@@ -1961,7 +1964,7 @@ async fn network_request_runs_on_granted_fleet() -> TestResult {
         &FleetName::try_new(DEFAULT_FLEET)?,
         Isa::X86_64,
         &SANDBOX,
-        &"host:test".parse()?,
+        Some(&"host:test".parse()?),
         Resources {
             vcpus: WORKER_VCPUS,
             memory: Bytes::new(WORKER_MEMORY),
@@ -1974,7 +1977,7 @@ async fn network_request_runs_on_granted_fleet() -> TestResult {
         Harness::start_with(vec![fleet.clone()], TestGate::allow(), Vec::new()).await?;
     harness.add_worker(WorkerPaths::new(scratch.path(), "worker"), fleet)?;
     let channel = public_channel(harness.public_port).await?;
-    let action = build_action(&[("network", "requested")])?;
+    let action = build_action(&[("gang_network_access", "requested")])?;
     upload_blobs(&channel, action.blobs).await?;
     let response = tokio::time::timeout(
         Duration::from_secs(30),
@@ -1983,6 +1986,49 @@ async fn network_request_runs_on_granted_fleet() -> TestResult {
     .await??;
     assert_eq!(response.result.ok_or("missing result")?.exit_code, 0);
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn spoofed_platform_cases() -> [PlatformCase<'static>; 4] {
+    [
+        (
+            Some(&[
+                ("cpu_count", "2"),
+                ("memory_kb", "16384"),
+                ("gang_network_access", "requested"),
+            ]),
+            &[("cpu_count", "3")],
+            "2",
+            "requested",
+        ),
+        (
+            None,
+            &[
+                ("cpu_count", "3"),
+                ("memory_kb", "16384"),
+                ("gang_network_access", "not-requested"),
+            ],
+            "3",
+            "<absent>",
+        ),
+        (
+            Some(&[]),
+            &[("cpu_count", "3"), ("memory_kb", "16384")],
+            "3",
+            "<absent>",
+        ),
+        (
+            Some(&[
+                ("cpu_count", "2"),
+                ("memory_kb", "16384"),
+                ("network", "requested"),
+                ("gang_action_environment", "identity-roots-v1"),
+            ]),
+            &[],
+            "2",
+            "<absent>",
+        ),
+    ]
 }
 
 #[cfg(target_os = "linux")]
@@ -2005,7 +2051,7 @@ async fn reserved_environment_and_platform_authority_survive_client_spoofing() -
             &FleetName::try_new(DEFAULT_FLEET)?,
             Isa::X86_64,
             &SANDBOX,
-            &"host:test".parse()?,
+            Some(&"host:test".parse()?),
             Resources {
                 vcpus: WORKER_VCPUS,
                 memory: Bytes::new(WORKER_MEMORY),
@@ -2031,35 +2077,7 @@ async fn reserved_environment_and_platform_authority_survive_client_spoofing() -
             .min_reservation
             .as_units()
             .to_string();
-        let cases: [PlatformCase<'_>; 3] = [
-            (
-                Some(&[
-                    ("cpu_count", "2"),
-                    ("memory_kb", "16384"),
-                    ("network", "requested"),
-                ]),
-                &[("cpu_count", "3")],
-                "2",
-                "requested",
-            ),
-            (
-                None,
-                &[
-                    ("cpu_count", "3"),
-                    ("memory_kb", "16384"),
-                    ("network", "not-requested"),
-                ],
-                "3",
-                "<absent>",
-            ),
-            (
-                Some(&[]),
-                &[("cpu_count", "3"), ("memory_kb", "16384")],
-                "3",
-                "<absent>",
-            ),
-        ];
-        for (action_platform, command_platform, cpu, network) in cases {
+        for (action_platform, command_platform, cpu, network) in spoofed_platform_cases() {
             let env = [
                 ("GANG_NETWORK", "spoofed"),
                 ("GANG_CPU_COUNT", "spoofed"),
@@ -2363,7 +2381,7 @@ fn worker_server_settings(port: u16) -> Result<gang_server::ServerSettings, Box<
             ..gang_config::ActionsConfig::default()
         }),
         scaling: Arc::new(gang_config::ScalingConfig::default()),
-        proxy_protocol: Arc::new(gang_config::ProxyProtocolConfig::default()),
+        proxy_protocol: None,
         leadership: gang_config::LeadershipConfig::default(),
         standby_routability_delay: Duration::ZERO,
         handoff_timeout: Duration::from_mins(1),

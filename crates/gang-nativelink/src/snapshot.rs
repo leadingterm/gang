@@ -37,8 +37,8 @@ pub(crate) fn managed_worker(summary: &WorkerSummary) -> Option<(WorkerId, Fleet
 
 /// Converts a connected worker into a scheduler worker.
 ///
-/// Returns `None` for workers without a managed id or valid fleet. Missing or invalid
-/// environments are retained as unknown.
+/// Returns `None` for workers without a managed id or valid fleet, or with an invalid present
+/// environment. A genuinely missing environment is retained as unscoped.
 /// `NativeLink` reports `max_inflight_tasks` 0 for a worker without a limit, which maps to
 /// `None`, as do counts above `u32::MAX`. A paused worker is not draining: only the draining
 /// flag counts; the pause itself is reported by `paused`.
@@ -47,7 +47,9 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
     let environment = summary
         .platform_properties
         .get(property::ACTION_ENVIRONMENT)
-        .and_then(|value| value.parse().ok());
+        .map(|value| value.parse())
+        .transpose()
+        .ok()?;
     let max_inflight_actions = u32::try_from(summary.max_inflight_tasks)
         .ok()
         .and_then(NonZeroU32::new);
@@ -71,14 +73,20 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
 ///
 /// Candidates ignore environment so an old live worker can satisfy demand; capacity accounting
 /// checks the identity separately before attributing work or launching workers.
-/// Each missing or malformed resource property contributes zero to its dimension. Actions
-/// without a valid environment are omitted.
+/// Each missing or malformed resource property contributes zero to its dimension. A missing
+/// environment remains unscoped; malformed nonempty identities are omitted. The internal empty
+/// exact-match encoding is inserted only after admission has rejected invalid present values.
 fn queued_demand(
     info: &NativeActionInfo,
     fleets: &FleetCatalog,
     expected: Option<Duration>,
     source: Option<SourceId>,
 ) -> Option<QueuedDemand> {
+    let environment = match info.platform_properties.get(property::ACTION_ENVIRONMENT) {
+        None => None,
+        Some(value) if value.is_empty() => None,
+        Some(value) => Some(value.parse().ok()?),
+    };
     Some(QueuedDemand {
         source,
         candidates: fleets
@@ -89,11 +97,7 @@ fn queued_demand(
                     .map(|(key, value)| (key.as_str(), value.as_str())),
             )
             .unwrap_or_default(),
-        environment: info
-            .platform_properties
-            .get(property::ACTION_ENVIRONMENT)?
-            .parse()
-            .ok()?,
+        environment,
         resources: resources(&info.platform_properties),
         queued_since: Timestamp::from(info.insert_timestamp),
         priority: info.priority,
@@ -374,7 +378,7 @@ pub(crate) mod tests {
                 &FleetName::try_new(name).expect("valid fleet name"),
                 isa,
                 &"docker",
-                &"host:test".parse().expect("valid environment"),
+                Some(&"host:test".parse().expect("valid environment")),
                 Resources {
                     vcpus: 4,
                     memory: Bytes::gib(8),
@@ -442,7 +446,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unknown_worker_environment_preserves_connected_state() {
+    fn missing_worker_environment_preserves_connected_state() {
         let mut worker = summary(WORKER);
         worker.running_actions = 2;
         worker.is_paused = true;
@@ -450,26 +454,30 @@ pub(crate) mod tests {
         worker
             .platform_properties
             .remove(property::ACTION_ENVIRONMENT);
-        for environment in [None, Some("legacy")] {
-            if let Some(value) = environment {
-                worker
-                    .platform_properties
-                    .insert(property::ACTION_ENVIRONMENT.to_owned(), value.to_owned());
-            }
-            let state = worker_state(&worker).expect("managed worker remains connected");
-            assert_eq!(
-                state.id,
-                WorkerId::try_new(WORKER).expect("valid worker id")
-            );
-            assert_eq!(
-                state.fleet,
-                FleetName::try_new("fleet-a").expect("valid fleet")
-            );
-            assert_eq!(state.environment, None);
-            assert_eq!(state.running_actions, 2);
-            assert!(state.paused);
-            assert!(state.draining);
-            assert_eq!(state.last_seen, Timestamp::from_unix_millis(100_000));
+        let state = worker_state(&worker).expect("managed worker remains connected");
+        assert_eq!(
+            state.id,
+            WorkerId::try_new(WORKER).expect("valid worker id")
+        );
+        assert_eq!(
+            state.fleet,
+            FleetName::try_new("fleet-a").expect("valid fleet")
+        );
+        assert_eq!(state.environment, None);
+        assert_eq!(state.running_actions, 2);
+        assert!(state.paused);
+        assert!(state.draining);
+        assert_eq!(state.last_seen, Timestamp::from_unix_millis(100_000));
+    }
+
+    #[test]
+    fn invalid_present_worker_environment_is_not_unscoped() {
+        for value in ["", "legacy"] {
+            let mut worker = summary(WORKER);
+            worker
+                .platform_properties
+                .insert(property::ACTION_ENVIRONMENT.to_owned(), value.to_owned());
+            assert!(worker_state(&worker).is_none());
         }
     }
 
@@ -483,7 +491,10 @@ pub(crate) mod tests {
             ],
         );
         let demand = queued_demand(&entry, &catalog());
-        assert_eq!(demand.environment.as_str(), "host:old");
+        assert_eq!(
+            demand.environment,
+            Some("host:old".parse().expect("valid environment"))
+        );
         assert_eq!(demand.candidates.iter().collect::<Vec<_>>(), vec![1]);
     }
 
@@ -494,18 +505,32 @@ pub(crate) mod tests {
         let demand =
             super::queued_demand(&entry, &catalog(), None, source).expect("valid environment");
         assert_eq!(demand.source, source);
-        assert_eq!(demand.environment.as_str(), "host:old");
+        assert_eq!(
+            demand.environment,
+            Some("host:old".parse().expect("valid environment"))
+        );
         assert_eq!(demand.candidates.iter().collect::<Vec<_>>(), vec![0, 1]);
     }
 
     #[test]
-    fn invalid_environment_is_not_queued_even_with_a_source() {
+    fn missing_environment_is_retained_but_invalid_present_environment_is_not() {
         let mut entry = demand(0, &[]);
         Arc::make_mut(&mut entry)
             .platform_properties
             .remove(property::ACTION_ENVIRONMENT);
         let source = SourceId::from_identity_str("local:alice");
-        assert!(super::queued_demand(&entry, &catalog(), None, source).is_none());
+        let unscoped = super::queued_demand(&entry, &catalog(), None, source)
+            .expect("genuinely missing identity remains queued");
+        assert_eq!(unscoped.environment, None);
+        assert_eq!(unscoped.source, source);
+        assert_eq!(unscoped.candidates.iter().collect::<Vec<_>>(), vec![0, 1]);
+        Arc::make_mut(&mut entry)
+            .platform_properties
+            .insert(property::ACTION_ENVIRONMENT.to_owned(), String::new());
+        assert_eq!(
+            super::queued_demand(&entry, &catalog(), None, source),
+            Some(unscoped)
+        );
         Arc::make_mut(&mut entry).platform_properties.insert(
             property::ACTION_ENVIRONMENT.to_owned(),
             "invalid".to_owned(),
@@ -608,7 +633,7 @@ pub(crate) mod tests {
             QueuedDemand {
                 source: None,
                 candidates: FleetSet::prefix(1).expect("fleet count in range"),
-                environment: "host:test".parse().expect("valid environment"),
+                environment: Some("host:test".parse().expect("valid environment")),
                 resources: ActionResources {
                     cpu_millicores: 4000,
                     memory: Bytes::kib(1024),
@@ -833,14 +858,61 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn fill_retains_running_workers_with_unknown_environments() {
+    async fn fill_retains_unscoped_queue_and_omits_invalid_present_identity() {
+        let mut absent = info(4, 1_000, &[(property::ISA, "aarch64")]);
+        Arc::make_mut(&mut absent)
+            .platform_properties
+            .remove(property::ACTION_ENVIRONMENT);
+        let normalized = info(3, 2_000, &[(property::ACTION_ENVIRONMENT, "")]);
+        let invalid = info(2, 3_000, &[(property::ACTION_ENVIRONMENT, "invalid")]);
+        let fake = Fake {
+            queued: vec![
+                row("absent", ActionStage::Queued, 0, absent, None),
+                row("normalized", ActionStage::Queued, 0, normalized, None),
+                row("invalid", ActionStage::Queued, 0, invalid, None),
+            ],
+            ..Default::default()
+        };
+        let mut snapshot = SchedulerSnapshot::default();
+        fill(
+            &fake,
+            &[],
+            &catalog(),
+            &history(),
+            Timestamp::from_unix_millis(10_000),
+            0,
+            &mut snapshot,
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(snapshot.queued.len(), 2);
+        assert!(
+            snapshot
+                .queued
+                .iter()
+                .all(|demand| demand.environment.is_none())
+        );
+        assert_eq!(snapshot.queued[0].priority, 4);
+        assert_eq!(
+            snapshot.queued[0].candidates.iter().collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(snapshot.queued[1].priority, 3);
+        assert_eq!(
+            snapshot.queued[1].candidates.iter().collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_retains_running_workers_with_missing_environments() {
         let (mut workers, fake) = populated_listing();
         workers[0]
             .platform_properties
             .remove(property::ACTION_ENVIRONMENT);
         workers[2]
             .platform_properties
-            .insert(property::ACTION_ENVIRONMENT.to_owned(), "legacy".to_owned());
+            .remove(property::ACTION_ENVIRONMENT);
         let mut snapshot = SchedulerSnapshot::default();
         fill(
             &fake,

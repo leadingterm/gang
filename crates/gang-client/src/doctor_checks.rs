@@ -98,7 +98,7 @@ fn endpoint_fix(flag: &str, source: &OptionSource) -> String {
 pub(crate) fn action_environment(gang: &Gang, options: &EffectiveOptions) -> Option<Finding> {
     let expected = gang.info.action_environment.as_str();
     for (flag, key) in [
-        ("repo_env", "GANG_ACTION_ENVIRONMENT"),
+        ("repo_env", "GANG_EXECUTION_ENVIRONMENT"),
         (
             "remote_default_exec_properties",
             gang_types::property::ACTION_ENVIRONMENT,
@@ -745,10 +745,10 @@ mod tests {
                 },
             )
         };
-        let repo = setting("repo_env", "GANG_ACTION_ENVIRONMENT=host:test");
+        let repo = setting("repo_env", "GANG_EXECUTION_ENVIRONMENT=host:test");
         let property = setting(
             "remote_default_exec_properties",
-            "gang_action_environment=host:test",
+            "gang_execution_environment=host:test",
         );
         assert!(
             action_environment(
@@ -764,12 +764,19 @@ mod tests {
                 repo.clone(),
                 setting(
                     "remote_default_exec_properties",
-                    "gang_action_environment=host:old",
+                    "gang_execution_environment=host:old",
                 ),
             ],
             vec![
                 property,
-                setting("repo_env", "GANG_ACTION_ENVIRONMENT=host:old"),
+                setting("repo_env", "GANG_EXECUTION_ENVIRONMENT=host:old"),
+            ],
+            vec![
+                setting("repo_env", "GANG_ACTION_ENVIRONMENT=host:test"),
+                setting(
+                    "remote_default_exec_properties",
+                    "gang_action_environment=host:test",
+                ),
             ],
         ] {
             let finding = action_environment(&gang, &EffectiveOptions::new(options))

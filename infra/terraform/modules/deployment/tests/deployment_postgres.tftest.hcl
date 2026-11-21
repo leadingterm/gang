@@ -1,4 +1,8 @@
 mock_provider "aws" {
+  mock_data "aws_caller_identity" {
+    defaults = { account_id = "000000000000" }
+  }
+
   mock_data "aws_network_interface" {
     defaults = { private_ips = ["10.20.1.10", "10.20.1.11"] }
   }
@@ -216,20 +220,6 @@ variables {
 }
 
 
-run "proxy_off_omits_section" {
-  command = apply
-  variables {
-    database         = { engine = "postgres", postgres = { rds = {} } }
-    controller_count = 2
-    hostname         = "gang.example.com"
-    load_balancer    = { proxy_protocol_stage = "off" }
-    nat_mode         = "per_az"
-  }
-  assert {
-    condition     = !strcontains(output.gang_toml, "[server.proxy_protocol]")
-    error_message = "Off must leave PROXY disabled by default."
-  }
-}
 
 run "rds_group_shape" {
   command = apply
@@ -267,8 +257,8 @@ run "rds_group_shape" {
     error_message = "The RDS controller digest must include the initial password version."
   }
   assert {
-    condition     = strcontains(output.gang_toml, "[server.proxy_protocol]\npublic = \"accept\"\nworker = \"accept\"\nhealth = \"accept\"\ntrusted_cidrs = [\"10.20.1.10/32\",\"10.20.1.11/32\"]") && !strcontains(output.gang_toml, "10.20.0.0/16")
-    error_message = "Default shared deployment must trust only exact ENI addresses in accept mode."
+    condition     = strcontains(output.gang_toml, "[server.proxy_protocol]\ntrusted_cidrs = [\"10.20.1.10/32\",\"10.20.1.11/32\"]") && !strcontains(output.gang_toml, "10.20.0.0/16")
+    error_message = "Shared deployment must trust only exact NLB ENI addresses."
   }
 }
 
@@ -291,37 +281,6 @@ run "rds_password_rotation_refreshes_controllers" {
   }
 }
 
-run "proxy_proxied_does_not_refresh_controller" {
-  command = apply
-  variables {
-    database           = { engine = "postgres", postgres = { rds = { password_version = 2 } } }
-    controller_count   = 2
-    hostname           = "gang.example.com"
-    load_balancer      = { proxy_protocol_stage = "proxied" }
-    nat_mode           = "per_az"
-    previous_gang_toml = run.rds_password_rotation_refreshes_controllers.gang_toml
-    previous_digest    = run.rds_password_rotation_refreshes_controllers.controller_config_digest
-  }
-  assert {
-    condition     = output.gang_toml == var.previous_gang_toml && output.controller_config_digest == var.previous_digest
-    error_message = "Switching accept to proxied must not change controller configuration or digest."
-  }
-}
-
-run "proxy_require_renders_modes" {
-  command = apply
-  variables {
-    database         = { engine = "postgres", postgres = { rds = { password_version = 2 } } }
-    controller_count = 2
-    hostname         = "gang.example.com"
-    load_balancer    = { proxy_protocol_stage = "require" }
-    nat_mode         = "per_az"
-  }
-  assert {
-    condition     = strcontains(output.gang_toml, "[server.proxy_protocol]\npublic = \"require\"\nworker = \"require\"\nhealth = \"require\"") && strcontains(output.gang_toml, "10.20.1.10/32")
-    error_message = "Require must render typed listener modes and exact ENI trust."
-  }
-}
 
 run "dynamodb_digest_unchanged" {
   command = apply

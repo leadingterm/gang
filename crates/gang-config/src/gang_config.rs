@@ -17,7 +17,6 @@ use crate::execution_config::ExecutionConfig;
 use crate::fleets::{Fleets, RawFleet};
 use crate::identity_config::IdentityConfig;
 use crate::plugin_set::PluginSet;
-use crate::proxy_protocol_config::ProxyProtocol;
 use crate::role_config::RoleConfig;
 use crate::scaling::ScalingConfig;
 use crate::server_config::{EndpointTrust, ServerConfig, Transport};
@@ -120,29 +119,9 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
     /// # Errors
     ///
     /// [`ConfigError::Gang`] for malformed TOML, unknown or missing fields and unknown, missing
-    /// or repeated plugin sections; [`ConfigError::RemovedScheduler`] for the removed scheduler table.
+    /// or repeated plugin sections.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        toml::from_str(text).map_err(|source: toml::de::Error| {
-            let message = source.message();
-            if message.starts_with("unknown field `scheduler`, expected ")
-                && message.contains("`poll_interval`")
-                && message.contains("`worker_endpoint`")
-            {
-                return ConfigError::RemovedScheduler(source);
-            }
-            let message = source.to_string();
-            for (old, replacement) in [
-                ("execution_endpoint", "endpoint"),
-                ("execution_listen", "listen"),
-            ] {
-                if message.contains(&format!("unknown field `{old}`")) {
-                    return ConfigError::Gang(serde::de::Error::custom(format!(
-                        "{message}\n`{old}` was removed; use `{replacement}` instead"
-                    )));
-                }
-            }
-            ConfigError::Gang(source)
-        })
+        toml::from_str(text).map_err(ConfigError::Gang)
     }
 
     /// Resolves the fleets and checks the references between sections that serde cannot
@@ -179,9 +158,6 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             limits,
         } = self;
         Self::check_listener_collisions(listen, worker_listen, health_listen)?;
-        if server.proxy_protocol.health != ProxyProtocol::Off && health_listen.is_none() {
-            return Err(ConfigError::ProxyProtocolWithoutListener { listener: "health" });
-        }
         Self::check_leadership(&server)?;
         let fleets = Fleets::resolve(fleets, &provisioner, &sandbox)?;
         Self::check_fleet_settings(&fleets, &server, default_isa)?;
@@ -598,7 +574,7 @@ impl<P: PluginSet> FromStr for GangConfig<P> {
     ///
     /// [`ConfigError::Gang`] for malformed TOML, unknown or missing fields (a `[[fleets]]` entry
     /// included) and unknown, missing or repeated plugin sections; the message lists the
-    /// accepted keys. [`ConfigError::RemovedScheduler`] identifies the removed top-level table.
+    /// accepted keys.
     /// Then the fleet and cross-section errors of [`ConfigError`].
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         Document::<P>::parse(text)?.resolve()

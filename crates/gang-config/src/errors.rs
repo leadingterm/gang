@@ -15,14 +15,6 @@ pub enum ConfigError {
     /// unknown backends and unknown fields are reported here with the accepted keys.
     #[error("invalid gang.toml")]
     Gang(#[source] toml::de::Error),
-    /// The removed top-level scheduler table must be migrated to the current configuration.
-    #[error(
-        "the top-level scheduler table is replaced by top-level worker_endpoint and [actions], [server], and [worker]"
-    )]
-    #[fix(
-        "move worker_endpoint to the top level; memory, disk and cold-start settings to [actions.memory], [actions.disk] and [actions.cold_start]; policy, retries, timeout and kill_grace to [actions] (actions.timeout and actions.kill_grace); HTTP limits to [server.http2]; worker liveness to server.worker_timeout; file limits to server.max_open_files and worker.max_open_files; transfer, connect, cleanup and keepalive settings to [worker]; remove scheduler_name"
-    )]
-    RemovedScheduler(#[source] toml::de::Error),
     /// A configuration could not be rendered as TOML.
     #[error("cannot render configuration")]
     Render(#[from] toml::ser::Error),
@@ -206,13 +198,6 @@ pub enum ConfigError {
     EndpointRequired {
         /// The configured public listen address.
         listen: SocketAddr,
-    },
-    /// PROXY is enabled for an optional listener that is not configured.
-    #[error("server.proxy_protocol.{listener} requires {listener}_listen")]
-    #[fix("configure {listener}_listen or set server.proxy_protocol.{listener} to off")]
-    ProxyProtocolWithoutListener {
-        /// Optional listener name.
-        listener: &'static str,
     },
     /// Two listeners cannot bind overlapping non-ephemeral addresses.
     #[error("{first} and {second} have conflicting listen addresses at `{listen}`")]
@@ -409,7 +394,6 @@ mod tests {
     fn every_variant() -> Vec<ConfigError> {
         vec![
             ConfigError::Gang(syntax_error()),
-            ConfigError::RemovedScheduler(syntax_error()),
             ConfigError::Render(
                 toml::to_string(&Unserializable).expect_err("the value cannot be serialized"),
             ),

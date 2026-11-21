@@ -85,7 +85,7 @@ pub fn render(
         quote(&format!("{}={}", property::ISA, info.default_isa))
     ));
     lines.push(format!(
-        "common --repo_env=GANG_ACTION_ENVIRONMENT={}",
+        "common --repo_env=GANG_EXECUTION_ENVIRONMENT={}",
         quote(info.action_environment.as_str())
     ));
     lines.push(format!(
@@ -173,10 +173,12 @@ mod tests {
         server.action_environment = "host:alternate".parse().expect("valid test environment");
         for writer in [BazelrcWriter::Setup, BazelrcWriter::Bazelrc] {
             let rc = render(&server, "gang.example.test", "gang", CA_FILE_NAME, writer);
-            assert!(rc.contains("common --repo_env=GANG_ACTION_ENVIRONMENT=host:alternate\n"));
+            assert!(rc.contains("common --repo_env=GANG_EXECUTION_ENVIRONMENT=host:alternate\n"));
             assert!(rc.contains(
-                "build --remote_default_exec_properties=gang_action_environment=host:alternate\n"
+                "build --remote_default_exec_properties=gang_execution_environment=host:alternate\n"
             ));
+            assert!(!rc.contains("GANG_ACTION_ENVIRONMENT"));
+            assert!(!rc.contains("gang_action_environment"));
         }
     }
 
@@ -218,8 +220,8 @@ mod tests {
             "build --remote_cache=grpcs://cache.example.test:443",
             "build --credential_helper=gang.example.test=/usr/local/bin/gang",
             "build --remote_default_exec_properties=ISA=x86-64",
-            "common --repo_env=GANG_ACTION_ENVIRONMENT=host:test",
-            "build --remote_default_exec_properties=gang_action_environment=host:test",
+            "common --repo_env=GANG_EXECUTION_ENVIRONMENT=host:test",
+            "build --remote_default_exec_properties=gang_execution_environment=host:test",
             "build --tls_certificate=gang-ca.pem",
         ] {
             assert!(
@@ -321,7 +323,7 @@ mod tests {
         assert!(rendered.contains("build --remote_cache=grpcs://cache.example.test:443\n"));
         assert!(rendered.contains("build --remote_default_exec_properties=ISA=x86-64\n"));
         assert!(rendered.contains(
-            "build --remote_default_exec_properties=gang_action_environment=host:test\n"
+            "build --remote_default_exec_properties=gang_execution_environment=host:test\n"
         ));
         assert!(!rendered.contains("--credential_helper"));
         assert!(!rendered.contains("--tls_certificate"));

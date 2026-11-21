@@ -95,8 +95,8 @@ impl Fixture {
         let clean_options = [
             json!({"optionName":"remote_executor", "optionValue":"grpc://127.0.0.1:8980"}),
             json!({"optionName":"remote_cache", "optionValue":"grpc://127.0.0.1:8980"}),
-            json!({"optionName":"repo_env", "optionValue":"GANG_ACTION_ENVIRONMENT=host:test"}),
-            json!({"optionName":"remote_default_exec_properties", "optionValue":"gang_action_environment=host:test"}),
+            json!({"optionName":"repo_env", "optionValue":"GANG_EXECUTION_ENVIRONMENT=host:test"}),
+            json!({"optionName":"remote_default_exec_properties", "optionValue":"gang_execution_environment=host:test"}),
         ];
         let clean_original = [
             json!({"optionName":"rc_source", "optionValue":workspace.join(".gang/bazelrc")}),

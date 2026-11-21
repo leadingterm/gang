@@ -251,44 +251,8 @@ cmd_converge() {
   esac
 }
 
-cmd_restart() {
-  require RUNNER_TEMP
-  local plan="$RUNNER_TEMP/infra-plan.json"
-  local needed gang shape region controller command_id status wait_rc=0
-
-  needed="$("$GANG" deploy restart-needed <"$plan")" || die "cannot parse $plan"
-  if [[ "$needed" != true ]]; then
-    log "no configuration change on a running controller; restart not needed"
-    return 0
-  fi
-
-  gang="$(tofu -chdir="$ROOT" output -json gang)"
-  shape="$(jq -er '.controller_shape // "instance"' <<<"$gang")" || die "output gang has an invalid controller_shape"
-  if [[ "$shape" == group ]]; then
-    log "controller group rolls configuration changes through instance refresh"
-    return 0
-  fi
-  [[ "$shape" == instance ]] || die "unknown controller_shape: $shape"
-  region="$(jq -er '.region' <<<"$gang")" || die "output gang has no region"
-  controller="$(jq -er '.controller_instance_id' <<<"$gang")" || die "output gang has no controller_instance_id"
-
-  command_id="$(aws ssm send-command --region "$region" --document-name AWS-RunShellScript \
-    --instance-ids "$controller" \
-    --parameters 'commands=["systemctl restart gang-config.service"]' \
-    --query Command.CommandId --output text)"
-  aws ssm wait command-executed --region "$region" --command-id "$command_id" --instance-id "$controller" || wait_rc=$?
-  status="$(aws ssm get-command-invocation --region "$region" --command-id "$command_id" --instance-id "$controller" \
-    --query Status --output text)"
-  if [[ "$status" != Success ]]; then
-    die "restart on $controller ended $status (waiter exit $wait_rc): $(aws ssm get-command-invocation \
-      --region "$region" --command-id "$command_id" --instance-id "$controller" \
-      --query StandardErrorContent --output text)"
-  fi
-  log "gang-config restarted on $controller"
-}
-
 usage() {
-  printf 'usage: %s {validate|init|plan|store|publish|resolve|fetch|verify|apply|converge|restart}\n' "$0" >&2
+  printf 'usage: %s {validate|init|plan|store|publish|resolve|fetch|verify|apply|converge}\n' "$0" >&2
   exit 2
 }
 
@@ -305,7 +269,6 @@ main() {
     verify) cmd_verify ;;
     apply) cmd_apply ;;
     converge) cmd_converge ;;
-    restart) cmd_restart ;;
     *) usage ;;
   esac
 }

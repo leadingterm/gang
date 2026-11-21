@@ -1,5 +1,5 @@
 //! Tests for the `SQLite` `StateRepositoryPort` implementation: certificate, revocation,
-//! principal, and scaling-event persistence, plus schema migration and async runtime behavior.
+//! principal, and scaling-event persistence, plus schema initialization and async runtime behavior.
 
 use std::error::Error;
 use std::num::NonZeroUsize;
@@ -250,17 +250,14 @@ fn relative_database_path_is_anchored_to_configuration() -> gang_testkit::TestRe
 }
 
 #[tokio::test]
-async fn version_two_upgrade_preserves_existing_rows() -> gang_testkit::TestResult {
+async fn current_schema_reopen_preserves_existing_rows() -> gang_testkit::TestResult {
     let dir = TempDir::new()?;
     let initial = store(&dir);
     initial.revocation_epoch().await?;
     initial.close().await?;
     let db = raw_connection(&dir);
     db.execute_batch(
-        "DROP TABLE counters;
-         DROP TABLE expiring_records;
-         PRAGMA user_version = 2;
-         INSERT INTO issued_certificates VALUES ('01', 'test', 'alice', 10, 20, NULL);
+        "INSERT INTO issued_certificates VALUES ('01', 'test', 'alice', 10, 20, NULL);
          INSERT INTO principals VALUES ('test', 'alice', 10, 10, NULL);
          INSERT INTO scaling_audit (at, fleet, kind) VALUES (10, 'fleet', 'terminated');",
     )?;
@@ -640,7 +637,7 @@ async fn certificates_of_survives_reopening_the_database() {
     );
 }
 
-/// `issued_certificates` with the migration 1 columns and indexes in a different order.
+/// `issued_certificates` with its columns and indexes in a different order.
 const REORDERED_ISSUED_CERTIFICATES: &str = "
 BEGIN;
 CREATE TABLE issued_certificates_new (
@@ -2192,7 +2189,7 @@ async fn database_with_a_newer_schema_is_refused() {
         store
             .certificate(&serial("01"))
             .await
-            .expect("lookup migrates the database");
+            .expect("lookup initializes the database");
         store.close().await.expect("connection closes");
     }
     {
@@ -2224,12 +2221,12 @@ async fn database_with_a_newer_schema_is_refused() {
     assert!(
         matches!(
             schema_too_new,
-            Some(SqliteError::Schema(gang_spi::SchemaTooNew {
-                stored: gang_spi::SchemaVersion { current: 999, .. },
+            Some(SqliteError::Schema(gang_spi::SchemaMismatch {
+                stored: 999,
                 ..
             }))
         ),
-        "expected SchemaTooNew in the source chain, got {schema_too_new:?}"
+        "expected SchemaMismatch in the source chain, got {schema_too_new:?}"
     );
 }
 
@@ -2240,7 +2237,7 @@ async fn statements_do_not_block_the_async_runtime() {
     settings.busy_timeout = NonZeroDuration::from_millis(100);
     let store = open(settings);
     let who = identity("alpha", "dev@example.test");
-    // The first read creates and migrates the database, so the lock below contends only with writes.
+    // The first read initializes the database, so the lock below contends only with writes.
     store
         .certificate(&serial("01"))
         .await

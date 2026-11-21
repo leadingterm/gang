@@ -185,7 +185,6 @@ impl Drop for Listener {
 pub struct Balancer {
     serve: Listener,
     workers: Listener,
-    legacy_execution: Option<Listener>,
     changes: Arc<Changes>,
 }
 
@@ -205,28 +204,8 @@ impl Balancer {
             )
             .await?,
             workers: Listener::start(clock, probe, Frontend::Workers, Arc::clone(&changes)).await?,
-            legacy_execution: None,
             changes,
         })
-    }
-
-    pub(crate) async fn start_release<C: Clock + 'static>(
-        clock: Arc<C>,
-        probe: Probe,
-        split_execution: bool,
-    ) -> Result<Self, E2eError> {
-        let mut balancer = Self::start(Arc::clone(&clock), probe).await?;
-        if split_execution {
-            balancer.legacy_execution = Some(
-                Listener::start(clock, probe, Frontend::Serve, Arc::clone(&balancer.changes))
-                    .await?,
-            );
-        }
-        Ok(balancer)
-    }
-
-    pub(crate) fn legacy_execution(&self) -> Option<&Listener> {
-        self.legacy_execution.as_ref()
     }
 
     fn listener(&self, frontend: Frontend) -> &Listener {
@@ -285,10 +264,6 @@ impl Balancer {
 }
 
 impl Listener {
-    pub(crate) fn address(&self) -> SocketAddr {
-        self.address
-    }
-
     pub(crate) fn register(&self, target: Target) {
         self.targets
             .lock()
@@ -337,13 +312,6 @@ impl Listener {
         targets.policy = PolicyState { policy, generation };
         drop(targets);
         self.policy_changed.notify_one();
-        self.changes.notify();
-    }
-
-    pub(crate) fn remove(&self) {
-        self.accept.abort();
-        self.health.abort();
-        self.targets.lock().entries.clear();
         self.changes.notify();
     }
 
@@ -736,7 +704,7 @@ mod tests {
             expect_bytes(&mut direct_backend, b"draining-direct").await?;
             framed.write_all(b"draining-framed").await?;
             expect_bytes(&mut framed_backend, b"draining-framed").await?;
-            balancer.listener(Frontend::Workers).remove();
+            drop(balancer);
             let mut byte = [0];
             assert_eq!(direct.read(&mut byte).await?, 0);
             assert_eq!(framed.read(&mut byte).await?, 0);
@@ -923,8 +891,7 @@ mod tests {
 
     #[tokio::test]
     async fn controller_deregistration_preserves_all_frontend_flows() -> TestResult {
-        let balancer =
-            Balancer::start_release(Arc::new(TestClock::default()), Probe::default(), true).await?;
+        let balancer = Balancer::start(Arc::new(TestClock::default()), Probe::default()).await?;
         let old = Echo::start(1).await?;
         let new = Echo::start(2).await?;
         let frontends = [Frontend::Serve, Frontend::Workers];
@@ -948,50 +915,13 @@ mod tests {
                 },
             );
         }
-        let legacy = balancer
-            .legacy_execution()
-            .ok_or("missing legacy listener")?;
-        legacy.register(Target {
-            traffic: old.address,
-            health: old.address,
-        });
-        let mut legacy_flow = TcpStream::connect(legacy.address()).await?;
-        assert_eq!(exchange(&mut legacy_flow, 1).await?, 1);
-        legacy.register(Target {
-            traffic: new.address,
-            health: new.address,
-        });
         for frontend in frontends {
             balancer.deregister(frontend, old.address);
         }
-        legacy.deregister(old.address);
         for (frontend, mut flow) in frontends.into_iter().zip(flows) {
             assert_eq!(exchange(&mut flow, 2).await?, 1);
             assert_eq!(request(&balancer, frontend).await?, 2);
         }
-        assert_eq!(exchange(&mut legacy_flow, 2).await?, 1);
-        let mut replacement = TcpStream::connect(legacy.address()).await?;
-        assert_eq!(exchange(&mut replacement, 3).await?, 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn explicit_listener_removal_closes_existing_flows() -> TestResult {
-        let balancer =
-            Balancer::start_release(Arc::new(TestClock::default()), Probe::default(), true).await?;
-        let echo = Echo::start(9).await?;
-        let legacy = balancer
-            .legacy_execution()
-            .ok_or("missing legacy listener")?;
-        legacy.register(Target {
-            traffic: echo.address,
-            health: echo.address,
-        });
-        let mut stream = TcpStream::connect(legacy.address()).await?;
-        assert_eq!(exchange(&mut stream, 1).await?, 9);
-        legacy.remove();
-        let mut byte = [0];
-        assert_eq!(stream.read(&mut byte).await?, 0);
         Ok(())
     }
 

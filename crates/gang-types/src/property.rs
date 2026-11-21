@@ -17,14 +17,18 @@ pub const MEMORY_KB: &str = "memory_kb";
 /// Disk in KiB. Matches when the fleet has at least the requested amount.
 pub const DISK_KB: &str = "disk_kb";
 /// The action's requested network capability.
-pub const NETWORK: &str = "network";
+pub const NETWORK: &str = "gang_network_access";
+/// Original network hint; imposes no matching or capability constraint.
+pub const NETWORK_HINT: &str = "network";
 /// Persistent-worker marker; actions still execute one-shot.
 pub const SUPPORTS_WORKERS: &str = "supports-workers";
-/// The action environment identity. Matches exactly.
-pub const ACTION_ENVIRONMENT: &str = "gang_action_environment";
+/// The execution environment identity. Matches exactly.
+pub const ACTION_ENVIRONMENT: &str = "gang_execution_environment";
+/// Original action-cache namespace; imposes no execution identity constraint.
+pub const CACHE_NAMESPACE: &str = "gang_action_environment";
 
 /// Every reserved property key.
-pub const RESERVED: [&str; 10] = [
+pub const RESERVED: [&str; 12] = [
     FLEET,
     ISA,
     SANDBOX,
@@ -35,10 +39,12 @@ pub const RESERVED: [&str; 10] = [
     NETWORK,
     SUPPORTS_WORKERS,
     ACTION_ENVIRONMENT,
+    CACHE_NAMESPACE,
+    NETWORK_HINT,
 ];
 
 /// Explicitly harmless properties that impose nothing on matching.
-pub const HARMLESS_PROPERTIES: [&str; 1] = [SUPPORTS_WORKERS];
+pub const HARMLESS_PROPERTIES: [&str; 3] = [SUPPORTS_WORKERS, CACHE_NAMESPACE, NETWORK_HINT];
 
 /// Returns whether `key` is one of the [`RESERVED`] keys.
 ///
@@ -81,6 +87,8 @@ mod tests {
             "network",
             "supports-workers",
             "gang_action_environment",
+            "gang_execution_environment",
+            "gang_network_access",
         ] {
             assert!(is_reserved(key), "{key}");
         }

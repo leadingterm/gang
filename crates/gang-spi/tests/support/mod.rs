@@ -447,7 +447,7 @@ impl SchedulerPort for Stub {
         into.queued.push(QueuedDemand {
             source: None,
             candidates,
-            environment: "host:test".parse().map_err(PortError::backend)?,
+            environment: Some("host:test".parse().map_err(PortError::backend)?),
             resources: ActionResources::default(),
             queued_since: Timestamp::UNIX_EPOCH,
             priority: i32::try_from(self.number).map_err(PortError::backend)?,

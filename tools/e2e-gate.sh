@@ -28,10 +28,6 @@ bundle_file() {
 }
 previous_gang=$(bundle_file previous.binary)
 previous_fixture=$(bundle_file previous.fixture)
-historical_gang=$(bundle_file historical.binary)
-historical_fixture=$(bundle_file historical.fixture)
-calibration_gang=$(bundle_file calibration.binary)
-calibration_fixture=$(bundle_file calibration.fixture)
 candidate_fixture=$(bundle_file candidate_fixture)
 XDG_RUNTIME_DIR="/run/user/$(id -u)"
 export XDG_RUNTIME_DIR
@@ -45,8 +41,6 @@ start=$SECONDS
 systemd-run --user --unit="$unit" --collect --pipe --wait --same-dir --slice=gang.slice -p Type=oneshot -p Delegate=yes -p TimeoutStartSec="$budget" -p TimeoutStopSec=10 \
   --setenv=PATH="$PATH" --setenv=GANG_E2E_GLIBC_TOOL="$bundle/loaded_probe" \
   --setenv=GANG_E2E_PREVIOUS_GANG="$previous_gang" --setenv=GANG_E2E_PREVIOUS_FIXTURE="$previous_fixture" \
-  --setenv=GANG_E2E_HISTORICAL_GANG="$historical_gang" --setenv=GANG_E2E_HISTORICAL_FIXTURE="$historical_fixture" \
-  --setenv=GANG_E2E_CALIBRATION_GANG="$calibration_gang" --setenv=GANG_E2E_CALIBRATION_FIXTURE="$calibration_fixture" \
   --setenv=GANG_E2E_CANDIDATE_FIXTURE="$candidate_fixture" -- \
   nix develop -c env -u XDG_CONFIG_HOME -u XDG_CACHE_HOME HOME="$home" \
   "$bundle/local" --gang "$gang" --bazel "$bundle/bazel" --postgres "$bundle/postgresql.tar.gz" \

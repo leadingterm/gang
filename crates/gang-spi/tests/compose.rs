@@ -564,7 +564,7 @@ fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
         &name,
         Isa::X86_64,
         &"boxed",
-        &"host:test".parse()?,
+        Some(&"host:test".parse()?),
         Resources {
             vcpus: 4,
             memory: Bytes::new(1),

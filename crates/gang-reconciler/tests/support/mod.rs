@@ -181,13 +181,15 @@ impl Harness {
             self.snapshot.queued.push(QueuedDemand {
                 source: None,
                 candidates,
-                environment: candidates
-                    .iter()
-                    .find_map(|index| self.passes.get(index))
-                    .unwrap_or(&self.passes[0])
-                    .policy
-                    .action_environment
-                    .clone(),
+                environment: Some(
+                    candidates
+                        .iter()
+                        .find_map(|index| self.passes.get(index))
+                        .unwrap_or(&self.passes[0])
+                        .policy
+                        .action_environment
+                        .clone(),
+                ),
                 resources,
                 queued_since,
                 priority: 0,

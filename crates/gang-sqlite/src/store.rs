@@ -7,7 +7,7 @@ use gang_clock::Poll;
 use gang_spi::{Plugin, PluginContext, PortError};
 use gang_types::NonZeroDuration;
 
-use crate::migrations::migrate;
+use crate::schema::initialize;
 use crate::{SqliteConfig, SqliteError};
 
 /// The `SQLite`-backed state repository. Its lock is acquired at build time and its database
@@ -91,7 +91,7 @@ impl Sqlite {
         Ok(())
     }
 
-    /// Runs `work` on the database thread with the open, migrated connection; the first call
+    /// Runs `work` on the database thread with the open, initialized connection; the first call
     /// opens the database (a failed open is not cached).
     pub(crate) async fn run<T: Send + 'static>(
         &self,
@@ -146,10 +146,10 @@ struct BringUp {
     pragmas: String,
 }
 
-/// Applies the pragmas and migrates the schema. A failure leaves the database as it was.
+/// Applies the pragmas and initializes or checks the schema. A failure leaves the database as it was.
 fn bring_up(db: &mut rusqlite::Connection, settings: &BringUp) -> Result<(), SqliteError> {
     db.execute_batch(&settings.pragmas)?;
-    migrate(db)
+    initialize(db)
 }
 
 /// Brings the connection up, waiting at most `busy_timeout` in total while another connection
@@ -406,11 +406,11 @@ mod tests {
     }
 
     /// Two first opens of one database, interleaved through the pause: the first holds the write
-    /// lock while its migration is under way, the second finds it busy, and on the second's pause
-    /// the first finishes migrating. The second must then come up without running any migration
-    /// itself (a second run would fail on the existing tables).
+    /// lock while initialization is under way, the second finds it busy, and on the second's pause
+    /// the first finishes initializing. The second must then open the initialized schema without
+    /// trying to create the existing tables again.
     #[test]
-    fn an_opener_that_waits_for_a_first_migration_runs_none_of_its_own() {
+    fn an_opener_waits_for_initialization_then_opens_existing_schema() {
         let settings = bring_up_settings(Duration::from_secs(1));
         let dir = TempDir::new().expect("temp dir is created");
         let path = dir.path().join("gang.db");
@@ -428,19 +428,19 @@ mod tests {
                 first
                     .execute_batch("COMMIT")
                     .expect("write lock is released");
-                migrate(&mut first).expect("the first opener migrates");
+                initialize(&mut first).expect("the first opener initializes");
             }
         })
-        .expect("the second opener comes up after the first one's migration");
+        .expect("the second opener comes up after initialization");
 
         assert_eq!(pauses, 1, "the second opener waits exactly once");
         let version: i64 = second
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user version reads");
-        let mut migrated =
+        let mut initialized =
             rusqlite::Connection::open_in_memory().expect("in-memory database opens");
-        migrate(&mut migrated).expect("a fresh database migrates");
-        let newest: i64 = migrated
+        initialize(&mut initialized).expect("a fresh database initializes");
+        let newest: i64 = initialized
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user version reads");
         assert_eq!(version, newest);

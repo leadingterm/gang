@@ -351,11 +351,17 @@ mod tests {
             ),
             (
                 "repo_env".to_owned(),
-                setting("GANG_ACTION_ENVIRONMENT=host:test", OptionSource::Unknown),
+                setting(
+                    "GANG_EXECUTION_ENVIRONMENT=host:test",
+                    OptionSource::Unknown,
+                ),
             ),
             (
                 "remote_default_exec_properties".to_owned(),
-                setting("gang_action_environment=host:test", OptionSource::Unknown),
+                setting(
+                    "gang_execution_environment=host:test",
+                    OptionSource::Unknown,
+                ),
             ),
             (
                 CREDENTIAL_HELPER.to_owned(),
@@ -567,11 +573,17 @@ mod tests {
             ),
             (
                 "repo_env".to_owned(),
-                setting("GANG_ACTION_ENVIRONMENT=host:test", OptionSource::Unknown),
+                setting(
+                    "GANG_EXECUTION_ENVIRONMENT=host:test",
+                    OptionSource::Unknown,
+                ),
             ),
             (
                 "remote_default_exec_properties".to_owned(),
-                setting("gang_action_environment=host:test", OptionSource::Unknown),
+                setting(
+                    "gang_execution_environment=host:test",
+                    OptionSource::Unknown,
+                ),
             ),
             (
                 CREDENTIAL_HELPER.to_owned(),
@@ -949,11 +961,17 @@ mod tests {
                 ),
                 (
                     "repo_env".to_owned(),
-                    setting("GANG_ACTION_ENVIRONMENT=host:test", OptionSource::Unknown),
+                    setting(
+                        "GANG_EXECUTION_ENVIRONMENT=host:test",
+                        OptionSource::Unknown,
+                    ),
                 ),
                 (
                     "remote_default_exec_properties".to_owned(),
-                    setting("gang_action_environment=host:test", OptionSource::Unknown),
+                    setting(
+                        "gang_execution_environment=host:test",
+                        OptionSource::Unknown,
+                    ),
                 ),
             ])),
         };

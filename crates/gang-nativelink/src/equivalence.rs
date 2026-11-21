@@ -43,7 +43,7 @@ fn fleet(
         &FleetName::try_new(name)?,
         isa,
         &sandbox,
-        &"host:test".parse().expect("valid environment"),
+        Some(&"host:test".parse().expect("valid environment")),
         Resources {
             vcpus,
             memory: Bytes::new(gib << 30),

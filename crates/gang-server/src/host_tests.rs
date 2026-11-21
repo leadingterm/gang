@@ -40,7 +40,7 @@ fn host(
 ) -> Host<TlsDeployment> {
     let (providers, _verifier) = providers();
     Host {
-        proxy_protocol: Arc::new(gang_config::ProxyProtocolConfig::default()),
+        proxy_protocol: None,
         repository: repository.clone(),
         signer: Arc::new(TestSigner::authority().expect("the test signer builds")),
         security,

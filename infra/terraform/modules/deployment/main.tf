@@ -1,4 +1,5 @@
 data "aws_partition" "this" {}
+data "aws_caller_identity" "this" {}
 
 resource "terraform_data" "input_checks" {
   lifecycle {
@@ -24,8 +25,8 @@ resource "terraform_data" "input_checks" {
         var.database.engine == "postgres" && try(var.database.postgres.rds, null) != null ? "/${var.name}/database-password" : null,
         var.database.engine == "postgres" ? try(var.database.postgres.external.password_parameter, null) : null,
         var.database.engine == "postgres" ? try(var.database.postgres.external.ca_parameter, null) : null,
-      ])) : secret != local.config_parameter_name && !startswith(secret, "${local.config_parameter_name}/generations/")])
-      error_message = "Controller secret parameters must not overlap the legacy config parameter or its generations subtree."
+      ])) : !startswith(secret, "${local.config_parameter_name}/generations/")])
+      error_message = "Controller secret parameters must not overlap the configuration generations subtree."
     }
     precondition {
       condition     = !local.network_granted || var.execution_egress != null
@@ -99,7 +100,6 @@ locals {
   worker_host                       = local.group ? var.hostname : module.network.controller_private_dns
   endpoint                          = local.group && var.hostname == null ? null : (local.public_port == 443 ? "https://${local.public_host}" : "https://${local.public_host}:${local.public_port}")
   worker_endpoint                   = local.group && var.hostname == null ? null : "grpcs://${local.worker_host}:${local.worker_port}"
-  proxy_protocol_mode               = !local.group || var.load_balancer == null ? "off" : (var.load_balancer.proxy_protocol_stage == "proxied" ? "accept" : var.load_balancer.proxy_protocol_stage)
   health                            = jsondecode(file("${path.module}/../load-balancer/health-check.json"))
   standby_routability_delay_seconds = local.group && var.load_balancer != null ? local.health.interval_seconds * local.health.threshold : 0
 
@@ -140,7 +140,7 @@ locals {
     public_port                       = local.public_port
     worker_port                       = local.worker_port
     health_port                       = var.load_balancer == null ? null : module.network.health_port
-    proxy_protocol_mode               = local.proxy_protocol_mode
+    proxy_protocol_enabled            = local.group && var.load_balancer != null
     proxy_trusted_cidrs               = local.group && var.load_balancer != null ? module.load_balancer[0].proxy_protocol_trusted_cidrs : []
     endpoint                          = local.endpoint
     endpoint_trust                    = var.load_balancer == null ? null : "system"
@@ -171,30 +171,13 @@ locals {
   ])))
 }
 
-resource "aws_ssm_parameter" "config" {
-  name        = local.config_parameter_name
-  description = "Rendered gang.toml read by gang-config.service at boot. Contains no secrets: confidential values live in the SecureString parameters named by controller_secret_parameters and are referenced by file path."
-  type        = "String"
-  tier        = "Intelligent-Tiering"
-  value       = local.gang_toml
-  tags        = merge(var.tags, { Name = "${var.name}-config" })
-  lifecycle {
-    ignore_changes = [name, value]
-    destroy        = false
-
-    postcondition {
-      condition     = self.name == local.config_parameter_name
-      error_message = "The legacy configuration namespace is immutable."
-    }
-  }
-}
 
 resource "terraform_data" "config_generation" {
   triggers_replace = sha256(local.gang_toml)
 }
 
 resource "aws_ssm_parameter" "config_generation" {
-  name      = "${aws_ssm_parameter.config.name}/generations/${terraform_data.config_generation.id}"
+  name      = "${local.config_parameter_name}/generations/${terraform_data.config_generation.id}"
   type      = "String"
   tier      = "Intelligent-Tiering"
   value     = local.gang_toml
@@ -209,7 +192,7 @@ resource "aws_ssm_parameter" "config_generation" {
 }
 
 locals {
-  config_parameter_arns = [aws_ssm_parameter.config.arn, "${aws_ssm_parameter.config.arn}/generations/*"]
+  config_parameter_arns = ["arn:${data.aws_partition.this.partition}:ssm:${var.region}:${data.aws_caller_identity.this.account_id}:parameter${local.config_parameter_name}/generations/*"]
 }
 
 module "controller" {
@@ -260,7 +243,6 @@ module "load_balancer" {
   name                           = var.name
   vpc_id                         = module.network.vpc_id
   shared_database                = local.group
-  proxy_protocol_stage           = var.load_balancer.proxy_protocol_stage
   public_subnet_ids              = module.network.public_subnet_ids
   public_subnets_by_az           = local.public_subnets
   static_public_ips              = local.network_granted
@@ -281,6 +263,7 @@ module "load_balancer" {
   certificate_validation_timeout = var.load_balancer.certificate_validation_timeout
   tags                           = var.tags
 }
+
 
 module "worker_fleet" {
   source = "../worker-fleet"

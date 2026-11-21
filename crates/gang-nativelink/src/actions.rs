@@ -510,7 +510,7 @@ pub(crate) mod tests {
             &FleetName::try_new(name)?,
             isa,
             &"docker",
-            &"host:test".parse().expect("valid environment"),
+            Some(&"host:test".parse().expect("valid environment")),
             Resources {
                 vcpus: 4,
                 memory: Bytes::new(8_589_934_592),

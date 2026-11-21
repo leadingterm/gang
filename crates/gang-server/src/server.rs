@@ -60,7 +60,7 @@ impl From<&ServerSettings> for HealthLimits {
             max_connections: settings.health_max_connections,
             max_header_size: settings.health_max_header_size,
             accept_error_backoff: settings.accept_error_backoff,
-            proxy_protocol: Arc::clone(&settings.proxy_protocol),
+            proxy_protocol: settings.proxy_protocol.clone(),
         }
     }
 }
@@ -1762,16 +1762,6 @@ fn warn_unauthenticated(
     }
 }
 
-fn proxy_mode(
-    config: &gang_config::ProxyProtocolConfig,
-    role: EndpointRole,
-) -> gang_config::ProxyProtocol {
-    match role {
-        EndpointRole::Public => config.public,
-        EndpointRole::Worker => config.worker,
-    }
-}
-
 /// Opens one listener under the policy for its endpoint.
 async fn open_listener<D: Deployment>(
     listener: D::Listener,
@@ -1781,14 +1771,12 @@ async fn open_listener<D: Deployment>(
     accept_error_backoff: NonZeroDuration,
 ) -> Result<Accepting<D::Listener, Arc<D::Signer>, D::Clock>, ServerError> {
     let config = &core.host.proxy_protocol;
-    let mode = proxy_mode(config, role);
     let Security::Tls(tls) = &core.host.security else {
         return Ok(Accepting::plain(
             listener,
             accept_error_backoff,
             Arc::clone(&core.host.clock),
-            mode,
-            Arc::clone(config),
+            config.clone(),
         ));
     };
     let (name, certificates, alpn) = match role {
@@ -1810,7 +1798,7 @@ async fn open_listener<D: Deployment>(
         alpn,
         revoked_certificates,
         accept_error_backoff,
-        (mode, Arc::clone(config)),
+        config.clone(),
     );
     Accepting::secured(
         listener,
@@ -1830,10 +1818,7 @@ fn policy<K: Stack>(
     alpn: Alpn,
     revoked_certificates: &RevocationSet,
     accept_error_backoff: NonZeroDuration,
-    (proxy_mode, proxy_protocol): (
-        gang_config::ProxyProtocol,
-        Arc<gang_config::ProxyProtocolConfig>,
-    ),
+    proxy_protocol: Option<Arc<gang_config::ProxyProtocolConfig>>,
 ) -> TlsPolicy {
     TlsPolicy {
         names: vec![name.clone()],
@@ -1844,7 +1829,6 @@ fn policy<K: Stack>(
         alpn,
         handshake: tls.settings.handshake,
         accept_error_backoff,
-        proxy_mode,
         proxy_protocol,
     }
 }
@@ -2589,25 +2573,6 @@ mod tests {
             .map_err(|()| "restarted process stopped early")?;
         restarted.await?;
         Ok(())
-    }
-
-    #[test]
-    fn proxy_modes_are_selected_per_endpoint_role() {
-        use gang_config::{ProxyProtocol, ProxyProtocolConfig};
-        let config = ProxyProtocolConfig {
-            public: ProxyProtocol::Require,
-            worker: ProxyProtocol::Accept,
-            health: ProxyProtocol::Off,
-            ..ProxyProtocolConfig::default()
-        };
-        assert_eq!(
-            super::proxy_mode(&config, EndpointRole::Public),
-            ProxyProtocol::Require
-        );
-        assert_eq!(
-            super::proxy_mode(&config, EndpointRole::Worker),
-            ProxyProtocol::Accept
-        );
     }
 
     #[tokio::test]

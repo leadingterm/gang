@@ -18,11 +18,6 @@ output "config_parameter_reference" {
   value       = "${aws_ssm_parameter.config_generation.name}:1"
 }
 
-output "legacy_config_parameter_name" {
-  description = "Frozen legacy configuration parameter name."
-  value       = aws_ssm_parameter.config.name
-}
-
 output "endpoint" {
   description = "Public endpoint (Bazel, gang login and workload clients) written to gang.toml."
   value       = local.endpoint

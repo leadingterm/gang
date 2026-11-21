@@ -109,7 +109,7 @@ pub struct ServerSettings {
     /// Shared rate-based scaling policy for the adapter and each leadership term.
     pub scaling: Arc<gang_config::ScalingConfig>,
     /// Shared trusted PROXY protocol listener settings.
-    pub proxy_protocol: Arc<gang_config::ProxyProtocolConfig>,
+    pub proxy_protocol: Option<Arc<gang_config::ProxyProtocolConfig>>,
     /// Lease timing for this controller.
     pub leadership: LeadershipConfig,
     /// Time a newer standby must remain routable before requesting handover.

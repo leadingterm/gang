@@ -22,7 +22,7 @@ fn queued_environment_selects_only_matching_launch_fleet() -> TestResult {
     second.action_environment = "host:other".parse()?;
     let mut h = Harness::with_fleets(vec![first, second]);
     h.queue_candidates(FleetSet::prefix(2)?, 1);
-    h.snapshot.queued[0].environment = "host:other".parse()?;
+    h.snapshot.queued[0].environment = Some("host:other".parse()?);
     let steps = h.reconcile();
     assert!(
         steps
@@ -200,24 +200,203 @@ fn busy_stale_and_unborn_replacement_do_not_repeat_scale_out_at_target() -> Test
 }
 
 #[test]
-fn stale_busy_worker_finishes_and_live_only_demand_does_not_scale() -> TestResult {
-    let mut policy = policy()?;
-    policy.instances = InstanceBounds::try_new(0, NonZeroU32::MIN.saturating_add(1))?;
-    let mut h = Harness::with_policy(policy);
+fn stale_worker_retires_only_after_running_and_queued_work_finish() -> TestResult {
+    for environment in [None, Some("host:old".parse()?)] {
+        let mut policy = policy()?;
+        policy.instances = InstanceBounds::try_new(0, NonZeroU32::MIN.saturating_add(1))?;
+        let mut h = Harness::with_policy(policy);
+        h.settle_term()?;
+        serve(&mut h, "local-1", secs(60))?;
+        h.snapshot.workers[0].environment = environment.clone();
+        h.set_running("local-1", 1)?;
+        h.queue(X86, 1)?;
+        h.snapshot.queued[0].environment = environment;
+        assert!(h.run().is_empty());
+        h.set_running("local-1", 0)?;
+        assert!(h.run().is_empty());
+        assert_eq!(h.outlook(X86)?.queued, 0);
+        h.snapshot.queued.clear();
+        let steps = h.run();
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step.action, Action::StartDrain { .. }))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn idle_stale_worker_retains_capacity_for_its_queued_environment() -> TestResult {
+    let mut h = Harness::new()?;
     h.settle_term()?;
     serve(&mut h, "local-1", secs(60))?;
     h.snapshot.workers[0].environment = Some("host:old".parse()?);
-    h.set_running("local-1", 1)?;
     h.queue(X86, 1)?;
-    h.snapshot.queued[0].environment = "host:old".parse()?;
+    h.snapshot.queued[0].environment = Some("host:old".parse()?);
     assert!(h.run().is_empty());
-    h.set_running("local-1", 0)?;
+    h.snapshot.queued.clear();
     let steps = h.run();
     assert!(
         steps
             .iter()
             .any(|step| matches!(step.action, Action::StartDrain { .. }))
     );
+    Ok(())
+}
+
+#[test]
+fn queued_stale_environment_resumes_only_controller_owned_drain() -> TestResult {
+    for (environment, owned) in [None, Some("host:old".parse()?)]
+        .into_iter()
+        .flat_map(|environment| [false, true].map(|owned| (environment.clone(), owned)))
+    {
+        let mut policy = policy()?;
+        policy.instances = InstanceBounds::try_new(0, NonZeroU32::MIN)?;
+        let mut h = Harness::with_policy(policy);
+        h.settle_term()?;
+        serve(&mut h, "local-1", secs(60))?;
+        h.snapshot.workers[0].environment = environment.clone();
+        h.queue(X86, 1)?;
+        h.snapshot.queued[0].environment = environment;
+        if owned {
+            h.set_draining("local-1", true)?;
+        } else {
+            h.snapshot.workers[0].draining = true;
+        }
+        let steps = h.run();
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(step.action, Action::CancelDrain(..)))
+                .count(),
+            usize::from(owned)
+        );
+        assert!(!steps.iter().any(|step| matches!(
+            step.action,
+            Action::StartDrain { .. } | Action::Terminate { .. } | Action::ScaleOut { .. }
+        )));
+        assert!(h.run().is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn unscoped_and_scoped_stale_work_do_not_retain_each_others_workers() -> TestResult {
+    for worker_environment in [None, Some("host:old".parse()?)] {
+        let mut h = Harness::new()?;
+        h.settle_term()?;
+        serve(&mut h, "local-1", secs(60))?;
+        h.queue(X86, 1)?;
+        h.snapshot.queued[0].environment = if worker_environment.is_some() {
+            None
+        } else {
+            Some("host:old".parse()?)
+        };
+        h.snapshot.workers[0].environment = worker_environment;
+        let steps = h.run();
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step.action, Action::StartDrain { .. }))
+        );
+        assert!(!steps.iter().any(|step| matches!(
+            step.action,
+            Action::CancelDrain(..) | Action::ScaleOut { .. }
+        )));
+        assert_eq!(h.outlook(X86)?.queued, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn unscoped_queue_cannot_launch_current_capacity_from_zero() -> TestResult {
+    let mut h = Harness::new()?;
+    h.settle_term()?;
+    h.queue(X86, 1)?;
+    h.snapshot.queued[0].environment = None;
+    assert!(h.run().is_empty());
+    assert_eq!(h.outlook(X86)?.queued, 0);
+    assert_eq!(h.outlook(X86)?.expected_wait, None);
+    Ok(())
+}
+
+#[test]
+fn matching_stale_environment_retains_worker_despite_current_catalog_exclusion() -> TestResult {
+    for environment in [None, Some("host:old".parse()?)] {
+        let mut h = Harness::new()?;
+        h.settle_term()?;
+        serve(&mut h, "local-1", secs(60))?;
+        h.snapshot.workers[0].environment = environment.clone();
+        h.set_running("local-1", 1)?;
+        h.queue(X86, 1)?;
+        h.snapshot.queued[0].environment = environment;
+        h.snapshot.queued[0].candidates = FleetSet::EMPTY;
+        assert!(h.run().is_empty());
+        h.set_running("local-1", 0)?;
+        assert!(h.run().is_empty());
+        assert_eq!(h.outlook(X86)?.queued, 0);
+        h.snapshot.queued.clear();
+        assert!(
+            h.run()
+                .iter()
+                .any(|step| matches!(step.action, Action::StartDrain { .. }))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn unscoped_queue_retention_does_not_supply_current_capacity() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(0, NonZeroU32::MIN.saturating_add(1))?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-1", secs(60))?;
+    h.snapshot.workers[0].environment = None;
+    h.queue(X86, 1)?;
+    h.snapshot.queued[0].environment = None;
+    h.queue(X86, 1)?;
+    let steps = h.reconcile();
+    assert!(
+        steps
+            .iter()
+            .any(|step| matches!(step.action, Action::ScaleOut { to: 2, .. }))
+    );
+    assert!(!steps.iter().any(|step| matches!(
+        step.action,
+        Action::StartDrain { .. } | Action::Terminate { .. } | Action::CancelDrain(..)
+    )));
+    assert_eq!(h.outlook(X86)?.queued, 1);
+    Ok(())
+}
+
+#[test]
+fn mismatched_queue_never_resumes_an_owned_unscoped_drain() -> TestResult {
+    for environment in ["host:test", "host:old"] {
+        let mut policy = policy()?;
+        policy.instances = InstanceBounds::try_new(0, NonZeroU32::MIN)?;
+        let mut h = Harness::with_policy(policy);
+        h.settle_term()?;
+        serve(&mut h, "local-1", secs(60))?;
+        h.snapshot.workers[0].environment = None;
+        h.set_draining("local-1", true)?;
+        h.queue(X86, 1)?;
+        h.snapshot.queued[0].environment = Some(environment.parse()?);
+        let steps = h.run();
+        assert!(steps.iter().any(|step| matches!(
+            step.action,
+            Action::Terminate {
+                cause: TerminationCause::StaleEnvironment,
+                ..
+            }
+        )));
+        assert!(
+            !steps
+                .iter()
+                .any(|step| matches!(step.action, Action::CancelDrain(..)))
+        );
+    }
     Ok(())
 }
 

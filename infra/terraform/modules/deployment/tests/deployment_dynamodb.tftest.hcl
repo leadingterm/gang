@@ -1,4 +1,8 @@
 mock_provider "aws" {
+  mock_data "aws_caller_identity" {
+    defaults = { account_id = "000000000000" }
+  }
+
   mock_data "aws_network_interface" {
     defaults = { private_ips = ["10.20.2.10", "10.20.2.11"] }
   }
@@ -224,8 +228,8 @@ run "dynamodb_group_shape" {
     error_message = "The group must use its deployment-named table without a controller Elastic IP."
   }
   assert {
-    condition     = strcontains(output.gang_toml, "[server.proxy_protocol]\npublic = \"accept\"\nworker = \"accept\"\nhealth = \"accept\"\ntrusted_cidrs = [\"10.20.2.10/32\",\"10.20.2.11/32\"]") && !strcontains(output.gang_toml, "10.20.0.0/16")
-    error_message = "DynamoDB must render accept mode and exact NLB interface addresses."
+    condition     = strcontains(output.gang_toml, "[server.proxy_protocol]\ntrusted_cidrs = [\"10.20.2.10/32\",\"10.20.2.11/32\"]") && !strcontains(output.gang_toml, "10.20.0.0/16")
+    error_message = "DynamoDB must render exact NLB interface addresses."
   }
 }
 

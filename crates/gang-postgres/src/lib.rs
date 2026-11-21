@@ -22,11 +22,11 @@ mod config;
 mod errors;
 mod expiring;
 mod lease;
-mod migrations;
 mod plugin;
 mod repository;
+mod schema;
 
 pub use config::{PostgresConfig, Tls};
 pub use errors::PostgresError;
-pub use migrations::SCHEMA_VERSION;
 pub use plugin::Postgres;
+pub use schema::SCHEMA_VERSION;

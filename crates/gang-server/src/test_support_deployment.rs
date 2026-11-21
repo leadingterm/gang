@@ -202,7 +202,7 @@ pub fn tls_settings() -> ServerSettings {
             ..gang_config::ActionsConfig::default()
         }),
         scaling: Arc::new(gang_config::ScalingConfig::default()),
-        proxy_protocol: std::sync::Arc::new(gang_config::ProxyProtocolConfig::default()),
+        proxy_protocol: None,
         leadership: gang_config::LeadershipConfig::default(),
         standby_routability_delay: Duration::ZERO,
         handoff_timeout: Duration::from_mins(1),

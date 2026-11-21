@@ -153,7 +153,7 @@ impl FleetPolicy {
             &self.name,
             self.isa,
             sandbox,
-            &self.action_environment,
+            Some(&self.action_environment),
             self.instance(),
             &self.actions,
             options,

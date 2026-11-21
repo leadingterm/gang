@@ -515,7 +515,7 @@ async fn a_second_core_continues_a_device_login() -> gang_testkit::TestResult {
     let original = &fixture.harness.core;
     let core: Arc<Core<TlsDeployment>> = Core::new(
         Host {
-            proxy_protocol: Arc::clone(&original.host.proxy_protocol),
+            proxy_protocol: original.host.proxy_protocol.clone(),
             repository: original.host.repository.clone(),
             signer: Arc::clone(&original.host.signer),
             security: Security::Plaintext,

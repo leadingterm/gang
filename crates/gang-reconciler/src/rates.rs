@@ -509,9 +509,9 @@ impl SourceRates {
             self.current(
                 row.source,
                 row.candidates.iter().find(|&index| {
-                    fleets
-                        .get(index)
-                        .is_some_and(|fleet| fleet.policy.action_environment == row.environment)
+                    fleets.get(index).is_some_and(|fleet| {
+                        row.environment.as_ref() == Some(&fleet.policy.action_environment)
+                    })
                 }),
                 ResourceVector::from_action(row.resources),
                 duration,
@@ -680,9 +680,9 @@ impl SourceRates {
             let vector = ResourceVector::from_action(row.resources);
             let work = vector.scaled(self.queued_durations[i].as_secs_f64());
             let preferred = row.candidates.iter().find(|&index| {
-                fleets
-                    .get(index)
-                    .is_some_and(|fleet| fleet.policy.action_environment == row.environment)
+                fleets.get(index).is_some_and(|fleet| {
+                    row.environment.as_ref() == Some(&fleet.policy.action_environment)
+                })
             });
             let persistent = self.is_persistent(row.source, preferred);
             let scratch = &mut self.fleet_scratch[*fleet];
@@ -975,9 +975,11 @@ mod tests {
         QueuedDemand {
             source,
             candidates: FleetSet::try_from_indices([preferred]).unwrap(),
-            environment: gang_testkit::fleet_policy("workers")
-                .unwrap()
-                .action_environment,
+            environment: Some(
+                gang_testkit::fleet_policy("workers")
+                    .unwrap()
+                    .action_environment,
+            ),
             resources: ActionResources::default(),
             expected: expected.map(Duration::from_secs),
             queued_since: Timestamp::default(),

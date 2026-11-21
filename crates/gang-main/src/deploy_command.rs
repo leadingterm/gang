@@ -28,7 +28,6 @@ pub(crate) fn run(command: DeployCommand, input: impl Read, out: &Output) -> Res
     match command {
         DeployCommand::Policy => policy(input, out),
         DeployCommand::Configuration => configuration(input, std::io::stdout().lock()),
-        DeployCommand::RestartNeeded => restart_needed(input, out),
         DeployCommand::StoreRequest(args) => store_request(args, input, out),
         DeployCommand::Manifest(args) => manifest(args, input, out),
         DeployCommand::Comment(args) => comment(&args, input, out),
@@ -79,13 +78,6 @@ fn policy(input: impl Read, out: &Output) -> Result<ExitCode> {
         out.notice(change.to_string());
     }
     Ok(ExitCode::from(BLOCKED_EXIT_CODE))
-}
-
-/// Prints `true` when applying the plan needs the controller to reload its configuration.
-fn restart_needed(input: impl Read, out: &Output) -> Result<ExitCode> {
-    let plan: Plan = stdin_document(input)?;
-    out.data(plan.restart_needed().to_string())?;
-    Ok(ExitCode::SUCCESS)
 }
 
 /// Writes the planned configuration without changing its bytes.
@@ -303,7 +295,6 @@ mod tests {
     const WORKFLOW: &str = "example-org/gang/.github/workflows/infra.yml@refs/heads/main";
     const EMPTY_PLAN: &str = "{}";
     const BLOCKED_PLAN: &str = r#"{"resource_changes":[{"address":"aws_kms_key.state","type":"aws_kms_key","change":{"actions":["delete"]}}]}"#;
-    const RESTART_PLAN: &str = r#"{"resource_changes":[{"address":"module.gang.aws_ssm_parameter.config","type":"aws_ssm_parameter","change":{"actions":["update"],"before":{"value":"a"},"after":{"value":"b"},"after_unknown":{}}}]}"#;
 
     struct Case<'a> {
         args: Vec<&'a str>,
@@ -490,13 +481,6 @@ mod tests {
                     code: ExitCode::from(3),
                     stdout: "has_changes=true\nblocked=true\n",
                     stderr: Some("aws_kms_key.state"),
-                },
-                Case {
-                    args: vec!["restart-needed"],
-                    stdin: RESTART_PLAN,
-                    code: ExitCode::SUCCESS,
-                    stdout: "true\n",
-                    stderr: None,
                 },
                 Case {
                     args: vec![

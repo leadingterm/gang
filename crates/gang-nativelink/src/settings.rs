@@ -508,7 +508,7 @@ mod tests {
             &FleetName::try_new(name).expect("valid fleet name"),
             isa,
             &"docker",
-            &"host:test".parse().expect("valid environment"),
+            Some(&"host:test".parse().expect("valid environment")),
             Resources {
                 vcpus: 4,
                 memory: Bytes::new(8 * 1024 * 1024 * 1024),
@@ -618,7 +618,7 @@ mod tests {
             &FleetName::try_new("fleet-a").expect("valid fleet name"),
             Isa::X86_64,
             &"docker",
-            &"host:test".parse().expect("valid environment"),
+            Some(&"host:test".parse().expect("valid environment")),
             Resources {
                 vcpus: 15,
                 memory: Bytes::gib(8),
@@ -773,7 +773,7 @@ mod tests {
             &FleetName::try_new("limited").expect("fleet"),
             Isa::X86_64,
             &"docker",
-            &"host:test".parse().expect("valid environment"),
+            Some(&"host:test".parse().expect("valid environment")),
             Resources {
                 vcpus: 4,
                 memory: Bytes::gib(8),
@@ -1293,7 +1293,7 @@ mod tests {
                 &FleetName::try_new("fleet-b").expect("fleet name"),
                 Isa::Aarch64,
                 &"bwrap",
-                &"host:test".parse().expect("valid environment"),
+                Some(&"host:test".parse().expect("valid environment")),
                 Resources {
                     vcpus: 6,
                     memory: Bytes::gib(16),
@@ -1352,12 +1352,12 @@ mod tests {
             json!([
                 {
                     "minimum": { "cpu_count": 4, "cpu_millicores": 4000, "memory_kb": 8_388_608, "disk_kb": 104_857_600 },
-                    "exact": { "fleet": "fleet-a", "ISA": "x86-64", "sandbox": "docker", "gang_action_environment": "host:test", "capacity": "2" },
+                    "exact": { "fleet": "fleet-a", "ISA": "x86-64", "sandbox": "docker", (property::ACTION_ENVIRONMENT): "host:test", "capacity": "2" },
                     "action_ceilings": {}
                 },
                 {
                     "minimum": { "cpu_count": 6, "cpu_millicores": 6000, "memory_kb": 16_777_216, "disk_kb": 83_886_080 },
-                    "exact": { "fleet": "fleet-b", "ISA": "aarch64", "sandbox": "bwrap", "gang_action_environment": "host:test", "capacity": "3", "machine_class": "arm" },
+                    "exact": { "fleet": "fleet-b", "ISA": "aarch64", "sandbox": "bwrap", (property::ACTION_ENVIRONMENT): "host:test", "capacity": "3", "machine_class": "arm" },
                     "action_ceilings": {}
                 }
             ])

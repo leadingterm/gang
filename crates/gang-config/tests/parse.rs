@@ -588,71 +588,60 @@ impl Sections {
     }
 }
 #[test]
-fn proxy_protocol_defaults_are_off_and_bounded() -> Result<(), Box<dyn Error>> {
-    let proxy = Sections::VALID.parse()?.server.proxy_protocol;
-    assert_eq!(proxy.public, gang_config::ProxyProtocol::Off);
-    assert_eq!(proxy.worker, gang_config::ProxyProtocol::Off);
-    assert_eq!(proxy.health, gang_config::ProxyProtocol::Off);
-    assert!(proxy.trusted_cidrs.is_empty());
-    assert_eq!(proxy.header_timeout.get(), Duration::from_secs(10));
-    assert_eq!(proxy.max_pending_headers.get(), 256);
-    assert_eq!(proxy.max_header_size, Bytes::kib(4));
+fn proxy_protocol_defaults_to_direct_connections() -> Result<(), Box<dyn Error>> {
+    assert!(Sections::VALID.parse()?.server.proxy_protocol.is_none());
+    let configured =
+        toml::from_str::<gang_config::ProxyProtocolConfig>("trusted_cidrs = [\"192.0.2.1/32\"]")?;
+    assert_eq!(configured.header_timeout.get(), Duration::from_secs(10));
+    assert_eq!(configured.max_pending_headers.get(), 256);
+    assert_eq!(configured.max_header_size, Bytes::kib(4));
     Ok(())
 }
 
 #[test]
-fn proxy_protocol_document_round_trips_modes_and_networks() -> Result<(), Box<dyn Error>> {
+fn proxy_protocol_document_round_trips_networks() -> Result<(), Box<dyn Error>> {
     let text = format!(
-        "health_listen = \"127.0.0.1:9446\"\n{}\n[server.proxy_protocol]\npublic = \"require\"\nworker = \"accept\"\nhealth = \"accept\"\ntrusted_cidrs = [\"192.0.2.1/32\", \"2001:db8::/64\"]\nheader_timeout = \"3s\"\nmax_pending_headers = 17\nmax_header_size = \"65551B\"\n",
+        "{}\n[server.proxy_protocol]\ntrusted_cidrs = [\"192.0.2.1/32\", \"2001:db8::/64\"]\nheader_timeout = \"3s\"\nmax_pending_headers = 17\nmax_header_size = \"65551B\"\n",
         Sections::VALID.text()
     );
     let document = Document::<Plugins>::parse(&text)?;
-    let proxy = &document.server.proxy_protocol;
-    assert_eq!(proxy.public, gang_config::ProxyProtocol::Require);
-    assert_eq!(proxy.worker, gang_config::ProxyProtocol::Accept);
-    assert_eq!(proxy.health, gang_config::ProxyProtocol::Accept);
+    let proxy = document
+        .server
+        .proxy_protocol
+        .as_ref()
+        .expect("configured proxy");
     assert_eq!(proxy.trusted_cidrs[0].to_string(), "192.0.2.1/32");
     assert_eq!(proxy.trusted_cidrs[1].to_string(), "2001:db8::/64");
     assert_eq!(proxy.header_timeout.get(), Duration::from_secs(3));
     assert_eq!(proxy.max_pending_headers.get(), 17);
     assert_eq!(proxy.max_header_size, Bytes::new(65_551));
     let reparsed = Document::<Plugins>::parse(&document.to_toml()?)?;
-    assert_eq!(reparsed.server.proxy_protocol, *proxy);
+    assert_eq!(reparsed.server.proxy_protocol.as_ref(), Some(proxy));
     Ok(())
 }
 
 #[test]
 fn proxy_protocol_rejects_invalid_fields_and_limits() {
     for input in [
-        "public = \"disabled\"",
-        "public = \"v1\"",
-        "public = \"v2\"",
-        "unknown = true",
-        "execution = \"off\"",
+        "",
+        "trusted_cidrs = []",
+        "public = \"off\"\ntrusted_cidrs = [\"192.0.2.1/32\"]",
+        "worker = \"accept\"\ntrusted_cidrs = [\"192.0.2.1/32\"]",
+        "health = \"require\"\ntrusted_cidrs = [\"192.0.2.1/32\"]",
+        "unknown = true\ntrusted_cidrs = [\"192.0.2.1/32\"]",
         "trusted_cidrs = [\"not-a-network\"]",
-        "public = \"accept\"",
-        "worker = \"require\"",
-        "header_timeout = \"0s\"",
-        "max_pending_headers = 0",
-        "max_header_size = \"15B\"",
-        "max_header_size = \"65552B\"",
+        "trusted_cidrs = [\"192.0.2.1/32\"]\nheader_timeout = \"0s\"",
+        "trusted_cidrs = [\"192.0.2.1/32\"]\nmax_pending_headers = 0",
+        "trusted_cidrs = [\"192.0.2.1/32\"]\nmax_header_size = \"15B\"",
+        "trusted_cidrs = [\"192.0.2.1/32\"]\nmax_header_size = \"65552B\"",
     ] {
         assert!(
             toml::from_str::<gang_config::ProxyProtocolConfig>(input).is_err(),
             "accepted {input}"
         );
     }
-    for listener in ["public", "worker", "health"] {
-        for mode in ["accept", "require"] {
-            let input = format!("{listener} = \"{mode}\"");
-            assert!(
-                toml::from_str::<gang_config::ProxyProtocolConfig>(&input).is_err(),
-                "accepted {input} without trusted CIDRs"
-            );
-        }
-    }
     for size in ["16B", "65551B"] {
-        let input = format!("max_header_size = \"{size}\"");
+        let input = format!("trusted_cidrs = [\"192.0.2.1/32\"]\nmax_header_size = \"{size}\"");
         assert!(
             toml::from_str::<gang_config::ProxyProtocolConfig>(&input).is_ok(),
             "rejected {input}"
@@ -661,27 +650,12 @@ fn proxy_protocol_rejects_invalid_fields_and_limits() {
 }
 
 #[test]
-fn optional_health_proxy_mode_requires_its_listener() {
-    let off = format!(
-        "{}\n[server.proxy_protocol]\nhealth = \"off\"\n",
+fn proxy_policy_does_not_require_health_listener() {
+    let text = format!(
+        "{}\n[server.proxy_protocol]\ntrusted_cidrs = [\"192.0.2.1/32\"]\n",
         Sections::VALID.text()
     );
-    assert!(off.parse::<GangConfig<Plugins>>().is_ok());
-    for mode in ["accept", "require"] {
-        let proxy = format!(
-            "\n[server.proxy_protocol]\nhealth = \"{mode}\"\ntrusted_cidrs = [\"192.0.2.1/32\"]\n"
-        );
-        let missing = format!("{}{proxy}", Sections::VALID.text());
-        assert!(matches!(
-            missing.parse::<GangConfig<Plugins>>(),
-            Err(ConfigError::ProxyProtocolWithoutListener { listener: "health" })
-        ));
-        let text = format!(
-            "health_listen = \"127.0.0.1:9446\"\n{}{proxy}",
-            Sections::VALID.text()
-        );
-        assert!(text.parse::<GangConfig<Plugins>>().is_ok(), "health {mode}");
-    }
+    assert!(text.parse::<GangConfig<Plugins>>().is_ok());
 }
 
 #[test]
@@ -859,14 +833,10 @@ fn health_listener_defaults_to_none_and_parses() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn removed_execution_keys_name_their_replacements() {
-    for (key, value, replacement) in [
-        (
-            "execution_endpoint",
-            "https://gang.example.com:9444",
-            "endpoint",
-        ),
-        ("execution_listen", "127.0.0.1:9444", "listen"),
+fn removed_execution_keys_are_rejected() {
+    for (key, value) in [
+        ("execution_endpoint", "https://gang.example.com:9444"),
+        ("execution_listen", "127.0.0.1:9444"),
     ] {
         let top = format!("{TOP}\n{key} = \"{value}\"\n");
         let text = Sections {
@@ -882,12 +852,7 @@ fn removed_execution_keys_name_their_replacements() {
             let ConfigError::Gang(source) = error else {
                 panic!("expected a schema error");
             };
-            let message = source.to_string();
-            assert!(message.contains(&format!("`{key}`")), "{message}");
-            assert!(
-                message.contains(&format!("use `{replacement}` instead")),
-                "{message}"
-            );
+            assert!(source.to_string().contains(&format!("`{key}`")));
         }
     }
 }
@@ -1265,54 +1230,10 @@ fn a_document_written_back_parses_to_the_same_configuration() -> Result<(), Box<
 }
 
 #[test]
-fn scheduler_is_not_required_or_serialized_and_legacy_tables_are_rejected()
--> Result<(), Box<dyn Error>> {
+fn scheduler_is_not_required_or_serialized() -> Result<(), Box<dyn Error>> {
     let text = Sections::VALID.text();
     let rendered = Document::<Plugins>::parse(&text)?.to_toml()?;
     assert!(!rendered.contains("[scheduler"), "{rendered}");
-    for (legacy, destinations) in [
-        ("[scheduler]\n", &["worker_endpoint"][..]),
-        (
-            "[scheduler.nativelink]\nscheduler_name = \"MAIN_SCHEDULER\"\n",
-            &["worker_endpoint"][..],
-        ),
-        ("[scheduler.nativelink.memory]\n", &["actions.memory"][..]),
-        ("[scheduler.nativelink.disk]\n", &["actions.disk"][..]),
-        (
-            "[scheduler.nativelink.cold_start]\n",
-            &["actions.cold_start"][..],
-        ),
-        ("[scheduler.nativelink.http2]\n", &["server.http2"][..]),
-        (
-            "[scheduler.nativelink.worker]\n",
-            &["worker", "actions.timeout"][..],
-        ),
-        (
-            "[scheduler.nativelink.scheduler]\n",
-            &["actions", "server.worker_timeout"][..],
-        ),
-    ] {
-        let text = format!("{text}\n{legacy}");
-        let error = text
-            .parse::<GangConfig<Plugins>>()
-            .err()
-            .ok_or("accepted scheduler")?;
-        assert!(matches!(error, ConfigError::RemovedScheduler(_)), "{error}");
-        let message = error.to_string();
-        for name in [
-            "scheduler",
-            "actions",
-            "server",
-            "worker",
-            "worker_endpoint",
-        ] {
-            assert!(message.contains(name), "{message}");
-        }
-        let fix = gang_types::Fix::fix(&error).ok_or("missing scheduler migration guidance")?;
-        for destination in destinations {
-            assert!(fix.contains(destination), "{legacy}: {fix}");
-        }
-    }
     Ok(())
 }
 

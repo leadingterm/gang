@@ -97,7 +97,7 @@
 //! let rejected = "poll_interval = \"1s\"".parse::<GangConfig<Plugins>>();
 //! assert!(matches!(rejected, Err(ConfigError::Gang(_))));
 //! let old = "[scheduler.nativelink]\n".parse::<GangConfig<Plugins>>();
-//! assert!(matches!(old, Err(ConfigError::RemovedScheduler(_))));
+//! assert!(matches!(old, Err(ConfigError::Gang(_))));
 //! let unrelated = "[not_scheduler]\n".parse::<GangConfig<Plugins>>();
 //! assert!(matches!(unrelated, Err(ConfigError::Gang(_))));
 //! let nested = "[server]\nscheduler = 1\n".parse::<GangConfig<Plugins>>();
@@ -154,7 +154,7 @@ pub use open_file_limit::{OpenFileLimit, OpenFileLimitError};
 pub use plugin_set::{
     FleetOptionsError, FleetOptionsTable, PluginSet, SandboxSelection, validated_fleet_options,
 };
-pub use proxy_protocol_config::{ProxyProtocol, ProxyProtocolConfig};
+pub use proxy_protocol_config::ProxyProtocolConfig;
 pub use rate_limit_config::{
     BucketConfig, Ipv6PrefixLength, Ipv6PrefixLengthError, RateLimitConfig,
 };

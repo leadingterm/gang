@@ -21,7 +21,7 @@ use crate::security::Security;
 /// The authentication host: lends the server's collaborators to plugins for one call.
 pub(crate) struct Host<K: Stack> {
     /// Shared trusted PROXY protocol listener settings.
-    pub(crate) proxy_protocol: Arc<gang_config::ProxyProtocolConfig>,
+    pub(crate) proxy_protocol: Option<Arc<gang_config::ProxyProtocolConfig>>,
     /// The ledger of certificates and principals.
     pub(crate) repository: K::Repository,
     /// The signer that holds the authority's key.

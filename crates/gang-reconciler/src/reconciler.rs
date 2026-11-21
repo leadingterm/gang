@@ -68,6 +68,7 @@ struct Hosted {
     serving: bool,
     busy: bool,
     running: u32,
+    queued: bool,
     environment: EnvironmentClass,
 }
 
@@ -289,7 +290,7 @@ impl Reconciler {
             for index in action.candidates {
                 if let Some(fleet) = fleets.get_mut(index) {
                     fleet.outlook.candidates = fleet.outlook.candidates.saturating_add(1);
-                    if fleet.policy.action_environment == action.environment {
+                    if action.environment.as_ref() == Some(&fleet.policy.action_environment) {
                         matching.insert(index);
                     }
                 }
@@ -475,6 +476,16 @@ impl Reconciler {
             );
             let seen = self.observations.observe_worker(&workers[index], pass.now);
             hosted.add(index, seen, workers);
+            if !hosted.queued
+                && workers[index].environment.as_ref() != Some(&view.policy.action_environment)
+            {
+                hosted.queued = pass
+                    .hosted
+                    .snapshot()
+                    .queued
+                    .iter()
+                    .any(|action| action.environment == workers[index].environment);
+            }
         }
         if hosted.worker.is_some() {
             hosted.environment = environment;
@@ -602,6 +613,18 @@ impl Reconciler {
         plan: &mut Plan,
     ) -> Standing {
         let (worker, owned, _) = drain;
+        if hosted.queued {
+            if owned {
+                plan.steps.push(PlanStep {
+                    fleet: view.index,
+                    action: Action::CancelDrain(
+                        pass.hosted.snapshot().workers[worker].id.clone(),
+                        NeedCause::Demand,
+                    ),
+                });
+            }
+            return Standing::Retained;
+        }
         if owned || !hosted.serving {
             return self.classify_drain(pass, view, entry, hosted, drain);
         }

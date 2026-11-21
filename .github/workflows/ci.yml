@@ -277,8 +277,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/e2e"
           cp $(bazel cquery --output=files //crates/gang-e2e:bundle) "$RUNNER_TEMP/e2e/"
           files=$(jq -er '
-            [.previous.binary, .previous.fixture, .historical.binary, .historical.fixture,
-             .calibration.binary, .calibration.fixture, .candidate_fixture] |
+            [.previous.binary, .previous.fixture, .candidate_fixture] |
             if all(.[]; if type == "string" then test("^[A-Za-z0-9][A-Za-z0-9._-]*$") else false end)
             then .[] else error("invalid upgrade bundle manifest") end
           ' "$RUNNER_TEMP/e2e/upgrade-inputs.json")

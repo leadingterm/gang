@@ -484,7 +484,7 @@ fn server_settings(source: SettingsSource, server: ServerConfig) -> Result<Serve
     Ok(ServerSettings {
         actions: source.actions,
         scaling: source.scaling,
-        proxy_protocol: Arc::new(server.proxy_protocol),
+        proxy_protocol: server.proxy_protocol.map(Arc::new),
         poll_interval: source.poll_interval,
         client_action_timeout: source.client_action_timeout,
         default_isa: source.default_isa,

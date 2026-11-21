@@ -113,18 +113,6 @@ variable "static_public_ips" {
   }
 }
 
-variable "proxy_protocol_stage" {
-  description = "Shared-database only; defaults to accept. Move one adjacent step per apply through off, accept, proxied, require (or reverse), waiting for all controller refreshes before the next step."
-  type        = string
-  default     = "accept"
-  nullable    = false
-
-  validation {
-    condition     = contains(["off", "accept", "proxied", "require"], var.proxy_protocol_stage)
-    error_message = "proxy_protocol_stage must be off, accept, proxied, or require."
-  }
-}
-
 variable "public_subnet_ids" {
   description = "Public subnets for the multi-controller public load balancer."
   type        = list(string)

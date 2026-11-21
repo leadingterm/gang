@@ -43,12 +43,9 @@ pub enum SqliteError {
     #[error("the sqlite database thread cannot serve statements")]
     #[failure(unavailable)]
     Closed,
-    /// The database schema requires a newer binary.
+    /// The stored schema differs from the supported version.
     #[error("database schema cannot be used")]
-    Schema(#[from] gang_spi::SchemaTooNew),
-    /// The number of migrations cannot be represented as a schema version.
-    #[error("sqlite migration count exceeds the schema version range")]
-    MigrationCountOverflow,
+    Schema(#[from] gang_spi::SchemaMismatch),
     /// A timestamp, in unix milliseconds, does not fit in a stored integer.
     #[error("timestamp of {0} ms does not fit in the database")]
     TimestampRange(u64),
@@ -124,11 +121,8 @@ mod tests {
             gang_spi::PortError::from(SqliteError::from(driver)),
             gang_spi::PortError::Backend(_)
         ));
-        let schema = SqliteError::Schema(gang_spi::SchemaTooNew {
-            stored: gang_spi::SchemaVersion {
-                current: 2,
-                oldest_compatible: 2,
-            },
+        let schema = SqliteError::Schema(gang_spi::SchemaMismatch {
+            stored: 2,
             supported: 1,
         });
         assert!(matches!(
@@ -146,11 +140,8 @@ mod tests {
             },
             SqliteError::Query(rusqlite::Error::InvalidQuery),
             SqliteError::Closed,
-            SqliteError::Schema(gang_spi::SchemaTooNew {
-                stored: gang_spi::SchemaVersion {
-                    current: 2,
-                    oldest_compatible: 2,
-                },
+            SqliteError::Schema(gang_spi::SchemaMismatch {
+                stored: 2,
                 supported: 1,
             }),
             SqliteError::TimestampRange(u64::MAX),

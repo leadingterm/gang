@@ -11,7 +11,7 @@ use gang_spi::{
     Executed, ExecutionTimes, FleetSupply, InstanceCordon, Observation, ObservationSink, Phase,
     PortError,
 };
-use gang_types::{FleetCatalog, FleetName, Identity, InstanceId};
+use gang_types::{ActionEnvironment, FleetCatalog, FleetName, Identity, InstanceId, property};
 use nativelink_error::{Code, Error, make_err};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, RootMetricsComponent,
@@ -31,6 +31,7 @@ use nativelink_util::operation_state_manager::{
     ClientStateManager, OperationFilter, OperationStageFlags,
 };
 use nativelink_util::origin_event::OriginMetadata;
+use nativelink_util::platform_properties::PlatformPropertyValue;
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use parking_lot::Mutex;
 use tokio::sync::RwLock;
@@ -56,7 +57,7 @@ pub(crate) struct ObservingWorkerScheduler {
     clock: Arc<dyn Clock>,
     fleets: Arc<FleetCatalog>,
     rates: Arc<SourceRates>,
-    cordons: InstanceCordons,
+    cordons: Arc<InstanceCordons>,
     retiring: RwLock<bool>,
 }
 
@@ -71,7 +72,7 @@ impl ObservingWorkerScheduler {
         handoff: HandOff,
         durations: Arc<Mutex<ActionDurations>>,
         clock: Arc<dyn Clock>,
-        fleets: Arc<FleetCatalog>,
+        cordons: Arc<InstanceCordons>,
         rates: Arc<SourceRates>,
     ) -> Self {
         Self {
@@ -82,8 +83,8 @@ impl ObservingWorkerScheduler {
             handoff,
             durations,
             clock,
-            cordons: InstanceCordons::new(Arc::clone(&fleets)),
-            fleets,
+            fleets: Arc::clone(cordons.catalog()),
+            cordons,
             rates,
             retiring: RwLock::new(false),
         }
@@ -265,6 +266,34 @@ impl WorkerScheduler for ObservingWorkerScheduler {
                 Code::Unavailable,
                 "the controller is handing off"
             ));
+        }
+        if let Some(value) = worker
+            .total_platform_properties
+            .properties
+            .get(property::ACTION_ENVIRONMENT)
+        {
+            let PlatformPropertyValue::Exact(value) = value else {
+                return Err(make_err!(
+                    Code::InvalidArgument,
+                    "invalid worker execution environment"
+                ));
+            };
+            value.parse::<ActionEnvironment>().map_err(|_| {
+                make_err!(
+                    Code::InvalidArgument,
+                    "invalid worker execution environment"
+                )
+            })?;
+        } else {
+            // Keep the advertised total untouched: absence is metadata, not a public identity.
+            worker.platform_properties.properties.insert(
+                property::ACTION_ENVIRONMENT.to_owned(),
+                PlatformPropertyValue::Exact(String::new()),
+            );
+            worker.action_platform_properties.properties.insert(
+                property::ACTION_ENVIRONMENT.to_owned(),
+                PlatformPropertyValue::Exact(String::new()),
+            );
         }
         let _admission = self.cordons.admission(&*self.inner, &mut worker).await;
         self.inner.add_worker(worker).await
@@ -733,7 +762,7 @@ mod tests {
                 HandOff::new(),
                 test_durations(),
                 test_clock(),
-                test_fleets(),
+                Arc::new(InstanceCordons::new(test_fleets())),
                 test_rates(),
             );
             let forwarded = scheduler
@@ -858,7 +887,7 @@ mod tests {
                 HandOff::new(),
                 test_durations(),
                 test_clock(),
-                test_fleets(),
+                Arc::new(InstanceCordons::new(test_fleets())),
                 test_rates(),
             );
             scheduler
@@ -970,7 +999,7 @@ mod tests {
                 HandOff::new(),
                 Arc::clone(&durations),
                 clock.clone(),
-                test_fleets(),
+                Arc::new(InstanceCordons::new(test_fleets())),
                 Arc::clone(&rates),
             );
             let duplicate = result.clone();
@@ -1300,7 +1329,7 @@ mod tests {
             HandOff::new(),
             test_durations(),
             test_clock(),
-            test_fleets(),
+            Arc::new(InstanceCordons::new(test_fleets())),
             test_rates(),
         );
         (inner, counting, completed)

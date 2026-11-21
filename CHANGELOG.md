@@ -1,24 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.3.4
 
 ### Added
 
-- Configure per-fleet action capability grants and optional per-action resource ceilings separately from worker capacity.
-- Opt in to isolated public network egress with protected networks for enforcing sandboxes.
-- Configure public action DNS resolvers with `dns_servers`; host and slirp DNS are not used.
-- Bound network setup with `setup_timeout` (default `10s`).
-- **v0.3.4:** Rate-based scale-out separates persistent authenticated-source load from transient backlog; N−1 scale-in cordons the physical instance that empties soonest after a waterline dwell, with returning-load rescue before new purchases.
-- Optional `[scaling]` keys: `payback_percent` (default 50), `load_half_life`, `source_idle`, `max_sources`, `unknown_action_duration`, `readiness_prior`, `scale_in_waterline_percent`, `scale_in_dwell` and `max_cordons`. See [configuration and scaling policy](docs/SPECIFICATION.md#12-cratesgang-configsrc).
-- Persist source activity profiles as fenced learned-history `SourceProfile` records without principal strings, including active checkpoints for a first build.
-- Expose quantized persistent `load`, transient `backlog` and serving `utilization` demand estimates; add the `utilization` scaling cause and optional scale-out/drain decision detail.
-- Extend Gate 2 with `cold-burst-from-zero`, `sustained-stream`, `two-sources` and `utilization-scale-in`; retain trained-burst, short-work and backlog scenarios with explicit duration fixtures.
+- Canonicalize action work roots so output symlinks work correctly through symlinked work directories.
+- Run bwrap actions in a pinned, read-only Debian 13 rootfs with builder UID/GID 1000 and an exact content-based action-environment identity across architectures.
+- Configure per-fleet action capability grants and optional per-action resource ceilings separately from worker capacity. Public network egress is opt-in and denied by default; enforcing sandboxes use a sealed network gate, protected networks and configured public DNS resolvers.
+- Rate-based scale-out separates persistent authenticated-source load from transient backlog, using resource-vector payback accounting. N−1 utilization scale-in cordons the physical instance that empties soonest after a waterline dwell, with returning-load rescue before new purchases.
+- Persist source activity profiles as fenced learned-history records, and expose persistent load, transient backlog and serving utilization demand estimates.
+- Advance release upgrade gates using the real published v0.3.3 artifacts.
 
 ### Changed
 
 - Reject unknown platform properties, ungranted network requests and over-ceiling requests at admission instead of silently accepting them.
-- **v0.3.4:** Replace candidate-count payback simulation and the 2B queue-age stream override with resource-vector purchase accounting. Unknown action durations no longer use readiness; cold readiness uses `min(scaling.readiness_prior, fleet.boot_grace)`, without rejecting shorter boot-grace configurations.
-- **v0.3.4 upgrade:** Use `max_cordons = 0` for an initial soak; idle-timeout drains remain enabled. Before the first `utilization` audit row, rollback must restore the old configuration as well as the binary. After that row, v0.3.3 database readers reject the new cause: downgrade is unsupported, not transparent. Optional detail inside known wire event members remains backward-readable. See [restart and rollback](docs/SPECIFICATION.md#5-autoscaler-state--restart).
+- Credit pending and reliable requested capacity without repeatedly raising desired size; keep transient credential-refresh gaps separate from serving surplus and preserve failed-request withdrawal.
+- Keep controller cordons across reconnects and overlapping worker generations within the live engine; reset N−1 dwell after skipped passes.
 
 ### Fixed
 
@@ -31,6 +28,17 @@
 - **v0.3.4:** Declare rate probes explicitly so the checked-in sample passes harness validation.
 - **v0.3.4:** Credit pending and reliable requested capacity without repeatedly raising desired size; keep transient credential-refresh gaps separate from serving surplus and preserve failed-request withdrawal.
 - **v0.3.4:** Keep controller cordons across reconnects and overlapping worker generations within the live engine; do not adopt worker self-drain flags as controller intent. Reset N−1 dwell after skipped passes and keep repeated cordon reinforcement out of audit history.
+- Retain noncurrent and genuinely unscoped workers while queued or running actions need their exact optional execution identity; resume only controller-owned stale drains for same-identity queued work.
+- Keep the published `gang_action_environment` / `GANG_ACTION_ENVIRONMENT` channels cache-only and the old `network` property an ignored hint. Use separate `gang_execution_environment` / `GANG_EXECUTION_ENVIRONMENT` channels for exact optional execution identity and `gang_network_access` for enforced capability requests and grants, preserving immutable old-client build continuity without compatibility aliases.
+
+### Removed
+
+- Remove obsolete transitional health and configuration aliases, staged PROXY modes, historical database migrations, old upgrade controls, legacy CI cache formats and the in-place configuration restart workflow. See the [specification](docs/SPECIFICATION.md) for compatibility and configuration details.
+
+### Upgrade notes
+
+- Run `gang setup` after upgrading for new scoped actions. Explicit execution platforms and target execution properties must merge `EXEC_PROPERTIES` from `@gang_env//:defs.bzl`; see [client wiring](docs/SPECIFICATION.md#42-client-wiring--github-actions). Expect a cold cache because the action-environment identity changed. Frozen old rendered rc files remain unchanged and genuinely unscoped: their cache labels do not identify execution, and only actual unscoped live workers can serve them. Noncurrent identities likewise require matching live workers. Once matching workers retire, rerun setup for new actions; already queued work can wait until its existing timeout.
+- See [restart and rollback](docs/SPECIFICATION.md#5-autoscaler-state--restart) for scaling configuration and downgrade constraints, and the [specification](docs/SPECIFICATION.md) for the v0.3.3 upgrade prerequisite and compatibility removals.
 
 ## 0.3.3
 
@@ -42,8 +50,6 @@
 - Require ordinary instance-refresh qualification to prove shared authentication and validate its bearer on the first Capabilities request, followed by a separate cold old-CLI credential mint and first Capabilities validation through the original load balancer, without retries, during the live held-build drain. The harness does not prove fresh leader-only RPC refusal; build-continuity requirements remain unchanged.
 
 ### Changed
-
-- **Action environment cutover:** run `gang setup` after upgrading; old caches and requests with absent or obsolete action-environment identities are unsupported. Explicit execution platforms and target execution properties must merge `@gang_env//:defs.bzl`'s `EXEC_PROPERTIES`; see [the specification](docs/SPECIFICATION.md#42-client-wiring--github-actions). Bwrap now uses a content-addressed read-only rootfs; noop retains its operator-asserted host environment. Running builds are not interrupted by the cutover. Already queued work for an identity no longer served can wait until its existing timeout.
 
 - Check follower shared responses against the leader and verify marked leader-only refusals in the build scenario.
 - Include bounded state, redacted local launch records and build status in launch-failure scenario timeout diagnostics.
@@ -67,7 +73,7 @@
 - Move the production apply runtime from OpenTofu 1.13.5 to the 1.13.9 patch release, aligning Bazel tests with the deploy runtime.
 - Hand leadership to a routable newer controller during shared-database refresh without terminating the former leader process. Prepared controllers serve shared authentication, API and cache services before promotion and throughout handoff; leader-only refusals safely retire connections while admitted streams drain. Host priority survives restart, and a bounded learned-history snapshot precedes release, though late measurements may be lost. The v0.3.3 health listener retains `/leader` as an exact `/ready` alias for mixed-version rollout.
 - Generate `--remote_download_outputs=toplevel` in client rc files so unused remote intermediate outputs are not downloaded.
-- Supply sandboxed actions with a synthetic worker identity and public TLS roots.
+- Supply sandboxed actions with a synthetic worker identity and public TLS roots, and partition caches by action environment revision.
 - Avoid killing actions for ambient memory stalls without a sustained action-pool shortage.
 - Align dashboard sections and cache charts using shared responsive layout.
 - Preserve client identity with PROXY v2 while avoiding cross-zone NLB backend connection collisions in shared-database deployments. Keep the default `accept` stage during the v0.3.3 release deploy; after every binary has rolled out, apply `proxied` and `require` in separate steps, waiting after each. Roll back one stage per apply in reverse: `require` → `proxied` → `accept` → `off`, waiting after each; reach `off` before downgrading to a parserless binary. See the deployment specification for trust and rollout details.

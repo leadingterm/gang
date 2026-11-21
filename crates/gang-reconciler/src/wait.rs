@@ -865,9 +865,11 @@ mod tests {
             source: None,
             candidates: FleetSet::try_from_indices(candidates.iter().copied())
                 .expect("valid fleets"),
-            environment: gang_testkit::fleet_policy("workers")
-                .expect("valid policy")
-                .action_environment,
+            environment: Some(
+                gang_testkit::fleet_policy("workers")
+                    .expect("valid policy")
+                    .action_environment,
+            ),
             resources: ActionResources::default(),
             queued_since: Timestamp::from_unix_millis(1_000_000),
             priority: 0,

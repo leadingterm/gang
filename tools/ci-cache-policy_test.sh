@@ -29,9 +29,6 @@ translate() {
   expr=${expr//env.BAZEL_CURRENT_CACHE_HIT/"\"\$CURRENT_CACHE_HIT\""}
   expr=${expr//env.BAZEL_DISK_CACHE_SAVE/"\"\$SAVE\""}
   expr=${expr//runner.os/"\"\$OS\""}
-  expr=${expr//steps.restore.outputs.cache-matched-key/"\"\$RESTORED_KEY\""}
-  expr=${expr//steps.base.outputs.cache-matched-key/"\"\$BASE_KEY\""}
-  expr=${expr//steps.pr.outputs.cache-matched-key/"\"\$PR_KEY\""}
   expr=${expr//steps.restore.outputs.cache-hit/"\"\$CACHE_HIT\""}
   expr=${expr//steps.pr.outputs.cache-hit/"\"\$PR_CACHE_HIT\""}
   expr=${expr//steps.validate.outcome/"\"\$VALIDATE_OUTCOME\""}
@@ -62,12 +59,10 @@ yq -er '.runs.steps[] | select(.name == "Mark the start of the build") | .run' "
 bazel_base=$(yq -er '.runs.steps[] | select(.id == "base") | .if' "$script_dir/../.github/actions/setup-bazel/action.yml")
 bazel_pr=$(yq -er '.runs.steps[] | select(.id == "pr") | .if' "$script_dir/../.github/actions/setup-bazel/action.yml")
 bazel_restore=$(yq -er '.runs.steps[] | select(.id == "restore") | .if' "$script_dir/../.github/actions/setup-bazel/action.yml")
-bazel_legacy=$(yq -er '.runs.steps[] | select(.id == "legacy") | .if' "$script_dir/../.github/actions/setup-bazel/action.yml")
 # Step conditions omit the optional GitHub expression delimiters.
 bazel_base=$(translate "\${{ $bazel_base }}")
 bazel_pr=$(translate "\${{ $bazel_pr }}")
 bazel_restore=$(translate "\${{ $bazel_restore }}")
-bazel_legacy=$(translate "\${{ $bazel_legacy }}")
 nix_restore=$(yq -o=json '.runs.steps' "$script_dir/../.github/actions/setup-nix/action.yml" | jq -er '.[] | select((.uses // "") | startswith("nix-community/cache-nix-action@")) | .if')
 nix_restore=$(translate "\${{ $nix_restore }}")
 bazel_export=$(yq -er '.runs.steps[] | select(.name == "Export shard working set") | .if' "$script_dir/../.github/actions/save-bazel-cache/action.yml")
@@ -228,7 +223,7 @@ check 'Bazel exact PR cache hit does not save' "$bazel" false
 PR_CACHE_HIT=false
 
 # Prefix matches are not exact hits. Empty action outputs also remain false.
-export RESTORED_KEY=current-prefix-match BASE_KEY=base-match PR_KEY=pr-prefix-match LEGACY_KEY=legacy-match
+export RESTORED_KEY=current-prefix-match BASE_KEY=base-match PR_KEY=pr-prefix-match
 for CACHE_HIT in true false ''; do
   for PR_CACHE_HIT in true false ''; do
     if [[ $CACHE_HIT == true || $PR_CACHE_HIT == true ]]; then expected=true; else expected=false; fi
@@ -269,7 +264,6 @@ for OS in macOS Linux; do
           check "Bazel $OS/$ARCH/$JOB/$EVENT never restores base" "$bazel_base" false
           check "Bazel $OS/$ARCH/$JOB/$EVENT never restores PR" "$bazel_pr" false
           check "Bazel $OS/$ARCH/$JOB/$EVENT never restores current" "$bazel_restore" false
-          check "Bazel $OS/$ARCH/$JOB/$EVENT never restores legacy" "$bazel_legacy" false
           check "Bazel $OS/$ARCH/$JOB/$EVENT never saves" "$bazel" false
         fi
         if [[ $OS != Linux || $ARCH != X64 || $JOB == cross ]]; then
@@ -290,16 +284,6 @@ for EVENT in push workflow_dispatch; do
   check "Bazel Linux $EVENT does not restore a base cache" "$bazel_base" false
   check "Bazel Linux $EVENT does not restore a PR cache" "$bazel_pr" false
   check "Bazel Linux $EVENT restores a current cache" "$bazel_restore" true
-done
-for EVENT in pull_request push workflow_dispatch; do
-  RESTORED_KEY='' BASE_KEY='' PR_KEY=''
-  check "Bazel Linux $EVENT restores legacy only after all current caches miss" "$bazel_legacy" true
-  RESTORED_KEY=current-match
-  check "Bazel Linux $EVENT current match skips legacy restore" "$bazel_legacy" false
-  RESTORED_KEY='' BASE_KEY=base-match
-  check "Bazel Linux $EVENT base match skips legacy restore" "$bazel_legacy" false
-  BASE_KEY='' PR_KEY=pr-match
-  check "Bazel Linux $EVENT PR match skips legacy restore" "$bazel_legacy" false
 done
 
 for kind in root checkout-child checkout-parent home-child home-parent target-child target-parent; do

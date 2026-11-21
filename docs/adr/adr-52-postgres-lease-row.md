@@ -10,7 +10,7 @@ Status: Accepted. Builds on ADR-44 and ADR-48. Partly superseded by ADR-59: the 
 
 ## Consequences
 - Shared backends use a clock-based TTL and epoch fence; SQLite instead holds an exclusive file lock. No session state is needed, so a transaction-mode pooler is not excluded (none is exercised at runtime); dropping a connection does not itself end leadership: the TTL does.
-- Schema migrations use only the transaction-scoped `pg_advisory_xact_lock`.
+- Schema initialization uses only the transaction-scoped `pg_advisory_xact_lock`.
 - Every write (lease acquire, renew and release, expiring-record replace, remove and purge, issuance and principal observation records) is one transaction with `SET LOCAL statement_timeout` and `idle_in_transaction_session_timeout`; reads are single statements. A cancelled call discards its connection and the pool aborts its driver at once. A transaction whose `COMMIT` was not yet sent is rolled back by the server when it reads the closed connection. Once `COMMIT` has been sent, cancellation guarantees nothing: the write may still apply, as after a cut link. Residual server work is bounded by `statement_timeout`.
 
 ## Rejected alternatives

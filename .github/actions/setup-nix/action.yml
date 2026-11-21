@@ -46,11 +46,6 @@ runs:
         restore-prefixes-first-match: |
           nix-${{ inputs.shell != '' && format('{0}-', inputs.shell) || '' }}v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/flake.lock', inputs.path), format('{0}/flake.nix', inputs.path), format('{0}/MODULE.bazel', inputs.path), format('{0}/tools/darwin-check.sh', inputs.path), format('{0}/.github/actions/setup-nix/action.yml', inputs.path)) }}-
           nix-${{ inputs.shell != '' && format('{0}-', inputs.shell) || '' }}v3-${{ runner.os }}-${{ runner.arch }}-
-          ${{ inputs.shell == '' && format('nix-v2-{0}-{1}-', runner.os, runner.arch) || '' }}
-          ${{ inputs.shell == '' && format('nix-v1-{0}-{1}-vm-', runner.os, runner.arch) || '' }}
-          ${{ inputs.shell == '' && format('nix-v1-{0}-{1}-portable-', runner.os, runner.arch) || '' }}
-          ${{ inputs.shell == '' && format('nix-v1-{0}-{1}-devshell-', runner.os, runner.arch) || '' }}
-          ${{ inputs.shell == '' && format('nix-v1-{0}-{1}-', runner.os, runner.arch) || '' }}
         save: ${{ inputs.cache-save == 'true' && runner.os == 'Linux' && github.job != 'cross' && (runner.arch == 'X64' || (runner.arch == 'ARM64' && inputs.shell == 'deploy')) && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))) }}
         # Upstream bounds GC's live-store target, not the compressed /nix archive size.
         # Rooted closures can exceed it: v7 has no hard store/archive cap and must preserve VM roots.

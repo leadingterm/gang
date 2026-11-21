@@ -45,6 +45,7 @@ use gang_spi::{
 use gang_types::{FleetCatalog, SaturatingInto};
 
 use crate::config::NativeLinkConfig;
+use crate::cordons::InstanceCordons;
 use crate::durations::ActionDurations;
 use crate::errors::NativeLinkEmbedError;
 use crate::fitted::FittedActions;
@@ -202,6 +203,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         actions: action_scheduler,
         workers: worker_scheduler,
         resource,
+        cordons,
     } = scheduler_stack(
         &scheduler,
         spec.fleets,
@@ -215,7 +217,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
     let completed = Arc::new(AtomicU64::new(0));
     let durations = retained_durations(histories, resource, &spec.actions);
     let clock = Arc::clone(&spec.clock);
-    let fleets = Arc::new(spec.fleets.clone());
+    let fleets = Arc::clone(cordons.catalog());
     let rates = Arc::new(
         SourceRates::new(&spec.scaling, fleets.len(), Arc::clone(&clock))
             .map_err(NativeLinkEmbedError::native("source rates"))?,
@@ -229,7 +231,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         handoff.clone(),
         Arc::clone(&durations),
         Arc::clone(&clock),
-        Arc::clone(&fleets),
+        cordons,
         Arc::clone(&rates),
     ));
     let worker_scheduler: Arc<dyn WorkerScheduler> = draining.clone();
@@ -439,6 +441,7 @@ struct SchedulerStack {
     actions: Arc<dyn KnownPlatformPropertyProvider>,
     workers: Arc<dyn WorkerScheduler>,
     resource: Arc<ResourceSketch>,
+    cordons: Arc<InstanceCordons>,
 }
 
 /// The action stack over `NativeLink`'s simple scheduler.
@@ -450,12 +453,14 @@ fn scheduler_stack(
     clock: Arc<dyn Clock>,
 ) -> Result<SchedulerStack, NativeLinkEmbedError> {
     let mut resource = None;
+    let cordons = Arc::new(InstanceCordons::new(Arc::new(fleets.clone())));
     let (actions, workers) = action_stack(
         scheduler,
         fleets,
         actions,
         resources,
         clock,
+        Arc::clone(&cordons),
         |simple, notify, sketch| {
             resource = Some(Arc::clone(&sketch));
             let db = memory_awaited_action_db_factory(
@@ -476,6 +481,7 @@ fn scheduler_stack(
         actions,
         workers,
         resource,
+        cordons,
     })
 }
 
@@ -490,6 +496,7 @@ fn action_stack(
     actions: &gang_config::ActionsConfig,
     resources: &OnceLock<Arc<ResourceSketch>>,
     clock: Arc<dyn Clock>,
+    cordons: Arc<InstanceCordons>,
     simple_scheduler: impl FnOnce(
         &SimpleSpec,
         Arc<Notify>,
@@ -548,6 +555,7 @@ fn action_stack(
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> = Arc::new(
         PlaceableActions::new(historical, fleets.clone(), admitted).with_workers(
             Arc::clone(&worker_scheduler),
+            cordons,
             clock,
             std::time::Duration::from_secs(simple.worker_timeout_s),
         ),
@@ -847,7 +855,7 @@ mod tests {
             &FleetName::try_new(name).expect("valid fleet name"),
             isa,
             &"docker",
-            &"host:test".parse().expect("valid environment"),
+            Some(&"host:test".parse().expect("valid environment")),
             Resources {
                 vcpus: 4,
                 memory: Bytes::new(8 << 30),
@@ -869,7 +877,7 @@ mod tests {
         /// The outer action scheduler.
         actions: Arc<dyn KnownPlatformPropertyProvider>,
         /// The worker scheduler.
-        workers: Arc<dyn WorkerScheduler>,
+        workers: Arc<ObservingWorkerScheduler>,
         /// The simple scheduler, used to drive matching.
         simple: Arc<SimpleScheduler>,
         /// The sketch the historical layer learns from.
@@ -941,12 +949,14 @@ mod tests {
         let mut simple_slot = None;
         let mut sketch_slot = None;
         let mut notify_slot = None;
+        let cordons = Arc::new(InstanceCordons::new(Arc::new(fleets.clone())));
         let (actions, workers) = action_stack(
             &rendered,
             fleets,
             actions,
             resources,
             Arc::new(SystemClock::new()),
+            Arc::clone(&cordons),
             |simple, notify, sketch| {
                 notify_slot = Some(Arc::clone(&notify));
                 let db = memory_awaited_action_db_factory(
@@ -978,6 +988,25 @@ mod tests {
                 (scheduler, workers)
             },
         )?;
+        let clock: Arc<dyn Clock> = Arc::new(gang_clock::TestClock::default());
+        let workers = Arc::new(ObservingWorkerScheduler::new(
+            workers,
+            actions.clone(),
+            Arc::new(AtomicU64::new(0)),
+            observations,
+            HandOff::new(),
+            Arc::new(Mutex::new(ActionDurations::new(
+                std::num::NonZeroUsize::MIN,
+                gang_config::HistoryWindow::from_units(1),
+            ))),
+            Arc::clone(&clock),
+            cordons,
+            Arc::new(SourceRates::new(
+                &gang_config::ScalingConfig::default(),
+                fleets.len(),
+                clock,
+            )?),
+        ));
         Ok((
             TestStack {
                 actions,
@@ -1003,17 +1032,18 @@ mod tests {
         id: &WorkerId,
         max_inflight_tasks: u64,
     ) -> TestResult<mpsc::Receiver<UpdateForWorker>> {
-        connect_arm_worker_with_environment(workers, id, max_inflight_tasks, "host:test").await
+        connect_arm_worker_with_environment(workers, id, max_inflight_tasks, Some("host:test"))
+            .await
     }
 
     async fn connect_arm_worker_with_environment(
         workers: &dyn WorkerScheduler,
         id: &WorkerId,
         max_inflight_tasks: u64,
-        environment: &str,
+        environment: Option<&str>,
     ) -> TestResult<mpsc::Receiver<UpdateForWorker>> {
         let (tx, rx) = mpsc::channel(64);
-        let properties = PlatformProperties::new(HashMap::from([
+        let mut properties = PlatformProperties::new(HashMap::from([
             (
                 property::FLEET.to_owned(),
                 PlatformPropertyValue::Exact("arm".to_owned()),
@@ -1025,10 +1055,6 @@ mod tests {
             (
                 property::SANDBOX.to_owned(),
                 PlatformPropertyValue::Exact("docker".to_owned()),
-            ),
-            (
-                property::ACTION_ENVIRONMENT.to_owned(),
-                PlatformPropertyValue::Exact(environment.to_owned()),
             ),
             (
                 property::CPU_COUNT.to_owned(),
@@ -1047,6 +1073,12 @@ mod tests {
                 PlatformPropertyValue::Minimum(100 * 1024 * 1024),
             ),
         ]));
+        if let Some(environment) = environment {
+            properties.properties.insert(
+                property::ACTION_ENVIRONMENT.to_owned(),
+                PlatformPropertyValue::Exact(environment.to_owned()),
+            );
+        }
         workers
             .add_worker(Worker::new(
                 id.clone(),
@@ -1169,10 +1201,19 @@ mod tests {
             .await
             .expect("background matcher reached the gate");
         let old_id = WorkerId("old-worker".to_owned());
-        let mut old =
-            connect_arm_worker_with_environment(stack.workers.as_ref(), &old_id, 1, "host:old")
-                .await?;
+        let mut old = connect_arm_worker_with_environment(
+            stack.workers.as_ref(),
+            &old_id,
+            1,
+            Some("host:old"),
+        )
+        .await?;
         old.try_recv().expect("connection acknowledgement");
+        let unscoped_id = WorkerId("unscoped-worker".to_owned());
+        let mut unscoped =
+            connect_arm_worker_with_environment(stack.workers.as_ref(), &unscoped_id, 1, None)
+                .await?;
+        unscoped.try_recv().expect("connection acknowledgement");
         let client = OperationId::from("identity-client");
         let _subscription = stack
             .actions
@@ -1187,6 +1228,10 @@ mod tests {
             old.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+        assert!(matches!(
+            unscoped.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         let current_id = WorkerId("current-worker".to_owned());
         let mut current = connect_arm_worker(stack.workers.as_ref(), &current_id).await?;
         current.try_recv().expect("connection acknowledgement");
@@ -1196,6 +1241,282 @@ mod tests {
             old.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+        assert!(matches!(
+            unscoped.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        Ok(())
+    }
+
+    async fn gated_identity_stack(fleets: &FleetCatalog) -> TestResult<TestStack> {
+        NOW.set(Duration::from_secs(1_000_000));
+        let (ready_tx, mut ready_rx) = mpsc::channel(1);
+        let (stack, notify) =
+            stack_on_test_clock_with_matching_gate(fleets, &default_config(), Some(ready_tx))?;
+        notify.notify_one();
+        ready_rx
+            .recv()
+            .await
+            .expect("background matcher reached the gate");
+        Ok(stack)
+    }
+
+    async fn assert_unscoped_worker_metadata(stack: &TestStack, worker: &WorkerId, running: u32) {
+        let snapshot = stack.workers.worker_snapshot().await;
+        let raw = snapshot
+            .iter()
+            .find(|row| row.id == worker.0)
+            .expect("registered");
+        assert_eq!(raw.running_actions, running);
+        assert!(
+            !raw.platform_properties
+                .contains_key(property::ACTION_ENVIRONMENT)
+        );
+        assert!(!raw.platform_properties.contains_key(property::NETWORK));
+    }
+
+    async fn assert_unscoped_requests_fail_closed(stack: &TestStack, request: &Arc<ActionInfo>) {
+        for invalid in ["", "host:", "malformed"] {
+            let mut invalid_action = Arc::clone(request);
+            Arc::make_mut(&mut invalid_action)
+                .platform_properties
+                .insert(property::ACTION_ENVIRONMENT.to_owned(), invalid.to_owned());
+            let error = stack
+                .actions
+                .add_action(OperationId::from("invalid-action"), invalid_action)
+                .await
+                .err()
+                .expect("invalid presence is not absence");
+            assert_eq!(error.code, Code::InvalidArgument);
+            let error = connect_arm_worker_with_environment(
+                stack.workers.as_ref(),
+                &WorkerId("invalid-worker".to_owned()),
+                1,
+                Some(invalid),
+            )
+            .await
+            .expect_err("invalid worker identity rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid worker execution environment")
+            );
+        }
+        let mut grant_request = Arc::clone(request);
+        Arc::make_mut(&mut grant_request)
+            .platform_properties
+            .insert(property::NETWORK.to_owned(), "requested".to_owned());
+        assert!(
+            stack
+                .actions
+                .add_action(OperationId::from("ungranted"), grant_request)
+                .await
+                .is_err()
+        );
+    }
+
+    async fn assert_incomplete_workers_rejected(
+        stack: &TestStack,
+        worker: &WorkerId,
+        registered: &HashMap<String, String>,
+        request: &Arc<ActionInfo>,
+    ) -> TestResult {
+        let manager = stack.workers.get_platform_property_manager();
+        for missing in [
+            property::FLEET,
+            property::ISA,
+            property::SANDBOX,
+            property::CPU_COUNT,
+            property::CPU_MILLICORES,
+            property::MEMORY_KB,
+            property::DISK_KB,
+        ] {
+            let mut incomplete = registered.clone();
+            incomplete.remove(missing);
+            let (tx, mut rx) = mpsc::channel(64);
+            stack
+                .workers
+                .add_worker(Worker::new(
+                    worker.clone(),
+                    manager.make_platform_properties(incomplete)?,
+                    tx,
+                    NOW.get().as_secs(),
+                    1,
+                ))
+                .await?;
+            rx.try_recv().expect("connection acknowledgement");
+            assert!(
+                stack
+                    .actions
+                    .add_action(OperationId::from("incomplete-worker"), Arc::clone(request))
+                    .await
+                    .is_err(),
+                "missing {missing} must not supply live capacity"
+            );
+            stack.workers.remove_worker(worker).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unscoped_dispatch_requires_an_actual_unscoped_worker() -> TestResult {
+        let fleets = x86_and_arm_fleets();
+        let stack = gated_identity_stack(&fleets).await?;
+        let current_id = WorkerId("current-worker".to_owned());
+        let mut current = connect_arm_worker(stack.workers.as_ref(), &current_id).await?;
+        current.try_recv().expect("connection acknowledgement");
+        let mut request = action(Isa::Aarch64, Some("252"));
+        let properties = &mut Arc::make_mut(&mut request).platform_properties;
+        properties.remove(property::ACTION_ENVIRONMENT);
+        properties.insert(
+            property::CACHE_NAMESPACE.to_owned(),
+            "cache-label".to_owned(),
+        );
+        properties.insert(property::NETWORK_HINT.to_owned(), "requested".to_owned());
+        let qualifier = request.unique_qualifier.clone();
+        let error = stack
+            .actions
+            .add_action(OperationId::from("no-unscoped-worker"), request.clone())
+            .await
+            .err()
+            .expect("a cache label cannot supply an execution identity");
+        assert_eq!(error.code, Code::InvalidArgument);
+        assert!(error.to_string().contains("gang setup"));
+        let unscoped_id = WorkerId("unscoped-1-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b".to_owned());
+        let mut unscoped =
+            connect_arm_worker_with_environment(stack.workers.as_ref(), &unscoped_id, 1, None)
+                .await?;
+        unscoped.try_recv().expect("connection acknowledgement");
+        assert_unscoped_worker_metadata(&stack, &unscoped_id, 0).await;
+        assert_unscoped_requests_fail_closed(&stack, &request).await;
+        let fleet = FleetName::try_new("arm")?;
+        let instance = gang_types::InstanceId::try_new("unscoped-1")?;
+        stack.workers.set_draining(&fleet, &instance, true).await?;
+        stack.workers.set_drain_worker(&unscoped_id, true).await?;
+        assert!(
+            stack
+                .actions
+                .add_action(OperationId::from("self-draining"), request.clone())
+                .await
+                .is_err()
+        );
+        stack.workers.set_drain_worker(&unscoped_id, false).await?;
+        let client = OperationId::from("unscoped-client");
+        let subscription = stack.actions.add_action(client.clone(), request).await?;
+        let retained = subscription.as_action_info().await?.0;
+        assert_eq!(retained.unique_qualifier, qualifier);
+        assert_eq!(
+            retained.platform_properties[property::CACHE_NAMESPACE],
+            "cache-label"
+        );
+        assert_eq!(
+            retained.platform_properties[property::NETWORK_HINT],
+            "requested"
+        );
+        stack.workers.remove_worker(&unscoped_id).await?;
+        stack.simple.do_try_match_for_test().await?;
+        assert_eq!(
+            stage_of(stack.actions.as_ref(), &client).await?,
+            Some(ActionStage::Queued)
+        );
+        assert!(matches!(
+            current.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let mut unscoped =
+            connect_arm_worker_with_environment(stack.workers.as_ref(), &unscoped_id, 1, None)
+                .await?;
+        unscoped.try_recv().expect("connection acknowledgement");
+        stack.simple.do_try_match_for_test().await?;
+        assert!(matches!(
+            unscoped.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        stack.workers.set_draining(&fleet, &instance, false).await?;
+        stack.simple.do_try_match_for_test().await?;
+        let _ = next_dispatch(&mut unscoped).await;
+        assert!(matches!(
+            current.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_unscoped_worker_metadata(&stack, &unscoped_id, 1).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_identities_use_their_own_selectors_resources_and_grants() -> TestResult {
+        for environment in [None, Some("host:retired")] {
+            let fleets = x86_and_arm_fleets();
+            let stack = gated_identity_stack(&fleets).await?;
+            let environment = environment.map(str::parse).transpose()?;
+            let mut policy = gang_types::FleetActionPolicy::default();
+            policy.grants.insert(gang_types::Capability::Network);
+            let actual = FleetProperties::new(
+                &FleetName::try_new("arm")?,
+                Isa::X86_64,
+                &"noop",
+                environment.as_ref(),
+                Resources {
+                    vcpus: 8,
+                    memory: Bytes::gib(16),
+                    disk: Bytes::gib(100),
+                },
+                &policy,
+                [],
+            );
+            let registered: HashMap<_, _> = actual
+                .worker_properties()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect();
+            let mut request = action(Isa::X86_64, Some("12582912"));
+            let properties = &mut Arc::make_mut(&mut request).platform_properties;
+            properties.remove(property::ACTION_ENVIRONMENT);
+            if let Some(environment) = &environment {
+                properties.insert(
+                    property::ACTION_ENVIRONMENT.to_owned(),
+                    environment.to_string(),
+                );
+            }
+            properties.insert(property::FLEET.to_owned(), "arm".to_owned());
+            properties.insert(property::SANDBOX.to_owned(), "noop".to_owned());
+            properties.insert(property::CPU_COUNT.to_owned(), "8".to_owned());
+            properties.insert(property::NETWORK.to_owned(), "requested".to_owned());
+            let manager = stack.workers.get_platform_property_manager();
+            let worker_id = WorkerId("actual-worker".to_owned());
+            assert_incomplete_workers_rejected(&stack, &worker_id, &registered, &request).await?;
+            let (tx, mut rx) = mpsc::channel(64);
+            stack
+                .workers
+                .add_worker(Worker::new(
+                    worker_id,
+                    manager.make_platform_properties(registered)?,
+                    tx,
+                    NOW.get().as_secs(),
+                    1,
+                ))
+                .await?;
+            rx.try_recv().expect("connection acknowledgement");
+            let _subscription = stack
+                .actions
+                .add_action(OperationId::from("actual-client"), request)
+                .await?;
+            stack.simple.do_try_match_for_test().await?;
+            let (dispatch, memory) = next_dispatch(&mut rx).await;
+            assert_eq!(memory, 12 << 20);
+            let properties = dispatch.platform.expect("dispatch platform").properties;
+            assert!(
+                properties
+                    .iter()
+                    .any(|entry| { entry.name == property::NETWORK && entry.value == "requested" })
+            );
+            assert!(properties.iter().any(|entry| {
+                entry.name == property::ACTION_ENVIRONMENT
+                    && entry.value
+                        == environment
+                            .as_ref()
+                            .map_or("", gang_types::ActionEnvironment::as_str)
+            }));
+        }
         Ok(())
     }
 
@@ -1205,9 +1526,17 @@ mod tests {
         let stack = stack_on_test_clock(&fleets, &default_config())?;
         let clock = Arc::new(gang_clock::TestClock::default());
         let timeout = Duration::from_secs(30);
-        let wrapper =
-            PlaceableActions::new(stack.actions.clone(), fleets, AdmittedFleets::default())
-                .with_workers(stack.workers.clone(), clock.clone(), timeout);
+        let wrapper = PlaceableActions::new(
+            stack.actions.clone(),
+            fleets.clone(),
+            AdmittedFleets::default(),
+        )
+        .with_workers(
+            stack.workers.clone(),
+            Arc::new(InstanceCordons::new(Arc::new(fleets))),
+            clock.clone(),
+            timeout,
+        );
         let mut old_action = action(Isa::Aarch64, Some("252"));
         Arc::make_mut(&mut old_action).platform_properties.insert(
             property::ACTION_ENVIRONMENT.to_owned(),
@@ -1232,7 +1561,8 @@ mod tests {
         assert_eq!(error.code, Code::Unavailable);
         let id = WorkerId("old-worker".to_owned());
         let _rx =
-            connect_arm_worker_with_environment(stack.workers.as_ref(), &id, 1, "host:old").await?;
+            connect_arm_worker_with_environment(stack.workers.as_ref(), &id, 1, Some("host:old"))
+                .await?;
         let _subscription = wrapper
             .add_action(OperationId::from("live"), old_action.clone())
             .await?;
@@ -1432,9 +1762,13 @@ mod tests {
         let fleets = x86_and_arm_fleets();
         let stack = stack_with_actions(&fleets, &config, None, &actions)?.0;
         let worker_id = WorkerId("arm-worker".to_owned());
-        let mut rx =
-            connect_arm_worker_with_environment(stack.workers.as_ref(), &worker_id, 1, environment)
-                .await?;
+        let mut rx = connect_arm_worker_with_environment(
+            stack.workers.as_ref(),
+            &worker_id,
+            1,
+            Some(environment),
+        )
+        .await?;
         let connected = rx
             .try_recv()
             .expect("the worker receives a connection result");
@@ -1861,7 +2195,7 @@ mod tests {
                         &FleetName::try_new(name).expect("valid fleet name"),
                         Isa::X86_64,
                         &"docker",
-                        &"host:test".parse().expect("valid environment"),
+                        Some(&"host:test".parse().expect("valid environment")),
                         Resources {
                             vcpus,
                             memory: Bytes::new(memory_gib << 30),

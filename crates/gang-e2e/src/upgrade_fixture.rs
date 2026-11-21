@@ -12,7 +12,6 @@ pub(crate) struct ReleaseFixture {
     pub(crate) gang_toml: String,
     pub(crate) local_config: String,
     pub(crate) public: FrontendPlan,
-    pub(crate) execution: Option<FrontendPlan>,
     pub(crate) workers: FrontendPlan,
     pub(crate) controller: ControllerPlan,
     pub(crate) configuration: ConfigurationPlan,
@@ -20,11 +19,8 @@ pub(crate) struct ReleaseFixture {
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct ConfigurationPlan {
-    pub(crate) legacy_name: String,
-    pub(crate) legacy_arn: String,
     pub(crate) controller: ConfigurationAccess,
     pub(crate) workers: Vec<ConfigurationAccess>,
-    pub(crate) legacy_unchanged: bool,
     pub(crate) generations_retained: bool,
 }
 
@@ -95,18 +91,14 @@ mod tests {
             "gang_toml": "rendered",
             "local_config": "local",
             "public": frontend,
-            "execution": null,
             "workers": frontend,
             "configuration": {
-                "legacy_name": "/gang/gang.toml",
-                "legacy_arn": "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml",
                 "controller": {
-                    "reference": "/gang/gang.toml",
+                    "reference": "/gang/gang.toml/generations/old:1",
                     "readable_resources": [],
                     "excluded_from_deny": []
                 },
                 "workers": [],
-                "legacy_unchanged": false,
                 "generations_retained": false
             },
             "controller": {
@@ -143,11 +135,8 @@ mod tests {
             ("workers", "proxy_protocol_v2"),
             ("controller", "warmup_seconds"),
             ("controller", "deregistration_delay_seconds"),
-            ("configuration", "legacy_name"),
-            ("configuration", "legacy_arn"),
             ("configuration", "controller"),
             ("configuration", "workers"),
-            ("configuration", "legacy_unchanged"),
             ("configuration", "generations_retained"),
         ] {
             let mut value = fixture();
