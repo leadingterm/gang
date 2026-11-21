@@ -435,6 +435,21 @@ mod tests {
         let launch = group.launch_candidates.ok_or("missing candidates")?;
         assert_eq!(launch.zones.as_ptr(), zones_ptr);
         assert_eq!(launch.overrides.as_ptr(), overrides_ptr);
+        let raw = &output.auto_scaling_groups()[0];
+        assert!(std::ptr::eq(launch.zones, raw.availability_zones()));
+        let overrides = raw
+            .mixed_instances_policy()
+            .and_then(|policy| policy.launch_template())
+            .ok_or("missing launch template")?
+            .overrides();
+        assert!(std::ptr::eq(launch.overrides, overrides));
+        // A second view borrows the same intact snapshot, as a cached observation does.
+        let reread = Group::read(&output, GROUP)?;
+        let reread = reread
+            .launch_candidates
+            .ok_or("missing reread candidates")?;
+        assert!(std::ptr::eq(reread.zones, launch.zones));
+        assert!(std::ptr::eq(reread.overrides, launch.overrides));
         assert_eq!(
             launch.pairs().collect::<Vec<_>>(),
             vec![
@@ -496,8 +511,14 @@ mod tests {
                 .and_then(|template| template.version()),
             Some("2")
         );
-        assert!(raw.availability_zones.is_none());
-        assert!(launch.overrides.is_none());
+        let candidates = group
+            .launch_candidates
+            .as_ref()
+            .ok_or("missing candidates")?;
+        assert!(std::ptr::eq(candidates.zones, raw.availability_zones()));
+        assert!(std::ptr::eq(candidates.overrides, launch.overrides()));
+        assert_eq!(raw.availability_zones(), &["us-east-1a"]);
+        assert_eq!(launch.overrides()[0].instance_type(), Some("c7g.large"));
         Ok(())
     }
 
