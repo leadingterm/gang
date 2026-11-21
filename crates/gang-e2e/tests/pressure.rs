@@ -108,7 +108,7 @@ fn pressure_policy_retry_waits_for_neighbour_capacity() {
 }
 
 #[test]
-fn pool_oom_retry_waits_for_victim_capacity() {
+fn pool_oom_retries_wait_for_survivor_capacity() {
     let policy = ResourcePolicy::pool_oom_scenario().expect("valid pool OOM policy");
     let reserve = policy.memory.reserve.get().get();
     let actual_pool = policy
@@ -124,13 +124,15 @@ fn pool_oom_retry_waits_for_victim_capacity() {
         - reserve;
     let victim = 64 * 1024 * 1024_u64;
     let neighbour = 320 * 1024 * 1024_u64;
-    let retry = (neighbour * u64::from(policy.memory.escalation_percent.get()))
-        .div_ceil(100)
-        .min(retry_ceiling);
+    let escalation = u64::from(policy.memory.escalation_percent.get());
+    let neighbour_retry = (neighbour * escalation).div_ceil(100).min(retry_ceiling);
+    let victim_retry = (victim * escalation).div_ceil(100).min(retry_ceiling);
 
-    assert_eq!(retry, 416 * 1024 * 1024);
+    assert_eq!(actual_pool, retry_ceiling);
+    assert_eq!(neighbour_retry, 416 * 1024 * 1024);
     assert!(victim + neighbour <= actual_pool);
-    assert!(retry + victim > actual_pool);
+    assert!(neighbour_retry + victim > actual_pool);
+    assert!(victim_retry + neighbour > actual_pool);
 }
 
 #[test]

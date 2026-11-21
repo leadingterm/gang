@@ -130,7 +130,9 @@ fn launch_activities(activities: &[Activity]) -> impl Iterator<Item = &Activity>
 fn has_launch_in_flight(activities: &[Activity]) -> bool {
     activities.iter().any(|activity| {
         let terminal = matches!(
-            activity.status_code().map(|status| status.as_str()),
+            activity
+                .status_code()
+                .map(ScalingActivityStatusCode::as_str),
             Some("Failed" | "Successful" | "Cancelled")
         );
         let termination = activity
@@ -256,9 +258,9 @@ fn classify_attempt<'a>(
         return None;
     }
     Some(Attempt {
-        message,
         zone,
         instance_type,
+        message,
     })
 }
 
