@@ -1099,24 +1099,23 @@ mod tests {
                 .iter()
                 .any(|step| matches!(step.action, Action::Terminate { .. }))
         );
-        control.plan.steps.insert(
-            0,
-            PlanStep {
-                fleet: 0,
-                action: Action::ReinforceDrain(worker),
-            },
-        );
-        control.plan.steps.insert(
-            0,
-            PlanStep {
-                fleet: 0,
-                action: Action::ScaleOut {
-                    from: 1,
-                    to: 2,
-                    need: NeedCause::Demand,
-                    summary: ScaleDecision::default(),
+        control.plan.steps.splice(
+            0..0,
+            [
+                PlanStep {
+                    fleet: 0,
+                    action: Action::ScaleOut {
+                        from: 1,
+                        to: 2,
+                        need: NeedCause::Demand,
+                        summary: ScaleDecision::default(),
+                    },
                 },
-            },
+                PlanStep {
+                    fleet: 0,
+                    action: Action::ReinforceDrain(worker),
+                },
+            ],
         );
         let guard = scheduler.hold_control_acquisition().await?;
         {
@@ -1139,10 +1138,8 @@ mod tests {
                 .any(|event| matches!(event.kind, ScalingEventKind::ScaledOut { .. }))
         );
         drop(guard);
-        assert!(matches!(
-            control.pass().await,
-            PassOutcome::Completed { failed: 0, .. }
-        ));
+        let outcome = control.pass().await;
+        assert!(matches!(outcome, PassOutcome::Completed { failed: 0, .. }));
         assert_eq!(provisioner.terminations().len(), 1);
         Ok(())
     }
