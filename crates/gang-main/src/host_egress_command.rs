@@ -59,7 +59,7 @@ fn validate_host_addresses(ip: &Path, policy: &PublicEgressPolicy) -> io::Result
         ));
     }
     let output = Command::new(ip)
-        .args(["-j", "address", "show", "scope", "global"])
+        .args(["-j", "address", "show"])
         .env_clear()
         .output()?;
     if !output.status.success() {

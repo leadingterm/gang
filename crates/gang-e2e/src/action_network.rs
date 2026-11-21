@@ -84,7 +84,7 @@ mod linux {
             .await?
             .ok_or("missing action pool")?;
         let text = format!(
-            "work_directory = \"{}\"\nselected = \"bwrap\"\ncontroller_endpoints = [\"http://127.0.0.1:50051\", \"grpc://127.0.0.1:9090\"]\n[actions]\ngrants = [\"network\"]\n[sandbox.bwrap]\nroot = \"{}\"\nprogram = \"{}\"\n[sandbox.bwrap.egress]\nprogram = \"{}\"\n[execution.egress]\nprotected_networks = [\"10.0.0.0/8\", \"11.0.0.1/32\", \"169.254.0.0/16\"]\ndns_servers = [\"1.1.1.1\"]\n[limits.cgroup]\n",
+            "work_directory = \"{}\"\nselected = \"bwrap\"\ncontroller_endpoints = [\"http://127.0.0.1:50051\", \"grpc://127.0.0.1:9090\"]\n[actions]\ngrants = [\"network\"]\n[sandbox.bwrap]\nroot = \"{}\"\nprogram = \"{}\"\n[sandbox.bwrap.egress]\nprogram = \"{}\"\n[execution.egress]\nprotected_networks = [\"10.0.0.0/8\", \"11.0.0.1/32\", \"169.254.0.0/16\", \"2001:db8::/32\"]\ndns_servers = [\"1.1.1.1\"]\n[limits.cgroup]\n",
             root.join("work").display(),
             std::env::var("ROOTFS")?,
             std::env::var("BWRAP")?,
@@ -138,6 +138,31 @@ mod linux {
         .await??;
         wait(a, true).await?;
         wait(b, true).await?;
+        fs::write(
+            &config_path,
+            text.replace("127.0.0.1:50051", "127.0.0.1:50052"),
+        )?;
+        wait(
+            start(&root, "protected-override", true, "connect", "11.0.0.2")?,
+            true,
+        )
+        .await?;
+        if !root.join("work/protected-override/work/started").exists() {
+            return Err("protected-override payload did not execute".into());
+        }
+        fs::write(
+            &config_path,
+            text.replace("127.0.0.1:50051", "1.1.1.2:50051"),
+        )?;
+        wait(
+            start(&root, "unprotected-override", true, "connect", "11.0.0.2")?,
+            false,
+        )
+        .await?;
+        if root.join("work/unprotected-override/work/started").exists() {
+            return Err("unprotected-override payload executed".into());
+        }
+        fs::write(&config_path, &text)?;
         fs::write(&config_path, text.replace("[limits.cgroup]\n", ""))?;
         wait(
             start(&root, "no-scope", true, "connect", "11.0.0.2")?,

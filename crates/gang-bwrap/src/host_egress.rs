@@ -226,10 +226,7 @@ pub fn verify_host_egress(
     trusted(record, false)?;
     let state: HostEgressPolicy =
         serde_json::from_slice(&fs::read(record)?).map_err(io::Error::other)?;
-    if &state.policy != policy
-        || state.controller_endpoints != controller_endpoints
-        || !action_cgroup.is_absolute()
-    {
+    if &state.policy != policy || !action_cgroup.is_absolute() {
         return Err(invalid("host egress policy mismatch"));
     }
     let action = fs::canonicalize(action_cgroup)?;
@@ -238,6 +235,9 @@ pub fn verify_host_egress(
         || fs::metadata(&state.cgroup)?.ino() != state.cgroup_id
     {
         return Err(invalid("action cgroup does not match host egress policy"));
+    }
+    if state.controller_endpoints != controller_endpoints {
+        endpoints_protected(policy, controller_endpoints)?;
     }
     Ok(())
 }

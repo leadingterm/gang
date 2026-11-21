@@ -45,7 +45,7 @@
   configFile = pkgs.writeText "gang-network-test.toml" ((builtins.readFile ../../../configs/gang.local.plaintext.toml)
     + ''
       [execution.egress]
-      protected_networks = ["10.0.0.0/8", "11.0.0.1/32", "169.254.0.0/16"]
+      protected_networks = ["10.0.0.0/8", "11.0.0.1/32", "169.254.0.0/16", "2001:db8::/32"]
       dns_servers = ["1.1.1.1"]
     '');
 in
@@ -78,6 +78,8 @@ in
     nodes.worker = {pkgs, ...}: {
       imports = [../worker.nix];
       _module.args.gang = gang;
+      networking.firewall.enable = true;
+      networking.dhcpcd.enable = lib.mkForce false;
       networking.interfaces.eth0.useDHCP = lib.mkForce false;
       networking.defaultGateway = lib.mkForce {
         address = "11.0.0.2";
@@ -89,22 +91,24 @@ in
           prefixLength = 24;
         }
       ];
-      networking.interfaces.lo.ipv4.addresses = [
-        {
-          address = "169.254.169.254";
-          prefixLength = 32;
-        }
-      ];
       users.groups.gang = {};
       users.users.gang = {
         isSystemUser = true;
         group = "gang";
       };
       environment.systemPackages = [pkgs.netcat pkgs.socat];
+      systemd.services.imds-address = {
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${pkgs.iproute2}/bin/ip addr replace 169.254.169.254/32 dev lo";
+        };
+      };
       systemd.services.fixture = {
         wantedBy = ["multi-user.target"];
-        after = ["network-online.target"];
+        after = ["network-online.target" "imds-address.service"];
         wants = ["network-online.target"];
+        requires = ["imds-address.service"];
         serviceConfig.ExecStart = "${pkgs.socat}/bin/socat TCP-LISTEN:18080,bind=169.254.169.254,reuseaddr,fork EXEC:${pkgs.coreutils}/bin/true";
       };
       systemd.services.gang-config = lib.mkForce {
