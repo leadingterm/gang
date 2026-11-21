@@ -17,9 +17,8 @@ impl Bwrap {
     /// the content store and other actions' directories are never mapped.
     /// The action directory is bound read-write, so every input resolves,
     /// including those outside the working directory (`../input`, relative symlinks); the working
-    /// directory inside it becomes the current directory. The host network is never shared.
-    /// The `bwrap` process itself starts with an empty environment. For gated actions the
-    /// trusted reset process also starts empty; the environment is delivered after setup.
+    /// directory inside it becomes the current directory. Granted actions share only pasta's
+    /// network namespace. The outer processes start with an empty environment.
     ///
     /// `info_fd` is the descriptor `bwrap` writes its `--info-fd` report to. It is passed through
     /// unchanged, so the caller keeps it open in the spawned process; `bwrap` writes the report
@@ -32,19 +31,47 @@ impl Bwrap {
         &self,
         spec: &ActionExecutionSpec<'_>,
         info_fd: RawFd,
-        network: Option<(BorrowedFd<'_>, BorrowedFd<'_>)>,
+        network: Option<BorrowedFd<'_>>,
     ) -> Command {
         let action_directory = spec.action_directory.as_os_str();
+        let outer = network
+            .and(self.egress.as_ref())
+            .map_or(&self.program, |egress| &egress.program);
         let mut command = match spec.launcher.split_first() {
             Some((launcher, launcher_arguments)) => {
                 let mut command = Command::new(launcher);
-                command.args(launcher_arguments).arg(&self.program);
+                command.args(launcher_arguments).arg(outer);
                 command
             }
-            None => Command::new(&self.program),
+            None => Command::new(outer),
         };
         command.env_clear();
+        if network.is_some() {
+            command.args([
+                "--foreground",
+                "--config-net",
+                "--no-map-gw",
+                "--dns",
+                "none",
+                "--search",
+                "none",
+                "-t",
+                "none",
+                "-u",
+                "none",
+                "-T",
+                "none",
+                "-U",
+                "none",
+                "--no-pidns",
+                "--pass-fds",
+            ]);
+            command.arg(&self.program);
+        }
         command.args(self.prefix.iter());
+        if network.is_some() {
+            command.arg("--share-net");
+        }
         command.arg("--info-fd").arg(info_fd.to_string());
         command.args([
             OsStr::new("--bind"),
@@ -53,15 +80,14 @@ impl Bwrap {
             OsStr::new("--chdir"),
             spec.working_directory.as_os_str(),
         ]);
-        if let Some((_gate, resolver)) = network {
+        if let Some(resolver) = network {
             command
                 .arg("--ro-bind-data")
                 .arg(resolver.as_raw_fd().to_string())
                 .arg("/etc/resolv.conf");
-        } else {
-            for (name, value) in spec.environment {
-                command.arg("--setenv").arg(name).arg(value);
-            }
+        }
+        for (name, value) in spec.environment {
+            command.arg("--setenv").arg(name).arg(value);
         }
         command
             .arg("--ro-bind")
@@ -71,11 +97,6 @@ impl Bwrap {
             .arg("/")
             .arg("--")
             .arg(RESET_PATH);
-        if let Some((gate, _resolver)) = network {
-            command
-                .arg("--execution-gate-fd")
-                .arg(gate.as_raw_fd().to_string());
-        }
         command
             .arg("--")
             .arg(spec.command.program())
@@ -120,7 +141,7 @@ mod tests {
         action_directory: &Path,
         working_directory: &Path,
         network: NetworkAccess<'_>,
-        setup: Option<(BorrowedFd<'_>, BorrowedFd<'_>)>,
+        setup: Option<BorrowedFd<'_>>,
     ) -> Result<Command, Box<dyn std::error::Error>> {
         let argv = [
             OsString::from("/bin/sh"),
@@ -137,6 +158,7 @@ mod tests {
             environment: &environment,
             action_directory,
             working_directory,
+            memory_cgroup: None,
             network,
         };
         Ok(bwrap.command(&spec, INFO_FD, setup))
@@ -302,15 +324,16 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn action_policy_never_shares_host_network() -> Result<(), Box<dyn std::error::Error>> {
-        let bwrap = bwrap();
-        let (_parent, gate) = gang_os::execution_gate_pair()?;
+    fn action_policy_uses_pasta_namespace() -> Result<(), Box<dyn std::error::Error>> {
+        let mut bwrap = bwrap();
+        bwrap.egress = Some(crate::EgressPrograms {
+            program: "/usr/bin/pasta".into(),
+        });
         let resolver = tempfile::tempfile()?;
-        let gate_fd = gate.as_raw_fd().to_string();
         let resolver_fd = resolver.as_raw_fd().to_string();
         let policy: gang_types::PublicEgressPolicy =
             toml::from_str("protected_networks = [\"10.0.0.0/8\"]\ndns_servers = [\"1.1.1.1\"]")?;
-        let args = args(&command(
+        let command = command(
             &bwrap,
             Path::new("/work/a"),
             Path::new("/work/a"),
@@ -318,11 +341,38 @@ mod tests {
                 policy: &policy,
                 controller_endpoints: &[],
             },
-            Some((gate.as_fd(), resolver.as_fd())),
-        )?);
-        assert!(args.iter().any(|arg| arg == "--unshare-all"), "{args:?}");
-        assert!(!args.iter().any(|arg| arg == "--share-net"), "{args:?}");
-        assert!(!args.iter().any(|arg| arg == "--setenv"), "{args:?}");
+            Some(resolver.as_fd()),
+        )?;
+        assert_eq!(command.get_program(), "/usr/bin/pasta");
+        let args = args(&command);
+        assert_eq!(
+            &args[..18],
+            [
+                "--foreground",
+                "--config-net",
+                "--no-map-gw",
+                "--dns",
+                "none",
+                "--search",
+                "none",
+                "-t",
+                "none",
+                "-u",
+                "none",
+                "-T",
+                "none",
+                "-U",
+                "none",
+                "--no-pidns",
+                "--pass-fds",
+                "/usr/bin/bwrap",
+            ]
+        );
+        assert!(
+            position(&args, "--unshare-all") < position(&args, "--share-net"),
+            "{args:?}"
+        );
+        assert!(args.iter().any(|arg| arg == "--setenv"), "{args:?}");
         let resolver = position(&args, "/etc/resolv.conf");
         assert_eq!(
             &args[resolver - 2..=resolver],
@@ -331,11 +381,6 @@ mod tests {
                 resolver_fd,
                 "/etc/resolv.conf".into()
             ]
-        );
-        let gate = position(&args, "--execution-gate-fd");
-        assert_eq!(
-            &args[gate + 1..gate + 4],
-            [gate_fd, "--".into(), "/bin/sh".into()]
         );
         Ok(())
     }
@@ -396,6 +441,7 @@ mod tests {
             action_directory: Path::new("/work/a"),
             working_directory: Path::new("/work/a"),
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
         };
 
         let command = bwrap.command(&spec, INFO_FD, None);
@@ -444,6 +490,7 @@ mod tests {
             action_directory: directory.path(),
             working_directory: directory.path(),
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
         };
         // The bwrap stand-in is a Bazel-built binary: no host program runs.
         let outcome = bwrap.start(&spec).await?.wait().await?;

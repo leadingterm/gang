@@ -5,7 +5,7 @@ import type { EarlierBuilds } from "../src/client.ts";
 import { clock } from "../src/format.ts";
 import type { Screen } from "../src/routes.ts";
 import { Shell } from "../src/shell.tsx";
-import { ClientContext } from "../src/ui.tsx";
+import { ClientContext, Tile, Tiles } from "../src/ui.tsx";
 import { Actions } from "../src/views/actions.tsx";
 import { Activity } from "../src/views/activity.tsx";
 import { Build, BuildView } from "../src/views/build.tsx";
@@ -673,6 +673,49 @@ test("every section header renders through the one header component", (t) => {
       t.assert.match(heading, /class="shead__title(?: shead__title--mono)?"/, name);
     }
   }
+});
+
+test("Tiles spans the final readout for four- and five-column grids", (t) => {
+  const cases = [
+    { columns: 4, count: 0, span: 1 },
+    { columns: 4, count: 1, span: 4 },
+    { columns: 4, count: 3, span: 2 },
+    { columns: 4, count: 5, span: 4 },
+    { columns: 4, count: 6, span: 3 },
+    { columns: 4, count: 7, span: 2 },
+    { columns: 5, count: 0, span: 1 },
+    { columns: 5, count: 1, span: 5 },
+    { columns: 5, count: 3, span: 3 },
+    { columns: 5, count: 5, span: 1 },
+    { columns: 5, count: 6, span: 5 },
+    { columns: 5, count: 7, span: 4 },
+  ];
+  for (const { columns, count, span } of cases) {
+    const tiles = Array.from({ length: count }, (_, index) =>
+      <Tile key={index} label={`Label ${index}`} value={`Value ${index}`} />);
+    const markup = render(<Tiles columns={columns}>{tiles}</Tiles>);
+    const context = `${columns} columns, ${count} readouts`;
+    t.assert.match(markup, new RegExp(`--tile-columns:\\s*${columns}(?:;|")`), context);
+    t.assert.match(markup, new RegExp(`--tile-last-span:\\s*${span}(?:;|")`), context);
+    t.assert.equal((markup.match(/class="readout"/g) ?? []).length, count, context);
+    t.assert.equal(markup.slice(markup.indexOf(">") + 1, -6), tiles.map((tile) => render(tile)).join(""), context);
+  }
+});
+
+test("Tiles flattens nested children and ignores null and false with default columns", (t) => {
+  const tiles = [0, 1, 2].map((index) =>
+    <Tile key={index} label={`Label ${index}`} value={`Value ${index}`} />);
+  const markup = render(<Tiles>{[null, [tiles[0], false, [tiles[1], null]], tiles[2], false]}</Tiles>);
+  t.assert.match(markup, /--tile-columns:\s*5(?:;|")/);
+  t.assert.match(markup, /--tile-last-span:\s*3(?:;|")/);
+  t.assert.equal((markup.match(/class="readout"/g) ?? []).length, 3);
+  t.assert.equal(markup.slice(markup.indexOf(">") + 1, -6), tiles.map((tile) => render(tile)).join(""));
+
+  const emptyMarkup = render(<Tiles>{[null, [false, []]]}</Tiles>);
+  t.assert.match(emptyMarkup, /--tile-columns:\s*5(?:;|")/);
+  t.assert.match(emptyMarkup, /--tile-last-span:\s*1(?:;|")/);
+  t.assert.equal((emptyMarkup.match(/class="readout"/g) ?? []).length, 0);
+  t.assert.equal(emptyMarkup.slice(emptyMarkup.indexOf(">") + 1, -6), "");
 });
 
 test("every overview readout reserves a chart slot, including instances", (t) => {

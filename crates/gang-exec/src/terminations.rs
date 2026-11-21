@@ -125,6 +125,7 @@ mod tests {
                             action_directory: directory.path(),
                             working_directory: directory.path(),
                             network: NetworkAccess::Offline,
+                            memory_cgroup: None,
                             launcher: &[],
                         },
                         limits: ActionLimits {

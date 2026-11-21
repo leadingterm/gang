@@ -27,10 +27,8 @@ pub mod isolation {
         "an action of the noop fleet runs in the host's net and mnt namespaces";
 }
 
-/// Names of the checks of network capability admission and isolation.
+/// Names of the checks of network capability admission.
 pub mod network {
-    /// The noop sandbox cannot provide the network fixture.
-    pub const SUPPORTED: &str = "the sandbox supports public egress";
     /// An ungranted request is rejected before the action reports output.
     pub const ADMISSION: &str = "an ungranted network request is rejected before execution";
 }

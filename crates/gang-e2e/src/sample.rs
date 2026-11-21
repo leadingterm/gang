@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use gang_types::Isa;
 use sha2::{Digest, Sha256};
 
-use crate::egress_wire::EgressTargets;
 use crate::errors::{E2eError, Result};
 use crate::system::{Probe, Sandbox};
 
@@ -20,9 +19,6 @@ const CONFIG_FILE: &str = "config.bzl";
 
 /// The file name the glibc tool is staged under, the input of the sample's `glibc_tool` probe.
 const GLIBC_TOOL_FILE: &str = "glibc-tool";
-
-const EGRESS_PROBE_FILE: &str = "egress-probe";
-const EGRESS_TARGETS_FILE: &str = "egress-targets.json";
 
 /// The number of random bytes a salt is made of. Each byte becomes two hex digits.
 const SALT_BYTES: usize = 8;
@@ -77,10 +73,6 @@ pub struct SampleParameters {
     pub requested_sandbox: Sandbox,
     /// The dynamically linked glibc program staged as [`GLIBC_TOOL_FILE`]; `None` where the platform has no bwrap.
     pub glibc_tool: Option<PathBuf>,
-    /// The executable used by network probes, when the fixture is available.
-    pub egress_probe: Option<PathBuf>,
-    /// Addresses and policy for the network fixture, when available.
-    pub egress_targets: Option<EgressTargets>,
 }
 
 /// Copies the sample workspace at `source` to `destination` and writes its parameters.
@@ -91,8 +83,6 @@ pub struct SampleParameters {
 /// After the copy, `BUILD.bazel` is checked for a literal name attribute for every probe,
 /// and `config.bzl` in `destination` is overwritten with the parameters.
 /// The glibc tool, when set, is copied in as `glibc-tool` with its permissions.
-/// The optional egress probe and its targets are staged as `egress-probe` and
-/// `egress-targets.json`, respectively.
 ///
 /// # Errors
 ///
@@ -117,20 +107,6 @@ pub fn stage(source: &Path, destination: &Path, parameters: &SampleParameters) -
             tool.display(),
             staged.display()
         )))?;
-    }
-    if let Some(tool) = &parameters.egress_probe {
-        let staged = destination.join(EGRESS_PROBE_FILE);
-        fs::copy(tool, &staged).map_err(E2eError::io(format!(
-            "copying {} to {}",
-            tool.display(),
-            staged.display()
-        )))?;
-    }
-    if let Some(targets) = &parameters.egress_targets {
-        let staged = destination.join(EGRESS_TARGETS_FILE);
-        let json = serde_json::to_vec(targets)
-            .map_err(E2eError::system_from("serializing egress targets"))?;
-        fs::write(&staged, json).map_err(E2eError::io(format!("writing {}", staged.display())))?;
     }
     let build_path = destination.join("BUILD.bazel");
     let build_file = fs::read_to_string(&build_path)

@@ -268,34 +268,6 @@ pub struct ActionTools {
     pub glibc_tool: Option<PathBuf>,
     /// Rootfs envelope used by bubblewrap workers.
     pub action_rootfs: Option<PathBuf>,
-    /// Pinned tools for the isolated public-egress fixture, when available.
-    pub egress: Option<EgressTools>,
-}
-
-/// Pinned programs and fixture state for the public-egress scenario.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EgressTools {
-    /// Rootless network implementation.
-    pub slirp4netns: PathBuf,
-    /// Firewall program.
-    pub nft: PathBuf,
-    /// Namespace entry program.
-    pub nsenter: PathBuf,
-    /// Network configuration program.
-    pub ip: PathBuf,
-    /// Namespace creation program.
-    pub unshare: PathBuf,
-    /// Action-side network probe.
-    pub probe: PathBuf,
-    /// Fixture peer.
-    pub peer: PathBuf,
-    /// Policy installed by the fixture.
-    pub policy: Option<gang_types::PublicEgressPolicy>,
-    /// Targets installed by the fixture.
-    pub targets: Option<crate::egress_wire::EgressTargets>,
-    /// Host-prefetched Bazel repositories, replayed offline only by the isolated fixture.
-    #[serde(default)]
-    pub repository_cache: Option<PathBuf>,
 }
 
 impl ActionTools {
@@ -331,41 +303,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deployment_inputs_round_trip_upgrade_and_egress() {
-        let policy: gang_types::PublicEgressPolicy = serde_json::from_value(serde_json::json!({
-            "protected_networks": ["10.0.0.0/8"],
-            "dns_servers": ["8.8.8.8"],
-            "setup_timeout": "10s"
-        }))
-        .expect("egress policy parses");
-        let targets = crate::egress_wire::EgressTargets {
-            public_ipv4: "192.0.2.1:8080".parse().expect("IPv4 address parses"),
-            public_ipv6: "[2001:db8::1]:8080".parse().expect("IPv6 address parses"),
-            blocked: [(
-                "private".to_owned(),
-                "10.0.0.1:8080".parse().expect("address parses"),
-            )]
-            .into_iter()
-            .collect(),
-            dns: "8.8.8.8".parse().expect("DNS address parses"),
-            nonce: "fixture-nonce".to_owned(),
-            uid: 1234,
-            gid: 5678,
-            timeout: Duration::from_secs(3),
-            policy: policy.clone(),
-        };
-        let tools = EgressTools {
-            slirp4netns: "slirp4netns".into(),
-            nft: "nft".into(),
-            nsenter: "nsenter".into(),
-            ip: "ip".into(),
-            unshare: "unshare".into(),
-            probe: "probe".into(),
-            peer: "peer".into(),
-            policy: Some(policy),
-            targets: Some(targets),
-            repository_cache: Some("repository-cache".into()),
-        };
+    fn deployment_inputs_round_trip_upgrade() {
         let release = |name: &str| ReleaseInput {
             binary: format!("{name}-binary").into(),
             fixture: format!("{name}-fixture").into(),
@@ -388,7 +326,6 @@ mod tests {
                     bwrap: Some("bwrap".into()),
                     glibc_tool: Some("glibc".into()),
                     action_rootfs: Some("rootfs".into()),
-                    egress: Some(tools.clone()),
                 },
                 upgrade: Some(UpgradeInputs {
                     previous: release("previous"),

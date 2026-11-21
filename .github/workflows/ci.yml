@@ -43,7 +43,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/family=m8i/image=ubuntu24-full-x64/nested-virt', github.run_id) || 'ubuntu-24.04' }}
-    timeout-minutes: 25
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,6 +52,10 @@ jobs:
         with:
           kvm: 'true'
           cache-save: 'true'
+      - uses: ./.github/actions/setup-bazel
+        with:
+          cache-job: linux-x86_64
+          restore-only: 'true'
       - name: Run NixOS VM checks
         env:
           NIX_CHECK_RESULTS: ${{ runner.temp }}/nix-check-results

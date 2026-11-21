@@ -56,6 +56,7 @@ mod tests {
             action_directory: Path::new("/work"),
             working_directory: Path::new("/work"),
             network: NetworkAccess::Offline,
+            memory_cgroup: None,
         };
 
         let command = command(&spec, Path::new("/tmp/action"));

@@ -8,7 +8,7 @@ Status: Accepted; the former host-sharing network policy is superseded by ADR-58
 
 ## Decision
 - **Sandbox domain.** `ActionIsolationPort` has one or more plugins active; the worker's fleet selects the one that runs an action (ADR-16).
-  - `gang-bwrap` (Linux) runs `bwrap` with all namespaces unshared, `--clearenv`, read-only binds, the action directory bound read-write with the command in its working directory, and the CAS directory and other actions' directories invisible. With the network namespace unshared the action reaches neither IMDS nor the controller.
+  - `gang-bwrap` (Linux) runs `bwrap` with isolated namespaces, `--clearenv`, read-only binds, the action directory bound read-write with the command in its working directory, and the CAS directory and other actions' directories invisible. Offline actions use an unshared network namespace; granted actions use isolated pasta networking and the host policy in SPEC §3.4.
   - `gang-noop` runs the action directly with an isolated `TMPDIR`, for macOS Local Mode and environments where the pod or job already isolates.
 - **Network** never shares the host network; requests are rejected by default without a selected-fleet grant (ADR-58).
 - **`gang exec` is the boundary Gang owns.** It is NativeLink's worker `entrypoint`, reached by argv0 multicall through the `gang-exec` link. Its order is fixed: read the sandbox file, apply `input_links`, enter the limits scope, run the action, leave the scope, exit. `Exited(c)` exits `c` and `Signaled(n)` exits `128 + n`. Termination ownership is recorded in ADR-54.

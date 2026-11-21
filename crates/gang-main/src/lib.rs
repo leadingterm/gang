@@ -51,6 +51,7 @@ mod errors;
 mod exec_command;
 mod guard_command;
 mod help;
+mod host_egress_command;
 mod join_command;
 mod local_down;
 mod local_pin;

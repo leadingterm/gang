@@ -56,9 +56,7 @@ use crate::setup::setup;
 use crate::skipped_pass::skipped_pass;
 use crate::stack::Stack;
 use crate::stale_scope::stale_scope;
-use crate::system::{
-    ActionLimits, FleetLayout, PermitNetwork, Sandbox, SoftMemory, System, Variant,
-};
+use crate::system::{ActionLimits, FleetLayout, Sandbox, SoftMemory, System, Variant};
 use crate::template::Transport;
 use crate::timeout::{action_timeout, exit_signals};
 use crate::work_aware::{backlog_grows_fleet, burst_from_zero, queued_behind_short_work};
@@ -130,7 +128,7 @@ gang_types::string_enum! {
         /// A fleet starts empty, scales out for a cold build, drains, and serves a warm rebuild from
         /// the cache.
         Lifecycle = "lifecycle",
-        /// An action that requests the network shares the host's network exactly when permitted.
+        /// An ungranted network request is rejected before execution.
         Network = "network",
         /// An action that modifies a cached input does not change what a later action sees, unless
         /// the workspace keeps its input links.
@@ -761,60 +759,12 @@ fn sessions_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     })
 }
 
-/// Runs both admission variants inside the isolated fixture worker.
-pub fn egress_worker(inputs: &DeploymentInputs, targets: &crate::EgressTargets) -> Report {
-    let mut report = Report::default();
-    let issuer = match TestIssuer::start(&inputs.settings) {
-        Ok(issuer) => issuer,
-        Err(error) => {
-            report.extend([Check::failed(
-                names::suite::ISSUER_STARTS,
-                gang_types::error_chain(&error).to_string(),
-            )]);
-            return report;
-        }
-    };
-    let baseline = Variant::baseline(Sandbox::Bwrap);
-    for permit_network in [PermitNetwork::Denied, PermitNetwork::Permitted] {
-        let variant = Variant {
-            permit_network,
-            ..baseline
-        };
-        report.extend(attempt(Scenario::Network, || {
-            let stack = Stack::create(inputs, &variant, Transport::Tls, &issuer)?;
-            network(&stack, &variant, targets)
-        }));
-    }
-    report
-}
-
-/// The network scenario uses a separate fixture before constructing any deployment.
+/// Checks network capability admission without an egress fixture.
 fn network_checks(ctx: &RunContext<'_>) -> Vec<Check> {
-    match ctx.sandbox {
-        Sandbox::Bwrap => {
-            let mut checks = match crate::egress_fixture::launch(ctx.inputs) {
-                Ok(report) => report.checks,
-                Err(error) => vec![Check::failed(
-                    names::suite::scenario_completes(Scenario::Network),
-                    gang_types::error_chain(&error).to_string(),
-                )],
-            };
-            match crate::egress_fixture::lifecycle_targets(ctx.inputs)
-                .and_then(|targets| crate::egress_lifecycle::run(ctx.inputs, &targets))
-            {
-                Ok(report) => checks.extend(report.checks),
-                Err(error) => checks.push(Check::failed(
-                    "egress lifecycle: delegated driver",
-                    gang_types::error_chain(&error).to_string(),
-                )),
-            }
-            checks
-        }
-        Sandbox::Noop => vec![Check::skipped(
-            names::suite::scenario_completes(Scenario::Network),
-            "the noop sandbox does not isolate",
-        )],
-    }
+    attempt(Scenario::Network, || {
+        let stack = Stack::create(ctx.inputs, &ctx.baseline, Transport::Tls, ctx.issuer)?;
+        network(&stack)
+    })
 }
 
 /// The verdicts of the glibc toolchain scenario, or one skipped check where the sandbox is the host.
@@ -1545,7 +1495,6 @@ mod tests {
                 bwrap: None,
                 glibc_tool: None,
                 action_rootfs: None,
-                egress: None,
             },
             upgrade: None,
         };

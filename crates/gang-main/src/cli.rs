@@ -373,6 +373,9 @@ pub enum Command {
     /// Run a Gang worker.
     #[command(hide = true, after_help = WORKER_EXAMPLES)]
     Worker(WorkerArgs),
+    /// Install the worker's host action-egress policy.
+    #[command(name = "__prepare-action-egress", hide = true)]
+    PrepareActionEgress(PrepareActionEgressArgs),
     /// Commit a local worker's identity before executing its launcher.
     #[command(name = "__local-worker", hide = true)]
     LocalWorker(LocalWorkerArgs),
@@ -413,6 +416,7 @@ impl Command {
             Self::Config(ConfigCommand::Check(_)) => "gang config check",
             Self::Database(DatabaseCommand::Copy(_)) => "gang database copy",
             Self::Worker(_) => "gang worker",
+            Self::PrepareActionEgress(_) => "gang prepare action egress",
             Self::LocalWorker(_) => "gang local worker",
             Self::Exec(_) => "gang exec",
             Self::Local(LocalCommand::Up(_)) => "gang local up",
@@ -424,6 +428,23 @@ impl Command {
             Self::Release(command) => command.subject(),
         }
     }
+}
+
+/// Arguments for the privileged host policy installer.
+#[derive(Debug, Args)]
+pub struct PrepareActionEgressArgs {
+    /// Worker configuration.
+    #[arg(long)]
+    pub config: PathBuf,
+    /// Stable action cgroup ancestor.
+    #[arg(long)]
+    pub cgroup: PathBuf,
+    /// Absolute nft executable path.
+    #[arg(long)]
+    pub nft: PathBuf,
+    /// Absolute ip executable for host address inventory.
+    #[arg(long)]
+    pub ip: PathBuf,
 }
 
 /// Configuration commands.
