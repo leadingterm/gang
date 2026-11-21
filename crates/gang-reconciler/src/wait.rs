@@ -247,11 +247,11 @@ impl DispatchInstance {
         }
     }
 
-    fn event_at(&self, index: usize, work: &mut ProjectionWork) -> Option<Event> {
+    fn event_at(&self, index: usize, work: &mut ProjectionWork) -> Option<&Event> {
         if !work.charge(1) {
             return None;
         }
-        let event = self.events.get(index).copied();
+        let event = self.events.get(index);
         #[cfg(test)]
         if event.is_some() {
             work.event_visits += 1;
