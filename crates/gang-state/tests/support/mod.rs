@@ -110,6 +110,7 @@ pub fn worker_state(
         max_inflight_actions: max_inflight,
         capacity: None,
         reserved: None,
+        cache: None,
         draining,
         paused: false,
         last_seen: ts(0),

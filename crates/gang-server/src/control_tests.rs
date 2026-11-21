@@ -484,6 +484,7 @@ fn idle_worker(instance: &InstanceId, last_seen: Timestamp) -> TestResult<Worker
         max_inflight_actions: NonZeroU32::new(4),
         capacity: None,
         reserved: None,
+        cache: None,
         draining: false,
         last_seen,
         paused: false,

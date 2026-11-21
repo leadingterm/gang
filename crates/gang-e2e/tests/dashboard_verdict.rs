@@ -65,6 +65,10 @@ fn fleet(in_service: u32) -> Fleet {
             draining: 0,
             unconnected: 0,
         },
+        worker_cache: gang_wire::FleetWorkerCache {
+            workers: in_service,
+            ..gang_wire::FleetWorkerCache::default()
+        },
         demand: Demand {
             running: 0,
             queued: 0,
@@ -96,6 +100,7 @@ fn worker(phase: Phase) -> Worker {
         launch_time: at(0),
         phases: Vec::new(),
         infrastructure: None,
+        cache: None,
     }
 }
 

@@ -99,6 +99,7 @@ mod tests {
             max_inflight_actions: NonZeroU32::new(4),
             capacity: None,
             reserved: None,
+            cache: None,
             draining: false,
             paused: false,
             last_seen: Timestamp::default(),

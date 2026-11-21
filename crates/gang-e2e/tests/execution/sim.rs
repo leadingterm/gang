@@ -918,6 +918,7 @@ impl ExecSim {
             launch_time: at,
             phases: Vec::new(),
             infrastructure: None,
+            cache: None,
         }
     }
 

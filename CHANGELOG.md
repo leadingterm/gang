@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Show worker FastSlowStore cache reads, evictions and capacity in live state and the dashboard, with fleet reporting coverage.
+
 ### Changed
 
 - Bound AWS Auto Scaling observation traffic with a shared batched supply snapshot, per-controller pacing of all Auto Scaling HTTP attempts including SDK retries, and change-driven queue-less activity-history polling. The snapshot interval, HTTP attempt interval and minimum eligible history-poll interval default to `1s`, `500ms` and `60s`, respectively, and can be configured under `[provisioner.aws]`. Settled, unchanged groups with acknowledged history need no periodic activity reads; retries remain eligible for unmet or pending capacity, errors and unacknowledged history. The deployment module's `gang_settings.poll_interval` defaults to `2s` and remains operator-configurable; `gang_settings.cpu_oversubscription` configures the shared actions CPU multiplier and defaults to `2` (`1` disables oversubscription).
