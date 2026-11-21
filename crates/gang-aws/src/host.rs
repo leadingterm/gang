@@ -133,44 +133,39 @@ impl Aws {
                         description.target().and_then(|target| target.id())
                             == Some(instance.as_str())
                     });
-                match own {
-                    Some(description) => {
-                        let health = description
-                            .target_health()
-                            .and_then(|health| health.state())
-                            .ok_or_else(|| {
-                                AwsError::malformed(DESCRIBE_TARGET_HEALTH, "target health")
-                            })?;
-                        if !matches!(health.as_str(), "healthy" | "unhealthy") {
-                            ready = false;
-                        }
-                    }
-                    None => {
+                if let Some(description) = own {
+                    let health = description
+                        .target_health()
+                        .and_then(|health| health.state())
+                        .ok_or_else(|| {
+                            AwsError::malformed(DESCRIBE_TARGET_HEALTH, "target health")
+                        })?;
+                    if !matches!(health.as_str(), "healthy" | "unhealthy") {
                         ready = false;
-                        if !requested.contains(arn) {
-                            if self.state().await? != ControllerHostState::Active {
-                                return Err(AwsError::malformed(
-                                    DESCRIBE_GROUPS,
-                                    "eligible controller for target registration",
-                                )
-                                .into());
-                            }
-                            let target =
-                                aws_sdk_elasticloadbalancingv2::types::TargetDescription::builder()
-                                    .id(instance.as_str())
-                                    .build();
-                            runtime
-                                .elbv2
-                                .register_targets()
-                                .target_group_arn(arn)
-                                .targets(target)
-                                .send()
-                                .await
-                                .map_err(|error| {
-                                    AwsError::from(call_error(REGISTER_TARGETS, error))
-                                })?;
-                            requested.insert(arn.clone());
+                    }
+                } else {
+                    ready = false;
+                    if !requested.contains(arn) {
+                        if self.state().await? != ControllerHostState::Active {
+                            return Err(AwsError::malformed(
+                                DESCRIBE_GROUPS,
+                                "eligible controller for target registration",
+                            )
+                            .into());
                         }
+                        let target =
+                            aws_sdk_elasticloadbalancingv2::types::TargetDescription::builder()
+                                .id(instance.as_str())
+                                .build();
+                        runtime
+                            .elbv2
+                            .register_targets()
+                            .target_group_arn(arn)
+                            .targets(target)
+                            .send()
+                            .await
+                            .map_err(|error| AwsError::from(call_error(REGISTER_TARGETS, error)))?;
+                        requested.insert(arn.clone());
                     }
                 }
             }
@@ -344,7 +339,7 @@ impl ControllerHostPort for Aws {
                 Ok(ControllerHostState::Retiring) => return Ok(()),
                 Ok(ControllerHostState::Active) => {}
                 Err(error @ PortError::Unavailable(_)) => {
-                    tracing::warn!(%error, "controller retirement read failed; retrying")
+                    tracing::warn!(%error, "controller retirement read failed; retrying");
                 }
                 Err(error) => return Err(error),
             }

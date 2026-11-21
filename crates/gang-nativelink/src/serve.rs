@@ -23,7 +23,7 @@ use futures::StreamExt;
 use gang_clock::Clock;
 use gang_config::Http2Config;
 use gang_spi::{Listening, RequestGate, RequestScope};
-use gang_types::{NonZeroDuration, SaturatingInto};
+use gang_types::SaturatingInto;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;

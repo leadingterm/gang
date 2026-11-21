@@ -1813,6 +1813,7 @@ mod tests {
     -> gang_testkit::TestResult {
         use gang_clock::Clock;
         use gang_spi::{ControllerHostIdentity, ControllerId, ControllerReady, RecordKind};
+        use std::sync::Arc;
         use std::time::Duration;
         let (mut first, _dials, old) = crate::test_support::plain_parts();
         let (mut second, _dials, replacement) = crate::test_support::plain_parts();
@@ -2372,7 +2373,7 @@ mod tests {
         let snapshot_bound = settings.leadership.call_timeout.get();
         let server = super::Server::prepare(parts, settings).await?;
         let readiness = server.readiness.clone();
-        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let mut run = Box::pin(server.run(
             async {
                 let _ = stopped.await;
@@ -2609,7 +2610,7 @@ mod tests {
         ttl: std::time::Duration,
         history: gang_spi::LearnedHistory,
         release_drain: tokio::sync::oneshot::Sender<()>,
-        mut run: std::pin::Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
+        run: std::pin::Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
     ) -> gang_testkit::TestResult {
         use gang_clock::Clock;
         use gang_spi::{

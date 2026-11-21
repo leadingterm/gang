@@ -44,6 +44,7 @@ async fn controller_gates_preserve_lapse_admission_and_old_worker_store_drain_io
     assert_worker_store_admission(&gates, false).await;
     readiness.serve();
     assert_readiness_admission(&gates, false).await;
+    assert_worker_store_admission(&gates, false).await;
     readiness.lead();
     assert_readiness_admission(&gates, true).await;
     assert_worker_store_admission(&gates, true).await;
@@ -881,7 +882,6 @@ async fn promoted_gate_admits_cached_identity_during_database_failure() {
     let alice = client_token(&harness).await;
     let readiness = crate::health::Readiness::default();
     readiness.serve();
-    readiness.contend();
     readiness.lead();
     let gate = harness.gate.clone().with_readiness(readiness);
     let mut parts = cookie_parts("GET", EXECUTE_PATH, None, Some(&alice));

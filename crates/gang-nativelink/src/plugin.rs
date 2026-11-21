@@ -21,6 +21,7 @@ use tokio::sync::watch;
 
 use crate::config::NativeLinkConfig;
 use crate::controller::{self, Handles, SharedServices};
+use crate::history::Histories;
 use crate::snapshot;
 use crate::worker;
 // Hyper 1.12.0's HTTP/1 default read-buffer maximum bounds accepted request headers:

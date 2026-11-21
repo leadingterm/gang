@@ -350,6 +350,21 @@ struct SchedulerState {
     ready_hold: Option<oneshot::Receiver<()>>,
 }
 
+/// Projects an unexpired physical worker's dispatch stamp once into the drain census.
+fn retain_draining_worker(
+    workers: &mut Vec<DrainingWorker>,
+    stamp: &DrainingWorker,
+    now: Timestamp,
+) {
+    if stamp.deadline > now
+        && !workers
+            .iter()
+            .any(|entry| entry.fleet == stamp.fleet && entry.instance == stamp.instance)
+    {
+        workers.push(stamp.clone());
+    }
+}
+
 /// Counts calls made to a fake, so that a test can wait until a number of them has been made.
 #[derive(Clone)]
 pub struct CallCount(Arc<watch::Sender<usize>>);
@@ -411,7 +426,7 @@ async fn serve_controller_connections(
                         drop(merged);
                         drop(pending);
                         if let Some(hold) = drain_hold {
-                            let _ = hold.await;
+                            let () = hold.await;
                         }
                         return;
                     }
@@ -432,7 +447,7 @@ async fn serve_controller_connections(
     }
     drop(merged);
     if let Some(hold) = drain_hold {
-        let _ = hold.await;
+        let () = hold.await;
     }
 }
 
@@ -958,14 +973,7 @@ impl SchedulerPort for FakeScheduler {
                 .ok_or_else(|| {
                     PortError::config("executing worker has no dispatch-stamped attempt deadline")
                 })?;
-            if stamp.deadline > now
-                && !into
-                    .workers
-                    .iter()
-                    .any(|entry| entry.fleet == stamp.fleet && entry.instance == stamp.instance)
-            {
-                into.workers.push(stamp.clone());
-            }
+            retain_draining_worker(&mut into.workers, stamp, now);
         }
         for worker in &state.snapshot.workers {
             if worker.running_actions == 0 {
@@ -981,14 +989,7 @@ impl SchedulerPort for FakeScheduler {
                 .ok_or_else(|| {
                     PortError::config("running worker has no dispatch-stamped attempt deadline")
                 })?;
-            if stamp.deadline > now
-                && !into
-                    .workers
-                    .iter()
-                    .any(|entry| entry.fleet == stamp.fleet && entry.instance == stamp.instance)
-            {
-                into.workers.push(stamp.clone());
-            }
+            retain_draining_worker(&mut into.workers, stamp, now);
         }
         for action in &state.actions.running {
             let worker = state
@@ -1007,14 +1008,7 @@ impl SchedulerPort for FakeScheduler {
                 .ok_or_else(|| {
                     PortError::config("running worker has no dispatch-stamped attempt deadline")
                 })?;
-            if stamp.deadline > now
-                && !into
-                    .workers
-                    .iter()
-                    .any(|entry| entry.fleet == stamp.fleet && entry.instance == stamp.instance)
-            {
-                into.workers.push(stamp.clone());
-            }
+            retain_draining_worker(&mut into.workers, stamp, now);
         }
         into.workers.sort_unstable_by(|left, right| {
             (&left.fleet, &left.instance).cmp(&(&right.fleet, &right.instance))
