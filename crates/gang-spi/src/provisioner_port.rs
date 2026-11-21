@@ -9,6 +9,15 @@ use gang_types::{Fleet, InstanceId, InstanceLifecycle, Url, WorkerLifetime};
 
 use crate::{Held, InfrastructureEvent, PortError, port};
 
+/// Whether a removed instance may be reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationMode {
+    /// Ordinary scale-in may retain the instance in standby.
+    ScaleIn,
+    /// Replacement must physically destroy the instance, never returning it to standby.
+    Replace,
+}
+
 /// The worker fleets, on the compute backend that runs the instances.
 ///
 /// A method that changes anything takes a [`Held`], the fence's permission: reads take none, so
@@ -122,9 +131,10 @@ pub trait ProvisionerPort: Send + Sync {
         desired: u32,
     ) -> Result<(), PortError>;
 
-    /// Removes one instance from the fleet and lowers the desired capacity with it. The instance
-    /// may be retained in a standby pool. `Ok` when the instance is already gone, so a repeated
-    /// call is harmless. A [`Pending`](InstanceLifecycle::Pending) instance is cancelled.
+    /// Removes one instance from the fleet and lowers the desired capacity with it. The mode
+    /// controls whether the instance may be retained in a standby pool. `Ok` when the instance
+    /// is already gone, so a repeated call is harmless. A [`Pending`](InstanceLifecycle::Pending)
+    /// instance is cancelled.
     /// Terminating an instance that is not a member of the fleet (it never existed, is already
     /// gone, or belongs to another fleet) is Ok and changes nothing.
     ///
@@ -136,6 +146,7 @@ pub trait ProvisionerPort: Send + Sync {
         held: &Held,
         fleet: Fleet<'_, Self::FleetOptions>,
         instance: &InstanceId,
+        mode: TerminationMode,
     ) -> Result<(), PortError>;
 
     /// Whether the workers it starts serve many actions or exactly one. Does no I/O. A

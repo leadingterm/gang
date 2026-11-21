@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use gang_aws_sdk::CallError;
 use gang_clock::Timestamp;
-use gang_spi::FleetSupply;
+use gang_spi::{FleetSupply, TerminationMode};
 use gang_types::InstanceId;
 
 use crate::config::{
@@ -896,6 +896,7 @@ async fn terminate_on_demand_member_decrements_only_the_twin() -> TestResult {
                 held,
                 fleet.view(),
                 &InstanceId::try_new("i-od-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -943,6 +944,7 @@ async fn terminate_spot_member_decrements_only_spot() -> TestResult {
                 held,
                 fleet.view(),
                 &InstanceId::try_new("i-spot-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -987,6 +989,7 @@ async fn terminate_warm_twin_member_releases_into_pool() -> TestResult {
                 held,
                 fleet.view(),
                 &InstanceId::try_new("i-od-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -1060,6 +1063,7 @@ async fn terminate_spot_member_beside_warm_twin_skips_protection() -> TestResult
                 held,
                 fleet.view(),
                 &InstanceId::try_new("i-spot-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use gang_clock::{Tick, Timestamp};
 use gang_config::{FleetPolicy, ScalingConfig};
-use gang_spi::{FleetInstance, FleetSupply, WorkerState};
+use gang_spi::{FleetInstance, FleetSupply, TerminationMode, WorkerState};
 use gang_types::health::CLIENT_REROUTE_BOUND;
 use gang_types::{InstanceId, InstanceLifecycle, SaturatingInto};
 
@@ -850,6 +850,14 @@ impl Reconciler {
             action: Action::Terminate {
                 instance: instance.clone(),
                 cause,
+                mode: if pass
+                    .hosted
+                    .is_replacing(view.index, &view.policy.name, instance.as_str())
+                {
+                    TerminationMode::Replace
+                } else {
+                    TerminationMode::ScaleIn
+                },
             },
         });
         self.observations

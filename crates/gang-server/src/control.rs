@@ -787,10 +787,10 @@ where
             Action::CancelDrain(worker, _) => {
                 Self::set_draining(scheduler, configs, step.fleet, worker, false).await
             }
-            Action::Terminate { instance, .. } => {
+            Action::Terminate { instance, mode, .. } => {
                 let fleet = configs[step.fleet].fleet();
                 fence
-                    .run(async |held| provisioner.terminate(held, fleet, instance).await)
+                    .run(async |held| provisioner.terminate(held, fleet, instance, *mode).await)
                     .await
                     .map_err(PortError::from)
             }

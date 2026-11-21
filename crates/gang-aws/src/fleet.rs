@@ -16,7 +16,7 @@ use aws_sdk_ec2::types::Filter;
 use aws_sdk_ec2::types::builders::FilterBuilder;
 use gang_aws_sdk::call_error;
 use gang_clock::{Clock, Timestamp};
-use gang_spi::{FleetInstance, FleetSupply, Held, LaunchFailure};
+use gang_spi::{FleetInstance, FleetSupply, Held, LaunchFailure, TerminationMode};
 use gang_types::{Fleet, InstanceId, InstanceLifecycle};
 
 use crate::config::{AwsFleetOptions, CooldownPolicy, ON_DEMAND_SUFFIX, SpotFallback};
@@ -214,14 +214,15 @@ impl Fleets {
         }
     }
 
-    /// Retires an instance. Warm-pool reuse is allowed only when its launch-template id and
-    /// immutable version match the group's current template.
-    /// Unknown or stale generations are terminated with an atomic desired-capacity decrement.
+    /// Retires an instance. Scale-in may reuse the warm pool when its launch-template id and
+    /// immutable version match the group's current template. Replacement and unknown or stale
+    /// generations are terminated, decrementing desired capacity when it is nonzero.
     pub(crate) async fn terminate(
         &self,
         held: &Held,
         fleet: Fleet<'_, AwsFleetOptions>,
         instance: &InstanceId,
+        mode: TerminationMode,
     ) -> Result<(), AwsError> {
         let names = GroupNames::of(fleet);
         let output = self.describe_groups(names.iter()).await?;
@@ -235,7 +236,8 @@ impl Fleets {
         if member.lifecycle == InstanceLifecycle::Terminating {
             return Ok(());
         }
-        if member.lifecycle == InstanceLifecycle::InService
+        if mode == TerminationMode::ScaleIn
+            && member.lifecycle == InstanceLifecycle::InService
             && group.reuse_on_scale_in
             && member.current_generation
         {
@@ -245,7 +247,7 @@ impl Fleets {
         self.autoscaling
             .terminate_instance_in_auto_scaling_group()
             .instance_id(instance.as_str())
-            .should_decrement_desired_capacity(true)
+            .should_decrement_desired_capacity(group.desired != 0)
             .send()
             .await
             .map(|_| ())
@@ -1286,7 +1288,7 @@ mod tests {
         let result = gang_testkit::fence::with_expired_held(async |held| {
             harness
                 .fleets
-                .terminate(held, test_fleet.view(), &instance)
+                .terminate(held, test_fleet.view(), &instance, TerminationMode::ScaleIn)
                 .await
         })
         .await;
@@ -1312,6 +1314,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-a").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1347,14 +1350,14 @@ mod tests {
         gang_testkit::fence::with_held(async |held| {
             harness
                 .fleets
-                .terminate(held, fleet.view(), &instance)
+                .terminate(held, fleet.view(), &instance, TerminationMode::ScaleIn)
                 .await
         })
         .await?;
         gang_testkit::fence::with_held(async |held| {
             harness
                 .fleets
-                .terminate(held, fleet.view(), &instance)
+                .terminate(held, fleet.view(), &instance, TerminationMode::ScaleIn)
                 .await
         })
         .await?;
@@ -1375,6 +1378,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-t").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1396,6 +1400,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-gone").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1418,6 +1423,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-x").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1446,6 +1452,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-x").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1471,6 +1478,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-p").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1517,6 +1525,7 @@ mod tests {
                     held,
                     fleet("fleet-a").expect("test value is valid").view(),
                     &InstanceId::try_new("i-b").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1731,6 +1740,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-r").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })

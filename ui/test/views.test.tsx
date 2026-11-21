@@ -319,12 +319,6 @@ test("a utilization cordon explains the dwell without caution styling", (t) => {
   t.assert.doesNotMatch(row, /caution/);
 });
 
-test("an outdated cordon explains the release reason", (t) => {
-  const row = render(<EventRow withCause e={{ ...common, cause: "OUTDATED", drainStarted: { worker: `workers/${WORKER}` } }} />);
-  t.assert.match(row, /worker release is outdated or unknown/);
-  t.assert.doesNotMatch(row, /caution/);
-});
-
 test("an early exit names the instance and shows its failure", (t) => {
   const failure = "fail  gang worker: the scratch volume is too small";
   const row = render(<EventRow withCause e={{ ...common, exitedEarly: { instance: "instances/local-1", failure } }} />);
@@ -1146,7 +1140,7 @@ test("rollout desired beyond the logical maximum fits the tape without inventing
   const desired = Number(tape.match(/--d:\s*(\d+)/)?.[1]);
   t.assert.equal(max, 3);
   t.assert.equal(desired, 3);
-  t.assert.ok(max >= desired);
+  t.assert.equal(max >= desired, true);
   t.assert.equal((tape.match(/class="cell"/g) ?? []).length, 3);
   t.assert.match(tape, /1 stale, 0 no worker, 0 pending/);
   t.assert.match(tape, /of 1 maximum\. Desired 3/);

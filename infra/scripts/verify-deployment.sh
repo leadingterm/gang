@@ -109,7 +109,7 @@ exec "/proc/$pid/exe" -V' '{commands: [$command]}')
             attested='[]'
             command_id=''
           fi
-          instance=$(jq -r --argjson done "$attested" '[.[] | select(. as $id | $done | index($id) | not)] | .[0] // ""' <<<"$ids")
+          instance=$(jq -r --argjson 'done' "$attested" '[.[] | select(. as $id | $done | index($id) | not)] | .[0] // ""' <<<"$ids")
           if [[ -z $instance ]]; then break; fi
           if [[ -z $command_id ]]; then
             command_instance=$instance

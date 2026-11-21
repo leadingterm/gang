@@ -104,7 +104,7 @@ pub use plugin::{Plugin, PluginContext, SandboxPrograms};
 pub use private::__private;
 pub use provisioner_port::{
     FleetInstance, FleetSupply, InstanceExit, LaunchFailure, ProvisionerPort, ServerEndpoints,
-    Sidecar,
+    Sidecar, TerminationMode,
 };
 pub use repository_port::{
     CertStatus, IssuedCertRecord, PrincipalRecord, RecordedScalingEvent, RevocationEpoch,

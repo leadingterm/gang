@@ -8,7 +8,7 @@
 
 ### Changed
 
-- Automatically cordon and replace workers running an older or unknown Gang version without admitting new work to them. Existing actions finish before replacement, even beyond `max_drain_wait`; replacement capacity may temporarily exceed the fleet maximum while stale workers drain. Rootfs image digests remain independent of client and cache identity.
+- Automatically cordon and replace workers running an older or unknown Gang version without admitting new work to them. Existing actions finish before replacement, even beyond `max_drain_wait`; obsolete instances are destroyed instead of returned to a warm pool, while ordinary idle scale-in can still reuse current workers. Replacement capacity may temporarily exceed the fleet maximum while stale workers drain. Rootfs image digests remain independent of client and cache identity.
 - Verify the actual running Gang version on every in-service worker through a bounded read-only SSM command after deployment, rather than relying on image or launch-template versions; the check does not require `state.read`.
 
 ### Fixed

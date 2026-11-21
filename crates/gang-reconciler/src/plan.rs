@@ -4,7 +4,7 @@ use std::fmt;
 use std::time::Duration;
 
 use gang_clock::Timestamp;
-use gang_spi::{ScalingAuditEvent, ScalingEventKind};
+use gang_spi::{ScalingAuditEvent, ScalingEventKind, TerminationMode};
 use gang_types::{FleetName, InstanceId, ScalingCause, WorkerId};
 
 use crate::{CordonDecision, Metric, ScaleDecision};
@@ -227,6 +227,8 @@ pub enum Action {
         instance: InstanceId,
         /// Why termination is required.
         cause: TerminationCause,
+        /// Whether the instance may be reused or must be destroyed.
+        mode: TerminationMode,
     },
 }
 
@@ -522,6 +524,7 @@ mod tests {
         let audit = event(Action::Terminate {
             instance: instance.clone(),
             cause: TerminationCause::DrainFinished,
+            mode: TerminationMode::ScaleIn,
         })?;
         assert_eq!(audit.kind, ScalingEventKind::Terminated { instance });
         assert_eq!(audit.cause, Some(ScalingCause::DrainFinished));

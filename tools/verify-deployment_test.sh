@@ -73,15 +73,15 @@ aws() {
       fi
       if [[ $CASE == worker_ssm_failure || $CASE == worker_missing_pid ]]; then echo '{"Status":"Failed","ResponseCode":1,"StandardOutputContent":""}'; return; fi
       if [[ $CASE == worker_missing_output ]]; then echo '{"Status":"Success","ResponseCode":0,"StandardOutputContent":""}'; return; fi
-      if [[ $CASE == worker_mixed && $8 == i-old ]]; then : >"$PENDING_MARKER-old"; echo '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 0.9.0\n"}'; return; fi
+      if [[ $CASE == worker_mixed && $8 == i-old ]]; then : >"$PENDING_MARKER-old"; printf '%s\n' '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 0.9.0\n"}'; return; fi
       if [[ $CASE == worker_replacement && $8 == i-worker-one ]]; then
-        : >"$PENDING_MARKER-replace"; echo '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 0.9.0\n"}'; return
+        : >"$PENDING_MARKER-replace"; printf '%s\n' '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 0.9.0\n"}'; return
       fi
       if [[ $CASE == worker_delayed_rollover && $8 == i-worker-one ]]; then
-        : >"$PENDING_MARKER-rollover"; echo '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 0.9.0\n"}'; return
+        : >"$PENDING_MARKER-rollover"; printf '%s\n' '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 0.9.0\n"}'; return
       fi
       if [[ $CASE == worker_appearing && $8 == i-worker-one ]]; then : >"$PENDING_MARKER-appeared"; fi
-      echo '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 1.2.3\n"}' ;;
+      printf '%s\n' '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 1.2.3\n"}' ;;
     '--region region-1 elbv2 describe-target-health --target-group-arn arn:one --output json'|'--region region-1 elbv2 describe-target-health --target-group-arn arn:two --output json')
       local leader=healthy
       if [[ $CASE == unhealthy ]]; then leader=unhealthy; fi

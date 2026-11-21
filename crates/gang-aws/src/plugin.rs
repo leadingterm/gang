@@ -40,7 +40,7 @@ use gang_clock::{Clock, SystemClock};
 use gang_spi::{
     FleetSupply, Held, InstanceIdentity, MountedScratchVolume, NodeLifecyclePort, Plugin,
     PluginContext, PortError, PreemptionNotice, ProvisionerPort, ScratchVolumePort,
-    WorkloadCredentialPort,
+    TerminationMode, WorkloadCredentialPort,
 };
 use gang_types::{Fleet, InstanceId, Proof, WorkerLifetime};
 use tokio::sync::OnceCell;
@@ -245,9 +245,13 @@ impl ProvisionerPort for Aws {
         held: &Held,
         fleet: Fleet<'_, AwsFleetOptions>,
         instance: &InstanceId,
+        mode: TerminationMode,
     ) -> Result<(), PortError> {
         let runtime = self.runtime().await?;
-        runtime.fleets.terminate(held, fleet, instance).await?;
+        runtime
+            .fleets
+            .terminate(held, fleet, instance, mode)
+            .await?;
         Ok(())
     }
 
@@ -508,6 +512,7 @@ mod tests {
                 held,
                 fleet(GROUP).expect("test value is valid").view(),
                 &InstanceId::try_new(OTHER_INSTANCE).expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
         })
