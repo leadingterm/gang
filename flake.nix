@@ -205,7 +205,7 @@
         ln -s ${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf $out/share/fonts/DejaVuSans.ttf
         ln -s ${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf $out/share/fonts/DejaVuSansMono.ttf
       '';
-      deployTools = [pkgs.awscli2 pkgs.coreutils pkgs.gh pkgs.git pkgs.jq opentofu];
+      deployTools = [pkgs.awscli2 pkgs.coreutils pkgs.curl pkgs.gh pkgs.git pkgs.jq opentofu];
     in {
       default = pkgs.mkShell ({
           # The e2e harness uses pinned action tools without the host toolchain.
