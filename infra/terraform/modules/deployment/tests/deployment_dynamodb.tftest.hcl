@@ -209,6 +209,11 @@ run "dynamodb_group_shape" {
   }
 
   assert {
+    condition     = can(regex("(?s)\\[server\\.http2\\][^\\[]*max_connections = 4096\n", output.gang_toml))
+    error_message = "The group must default to 4096 public listener connections."
+  }
+
+  assert {
     condition     = can(regex("(?s)\\[server\\.http2\\][^\\[]*shutdown_grace = \"300s\"", output.gang_toml))
     error_message = "The group must configure shutdown_grace in [server.http2]."
   }
@@ -230,6 +235,22 @@ run "dynamodb_group_shape" {
   assert {
     condition     = strcontains(output.gang_toml, "[server.proxy_protocol]\ntrusted_cidrs = [\"10.20.2.10/32\",\"10.20.2.11/32\"]") && !strcontains(output.gang_toml, "10.20.0.0/16")
     error_message = "DynamoDB must render exact NLB interface addresses."
+  }
+}
+
+run "dynamodb_custom_http2_max_connections" {
+  command = plan
+
+  variables {
+    database              = { engine = "dynamodb" }
+    hostname              = "gang.example.com"
+    load_balancer         = {}
+    http2_max_connections = 8192
+  }
+
+  assert {
+    condition     = can(regex("(?s)\\[server\\.http2\\][^\\[]*max_connections = 8192\n", output.gang_toml))
+    error_message = "The group must render the configured public listener connection limit."
   }
 }
 
