@@ -12,6 +12,8 @@
 - Mutations use fresh authoritative group reads. If a supply snapshot expires and its refresh is throttled, the planner skips the pass rather than using potentially unsafe stale supply; the dashboard retains its last observation only under its normal staleness rules. Shared activity-history polling replays bounded pending payloads until canonical insertion is acknowledged, preventing an observer's earlier poll from starving control without changing stored canonical events or requiring another AWS request.
 - Expose optional `Pass.error` state diagnostics, retaining nonfatal activity-history poll errors until the next successful poll while reconciliation continues.
 - Retry throttled AWS deployment-verifier reads with bounded backoff within the existing verification deadlines; permanent errors still fail without retry.
+- Automatically cordon and replace workers running an older or unknown Gang version without admitting new work to them. Existing actions finish before replacement, even beyond `max_drain_wait`; obsolete instances are destroyed instead of returned to a warm pool, while ordinary idle scale-in can still reuse current workers. Replacement capacity may temporarily exceed the fleet maximum while stale workers drain. Rootfs image digests remain independent of client and cache identity.
+- Verify the actual running Gang version on every in-service worker through a bounded read-only SSM command after deployment, rather than relying on image or launch-template versions; the check does not require `state.read`.
 
 ### Fixed
 

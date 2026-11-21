@@ -11,7 +11,8 @@ use gang_clock::TestClock;
 use gang_spi::{
     ControllerHostIdentity, ControllerHostPort, FleetSupply, Held, HostMilestone, InstanceIdentity,
     LaunchFailure, MountedScratchVolume, NodeLifecyclePort, PortError, PreemptionNotice,
-    ProvisionerPort, ScratchVolumePort, ServerEndpoints, Sidecar, WorkloadCredentialPort,
+    ProvisionerPort, ScratchVolumePort, ServerEndpoints, Sidecar, TerminationMode,
+    WorkloadCredentialPort,
 };
 use gang_types::{
     Bytes, Fleet, FleetName, InstanceId, InstanceLifecycle, Isa, NameError, Proof, WorkerLifetime,
@@ -71,7 +72,7 @@ struct State {
     converges: Vec<FleetName>,
     converge_hook: Option<ConvergeHook>,
     desired: Vec<(FleetName, u32)>,
-    terminations: Vec<InstanceId>,
+    terminations: Vec<(InstanceId, TerminationMode)>,
     milestones: Vec<HostMilestone>,
     serving_hold: Option<oneshot::Receiver<()>>,
     failures: Failures,
@@ -228,6 +229,16 @@ impl FakeProvisioner {
     /// Returns successful terminations in order.
     #[must_use]
     pub fn terminations(&self) -> Vec<InstanceId> {
+        self.state
+            .lock()
+            .terminations
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+    /// Returns successful terminations and their modes in order.
+    #[must_use]
+    pub fn termination_calls(&self) -> Vec<(InstanceId, TerminationMode)> {
         self.state.lock().terminations.clone()
     }
     /// Returns all host milestones reported, in order.
@@ -451,6 +462,7 @@ impl ProvisionerPort for FakeProvisioner {
         held: &Held,
         fleet: Fleet<'_, Opaque>,
         instance: &InstanceId,
+        mode: TerminationMode,
     ) -> Result<(), PortError> {
         held.check()?;
         let mut state = self.state.lock();
@@ -459,7 +471,7 @@ impl ProvisionerPort for FakeProvisioner {
                 "instance termination is unavailable",
             ));
         }
-        state.terminations.push(instance.clone());
+        state.terminations.push((instance.clone(), mode));
         if let Some(supply) = state.supplies.get_mut(fleet.name)
             && let Some(index) = supply.instances.iter().position(|member| {
                 member.id == *instance && member.lifecycle != InstanceLifecycle::Terminating
@@ -668,7 +680,7 @@ mod tests {
         ));
         assert!(matches!(
             crate::fence::with_expired_held(async |held| fake
-                .terminate(held, fleet, &instance)
+                .terminate(held, fleet, &instance, TerminationMode::ScaleIn)
                 .await)
             .await,
             Err(gang_spi::RunError::Failed(PortError::Unavailable(_)))
@@ -836,7 +848,11 @@ mod tests {
             },
         );
 
-        crate::fence::with_held(async |held| fake.terminate(held, fleet, &first).await).await?;
+        crate::fence::with_held(async |held| {
+            fake.terminate(held, fleet, &first, TerminationMode::ScaleIn)
+                .await
+        })
+        .await?;
         let mut supply = FleetSupply::default();
         fake.supply(fleet, &mut supply).await?;
         assert_eq!(supply.desired, 1);
@@ -844,22 +860,38 @@ mod tests {
         assert_eq!(supply.instances[0].id, second);
 
         let unknown = InstanceId::try_new("unknown")?;
-        crate::fence::with_held(async |held| fake.terminate(held, fleet, &unknown).await).await?;
-        crate::fence::with_held(async |held| fake.terminate(held, fleet, &first).await).await?;
+        crate::fence::with_held(async |held| {
+            fake.terminate(held, fleet, &unknown, TerminationMode::ScaleIn)
+                .await
+        })
+        .await?;
+        crate::fence::with_held(async |held| {
+            fake.terminate(held, fleet, &first, TerminationMode::ScaleIn)
+                .await
+        })
+        .await?;
         let mut after = FleetSupply::default();
         fake.supply(fleet, &mut after).await?;
         assert_eq!(after, supply);
 
         supply.instances[0].lifecycle = InstanceLifecycle::Terminating;
         fake.set_supply(&name, supply.clone());
-        crate::fence::with_held(async |held| fake.terminate(held, fleet, &second).await).await?;
+        crate::fence::with_held(async |held| {
+            fake.terminate(held, fleet, &second, TerminationMode::ScaleIn)
+                .await
+        })
+        .await?;
         fake.supply(fleet, &mut after).await?;
         assert_eq!(after, supply);
 
         supply.desired = 0;
         supply.instances[0].lifecycle = InstanceLifecycle::Pending;
         fake.set_supply(&name, supply);
-        crate::fence::with_held(async |held| fake.terminate(held, fleet, &second).await).await?;
+        crate::fence::with_held(async |held| {
+            fake.terminate(held, fleet, &second, TerminationMode::ScaleIn)
+                .await
+        })
+        .await?;
         fake.supply(fleet, &mut after).await?;
         assert_eq!(after.desired, 0);
         assert!(after.instances.is_empty());
@@ -978,12 +1010,23 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fake.desired_requests(), vec![(name.clone(), 2)]);
-        crate::fence::with_held(async |held| fake.terminate(held, fleet, &instance).await).await?;
+        crate::fence::with_held(async |held| {
+            fake.terminate(held, fleet, &instance, TerminationMode::ScaleIn)
+                .await
+        })
+        .await?;
         fake.fail_terminate(true);
         assert!(
-            crate::fence::with_held(async |held| fake.terminate(held, fleet, &instance).await)
-                .await
-                .is_err()
+            crate::fence::with_held(async |held| {
+                fake.terminate(held, fleet, &instance, TerminationMode::ScaleIn)
+                    .await
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            fake.termination_calls(),
+            vec![(instance.clone(), TerminationMode::ScaleIn)]
         );
         assert_eq!(fake.terminations(), vec![instance]);
         fake.fail_supply(false);

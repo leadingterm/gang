@@ -699,10 +699,12 @@ fn handoff<K: Fn(Option<&str>) -> Result<()>>(
         Some(promotion) => Ok(promotion),
         None => confirm_promotion(cluster, next, context.client, terminated.stop_started, None),
     };
+    let promotion = promotion?;
+    context.observe_worker()?;
     context.observe_worker()?;
     context.client.assert_original_rc()?;
     hold.release()?;
-    Ok((next, terminated.retiring, promotion?, terminated.witness))
+    Ok((next, terminated.retiring, promotion, terminated.witness))
 }
 
 // This runs only after the real old helper or its verification has failed. Observations
@@ -866,6 +868,7 @@ struct VerdictInputs<'a> {
     old_version: &'a str,
     candidate_version: &'a str,
     elapsed: Duration,
+    rollout: &'a RolloutWitness,
 }
 
 fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
@@ -893,7 +896,8 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         && (input.procedure != UpgradeProcedure::InstanceRefresh
             || drain_policy_ok(input.drain, input.warmup_policy.1, input.drain_policy.1))
         && input.timing.lease <= input.gap_limit
-        && availability_ok(input.gap, input.gap_limit);
+        && availability_ok(input.gap, input.gap_limit)
+        && input.rollout.valid();
     let termination = match input.procedure {
         UpgradeProcedure::PreStop => "pre-stop SIGTERM then deregistration",
         UpgradeProcedure::InstanceRefresh => "modeled late notification/hook then SIGTERM",
@@ -903,7 +907,7 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         HeldDrainWitness::receipt,
     );
     let metrics = format!(
-        "procedure={:?}, operator_step={}, observed_plain_guard_checked={}, termination={termination}, warmup actual/scaled={:?}/{:?}, drain actual/scaled={:?}/{:?}, drain elapsed={:?}, old leader before/after={}/{}, versions={:?}->{:?}, initial exit={:?} post exit={:?}, failed actions={}/{}, successful actions={}/{}, attempts={attempts}, reexecutions={}, workers={workers:?}, frozen in-flight={:?}, rpc calls={}/{}, rpc failures={}/{}, rpc retries={}/{}, execute/wait correlations={}/{}, warmcold_mints={}, probe failures={}, repeated probes after failures={}, max gap={:?}, lease takeover={:?}, client promotion={:?}, old exit={}, final leader={}, total={:?}, {drain_receipt}, stop apply offset={:?}",
+        "procedure={:?}, operator_step={}, observed_plain_guard_checked={}, termination={termination}, warmup actual/scaled={:?}/{:?}, drain actual/scaled={:?}/{:?}, drain elapsed={:?}, old leader before/after={}/{}, versions={:?}->{:?}, initial exit={:?} post exit={:?}, failed actions={}/{}, successful actions={}/{}, attempts={attempts}, reexecutions={}, workers={workers:?}, frozen in-flight={:?}, rpc calls={}/{}, rpc failures={}/{}, rpc retries={}/{}, execute/wait correlations={}/{}, warmcold_mints={}, probe failures={}, repeated probes after failures={}, max gap={:?}, lease takeover={:?}, client promotion={:?}, old exit={}, final leader={}, total={:?}, {drain_receipt}, stop apply offset={:?}, rollout={:?}",
         input.procedure,
         input.procedure == UpgradeProcedure::PreStop,
         input.procedure == UpgradeProcedure::InstanceRefresh,
@@ -942,6 +946,7 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         input.leader,
         input.elapsed,
         input.drain.stop_started,
+        input.rollout,
     );
     vec![detail("rolling upgrade", ok, metrics)]
 }
@@ -1003,6 +1008,7 @@ struct ObservedBuild {
     outcome: BuildOutcome,
     evidence: BuildEvidence,
     attempts: Attempts,
+    executables: BTreeMap<u32, PathBuf>,
 }
 
 struct Promotion {
@@ -1010,6 +1016,36 @@ struct Promotion {
     status: std::process::ExitStatus,
     timing: PromotionTiming,
     drain: DrainWitness,
+}
+
+#[derive(Debug)]
+struct RolloutWitness {
+    old_exited: bool,
+    old_workers_remaining: usize,
+    old_client_current: bool,
+    candidate_client_current: bool,
+}
+
+impl RolloutWitness {
+    fn valid(&self) -> bool {
+        self.old_exited
+            && self.old_workers_remaining == 0
+            && self.old_client_current
+            && self.candidate_client_current
+    }
+}
+
+fn current_executables(
+    attempts: &Attempts,
+    executables: &BTreeMap<u32, PathBuf>,
+    candidate: &Path,
+) -> bool {
+    !attempts.is_empty()
+        && attempts.values().all(|attempt| {
+            executables
+                .get(&attempt.worker)
+                .is_some_and(|path| path == candidate)
+        })
 }
 
 type MonitorOutcome = (Availability, Duration, usize, usize);
@@ -1348,6 +1384,15 @@ impl Upgrade<'_> {
         };
         let (initial, promotion) =
             self.finish_initial(observation.build, observation.attempts, promotion)?;
+        let old_pid = observation
+            .in_flight
+            .values()
+            .next()
+            .ok_or_else(|| E2eError::system("original held worker missing"))?
+            .0;
+        let old_exited =
+            process::await_gone(old_pid, self.cluster.stack().settings().startup_timeout)?
+                && !Path::new(&format!("/proc/{old_pid}/exe")).exists();
         self.client.assert_original_rc()?;
         let old_post = self.post_build(
             scope,
@@ -1356,20 +1401,55 @@ impl Upgrade<'_> {
             self.client.remote.clone(),
         )?;
         let candidate_remote = self.candidate_remote()?;
-        let post = self.post_build(scope, hold, &self.builds.post, candidate_remote);
+        let post = self.post_build(scope, hold, &self.builds.post, candidate_remote)?;
+        let candidate = fs::canonicalize(self.releases.candidate_binary)
+            .map_err(E2eError::io("resolving candidate release executable"))?;
+        let old_binary = fs::canonicalize(&self.releases.old.binary)
+            .map_err(E2eError::io("resolving old release executable"))?;
+        let entries = process::snapshot();
+        let workers =
+            process::workers_of(&entries, &self.cluster.stack().placement().config_file());
+        let mut old_workers_remaining = 0;
+        for worker in workers {
+            match fs::canonicalize(format!("/proc/{}/exe", worker.pid)) {
+                Ok(executable) => {
+                    if executable == old_binary {
+                        old_workers_remaining += 1;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(E2eError::io("observing fleet worker executable")(error)),
+            }
+        }
+        let rollout = RolloutWitness {
+            old_exited,
+            old_workers_remaining,
+            old_client_current: current_executables(
+                &old_post.attempts,
+                &old_post.executables,
+                &candidate,
+            ),
+            candidate_client_current: current_executables(
+                &post.attempts,
+                &post.executables,
+                &candidate,
+            ),
+        };
         let outcome = monitor.finish()?;
         let mut checks = self.report(
             &initial,
             &observation.in_flight,
             &promotion,
-            &post?,
+            &post,
             &outcome,
+            &rollout,
         )?;
         self.client.assert_original_rc()?;
         checks.push(detail(
             "fresh old client build",
             build_ok(&old_post.outcome, &old_post.evidence, 1)
-                && exact_attempts(&old_post.attempts, 1),
+                && exact_attempts(&old_post.attempts, 1)
+                && rollout.old_client_current,
             format!(
                 "{}, failed actions={}, successful actions={}, attempts={}",
                 old_post.outcome.exit_summary(),
@@ -1433,6 +1513,7 @@ impl Upgrade<'_> {
                 outcome,
                 evidence,
                 attempts,
+                executables: BTreeMap::new(),
             },
             promotion,
         ))
@@ -1496,6 +1577,7 @@ impl Upgrade<'_> {
         K: Fn(Option<&str>) -> Result<()>,
     {
         let mut attempts = Attempts::new();
+        let mut executables = BTreeMap::new();
         let post = hold.build(scope, None, move |_, stop| {
             let result = build.driver.build_until(
                 &remote,
@@ -1507,7 +1589,20 @@ impl Upgrade<'_> {
             result
         });
         let settled = hold.settle(Ok(()), || {
-            drain(&self.builds.journal, &build.run, &mut attempts)
+            loop {
+                let line = self.builds.journal.read_line()?;
+                if line == JOURNAL_END {
+                    return Ok(());
+                }
+                record_attempt(&line, build.run.as_ref(), &mut attempts)?;
+                for attempt in attempts.values() {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        executables.entry(attempt.worker)
+                    {
+                        entry.insert(worker_executable(attempt.worker)?);
+                    }
+                }
+            }
         });
         let result = joined(post);
         settled?;
@@ -1515,6 +1610,7 @@ impl Upgrade<'_> {
             outcome: result?,
             evidence: BuildEvidence::read(&build.bep, &build.rpc)?,
             attempts,
+            executables,
         })
     }
 
@@ -1525,6 +1621,7 @@ impl Upgrade<'_> {
         promotion: &Promotion,
         post: &ObservedBuild,
         monitor: &MonitorOutcome,
+        rollout: &RolloutWitness,
     ) -> Result<Vec<Check>> {
         let stack = self.cluster.stack();
         let leader = self.cluster.controller_is_leader(promotion.index)?;
@@ -1562,6 +1659,7 @@ impl Upgrade<'_> {
             old_version: &self.releases.old_version,
             candidate_version: &self.releases.candidate_version,
             elapsed: self.started.elapsed(),
+            rollout,
         }))
     }
 }
@@ -1718,6 +1816,23 @@ mod tests {
         assert!(!exact_attempts(&post, 1));
     }
 
+    #[test]
+    fn replacement_requires_the_candidate_executable_for_each_journal_worker() {
+        let (_, _, post) = verdict_attempts();
+        let candidate = Path::new("/candidate/gang");
+        let mut executables = BTreeMap::new();
+        assert!(!current_executables(&post, &executables, candidate));
+        executables.insert(43, PathBuf::from("/old/gang"));
+        assert!(!current_executables(&post, &executables, candidate));
+        executables.insert(43, candidate.to_path_buf());
+        assert!(current_executables(&post, &executables, candidate));
+        assert!(!current_executables(
+            &Attempts::new(),
+            &executables,
+            candidate
+        ));
+    }
+
     fn reexecuted_attempts() -> Attempts {
         let (_, mut attempts, _) = verdict_attempts();
         let action = PROBES[0].as_str();
@@ -1730,54 +1845,92 @@ mod tests {
         attempts
     }
 
+    struct VerdictFixture {
+        initial_outcome: BuildOutcome,
+        post_outcome: BuildOutcome,
+        initial_evidence: BuildEvidence,
+        post_evidence: BuildEvidence,
+        in_flight: InFlight,
+        initial_attempts: Attempts,
+        post_attempts: Attempts,
+        availability: Availability,
+        drain: DrainWitness,
+        rollout: RolloutWitness,
+    }
+
+    impl VerdictFixture {
+        fn new() -> Self {
+            let (in_flight, initial_attempts, post_attempts) = verdict_attempts();
+            Self {
+                initial_outcome: BuildOutcome::new(
+                    Some(0),
+                    "INFO: 8 processes: 8 remote.".to_owned(),
+                ),
+                post_outcome: BuildOutcome::new(Some(0), "INFO: 1 process: 1 remote.".to_owned()),
+                initial_evidence: BuildEvidence {
+                    successful_actions: 8,
+                    finished_success: true,
+                    rpc_calls: 1,
+                    ..BuildEvidence::default()
+                },
+                post_evidence: BuildEvidence {
+                    successful_actions: 1,
+                    finished_success: true,
+                    rpc_calls: 1,
+                    ..BuildEvidence::default()
+                },
+                in_flight,
+                initial_attempts,
+                post_attempts,
+                availability: Availability::default(),
+                drain: DrainWitness::default(),
+                rollout: RolloutWitness {
+                    old_exited: true,
+                    old_workers_remaining: 0,
+                    old_client_current: true,
+                    candidate_client_current: true,
+                },
+            }
+        }
+
+        fn inputs(&self) -> VerdictInputs<'_> {
+            use std::os::unix::process::ExitStatusExt;
+
+            VerdictInputs {
+                initial_outcome: &self.initial_outcome,
+                initial_evidence: &self.initial_evidence,
+                initial_attempts: &self.initial_attempts,
+                in_flight: &self.in_flight,
+                post_outcome: &self.post_outcome,
+                post_evidence: &self.post_evidence,
+                post_attempts: &self.post_attempts,
+                availability: &self.availability,
+                gap: Duration::ZERO,
+                retries: 0,
+                cold_mints: 2,
+                timing: PromotionTiming {
+                    lease: Duration::ZERO,
+                    client: Duration::ZERO,
+                },
+                procedure: UpgradeProcedure::PreStop,
+                warmup_policy: (Duration::ZERO, Duration::ZERO),
+                drain_policy: (Duration::ZERO, Duration::ZERO),
+                drain: &self.drain,
+                status: std::process::ExitStatus::from_raw(0),
+                leader: true,
+                gap_limit: Duration::from_secs(4),
+                old_version: "0.3.2",
+                candidate_version: "candidate",
+                elapsed: Duration::ZERO,
+                rollout: &self.rollout,
+            }
+        }
+    }
+
     #[test]
     fn final_verdict_requires_exactly_two_cold_mints() {
-        use std::os::unix::process::ExitStatusExt;
-
-        let initial_outcome = BuildOutcome::new(Some(0), "INFO: 8 processes: 8 remote.".to_owned());
-        let post_outcome = BuildOutcome::new(Some(0), "INFO: 1 process: 1 remote.".to_owned());
-        let initial_evidence = BuildEvidence {
-            successful_actions: 8,
-            finished_success: true,
-            rpc_calls: 1,
-            ..BuildEvidence::default()
-        };
-        let post_evidence = BuildEvidence {
-            successful_actions: 1,
-            finished_success: true,
-            rpc_calls: 1,
-            ..BuildEvidence::default()
-        };
-        let (in_flight, initial_attempts, post_attempts) = verdict_attempts();
-        let availability = Availability::default();
-        let drain = DrainWitness::default();
-        let mut input = VerdictInputs {
-            initial_outcome: &initial_outcome,
-            initial_evidence: &initial_evidence,
-            initial_attempts: &initial_attempts,
-            in_flight: &in_flight,
-            post_outcome: &post_outcome,
-            post_evidence: &post_evidence,
-            post_attempts: &post_attempts,
-            availability: &availability,
-            gap: Duration::ZERO,
-            retries: 0,
-            cold_mints: 2,
-            timing: PromotionTiming {
-                lease: Duration::ZERO,
-                client: Duration::ZERO,
-            },
-            procedure: UpgradeProcedure::PreStop,
-            warmup_policy: (Duration::ZERO, Duration::ZERO),
-            drain_policy: (Duration::ZERO, Duration::ZERO),
-            drain: &drain,
-            status: std::process::ExitStatus::from_raw(0),
-            leader: true,
-            gap_limit: Duration::from_secs(4),
-            old_version: "0.3.2",
-            candidate_version: "candidate",
-            elapsed: Duration::ZERO,
-        };
+        let fixture = VerdictFixture::new();
+        let mut input = fixture.inputs();
         input.procedure = UpgradeProcedure::InstanceRefresh;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
         let held_drain = credential_drain();
@@ -1793,36 +1946,49 @@ mod tests {
         input.timing.lease = Duration::from_secs(5);
         assert!(final_verdict(&input).iter().any(Check::is_failure));
         input.timing.lease = Duration::ZERO;
-        input.drain = &drain;
+        input.drain = &fixture.drain;
         input.procedure = UpgradeProcedure::PreStop;
         assert!(final_verdict(&input).iter().all(Check::is_passed));
+        let stale_remains = RolloutWitness {
+            old_workers_remaining: 1,
+            ..fixture.rollout
+        };
+        input.rollout = &stale_remains;
+        assert!(final_verdict(&input).iter().any(Check::is_failure));
+        let wrong_executable = RolloutWitness {
+            candidate_client_current: false,
+            ..fixture.rollout
+        };
+        input.rollout = &wrong_executable;
+        assert!(final_verdict(&input).iter().any(Check::is_failure));
+        input.rollout = &fixture.rollout;
         let empty = InFlight::new();
         input.in_flight = &empty;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
-        input.in_flight = &in_flight;
+        input.in_flight = &fixture.in_flight;
         let reexecuted = reexecuted_attempts();
         input.initial_attempts = &reexecuted;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
-        input.initial_attempts = &initial_attempts;
+        input.initial_attempts = &fixture.initial_attempts;
         let interrupted = BuildOutcome::new(Some(1), "build failed".to_owned());
         input.initial_outcome = &interrupted;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
-        input.initial_outcome = &initial_outcome;
+        input.initial_outcome = &fixture.initial_outcome;
         let failures = BuildEvidence {
             failed_actions: 1,
-            ..initial_evidence
+            ..fixture.initial_evidence
         };
         input.initial_evidence = &failures;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
-        input.initial_evidence = &initial_evidence;
+        input.initial_evidence = &fixture.initial_evidence;
         let (_, mut changed, _) = verdict_attempts();
         changed
-            .get_mut(in_flight.keys().next().expect("frozen attempt"))
+            .get_mut(fixture.in_flight.keys().next().expect("frozen attempt"))
             .expect("attempt")
             .worker += 1;
         input.initial_attempts = &changed;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
-        input.initial_attempts = &initial_attempts;
+        input.initial_attempts = &fixture.initial_attempts;
         for count in [0, 1, 3] {
             input.cold_mints = count;
             assert!(final_verdict(&input).iter().any(Check::is_failure));

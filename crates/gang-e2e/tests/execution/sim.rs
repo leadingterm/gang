@@ -915,6 +915,7 @@ impl ExecSim {
             capacity: None,
             reserved: None,
             paused: false,
+            stale: false,
             launch_time: at,
             phases: Vec::new(),
             infrastructure: None,

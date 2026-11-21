@@ -878,6 +878,9 @@ pub struct Worker {
     pub instance: String,
     /// The worker's phase.
     pub phase: Phase,
+    /// Whether the worker's release differs from the controller's or is unknown.
+    #[serde(default)]
+    pub stale: bool,
     /// Derived infrastructure status of the worker's instance, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub infrastructure: Option<InfrastructureStatus>,
@@ -1104,6 +1107,27 @@ mod tests {
         value.as_object_mut().expect("object").remove("connections");
         let old: State = serde_json::from_value(value).expect("old state parses");
         assert_eq!(old.connections, Connections::default());
+    }
+
+    #[test]
+    fn worker_staleness_round_trips_and_legacy_workers_default_to_current() {
+        let worker = Worker {
+            stale: true,
+            phase: Phase::Draining,
+            ..Worker::default()
+        };
+        let mut value = serde_json::to_value(&worker).expect("worker serializes");
+        assert_eq!(value["stale"], json!(true));
+        assert_eq!(
+            serde_json::from_value::<Worker>(value.clone()).expect("worker parses"),
+            worker
+        );
+        value.as_object_mut().expect("object").remove("stale");
+        assert!(
+            !serde_json::from_value::<Worker>(value)
+                .expect("old worker parses")
+                .stale
+        );
     }
 
     #[test]
@@ -1562,6 +1586,7 @@ mod tests {
             "fleet": "fleets/amd64-spot",
             "instance": "instances/i-0e10",
             "phase": "DRAINING",
+            "stale": true,
             "phaseTime": "2026-01-14T09:19:30.000Z",
             "running": 0,
             "paused": false,
@@ -1574,6 +1599,7 @@ mod tests {
             "fleet": "fleets/amd64-spot",
             "instance": "instances/i-0e10",
             "phase": "BUSY",
+            "stale": false,
             "phaseTime": "2026-01-14T09:19:30.000Z",
             "running": 2,
             "slots": 4,

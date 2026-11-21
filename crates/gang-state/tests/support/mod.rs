@@ -112,6 +112,7 @@ pub fn worker_state(
         reserved: None,
         cache: None,
         draining,
+        current_build: true,
         paused: false,
         last_seen: ts(0),
     })

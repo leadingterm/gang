@@ -14,6 +14,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
     Digest, GetActionResultRequest, RequestMetadata, digest_function,
 };
 
+use crate::build_output::BuildOutcome;
 use crate::check::{Check, awaited};
 use crate::cluster::Cluster;
 use crate::errors::{E2eError, Result};
@@ -187,6 +188,14 @@ fn variant_error(count: usize, variant: &str, error: &E2eError) -> E2eError {
         "{count} controllers: {variant}: {}",
         gang_types::error_chain(error)
     ))
+}
+
+fn settled_error_with_initial_build(error: E2eError, outcome: &Result<BuildOutcome>) -> E2eError {
+    let initial = match outcome {
+        Ok(outcome) => outcome.exit_summary(),
+        Err(error) => gang_types::error_chain(error).to_string(),
+    };
+    E2eError::system_from(format!("{error}; initial build: {initial}"))(error)
 }
 
 fn absent_action_result_request() -> GetActionResultRequest {
@@ -505,7 +514,8 @@ pub fn database_outage(cluster: &Cluster<'_>, controller_count: usize) -> Result
         let outcome = joined(build);
         let demand_outcome = demand.map(joined);
         hold.disarm();
-        let mut checks = settled?;
+        let mut checks =
+            settled.map_err(|error| settled_error_with_initial_build(error, &outcome))?;
         restore?;
         let outcome = outcome?;
         let demand_outcome = demand_outcome
@@ -812,7 +822,54 @@ fn observe_partition(
 
 #[cfg(test)]
 mod tests {
-    use super::{PARTITION_PROBES, PROBES, frontends_unready};
+    use std::error::Error;
+    use std::io;
+
+    use super::{PARTITION_PROBES, PROBES, frontends_unready, settled_error_with_initial_build};
+    use crate::build_output::BuildOutcome;
+    use crate::errors::E2eError;
+
+    #[test]
+    fn settled_journal_error_includes_failed_initial_build_output() {
+        let journal_error = E2eError::io("reading JOURNAL_END")(io::Error::other("journal closed"));
+        let outcome = Ok(BuildOutcome::new(Some(1), "Bazel action failed".to_owned()));
+
+        let error = settled_error_with_initial_build(journal_error, &outcome);
+        let report = gang_types::error_chain(&error).to_string();
+        assert!(report.contains("reading JOURNAL_END"));
+        assert!(report.contains("journal closed"));
+        assert!(report.contains("exited with Some(1)"));
+        assert!(report.contains("Bazel action failed"));
+        assert!(matches!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<E2eError>()),
+            Some(E2eError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn settled_journal_error_includes_initial_launcher_error_chain() {
+        let journal_error = E2eError::io("reading JOURNAL_END")(io::Error::other("journal closed"));
+        let launcher_error =
+            E2eError::system_from("launching Bazel")(E2eError::io("starting Bazel process")(
+                io::Error::other("launcher unavailable"),
+            ));
+
+        let error = settled_error_with_initial_build(journal_error, &Err(launcher_error));
+        let report = gang_types::error_chain(&error).to_string();
+        assert!(report.contains("reading JOURNAL_END"));
+        assert!(report.contains("journal closed"));
+        assert!(report.contains("launching Bazel"));
+        assert!(report.contains("starting Bazel process"));
+        assert!(report.contains("launcher unavailable"));
+        assert!(matches!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<E2eError>()),
+            Some(E2eError::Io { .. })
+        ));
+    }
 
     #[test]
     fn readiness_loss_waits_for_both_frontends() {

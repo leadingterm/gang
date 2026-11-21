@@ -2,7 +2,7 @@
 
 use std::error::Error;
 
-use gang_spi::FleetSupply;
+use gang_spi::{FleetSupply, TerminationMode};
 use gang_types::{InstanceId, InstanceLifecycle};
 
 use crate::config::CooldownPolicy;
@@ -84,13 +84,63 @@ async fn idle_retirement_discards_old_launch_generation_but_parks_current() -> T
             gang_testkit::fence::with_held(async |held| {
                 harness
                     .fleets
-                    .terminate(held, test_fleet.view(), &id("i-1").expect("valid instance"))
+                    .terminate(
+                        held,
+                        test_fleet.view(),
+                        &id("i-1").expect("valid instance"),
+                        TerminationMode::ScaleIn,
+                    )
                     .await
             })
             .await?;
             assert_eq!(harness.requests(TERMINATE), usize::from(stale));
             assert_eq!(harness.warm_ids(FLEET).len(), usize::from(!stale));
             assert!(harness.instance_ids(FLEET).is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacement_terminates_current_generation_instead_of_parking_it() -> TestResult {
+    for kind in [FakeTemplateKind::Direct, FakeTemplateKind::Mixed] {
+        for desired in [0, 1] {
+            let harness = Harness::start().await?;
+            let mut group = reuse_group(desired, &[("i-1", "InService", true)], true);
+            group.template_kind = kind;
+            harness.add_group_with(group);
+            let test_fleet = fleet(FLEET)?;
+
+            gang_testkit::fence::with_held(async |held| {
+                harness
+                    .fleets
+                    .terminate(
+                        held,
+                        test_fleet.view(),
+                        &id("i-1").expect("valid instance"),
+                        TerminationMode::Replace,
+                    )
+                    .await
+            })
+            .await?;
+
+            assert_eq!(harness.requests(TERMINATE), 1);
+            assert_eq!(harness.requests(SET_PROTECTION), 0);
+            assert_eq!(harness.requests(SET_DESIRED), 0);
+            let requests = harness.request_log();
+            let (_, parameters) = requests
+                .iter()
+                .find(|(operation, _)| operation == TERMINATE)
+                .ok_or("missing termination request")?;
+            assert_eq!(
+                parameters
+                    .get("ShouldDecrementDesiredCapacity")
+                    .map(String::as_str),
+                Some(if desired == 0 { "false" } else { "true" })
+            );
+            assert_eq!(harness.desired(FLEET), Some(0));
+            assert!(harness.instance_ids(FLEET).is_empty());
+            assert!(harness.warm_ids(FLEET).is_empty());
         }
     }
     Ok(())
@@ -117,6 +167,7 @@ async fn plain_group_terminates_with_one_atomic_decrement() -> TestResult {
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -199,6 +250,7 @@ async fn supply_reports_max_of_desired_and_live_while_released_member_remains() 
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -271,6 +323,7 @@ async fn release_unprotects_then_lowers_and_the_fake_moves_the_instance_to_the_p
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -295,7 +348,7 @@ async fn an_expired_permission_releases_nothing_to_the_warm_pool() -> TestResult
     let result = gang_testkit::fence::with_expired_held(async |held| {
         harness
             .fleets
-            .terminate(held, test_fleet.view(), &instance)
+            .terminate(held, test_fleet.view(), &instance, TerminationMode::ScaleIn)
             .await
     })
     .await;
@@ -330,7 +383,7 @@ async fn a_permission_lapsing_between_two_writes_stops_the_second() -> TestResul
         .run(async |held| {
             harness
                 .fleets
-                .terminate(held, test_fleet.view(), &instance)
+                .terminate(held, test_fleet.view(), &instance, TerminationMode::ScaleIn)
                 .await
         })
         .await;
@@ -366,6 +419,7 @@ async fn releasing_the_same_instance_twice_lowers_capacity_once() -> TestResult 
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -379,6 +433,7 @@ async fn releasing_the_same_instance_twice_lowers_capacity_once() -> TestResult 
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -411,6 +466,7 @@ async fn crash_after_unprotect_before_lowering_completes_with_one_lowering() -> 
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -429,6 +485,7 @@ async fn crash_after_unprotect_before_lowering_completes_with_one_lowering() -> 
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -461,6 +518,7 @@ async fn crash_after_lowering_before_removal_writes_nothing_on_retry() -> TestRe
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -492,6 +550,7 @@ async fn second_release_lost_to_a_failed_lowering_completes_on_retry() -> TestRe
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -505,6 +564,7 @@ async fn second_release_lost_to_a_failed_lowering_completes_on_retry() -> TestRe
                 held,
                 test_fleet.view(),
                 &id("i-2").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -521,6 +581,7 @@ async fn second_release_lost_to_a_failed_lowering_completes_on_retry() -> TestRe
                 held,
                 test_fleet.view(),
                 &id("i-2").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -556,6 +617,7 @@ async fn in_flight_scale_out_is_kept_when_releasing_one_member() -> TestResult {
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -586,6 +648,7 @@ async fn reuse_without_protection_is_a_config_error_with_no_writes() -> TestResu
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -619,6 +682,7 @@ async fn reuse_flag_false_terminates_atomically() -> TestResult {
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -652,6 +716,7 @@ async fn pending_member_terminates_atomically_even_in_a_reuse_group() -> TestRes
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -682,6 +747,7 @@ async fn warmed_member_is_already_leaving_so_terminate_writes_nothing() -> TestR
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -757,6 +823,7 @@ async fn honored_cooldown_applies_to_raises_and_release_lowerings() -> TestResul
                 held,
                 test_fleet.view(),
                 &id("i-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -796,6 +863,7 @@ async fn release_is_refused_while_a_pre_existing_unprotected_member_would_enter_
                 held,
                 test_fleet.view(),
                 &id("i-2").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -835,6 +903,7 @@ async fn release_proceeds_once_desired_is_already_lowered_below_live() -> TestRe
                 held,
                 test_fleet.view(),
                 &id("i-2").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })

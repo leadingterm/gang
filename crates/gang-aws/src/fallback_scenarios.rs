@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use gang_aws_sdk::CallError;
 use gang_clock::Timestamp;
-use gang_spi::FleetSupply;
+use gang_spi::{FleetSupply, TerminationMode};
 use gang_types::InstanceId;
 
 use crate::config::{
@@ -115,6 +115,58 @@ fn throttled() -> FakeFailure {
         code: "Throttling",
         message: "Rate exceeded",
     }
+}
+
+#[tokio::test]
+async fn rollout_grows_the_selected_spot_or_fallback_group() -> TestResult {
+    for down in [false, true] {
+        let mut spot = protected(FLEET, 2, &[("i-spot", "InService")]);
+        spot.max_size = 2;
+        let mut twin = protected(TWIN, 1, &[("i-twin", "InService")]);
+        twin.max_size = 1;
+        let harness = harness_with(vec![spot, twin]).await?;
+        if down {
+            harness.add_activity(FLEET, "Failed", &rfc3339_ago(30));
+        }
+        let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet.view(), 4)
+                .await
+        })
+        .await?;
+        let expected_group = if down { TWIN } else { FLEET };
+        let log = harness.request_log();
+        let mutations: Vec<_> = log
+            .iter()
+            .filter(|(operation, _)| {
+                operation == "UpdateAutoScalingGroup" || operation == "SetDesiredCapacity"
+            })
+            .collect();
+        assert_eq!(mutations.len(), 2);
+        assert_eq!(mutations[0].0, "UpdateAutoScalingGroup");
+        assert_eq!(mutations[1].0, "SetDesiredCapacity");
+        assert_eq!(
+            mutations[0]
+                .1
+                .get("AutoScalingGroupName")
+                .map(String::as_str),
+            Some(expected_group)
+        );
+        assert_eq!(
+            mutations[1]
+                .1
+                .get("AutoScalingGroupName")
+                .map(String::as_str),
+            Some(expected_group)
+        );
+        assert_eq!(
+            mutations[0].1.get("MaxSize"),
+            mutations[1].1.get("DesiredCapacity")
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -844,6 +896,7 @@ async fn terminate_on_demand_member_decrements_only_the_twin() -> TestResult {
                 held,
                 fleet.view(),
                 &InstanceId::try_new("i-od-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -891,6 +944,7 @@ async fn terminate_spot_member_decrements_only_spot() -> TestResult {
                 held,
                 fleet.view(),
                 &InstanceId::try_new("i-spot-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -935,6 +989,7 @@ async fn terminate_warm_twin_member_releases_into_pool() -> TestResult {
                 held,
                 fleet.view(),
                 &InstanceId::try_new("i-od-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })
@@ -1008,6 +1063,7 @@ async fn terminate_spot_member_beside_warm_twin_skips_protection() -> TestResult
                 held,
                 fleet.view(),
                 &InstanceId::try_new("i-spot-1").expect("test value is valid"),
+                TerminationMode::ScaleIn,
             )
             .await
     })

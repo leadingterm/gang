@@ -17,7 +17,7 @@ use aws_sdk_ec2::types::Filter;
 use aws_sdk_ec2::types::builders::FilterBuilder;
 use gang_aws_sdk::call_error;
 use gang_clock::{Clock, Tick, Timestamp};
-use gang_spi::{FleetInstance, FleetSupply, Held, LaunchFailure};
+use gang_spi::{FleetInstance, FleetSupply, Held, LaunchFailure, TerminationMode};
 use gang_types::{Fleet, InstanceId, InstanceLifecycle};
 use tokio::sync::Mutex;
 
@@ -30,6 +30,7 @@ use crate::fallback::{self, Counts, Tier};
 use crate::group::{DESCRIBE_GROUPS, Group, Member};
 
 const SET_DESIRED_CAPACITY: &str = "SetDesiredCapacity";
+const UPDATE_AUTO_SCALING_GROUP: &str = "UpdateAutoScalingGroup";
 const SET_INSTANCE_PROTECTION: &str = "SetInstanceProtection";
 const TERMINATE_INSTANCE: &str = "TerminateInstanceInAutoScalingGroup";
 const DESCRIBE_INSTANCES: &str = "DescribeInstances";
@@ -202,11 +203,11 @@ impl Fleets {
         match FleetGroups::read(&output, &names)? {
             FleetGroups::Plain(group) => {
                 if group.reported() < desired {
-                    self.set_capacity(held, &group.name, desired).await?;
+                    self.set_capacity(held, &group, desired).await?;
                 } else {
                     let target = desired.max(group.live());
                     if target < group.desired {
-                        self.set_capacity(held, &group.name, target).await?;
+                        self.set_capacity(held, &group, target).await?;
                     }
                 }
                 Ok(())
@@ -217,34 +218,35 @@ impl Fleets {
                 for write in
                     fallback::writes(Counts::from(&spot), Counts::from(&twin), down, desired)
                 {
-                    let name = match write.tier {
-                        Tier::Spot => &spot.name,
-                        Tier::OnDemand => &twin.name,
+                    let group = match write.tier {
+                        Tier::Spot => &spot,
+                        Tier::OnDemand => &twin,
                     };
                     if down {
                         tracing::info!(
                             fleet = %fleet.name,
-                            group = %name,
+                            group = %group.name,
                             desired = write.desired,
                             status_message = failed.as_ref().and_then(|failed| failed.status_message.as_deref()),
                             "spot fallback: writing desired capacity"
                         );
                     }
-                    self.set_capacity(held, name, write.desired).await?;
+                    self.set_capacity(held, group, write.desired).await?;
                 }
                 Ok(())
             }
         }
     }
 
-    /// Retires an instance. Warm-pool reuse is allowed only when its launch-template id and
-    /// immutable version match the group's current template.
-    /// Unknown or stale generations are terminated with an atomic desired-capacity decrement.
+    /// Retires an instance. Scale-in may reuse the warm pool when its launch-template id and
+    /// immutable version match the group's current template. Replacement and unknown or stale
+    /// generations are terminated, decrementing desired capacity when it is nonzero.
     pub(crate) async fn terminate(
         &self,
         held: &Held,
         fleet: Fleet<'_, AwsFleetOptions>,
         instance: &InstanceId,
+        mode: TerminationMode,
     ) -> Result<(), AwsError> {
         let mut observation = self.observation.lock().await;
         *observation = None;
@@ -260,7 +262,8 @@ impl Fleets {
         if member.lifecycle == InstanceLifecycle::Terminating {
             return Ok(());
         }
-        if member.lifecycle == InstanceLifecycle::InService
+        if mode == TerminationMode::ScaleIn
+            && member.lifecycle == InstanceLifecycle::InService
             && group.reuse_on_scale_in
             && member.current_generation
         {
@@ -270,7 +273,7 @@ impl Fleets {
         self.autoscaling
             .terminate_instance_in_auto_scaling_group()
             .instance_id(instance.as_str())
-            .should_decrement_desired_capacity(true)
+            .should_decrement_desired_capacity(group.desired != 0)
             .send()
             .await
             .map(|_| ())
@@ -293,22 +296,37 @@ impl Fleets {
                 .await?;
         }
         if target < group.desired {
-            self.set_capacity(held, &group.name, target).await?;
+            self.set_capacity(held, group, target).await?;
         }
         Ok(())
     }
 
-    /// Writes one group's desired capacity, honoring the cooldown policy. Every desired-capacity
-    /// write goes through here.
-    async fn set_capacity(&self, held: &Held, group: &str, desired: u32) -> Result<(), AwsError> {
-        held.check()?;
+    /// Raises the physical limit when necessary before writing desired capacity. The logical
+    /// fleet bound is enforced by the reconciler, not by this retained ASG limit.
+    async fn set_capacity(&self, held: &Held, group: &Group, desired: u32) -> Result<(), AwsError> {
         let wanted = i32::try_from(desired).map_err(|_| AwsError::Config {
             field: "desired",
             reason: "exceeds the largest capacity an auto scaling group accepts".to_owned(),
         })?;
+        if desired > group.max_size {
+            let maximum = desired.max(group.desired).max(group.live());
+            let maximum = i32::try_from(maximum).map_err(|_| AwsError::Config {
+                field: "desired",
+                reason: "exceeds the largest capacity an auto scaling group accepts".to_owned(),
+            })?;
+            held.check()?;
+            self.autoscaling
+                .update_auto_scaling_group()
+                .auto_scaling_group_name(&group.name)
+                .max_size(maximum)
+                .send()
+                .await
+                .map_err(|e| call_error(UPDATE_AUTO_SCALING_GROUP, e))?;
+        }
+        held.check()?;
         self.autoscaling
             .set_desired_capacity()
-            .auto_scaling_group_name(group)
+            .auto_scaling_group_name(&group.name)
             .desired_capacity(wanted)
             .honor_cooldown(self.cooldown.honors())
             .send()
@@ -806,7 +824,7 @@ mod tests {
         gang_testkit::fence::with_held(async |held| {
             harness
                 .fleets
-                .terminate(held, test_fleet.view(), &instance)
+                .terminate(held, test_fleet.view(), &instance, TerminationMode::ScaleIn)
                 .await
         })
         .await?;
@@ -984,7 +1002,9 @@ mod tests {
     #[tokio::test]
     async fn an_expired_permission_writes_no_capacity() -> TestResult {
         let harness = Harness::start().await?;
-        harness.add_group(FLEET, 1, &[("i-1", "InService")]);
+        let mut group = FakeGroup::new(FLEET, 1, &[("i-1", "InService")]);
+        group.max_size = 1;
+        harness.add_group_with(group);
         let test_fleet = fleet(FLEET)?;
         let result = gang_testkit::fence::with_expired_held(async |held| {
             harness
@@ -1000,6 +1020,7 @@ mod tests {
                 | gang_spi::RunError::Overran(_))
         ));
         assert_eq!(harness.requests("SetDesiredCapacity"), 0);
+        assert_eq!(harness.requests(UPDATE_AUTO_SCALING_GROUP), 0);
         Ok(())
     }
 
@@ -1282,6 +1303,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rollout_grows_physical_maximum_for_each_larger_request() -> TestResult {
+        let harness = Harness::start().await?;
+        let mut group = FakeGroup::new(
+            FLEET,
+            2,
+            &[("i-old-1", "InService"), ("i-old-2", "InService")],
+        );
+        group.min_size = 1;
+        group.max_size = 2;
+        group.stale_instances = vec!["i-old-1".to_owned(), "i-old-2".to_owned()];
+        group.simulate = true;
+        harness.add_group_with(group);
+        let fleet = fleet(FLEET)?;
+
+        for target in [4, 6, 6] {
+            gang_testkit::fence::with_held(async |held| {
+                harness
+                    .fleets
+                    .set_desired_capacity(held, fleet.view(), target)
+                    .await
+            })
+            .await?;
+        }
+        let state = harness.fake.state();
+        let group = &state.groups[0];
+        assert_eq!((group.min_size, group.max_size, group.desired), (1, 6, 6));
+        assert_eq!(group.instances.len(), 6);
+        let writes: Vec<_> = state
+            .requests
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request.operation.as_str(),
+                    UPDATE_AUTO_SCALING_GROUP | SET_DESIRED_CAPACITY
+                )
+            })
+            .map(|request| (request.operation.as_str(), &request.parameters))
+            .collect();
+        assert_eq!(writes.len(), 4);
+        assert_eq!(writes[0].0, UPDATE_AUTO_SCALING_GROUP);
+        assert_eq!(writes[0].1.get("MaxSize").map(String::as_str), Some("4"));
+        assert_eq!(writes[1].0, SET_DESIRED_CAPACITY);
+        assert_eq!(writes[2].0, UPDATE_AUTO_SCALING_GROUP);
+        assert_eq!(writes[2].1.get("MaxSize").map(String::as_str), Some("6"));
+        assert_eq!(writes[3].0, SET_DESIRED_CAPACITY);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_maximum_growth_never_sends_desired_and_retry_is_safe() -> TestResult {
+        let harness = Harness::start().await?;
+        let mut group = FakeGroup::new(FLEET, 2, &[("i-old", "InService")]);
+        group.max_size = 2;
+        harness.add_group_with(group);
+        harness.fail(
+            UPDATE_AUTO_SCALING_GROUP,
+            FakeFailure {
+                status: 400,
+                code: "ValidationError",
+                message: "maximum update refused",
+            },
+        );
+        let fleet = fleet(FLEET)?;
+        let result = gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet.view(), 4)
+                .await
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(harness.requests(SET_DESIRED_CAPACITY), 0);
+        assert_eq!(harness.desired(FLEET), Some(2));
+        harness.clear_failure(UPDATE_AUTO_SCALING_GROUP);
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet.view(), 4)
+                .await
+        })
+        .await?;
+        assert_eq!(harness.desired(FLEET), Some(4));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_maximum_needs_no_update() -> TestResult {
+        let harness = Harness::start().await?;
+        let mut group = FakeGroup::new(FLEET, 2, &[]);
+        group.max_size = 4;
+        harness.add_group_with(group);
+        let fleet = fleet(FLEET)?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet.view(), 4)
+                .await
+        })
+        .await?;
+        assert_eq!(harness.requests(UPDATE_AUTO_SCALING_GROUP), 0);
+        assert_eq!(harness.desired(FLEET), Some(4));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cooldown_failure_retains_grown_maximum_and_retry_only_sets_desired() -> TestResult {
+        let harness = Harness::start_with(CooldownPolicy::Honor).await?;
+        let mut group = FakeGroup::new(FLEET, 2, &[]);
+        group.max_size = 2;
+        group.in_cooldown = true;
+        harness.add_group_with(group);
+        let fleet = fleet(FLEET)?;
+        let result = gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet.view(), 4)
+                .await
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(harness.desired(FLEET), Some(2));
+        assert_eq!(harness.requests(UPDATE_AUTO_SCALING_GROUP), 1);
+        harness.fake.state().groups[0].in_cooldown = false;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet.view(), 4)
+                .await
+        })
+        .await?;
+        assert_eq!(harness.requests(UPDATE_AUTO_SCALING_GROUP), 1);
+        assert_eq!(harness.desired(FLEET), Some(4));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn set_desired_capacity_keeps_live_group_members() -> TestResult {
         let harness = Harness::start().await?;
         let members = [
@@ -1447,7 +1604,7 @@ mod tests {
         let result = gang_testkit::fence::with_expired_held(async |held| {
             harness
                 .fleets
-                .terminate(held, test_fleet.view(), &instance)
+                .terminate(held, test_fleet.view(), &instance, TerminationMode::ScaleIn)
                 .await
         })
         .await;
@@ -1473,6 +1630,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-a").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1508,14 +1666,14 @@ mod tests {
         gang_testkit::fence::with_held(async |held| {
             harness
                 .fleets
-                .terminate(held, fleet.view(), &instance)
+                .terminate(held, fleet.view(), &instance, TerminationMode::ScaleIn)
                 .await
         })
         .await?;
         gang_testkit::fence::with_held(async |held| {
             harness
                 .fleets
-                .terminate(held, fleet.view(), &instance)
+                .terminate(held, fleet.view(), &instance, TerminationMode::ScaleIn)
                 .await
         })
         .await?;
@@ -1536,6 +1694,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-t").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1557,6 +1716,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-gone").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1579,6 +1739,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-x").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1607,6 +1768,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-x").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1632,6 +1794,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-p").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1678,6 +1841,7 @@ mod tests {
                     held,
                     fleet("fleet-a").expect("test value is valid").view(),
                     &InstanceId::try_new("i-b").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })
@@ -1817,11 +1981,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raise_above_the_max_size_is_refused() -> TestResult {
+    async fn refused_maximum_growth_leaves_capacity_unchanged() -> TestResult {
         let harness = Harness::start().await?;
         let mut group = FakeGroup::new(FLEET, 2, &[]);
         group.max_size = 4;
         harness.add_group_with(group);
+        harness.fail(
+            UPDATE_AUTO_SCALING_GROUP,
+            FakeFailure {
+                status: 403,
+                code: "AccessDenied",
+                message: "maximum update denied",
+            },
+        );
 
         let result = gang_testkit::fence::with_held(async |held| {
             harness
@@ -1838,6 +2010,19 @@ mod tests {
             )))
         ));
         assert_eq!(harness.desired(FLEET), Some(2));
+        assert_eq!(harness.requests(SET_DESIRED_CAPACITY), 0);
+        assert_eq!(harness.requests(UPDATE_AUTO_SCALING_GROUP), 1);
+        let state = harness.fake.state();
+        assert_eq!(state.groups[0].max_size, 4);
+        let update = state
+            .requests
+            .iter()
+            .find(|request| request.operation == UPDATE_AUTO_SCALING_GROUP)
+            .expect("the maximum update was requested");
+        assert_eq!(
+            update.parameters.get("MaxSize").map(String::as_str),
+            Some("5")
+        );
         Ok(())
     }
 
@@ -1892,6 +2077,7 @@ mod tests {
                     held,
                     fleet(FLEET).expect("test value is valid").view(),
                     &InstanceId::try_new("i-r").expect("test value is valid"),
+                    TerminationMode::ScaleIn,
                 )
                 .await
         })

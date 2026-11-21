@@ -126,10 +126,17 @@ fi
 
 if [[ -n $workers ]]; then
   while IFS= read -r worker; do
-    worker_deadline=$(($(date +%s) + 180))
-    if (( worker_deadline > deadline )); then worker_deadline=$deadline; fi
+    attested='[]'
+    membership=''
+    command_id=''
+    command_instance=''
+    commands=$(jq -nc --arg command 'pid=$(systemctl show gang-worker.service -p MainPID --value)
+case "$pid" in ""|*[!0-9]*) exit 1 ;; esac
+case "$pid" in *[1-9]*) ;; *) exit 1 ;; esac
+kill -0 "$pid" || exit 1
+exec "/proc/$pid/exe" -V' '{commands: [$command]}')
     while :; do
-      if ! groups=$(aws_read "$worker_deadline" --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$worker" --output json); then
+      if ! groups=$(aws_read "$deadline" --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$worker" --output json); then
         echo "::error::failed to describe worker Auto Scaling group $worker" >&2; exit 1
       fi
       state=$(jq -r --arg name "$worker" '
@@ -138,15 +145,58 @@ if [[ -n $workers ]]; then
           if (.Instances | type) != "array" or (.DesiredCapacity | type) != "number" then "missing"
           else [.Instances[] | select((.LifecycleState // "") | startswith("Terminating") | not)] as $active
             | if any($active[]; .HealthStatus == "Unhealthy") then "unhealthy"
-              elif ($active | length) == .DesiredCapacity and all($active[]; .HealthStatus == "Healthy" and .LifecycleState == "InService") then "ready"
+              elif ($active | length) == .DesiredCapacity and all($active[]; .HealthStatus == "Healthy" and .LifecycleState == "InService" and (.InstanceId | type == "string" and length > 0)) and ([$active[].InstanceId] | length == (unique | length)) then "ready"
               else "pending" end
           end
         end' <<<"$groups")
+      ids=$(jq -c '[.AutoScalingGroups[0].Instances[]? | select((.LifecycleState // "") | startswith("Terminating") | not) | .InstanceId] | sort' <<<"$groups")
+      if [[ $ids != "$membership" ]]; then
+        membership=$ids
+        attested='[]'
+        command_id=''
+        command_instance=''
+      fi
       case $state in
-        ready) break ;;
+        ready)
+          if (( $(date +%s) >= deadline )); then
+            echo "::error::worker Auto Scaling group $worker did not attest the expected running version $expected" >&2; exit 1
+          fi
+          instance=$(jq -r --argjson 'done' "$attested" '[.[] | select(. as $id | $done | index($id) | not)] | .[0] // ""' <<<"$ids")
+          if [[ -z $instance ]]; then break; fi
+          if [[ -z $command_id ]]; then
+            command_instance=$instance
+            if result=$(aws_read "$deadline" --region "$region" ssm send-command --instance-ids "$instance" --document-name AWS-RunShellScript --parameters "$commands" --output json) &&
+              command_id=$(jq -er '.Command.CommandId | select(type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))' <<<"$result"); then
+              :
+            elif grep -Fq 'An error occurred (InvalidInstanceId) when calling' "$dir/aws-error"; then
+              command_id=''
+            else
+              echo "::error::worker Auto Scaling group $worker did not attest the expected running version $expected: failed to send SSM command" >&2; exit 1
+            fi
+          fi
+          if [[ -n $command_id ]]; then
+            if invocation=$(aws_read "$deadline" --region "$region" ssm get-command-invocation --command-id "$command_id" --instance-id "$command_instance" --output json); then
+              status=$(jq -r '.Status // ""' <<<"$invocation" 2>/dev/null) || status=''
+              case $status in
+                Pending|InProgress|Delayed) ;;
+                Success)
+                  if jq -e --arg expected "gang $expected" '.ResponseCode == 0 and (.StandardOutputContent | type == "string" and rtrimstr("\n") == $expected)' <<<"$invocation" >/dev/null; then
+                    attested=$(jq -c --arg id "$command_instance" '. + [$id]' <<<"$attested")
+                  fi
+                  command_id='' ;;
+                *) command_id='' ;;
+              esac
+            elif ! grep -Fq 'An error occurred (InvocationDoesNotExist) when calling' "$dir/aws-error"; then
+              echo "::error::worker Auto Scaling group $worker did not attest the expected running version $expected: failed to read SSM invocation" >&2; exit 1
+            fi
+          fi
+          if ! readiness_sleep "$deadline"; then
+            echo "::error::worker Auto Scaling group $worker did not attest the expected running version $expected" >&2; exit 1
+          fi
+          ;;
         missing|unhealthy) echo "::error::worker Auto Scaling group $worker is $state" >&2; exit 1 ;;
         *)
-          if ! readiness_sleep "$worker_deadline"; then
+          if ! readiness_sleep "$deadline"; then
             jq -c '.AutoScalingGroups[] | {AutoScalingGroupName, DesiredCapacity, Instances: [.Instances[] | {InstanceId, HealthStatus, LifecycleState}]}' <<<"$groups" >&2
             echo "::error::worker Auto Scaling group $worker did not reach desired healthy capacity" >&2; exit 1
           fi ;;

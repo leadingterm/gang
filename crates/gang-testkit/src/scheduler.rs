@@ -1369,6 +1369,7 @@ mod tests {
                 Ok(InstanceCordon {
                     fleet,
                     instance: Arc::new(InstanceId::try_new(name)?),
+                    replacing: false,
                 })
             })
             .collect::<TestResult<Vec<_>>>()?;
@@ -1390,6 +1391,7 @@ mod tests {
             capacity: None,
             reserved: None,
             cache: None,
+            current_build: true,
             draining: false,
             paused: false,
             last_seen: Timestamp::UNIX_EPOCH,
@@ -1479,6 +1481,7 @@ mod tests {
         into.cordons.push(InstanceCordon {
             fleet: 9,
             instance: Arc::new(InstanceId::try_new("stale")?),
+            replacing: false,
         });
         into.fleet_memory.push(FleetMemoryCapacity {
             fleet: 1,

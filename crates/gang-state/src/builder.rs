@@ -762,6 +762,7 @@ fn fill_workers(
             name::write_of::<name::Fleets>(&mut row.fleet, &worker.fleet);
             write_text_of::<name::Instances>(&mut row.instance, key);
             row.phase = phase;
+            row.stale = !worker.current_build;
             if let Some(earlier) = earlier {
                 row.phases.clone_from(&earlier.phases);
             } else {

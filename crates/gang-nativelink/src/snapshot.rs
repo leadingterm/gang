@@ -62,6 +62,11 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
         id,
         fleet,
         environment,
+        current_build: summary
+            .platform_properties
+            .get(property::GANG_VERSION)
+            .map(String::as_str)
+            == Some(env!("CARGO_PKG_VERSION")),
         running_actions: summary.running_actions,
         max_inflight_actions,
         draining: summary.is_draining,
@@ -456,6 +461,7 @@ pub(crate) mod tests {
             platform_properties: props(&[
                 (property::FLEET, "fleet-a"),
                 (property::ACTION_ENVIRONMENT, "host:test"),
+                (property::GANG_VERSION, env!("CARGO_PKG_VERSION")),
             ]),
             available_platform_properties: HashMap::new(),
             free_memory_kb: None,
@@ -587,6 +593,7 @@ pub(crate) mod tests {
                 id: WorkerId::try_new(WORKER).expect("valid worker id"),
                 fleet: FleetName::try_new("fleet-a").expect("valid fleet name"),
                 environment: Some("host:test".parse().expect("valid environment")),
+                current_build: true,
                 running_actions: 2,
                 max_inflight_actions: NonZeroU32::new(8),
                 draining: true,
@@ -793,6 +800,34 @@ pub(crate) mod tests {
             })
         );
         Ok(())
+    }
+
+    #[test]
+    fn worker_build_identity_requires_the_current_version() {
+        let mut listing = summary(WORKER);
+        listing.platform_properties.remove(property::GANG_VERSION);
+        assert!(
+            !worker_state(&listing)
+                .expect("managed worker")
+                .current_build
+        );
+        listing
+            .platform_properties
+            .insert(property::GANG_VERSION.to_owned(), "old".to_owned());
+        assert!(
+            !worker_state(&listing)
+                .expect("managed worker")
+                .current_build
+        );
+        listing.platform_properties.insert(
+            property::GANG_VERSION.to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+        );
+        assert!(
+            worker_state(&listing)
+                .expect("managed worker")
+                .current_build
+        );
     }
 
     #[test]

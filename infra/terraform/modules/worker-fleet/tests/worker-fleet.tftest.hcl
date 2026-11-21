@@ -107,7 +107,7 @@ run "one_spot_asg_per_fleet" {
       && aws_autoscaling_group.this[fleet.name].max_size == fleet.max_instances
       && aws_autoscaling_group.this[fleet.name].desired_capacity == 0
     ])
-    error_message = "Each fleet must scale from 0 up to max_instances, with desired capacity owned by the controller."
+    error_message = "Each fleet must bootstrap at zero with max_instances as its initial physical maximum."
   }
 
   assert {

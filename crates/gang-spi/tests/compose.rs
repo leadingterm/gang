@@ -319,7 +319,9 @@ fn every_provisioner_port_reaches_the_selected_plugin() -> Result<(), Box<dyn Er
     );
     let gone = instance(1)?;
     assert!(matches!(
-        ready(gang_testkit::fence::with_held(async |held| provisioner.terminate(held, fleet.view(), &gone).await)),
+        ready(gang_testkit::fence::with_held(async |held| provisioner
+            .terminate(held, fleet.view(), &gone, gang_spi::TerminationMode::ScaleIn)
+            .await)),
         Err(gang_spi::RunError::Failed(PortError::NotFound(Subject::Instance(found)))) if found == gone
     ));
     assert_eq!(ready(provisioner.identity())?.instance, instance(2)?);
@@ -386,6 +388,7 @@ impl ProvisionerPort for DefaultConverge {
         _held: &gang_spi::Held,
         _fleet: Fleet<'_, Self::FleetOptions>,
         _instance: &gang_types::InstanceId,
+        _mode: gang_spi::TerminationMode,
     ) -> Result<(), PortError> {
         Ok(())
     }
@@ -1105,7 +1108,12 @@ fn foreign_fleet_options_are_rejected_without_panicking() -> Result<(), Box<dyn 
     let gone = instance(1)?;
     assert!(matches!(
         ready(gang_testkit::fence::with_held(async |held| provisioner
-            .terminate(held, fleet.view(), &gone)
+            .terminate(
+                held,
+                fleet.view(),
+                &gone,
+                gang_spi::TerminationMode::ScaleIn
+            )
             .await)),
         Err(gang_spi::RunError::Failed(PortError::Config(_)))
     ));

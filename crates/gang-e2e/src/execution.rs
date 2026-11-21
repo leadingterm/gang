@@ -167,7 +167,7 @@ impl ResourcePolicy {
         })
     }
 
-    /// A 480 MiB kernel pool in which both held pressure fixtures cannot coexist.
+    /// A 416 MiB kernel pool in which both held pressure fixtures cannot coexist.
     ///
     /// # Errors
     ///
@@ -177,8 +177,9 @@ impl ResourcePolicy {
         policy.memory.escalation_percent = EscalationPercent::try_new(250)
             .map_err(E2eError::system_from("the pool OOM escalation percentage"))?;
         policy.memory.enforcement = gang_config::MemoryEnforcement::None;
-        policy.worker_memory_max = Some(NonZeroBytes::mib(512).get());
-        policy.fleet_memory = Some(NonZeroBytes::mib(448));
+        let fleet_memory = NonZeroBytes::mib(448);
+        policy.worker_memory_max = Some(fleet_memory.get());
+        policy.fleet_memory = Some(fleet_memory);
         Ok(policy)
     }
 }
