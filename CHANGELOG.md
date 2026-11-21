@@ -13,6 +13,10 @@
 - Remove `target_actions_per_instance` from fleet configuration and Terraform fleet inputs, and remove `targetActions` from the fleet policy state API. Operators must delete the setting from existing configuration and Terraform inputs before upgrading; dashboard/API clients must stop reading `targetActions`. There is no replacement action-count limit. Long-lived workers have no fixed in-flight limit; single-use workers retain their lifecycle.
 - Replace `[actions.cold_start] cpu_count`, expressed in whole cores, with the integer `cpu_millicores` setting. The new default is 250 millicores; migrate an explicit old value by multiplying it by 1000. The old key is rejected.
 
+### Fixed
+
+- Expose the public listener connection limit in the deployment module, defaulting to 4096. The module now owns `[server.http2]` for all backends; SQLite callers must remove any appended `[server.http2]` table and move their `max_connections` override to `http2_max_connections`.
+
 ## 0.3.4
 
 ### Added

@@ -545,6 +545,18 @@ variable "execution_egress" {
   }
 }
 
+variable "http2_max_connections" {
+  type        = number
+  nullable    = false
+  default     = 4096
+  description = "Maximum concurrent public listener connections (default 4096)."
+
+  validation {
+    condition     = var.http2_max_connections > 0 && var.http2_max_connections == floor(var.http2_max_connections) && var.http2_max_connections <= 9223372036854775807
+    error_message = "http2_max_connections must be a positive integer no greater than 9223372036854775807."
+  }
+}
+
 variable "extra_config_toml" {
   type        = string
   description = <<-EOT
@@ -553,10 +565,9 @@ variable "extra_config_toml" {
     TOML tables, not a string: JSON-encoding it would quote it. It must consist of complete [table] sections (developer
     and CI identity providers, tunables), never bare top-level keys: a key there would join the last table. TOML tables
     already opened by this module cannot be reopened here, even for settings omitted from the template such as
-    [database.sqlite].busy_timeout and [authentication.workers.mtls].certificate_ttl. With database.engine "postgres" or
-    "dynamodb", the module opens [server.http2] and owns shutdown_grace, so all other keys in that table,
-    including max_connections and receive_window, retain their defaults. With "sqlite", the module does not open that
-    table, so it can be appended here. For load-balanced shared databases, the
+    [database.sqlite].busy_timeout and [authentication.workers.mtls].certificate_ttl. The module always opens
+    [server.http2] and owns max_connections; for "postgres" and "dynamodb" it also owns shutdown_grace.
+    Unexposed settings such as receive_window retain their runtime defaults. For load-balanced shared databases, the
     module also opens [server.proxy_protocol], so it cannot be reopened here; header_timeout, max_pending_headers, and
     max_header_size are not exposed and retain their runtime defaults. Its first non-blank, non-comment line must start
     with "[". Content is public: it lands in the SSM parameter (gang.toml), not
