@@ -10,7 +10,7 @@ use gang_clock::Clock;
 use gang_config::SourceLimit;
 use gang_reconciler::{NeedCause, PassTime, PlanStep};
 use gang_testkit::TestResult;
-use gang_types::{ActionResources, InstanceLifecycle, SourceId};
+use gang_types::{ActionResources, Bytes, InstanceLifecycle, SourceId};
 
 use super::work_aware::{Workload, purchases, secs, source, summary};
 use crate::support::{Harness, X86};
@@ -558,7 +558,7 @@ fn source_period_flush_settles_unobserved_checkpoint_once() -> TestResult {
     Ok(())
 }
 
-fn train_long_source(src: SourceId) -> TestResult<Workload> {
+fn run_long_activity(src: SourceId) -> TestResult<Workload> {
     let mut w = Workload::new(6, 16, 50)?;
     w.serve(X86, "trained-worker")?;
     w.running(
@@ -596,6 +596,11 @@ fn train_long_source(src: SourceId) -> TestResult<Workload> {
     );
     w.h.advance(secs(1));
     w.pass();
+    Ok(w)
+}
+
+fn train_long_source(src: SourceId) -> TestResult<Workload> {
+    let mut w = run_long_activity(src)?;
     w.h.advance(Duration::from(w.h.scaling.source_idle));
     w.pass();
     let mut records = Vec::new();
@@ -603,14 +608,7 @@ fn train_long_source(src: SourceId) -> TestResult<Workload> {
         .snapshot(PassTime::read(&w.h.clock), &mut records)?;
     assert_eq!(records.len(), 1, "the 1800-second source period is durable");
     w.h.profiles.restore(PassTime::read(&w.h.clock), &records);
-    w.h.disconnect("trained-worker")?;
-    w.h.set_lifecycle(
-        X86,
-        "trained-worker",
-        InstanceLifecycle::Terminating,
-        Duration::ZERO,
-    )?;
-    w.h.set_desired_capacity(X86, 0);
+    retire_training_worker(&mut w)?;
     w.h.restart();
     Ok(w)
 }
@@ -697,4 +695,118 @@ fn serve_finite_cohort(w: &mut Workload, src: SourceId) -> TestResult<Vec<PlanSt
         );
     }
     Ok(steps)
+}
+
+fn retire_training_worker(w: &mut Workload) -> TestResult {
+    w.h.disconnect("trained-worker")?;
+    w.h.set_lifecycle(
+        X86,
+        "trained-worker",
+        InstanceLifecycle::Terminating,
+        Duration::ZERO,
+    )?;
+    w.h.set_desired_capacity(X86, 0);
+    Ok(())
+}
+
+#[test]
+fn same_term_long_mean_static_upload_across_passes_never_forecasts_refill() -> TestResult {
+    let src = source(1)?;
+    let mut w = run_long_activity(src)?;
+    // The empty cohort was observed for only one second: keep the live 600-second mean,
+    // retained persistence, and controller term rather than restoring or restarting.
+    assert!(secs(1) < Duration::from(w.h.scaling.source_idle));
+    retire_training_worker(&mut w)?;
+    let frame = w.h.snapshot.source_rates[0];
+    w.queue(Some(src), X86, 40, Some(secs(1)))?;
+    let mut steps = w.run();
+    assert_eq!(summary(&steps)?.persistent_streams, 1);
+    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
+    w.h.launch(
+        X86,
+        "upload-worker",
+        InstanceLifecycle::Pending,
+        Duration::ZERO,
+    )?;
+    w.h.advance(Duration::from_millis(50));
+    w.queue(Some(src), X86, 120, Some(secs(1)))?;
+    w.h.advance(Duration::from_millis(4950));
+    steps.extend(w.run());
+    assert_eq!(w.h.outlook(X86)?.needed, 1);
+    for _ in 0..6 {
+        w.h.advance(secs(5));
+        steps.extend(w.run());
+        assert_eq!(w.h.snapshot.queued.len(), 160);
+        assert_eq!(w.h.snapshot.source_rates[0].at, frame.at);
+        assert_eq!(
+            w.h.snapshot.source_rates[0].timed_completions,
+            frame.timed_completions
+        );
+        assert_eq!(
+            w.h.outlook(X86)?.needed,
+            1,
+            "static upload is not future arrivals"
+        );
+    }
+    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
+    assert_eq!(w.h.supply(X86)?.desired, 1);
+    Ok(())
+}
+
+#[test]
+fn restored_unknown_disk_batch_uploaded_across_passes_never_forecasts_refill() -> TestResult {
+    let src = source(1)?;
+    let mut w = train_long_source(src)?;
+    let frame = w.h.snapshot.source_rates[0];
+    let disk_capacity = w.h.passes[X86].policy.disk_per_instance.get().get();
+    let disk_per_action = Bytes::new(disk_capacity / 8);
+    assert_eq!(
+        disk_per_action.get() * 8,
+        disk_capacity,
+        "each action takes two of 16 disk slots"
+    );
+    let mut steps = Vec::new();
+    for total in [20, 90, 160] {
+        if total != 20 {
+            w.h.advance(secs(5));
+        }
+        w.queue(Some(src), X86, total - w.h.snapshot.queued.len(), None)?;
+        for row in &mut w.h.snapshot.queued {
+            row.resources.disk = disk_per_action;
+            assert_eq!(row.expected, None);
+        }
+        let pass = w.run();
+        if total == 20 {
+            assert_eq!(summary(&pass)?.persistent_streams, 1);
+            assert_eq!(summary(&pass)?.horizon, Duration::from_millis(322_500));
+            w.h.launch(
+                X86,
+                "upload-worker",
+                InstanceLifecycle::Pending,
+                Duration::ZERO,
+            )?;
+        }
+        steps.extend(pass);
+        assert_eq!(w.h.outlook(X86)?.needed, 1);
+    }
+    // Unknown work uses the 10-second prior: 160 * 2 * 10 = 3200 disk-slot-seconds,
+    // less than one worker's 16 * 322.5 = 5160. No completion backs a refill forecast.
+    for _ in 0..6 {
+        w.h.advance(secs(5));
+        steps.extend(w.run());
+        assert_eq!(w.h.snapshot.queued.len(), 160);
+        assert_eq!(w.h.snapshot.source_rates[0].at, frame.at);
+        assert_eq!(
+            w.h.snapshot.source_rates[0].timed_completions,
+            frame.timed_completions
+        );
+        assert_eq!(
+            w.h.outlook(X86)?.needed,
+            1,
+            "upload steps cannot fund another worker"
+        );
+    }
+    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
+    assert_eq!(w.h.supply(X86)?.desired, 1);
+    Ok(())
 }

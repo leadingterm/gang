@@ -23,6 +23,7 @@
 ### Fixed
 
 - **v0.3.4:** Bound persistent-queue scale-out by payback on queued work and qualified genuine arrivals, avoiding overscaling cheap static batches and closed-loop completion waves.
+- **v0.3.4:** Require completion-backed refill in the current cohort before forecasting future arrivals, so finite uploads do not create a sustained-load forecast.
 - **v0.3.4:** Give the cold-burst fixture a payback horizon that accounts for its minimum disk reservation while retaining the default unknown-action prior.
 - **v0.3.4:** Restore the declared action-environment-probe input and controlled action-local IPC for fresh database-partition probes.
 - **v0.3.4:** Declare rate probes explicitly so the checked-in sample passes harness validation.

@@ -235,11 +235,9 @@ pub fn sustained_stream(stack: &Stack<'_>) -> Result<Vec<Check>> {
         observed?;
         let outcome = outcome?;
         let mut checks = stream_checks(&after(stack, since)?, true);
-        checks.push(Check::expect(
-            "stream stays within paid capacity",
-            ceiling,
-            || "desired capacity exceeded one while lanes refilled".to_owned(),
-        ));
+        checks.push(Check::expect(names::STREAM_CEILING, ceiling, || {
+            "desired capacity exceeded one while lanes refilled".to_owned()
+        }));
         checks.push(Check::expect(
             names::STREAM_BUILD,
             outcome.succeeded(),
@@ -359,7 +357,7 @@ pub fn two_sources(system: &Secured<'_>) -> Result<Vec<Check>> {
         let b = outcome_b?;
         let mut checks = stream_checks(&after(stack, since)?, true);
         checks.push(Check::expect(
-            "distinct authenticated streams share one worker",
+            names::SOURCE_ISOLATION,
             first.principal != second.principal
                 && first.home != second.home
                 && first.token != second.token

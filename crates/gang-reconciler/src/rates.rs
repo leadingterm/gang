@@ -80,6 +80,7 @@ struct CompletionDelta {
 enum RefillEvidence {
     #[default]
     None,
+    Growing,
     Pending,
     Confirmed,
 }
@@ -156,12 +157,25 @@ impl Cell {
                     (self.completion_credit + self.fresh.all / kappa).min(f64::MAX);
             }
             let admitted = (self.n + self.completion_credit.floor()).min(f64::MAX);
+            let has_completions = self.completion_credit >= 1.0;
             self.refill = match self.refill {
                 RefillEvidence::Confirmed => RefillEvidence::Confirmed,
                 RefillEvidence::Pending if admitted >= self.admission_high_water => {
                     RefillEvidence::Confirmed
                 }
-                _ if admitted > self.admission_high_water => RefillEvidence::Pending,
+                RefillEvidence::Growing
+                    if has_completions
+                        && self.n > self.n_prev
+                        && admitted > self.admission_high_water =>
+                {
+                    RefillEvidence::Confirmed
+                }
+                _ if has_completions && admitted > self.admission_high_water => {
+                    RefillEvidence::Pending
+                }
+                _ if !has_completions && admitted > self.admission_high_water => {
+                    RefillEvidence::Growing
+                }
                 _ => RefillEvidence::None,
             };
             self.admission_high_water = self.admission_high_water.max(admitted);
@@ -1205,14 +1219,52 @@ mod tests {
     }
 
     #[test]
+    fn zero_completion_multichunk_upload_never_forecasts_held_work() {
+        let mut cell = Cell {
+            persistent: true,
+            ..Cell::default()
+        };
+        assert!(!sample_cohort(&mut cell, 20.0, 0.0, None, None, 0));
+        assert!(!sample_cohort(&mut cell, 90.0, 0.0, Some(0), None, 1));
+        assert_eq!(cell.refill, RefillEvidence::Growing);
+        assert!(!sample_cohort(&mut cell, 160.0, 0.0, Some(1), None, 2));
+        assert_eq!(cell.refill, RefillEvidence::Growing);
+        for now in 3..=1024 {
+            assert!(!sample_cohort(
+                &mut cell,
+                160.0,
+                0.0,
+                Some(now - 1),
+                None,
+                now,
+            ));
+            assert_ne!(cell.refill, RefillEvidence::Pending);
+            assert_ne!(cell.refill, RefillEvidence::Confirmed);
+        }
+        exact(cell.completion_credit, 0.0);
+        exact(cell.admission_high_water, 160.0);
+    }
+
+    #[test]
+    fn growing_cohort_requires_completion_backed_later_growth() {
+        let mut cell = Cell::default();
+        assert!(!sample_cohort(&mut cell, 20.0, 0.0, None, None, 0));
+        assert!(!sample_cohort(&mut cell, 90.0, 0.0, Some(0), None, 1));
+        assert!(!sample_cohort(&mut cell, 160.0, 0.9, Some(1), Some(1), 2));
+        assert_eq!(cell.refill, RefillEvidence::Growing);
+        assert!(sample_cohort(&mut cell, 170.0, 0.2, Some(2), Some(2), 3));
+        assert_eq!(cell.refill, RefillEvidence::Confirmed);
+    }
+
+    #[test]
     fn observed_empty_restarts_cohort_even_with_retained_persistence() {
         let mut cell = Cell {
             persistent: true,
             ..Cell::default()
         };
         assert!(!sample_cohort(&mut cell, 4.0, 0.0, None, None, 0));
-        assert!(!sample_cohort(&mut cell, 5.0, 0.0, Some(0), None, 1));
-        assert!(sample_cohort(&mut cell, 5.0, 0.0, Some(1), None, 2));
+        assert!(!sample_cohort(&mut cell, 5.0, 1.0, Some(0), Some(0), 1));
+        assert!(sample_cohort(&mut cell, 5.0, 1.0, Some(1), Some(1), 2));
         assert!(!sample_cohort(&mut cell, 0.0, 0.0, Some(2), None, 3));
         assert!(cell.persistent);
         assert!(!sample_cohort(&mut cell, 100.0, 10.0, Some(3), Some(3), 4));

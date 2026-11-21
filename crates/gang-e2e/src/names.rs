@@ -131,14 +131,14 @@ pub mod work_aware {
     pub const STREAM_REFILL: &str = "stream refills beyond readiness plus payback";
     /// Purchases advance one worker at a time.
     pub const STREAM_STEPS: &str = "stream scales out in bounded steps";
-    /// Purchases never exceed the outstanding-work ceiling.
-    pub const STREAM_CEILING: &str = "stream respects concurrency ceiling";
+    /// Closed-loop refill stays within one worker's paid capacity.
+    pub const STREAM_CEILING: &str = "stream stays within paid capacity";
     /// Successful purchases carry their decision inputs.
     pub const DECISION_DETAIL: &str = "scale-out audit includes decision detail";
     /// The streaming build succeeds after release.
     pub const STREAM_BUILD: &str = "sustained stream build succeeds";
-    /// An old principal cannot make a different young principal persistent.
-    pub const SOURCE_ISOLATION: &str = "authenticated sources have isolated activity ages";
+    /// Distinct authenticated streams share one worker while refilling.
+    pub const SOURCE_ISOLATION: &str = "distinct authenticated streams share one worker";
     /// Both independent principal builds finish.
     pub const SOURCES_BUILD: &str = "both source builds succeed";
     /// Light work occupies all three workers before scale-in.
