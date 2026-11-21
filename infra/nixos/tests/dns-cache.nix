@@ -2,7 +2,7 @@
   upstreamIP = "192.168.77.1";
   dnsmasq = "${pkgs.dnsmasq}/bin/dnsmasq";
   dig = "${pkgs.dnsutils}/bin/dig";
-  getent = "${pkgs.glibc.bin}/bin/getent";
+  getent = "${pkgs.glibc.getent}/bin/getent";
   grep = "${pkgs.gnugrep}/bin/grep";
   busctl = "${pkgs.systemd}/bin/busctl";
   resolvectl = "${pkgs.systemd}/bin/resolvectl";
