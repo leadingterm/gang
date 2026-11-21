@@ -213,12 +213,42 @@ impl Lost {
     }
 }
 
+/// Public listener connection gauges and cumulative refusals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectionCounts {
+    /// Connections currently served.
+    pub active: u64,
+    /// Configured connection limit.
+    pub limit: u64,
+    /// Connections refused since process start.
+    pub refused: u64,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionCounters {
+    active: AtomicU64,
+    limit: AtomicU64,
+    refused: AtomicU64,
+}
+
+/// Counts a public connection until the guard is dropped, including on task cancellation.
+#[derive(Debug)]
+#[must_use]
+pub struct PublicConnectionCount(Arc<ConnectionCounters>);
+
+impl Drop for PublicConnectionCount {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// The producing side of the bounded observation channel. Recording never waits for capacity.
 #[derive(Debug, Clone)]
 pub struct ObservationSink {
     sender: mpsc::Sender<Observation>,
     lost: Arc<Lost>,
     traffic: Arc<Mutex<Traffic>>,
+    connections: Arc<ConnectionCounters>,
 }
 
 /// The consuming side, owned by the server's recorder.
@@ -247,6 +277,7 @@ impl ObservationSink {
                 sender,
                 lost: Arc::clone(&lost),
                 traffic: Arc::clone(&traffic),
+                connections: Arc::new(ConnectionCounters::default()),
             },
             Observations {
                 receiver,
@@ -254,6 +285,40 @@ impl ObservationSink {
                 traffic,
             },
         )
+    }
+
+    /// Sets the configured public listener connection limit.
+    pub fn set_connection_limit(&self, limit: NonZeroUsize) {
+        self.connections
+            .limit
+            .store(limit.get() as u64, Ordering::Relaxed);
+    }
+
+    /// Counts an admitted public connection until the returned guard is dropped.
+    #[must_use]
+    pub fn connection_opened(&self) -> PublicConnectionCount {
+        self.connections.active.fetch_add(1, Ordering::Relaxed);
+        PublicConnectionCount(Arc::clone(&self.connections))
+    }
+
+    /// Counts a public connection refusal, saturating at `u64::MAX`.
+    pub fn connection_refused(&self) {
+        let _ =
+            self.connections
+                .refused
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    Some(count.saturating_add(1))
+                });
+    }
+
+    /// Reads the independently sampled public listener counters.
+    #[must_use]
+    pub fn connections(&self) -> ConnectionCounts {
+        ConnectionCounts {
+            active: self.connections.active.load(Ordering::Relaxed),
+            limit: self.connections.limit.load(Ordering::Relaxed),
+            refused: self.connections.refused.load(Ordering::Relaxed),
+        }
     }
 
     /// Adds cache traffic independently of attributed observations and channel losses.
@@ -367,6 +432,44 @@ mod tests {
             outcome: CallOutcome::Ok,
             transferred: Transferred::default(),
         })
+    }
+
+    #[tokio::test]
+    async fn public_connections_are_shared_and_survive_queue_loss_and_abort() {
+        let (sink, observations) = ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
+        let clone = sink.clone();
+        sink.set_connection_limit(NonZeroUsize::MIN);
+        sink.record(call("one"));
+        sink.record(call("two"));
+        clone.connection_refused();
+        let guard = clone.connection_opened();
+        assert_eq!(
+            sink.connections(),
+            ConnectionCounts {
+                active: 1,
+                limit: 1,
+                refused: 1
+            }
+        );
+        drop(guard);
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = clone.connection_opened();
+            let _ = ready.send(());
+            std::future::pending::<()>().await;
+        });
+        started.await.expect("connection task started");
+        assert_eq!(sink.connections().active, 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(sink.connections().active, 0);
+        drop(observations);
+        sink.connections
+            .refused
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        sink.connection_refused();
+        sink.connection_refused();
+        assert_eq!(sink.connections().refused, u64::MAX);
     }
 
     #[tokio::test]

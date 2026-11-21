@@ -2551,6 +2551,10 @@ fn hub() -> StateHub {
 
 /// A publisher that writes into `hub`, with no actions sample, traffic or cache measurement.
 fn publisher(hub: &StateHub) -> StatePublisher {
+    publisher_with_sink(hub).0
+}
+
+fn publisher_with_sink(hub: &StateHub) -> (StatePublisher, gang_spi::ObservationSink) {
     let config = BuilderConfig {
         events_limit: 100,
         history_window: Duration::from_mins(15),
@@ -2561,15 +2565,16 @@ fn publisher(hub: &StateHub) -> StatePublisher {
     };
     let builds = gang_config::BuildsConfig::default();
     let (builds, sink, _observations) = crate::builds::BuildsCell::channel(&builds);
-    StatePublisher::new(
+    let publisher = StatePublisher::new(
         hub.clone(),
         config,
         ActionsCache::default(),
         builds,
-        sink,
+        sink.clone(),
         crate::cache_usage::CacheUsage::default(),
         gang_state::CacheBaseline::default(),
-    )
+    );
+    (publisher, sink)
 }
 
 /// The state the hub serves now.
@@ -2632,6 +2637,10 @@ async fn skipped_pass_publishes_its_reason_with_no_good_pass_before() -> Result<
     let scheduler = FakeScheduler::new().expect("the scheduler fake builds");
     let repository = FakeRepository::default();
     let hub = hub();
+    let (publisher, sink) = publisher_with_sink(&hub);
+    sink.set_connection_limit(std::num::NonZeroUsize::MIN);
+    let _connection = sink.connection_opened();
+    sink.connection_refused();
     scheduler.set_snapshot(queued_snapshot()?);
     scheduler.fail_snapshot(true);
     let mut control = ControlLoop::new(
@@ -2650,7 +2659,7 @@ async fn skipped_pass_publishes_its_reason_with_no_good_pass_before() -> Result<
         },
         gang_testkit::fence::valid_fence(),
     )
-    .with_publisher(publisher(&hub));
+    .with_publisher(publisher);
 
     assert_eq!(
         control.pass().await,
@@ -2658,6 +2667,14 @@ async fn skipped_pass_publishes_its_reason_with_no_good_pass_before() -> Result<
     );
 
     let state = served(&hub);
+    assert_eq!(
+        state.connections,
+        gang_wire::Connections {
+            active: 1,
+            limit: 1,
+            refused: 1
+        }
+    );
     assert_eq!(state.pass.state, PassState::Skipped);
     assert_eq!(
         state.pass.skip_reason,

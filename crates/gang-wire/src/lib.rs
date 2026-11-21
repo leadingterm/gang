@@ -80,7 +80,7 @@ pub use session::{
     AuthenticateRequest, AuthenticateResponse, CookieNames, Credential, Session, SessionLogin,
 };
 pub use state::{
-    Actions, BucketUsage, Cache, CacheStore, Demand, Fleet, InfrastructurePhase,
+    Actions, BucketUsage, Cache, CacheStore, Connections, Demand, Fleet, InfrastructurePhase,
     InfrastructureReason, InfrastructureStatus, Instance, InstanceCounts, InstanceSize,
     LaunchFailure, Lifecycle, Named, Pass, PassState, Phase, PhaseSpan, Policy, Queue,
     QueuedAction, Recent, RunningAction, Sample, SkipReason, State, StoreUsage, Truncated, Worker,
