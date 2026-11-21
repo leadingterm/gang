@@ -1217,13 +1217,21 @@ mod tests {
             "scratch_mount_point": "/mnt/scratch",
             "activity_limit": 101
         }))?;
+        let autoscaling = aws_sdk_autoscaling::Client::new(&sdk);
         let events = Events::new(
             &sdk,
             &config,
             harness.clock.clone(),
             Arc::new(crate::events::Managed::default()),
+            autoscaling.clone(),
         );
-        let fleets = Fleets::new(&sdk, harness.clock.clone(), CooldownPolicy::Ignore, events);
+        let fleets = Fleets::new(
+            &sdk,
+            harness.clock.clone(),
+            CooldownPolicy::Ignore,
+            events,
+            autoscaling,
+        );
         assert_eq!(
             fleets
                 .launch_assessment(&group, since)
@@ -1302,15 +1310,23 @@ mod tests {
                 "scratch_mount_point": "/mnt/scratch",
                 "activity_limit": if scenario == "bounded-coverage" { 100 } else { 101 }
             }))?;
+            let autoscaling = aws_sdk_autoscaling::Client::new(&sdk);
             let events = Events::new(
                 &sdk,
                 &config,
                 harness.clock.clone(),
                 Arc::new(crate::events::Managed::default()),
+                autoscaling.clone(),
             );
-            let fleets = Fleets::new(&sdk, harness.clock.clone(), CooldownPolicy::Ignore, events);
-            let mut output = fleets.describe_groups(std::iter::once(FLEET)).await?;
-            let group = Group::read(&mut output, FLEET)?;
+            let fleets = Fleets::new(
+                &sdk,
+                harness.clock.clone(),
+                CooldownPolicy::Ignore,
+                events,
+                autoscaling,
+            );
+            let output = fleets.describe_groups(std::iter::once(FLEET)).await?;
+            let group = Group::read(&output, FLEET)?;
             let since = harness.clock.wall() - Duration::from_mins(5);
             assert!(
                 fleets.launch_assessment(&group, since).await?.is_none(),
