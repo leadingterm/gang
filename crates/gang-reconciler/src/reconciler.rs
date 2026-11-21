@@ -237,6 +237,11 @@ impl Reconciler {
             demand_settled: now.saturating_duration_since(first) >= CLIENT_REROUTE_BOUND,
         };
         let snapshot = hosted.snapshot();
+        for observation in &snapshot.fleet_memory {
+            if let Some(fleet) = fleets.get_mut(observation.fleet) {
+                fleet.policy.memory_per_instance = observation.capacity;
+            }
+        }
         self.repair_workers.clear();
         for step in plan.steps.drain(..) {
             if let Action::ReinforceDrain(worker) = step.action {
@@ -947,6 +952,8 @@ mod tests {
                 fleet: policy.name,
                 running_actions: 0,
                 max_inflight_actions: None,
+                capacity: None,
+                reserved: None,
                 paused: false,
                 draining,
                 last_seen: Timestamp::default(),
@@ -1000,6 +1007,113 @@ mod tests {
         assert_eq!(resources.memory, fleets[0].policy.memory_per_instance.get());
         assert_eq!(resources.disk, fleets[0].policy.disk_per_instance.get());
         assert_eq!(fleets[0].outlook.demand.actions(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn observed_fleet_memory_tracks_current_snapshot_and_retains_when_missing() -> TestResult {
+        use gang_types::{ActionResources, Bytes, FleetName, FleetSet, NonZeroBytes};
+
+        let (_, mut fleets, mut hosted) = fixture(0, false, false)?;
+        fleets[0].policy.memory_per_instance = NonZeroBytes::gib(63);
+        let mut other = fleets[0].policy.clone();
+        other.name = FleetName::try_new("other")?;
+        fleets.push(FleetPass::new(other));
+        let policies: Vec<_> = fleets.iter().map(|fleet| fleet.policy.clone()).collect();
+        let scaling = Arc::new(ScalingConfig::default());
+        let profiles = SourceProfiles::new(&scaling, gang_config::HistoryWindow::from_units(1));
+        let cpu_oversubscription = gang_types::nonzero_u32(2);
+        let mut reconciler =
+            Reconciler::new(&policies, scaling, profiles, cpu_oversubscription);
+        let mut plan = Plan::new();
+        let observed = NonZeroBytes::mib(62_229);
+        let mut snapshot = gang_spi::SchedulerSnapshot {
+            fleet_memory: vec![
+                gang_spi::FleetMemoryCapacity {
+                    fleet: 0,
+                    capacity: observed,
+                },
+                gang_spi::FleetMemoryCapacity {
+                    fleet: 9,
+                    capacity: NonZeroBytes::gib(1),
+                },
+            ],
+            queued: vec![gang_spi::QueuedDemand {
+                source: None,
+                candidates: FleetSet::prefix(1)?,
+                resources: ActionResources {
+                    memory: Bytes::gib(63),
+                    ..ActionResources::default()
+                },
+                queued_since: Timestamp::default(),
+                priority: 0,
+                expected: None,
+            }],
+            ..gang_spi::SchedulerSnapshot::default()
+        };
+        let queued = snapshot.queued.clone();
+        hosted.replace(&mut snapshot);
+        reconciler.reconcile(&mut fleets, &hosted, time(0), &mut plan);
+        let mut expected = policies[0].clone();
+        expected.memory_per_instance = observed;
+        assert_eq!(fleets[0].policy, expected);
+        assert_eq!(fleets[1].policy, policies[1]);
+        assert_eq!(
+            fleets[0]
+                .outlook
+                .demand
+                .instances(&fleets[0].policy, cpu_oversubscription),
+            2
+        );
+        assert_eq!(
+            fleets[0]
+                .outlook
+                .demand
+                .instances(&policies[0], cpu_oversubscription),
+            1
+        );
+
+        let mut snapshot = gang_spi::SchedulerSnapshot {
+            fleet_memory: vec![
+                gang_spi::FleetMemoryCapacity {
+                    fleet: 0,
+                    capacity: NonZeroBytes::gib(63),
+                },
+                gang_spi::FleetMemoryCapacity {
+                    fleet: 1,
+                    capacity: NonZeroBytes::gib(60),
+                },
+            ],
+            queued,
+            ..gang_spi::SchedulerSnapshot::default()
+        };
+        hosted.replace(&mut snapshot);
+        reconciler.reconcile(&mut fleets, &hosted, time(1), &mut plan);
+        expected.memory_per_instance = NonZeroBytes::gib(63);
+        assert_eq!(fleets[0].policy, expected);
+        assert_eq!(
+            fleets[0]
+                .outlook
+                .demand
+                .instances(&fleets[0].policy, cpu_oversubscription),
+            1
+        );
+        assert_eq!(
+            fleets[0]
+                .outlook
+                .demand
+                .instances(&policies[0], cpu_oversubscription),
+            1
+        );
+        let mut other_expected = policies[1].clone();
+        other_expected.memory_per_instance = NonZeroBytes::gib(60);
+        assert_eq!(fleets[1].policy, other_expected);
+
+        let mut snapshot = gang_spi::SchedulerSnapshot::default();
+        hosted.replace(&mut snapshot);
+        reconciler.reconcile(&mut fleets, &hosted, time(2), &mut plan);
+        assert_eq!(fleets[0].policy, expected);
+        assert_eq!(fleets[1].policy, other_expected);
         Ok(())
     }
 
@@ -1168,6 +1282,8 @@ mod tests {
                 environment: None,
                 running_actions: 3,
                 max_inflight_actions: None,
+                capacity: None,
+                reserved: None,
                 paused: false,
                 draining: false,
                 last_seen: Timestamp::default(),
@@ -1178,6 +1294,8 @@ mod tests {
                 environment: None,
                 running_actions: 2,
                 max_inflight_actions: None,
+                capacity: None,
+                reserved: None,
                 paused: false,
                 draining: true,
                 last_seen: Timestamp::default(),

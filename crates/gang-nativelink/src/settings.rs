@@ -79,6 +79,7 @@ pub(crate) fn scheduler(
 }
 
 /// Requeue resource kills against the declared capacities of each fleet.
+/// CPU count stays a catalog admission constraint; only its millicore ledger is a native minimum.
 fn resource_escalation(actions: &ActionsConfig, fleets: &FleetCatalog) -> Value {
     let capacities: Vec<Value> = fleets
         .fleets()
@@ -88,7 +89,7 @@ fn resource_escalation(actions: &ActionsConfig, fleets: &FleetCatalog) -> Value 
                 .declared()
                 .iter()
                 .filter_map(|&(key, kind)| {
-                    (kind == MatchKind::Minimum)
+                    (kind == MatchKind::Minimum && key != property::CPU_COUNT)
                         .then(|| {
                             fleet.capacity(key).map(|limit| {
                                 (
@@ -670,6 +671,16 @@ mod tests {
             supported_platform_properties(&fleets).get(property::CPU_MILLICORES),
             Some(&json!("minimum"))
         );
+        assert_eq!(
+            supported_platform_properties(&fleets).get(property::CPU_COUNT),
+            Some(&json!("ignore"))
+        );
+        let escalation = resource_escalation(&ActionsConfig::default(), &fleets);
+        let minimum = escalation["capacities"][0]["minimum"]
+            .as_object()
+            .expect("capacity minimum map");
+        assert!(!minimum.contains_key(property::CPU_COUNT));
+        assert_eq!(minimum.get(property::CPU_MILLICORES), Some(&json!(15000)));
     }
 
     #[test]
@@ -1486,12 +1497,12 @@ mod tests {
             serde_json::to_value(&escalation.capacities).expect("capacities"),
             json!([
                 {
-                    "minimum": { "cpu_count": 4, "cpu_millicores": 8000, "memory_kb": 8_388_608, "disk_kb": 104_857_600 },
+                    "minimum": { "cpu_millicores": 8000, "memory_kb": 8_388_608, "disk_kb": 104_857_600 },
                     "exact": { "fleet": "fleet-a", "ISA": "x86-64", "sandbox": "docker", "capacity": "2" },
                     "action_ceilings": { "cpu_millicores": 4000 }
                 },
                 {
-                    "minimum": { "cpu_count": 6, "cpu_millicores": 12000, "memory_kb": 16_777_216, "disk_kb": 83_886_080 },
+                    "minimum": { "cpu_millicores": 12000, "memory_kb": 16_777_216, "disk_kb": 83_886_080 },
                     "exact": { "fleet": "fleet-b", "ISA": "aarch64", "sandbox": "bwrap", "capacity": "3", "machine_class": "arm" },
                     "action_ceilings": { "cpu_millicores": 6000 }
                 }
