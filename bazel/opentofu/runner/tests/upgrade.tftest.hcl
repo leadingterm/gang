@@ -138,6 +138,8 @@ variables {
     min_instances               = 1
     max_instances               = 1
     vcpus_per_instance          = 2
+    # Baseline releases require this input; the current deployment derives memory.
+    memory_per_instance         = "4GiB"
     disk_per_instance           = "20GiB"
     target_actions_per_instance = 2
   }]
