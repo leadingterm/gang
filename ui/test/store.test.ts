@@ -109,6 +109,16 @@ test("cache deltas replace the whole part and omission preserves it", () => {
   assert.deepEqual(apply(replaced, after(replaced, { cache: {} })).cache, {});
 });
 
+test("connection deltas replace the whole part and omission preserves it", () => {
+  const state = { ...snapshot, connections: { active: 4, limit: 10, refused: 2 } };
+  const unchanged = apply(state, after(state));
+  assert.equal(unchanged.connections, state.connections);
+  const connections = { active: 10, limit: 10, refused: 3 };
+  const replaced = apply(unchanged, after(unchanged, { connections }));
+  assert.equal(replaced.connections, connections);
+  assert.equal(apply(replaced, after(replaced)).connections, connections);
+});
+
 test("a delta on another base asks for a resync", () => {
   assert.deepEqual(applyDelta(snapshot, { ...after(snapshot), base: snapshot.seq + 1 }), { kind: "resync" });
 });

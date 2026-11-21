@@ -165,6 +165,27 @@ const Banner = () => {
       />
     );
   }
+  const connections = client.state.value?.connections;
+  if (connections && connections.limit > 0 && connections.active >= connections.limit) {
+    return (
+      <BannerView
+        level="caution"
+        role="status"
+        title="Public connection limit reached"
+        meta={`${connections.active} / ${connections.limit} open · ${connections.refused} refused since server start`}
+      />
+    );
+  }
+  if (connections && connections.refused > 0) {
+    return (
+      <BannerView
+        level="caution"
+        role="status"
+        title={`${connections.refused} connections refused since server start`}
+        meta={`${connections.active} / ${connections.limit} open`}
+      />
+    );
+  }
   return null;
 };
 

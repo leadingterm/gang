@@ -1056,6 +1056,7 @@ pub(crate) fn state_frame(
         completed,
         recent: Recent::default(),
         cache: gang_wire::Cache::default(),
+        connections: gang_wire::Connections::default(),
         builds: Vec::new(),
         principals_epoch: 0,
     }
@@ -1283,6 +1284,7 @@ impl Simulation {
                 completed: None,
                 recent: None,
                 cache: None,
+                connections: None,
                 builds: None,
                 principals_epoch: None,
             };

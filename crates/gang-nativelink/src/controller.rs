@@ -115,6 +115,7 @@ struct SharedRoutes {
     standby_public: Router,
     standby_worker: Router,
     limits: ConnectionLimits,
+    observations: gang_spi::ObservationSink,
 }
 
 impl SharedServices {
@@ -146,9 +147,14 @@ impl SharedServices {
                     standby_public: with_request_metadata(standby.0, spec.observations.clone()),
                     standby_worker: standby.1,
                     limits: connection_limits(&config.http2, spec.max_workers),
+                    observations: spec.observations.clone(),
                 })
             })
             .await
+    }
+
+    pub(crate) fn observations(&self) -> Option<gang_spi::ObservationSink> {
+        self.routes.get().map(|routes| routes.observations.clone())
     }
 
     pub(crate) fn standby<A: ApiService>(
@@ -279,6 +285,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         routes.limits,
         &draining,
         handoff,
+        spec.observations.clone(),
     )
     .await
 }
@@ -332,6 +339,7 @@ async fn serve_connections<P: RequestGate, W: RequestGate, A: ApiService>(
     limits: ConnectionLimits,
     draining: &ObservingWorkerScheduler,
     handoff: HandOff,
+    observations: gang_spi::ObservationSink,
 ) -> Result<(), NativeLinkEmbedError> {
     let ClientAndWorkerRoutes {
         public: client_router,
@@ -351,6 +359,7 @@ async fn serve_connections<P: RequestGate, W: RequestGate, A: ApiService>(
         ended,
         handoff,
         mode: crate::serve::ServeMode::Controller,
+        observations: Some(observations),
     };
     let clock = SystemClock::new();
     let serving = async {

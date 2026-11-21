@@ -97,8 +97,8 @@ pub use limits_port::{
     GUARD_LINK_NAME, JOIN_LINK_NAME, MEMORY_KB_ENV, SIDE_CHANNEL_FILE_ENV,
 };
 pub use observation_port::{
-    Call, CallOutcome, Delivery, Executed, ExecutionTimes, Observation, ObservationSink,
-    Observations, Origin, Phase, Rpc, Traffic, Transferred,
+    Call, CallOutcome, ConnectionCounts, Delivery, Executed, ExecutionTimes, Observation,
+    ObservationSink, Observations, Origin, Phase, PublicConnectionCount, Rpc, Traffic, Transferred,
 };
 pub use plugin::{Plugin, PluginContext, SandboxPrograms};
 pub use private::__private;

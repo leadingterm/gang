@@ -122,6 +122,26 @@ fn base_state() -> State {
     }
 }
 
+#[test]
+fn connections_delta_round_trips() -> Result<(), Box<dyn Error>> {
+    let prev = base_state();
+    let mut cur = prev.clone();
+    cur.seq += 1;
+    cur.connections = gang_wire::Connections {
+        active: 1,
+        limit: 3,
+        refused: 7,
+    };
+    let delta = diff(&prev, &cur).ok_or("missing connection delta")?;
+    assert_eq!(delta.connections, Some(cur.connections));
+    let encoded = serde_json::to_string(&delta)?;
+    let decoded = serde_json::from_str(&encoded)?;
+    let mut rebuilt = prev;
+    apply(&mut rebuilt, &decoded)?;
+    assert_eq!(rebuilt, cur);
+    Ok(())
+}
+
 // Catches omitted cache deltas, merge-instead-of-replacement, and false nonempty deltas.
 #[test]
 fn cache_delta_replaces_the_whole_part() -> Result<(), Box<dyn Error>> {
@@ -607,6 +627,7 @@ fn snapshot(world: &World) -> State {
         completed: world.completed,
         recent: Recent::default(),
         cache: world.cache.clone(),
+        connections: gang_wire::Connections::default(),
         builds: Vec::new(),
         principals_epoch: world.principals_epoch,
     }
