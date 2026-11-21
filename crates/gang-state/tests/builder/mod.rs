@@ -145,6 +145,11 @@ fn fill_into(
     outcome: Outcome,
 ) -> TestResult {
     let passes = world.passes();
+    let mut observer_passes = passes.clone();
+    for pass in &mut observer_passes {
+        pass.outlook = FleetOutlook::default();
+        pass.past_boot_grace.clear();
+    }
     let catalog = FleetCatalog::try_new(world.properties.clone())?;
     let mut hosted = HostedSnapshot::default();
     hosted.replace(&mut world.snapshot.clone());
@@ -156,7 +161,7 @@ fn fill_into(
             hosted: Some(&hosted),
             supplies: &fresh,
         },
-        fleets: &passes,
+        fleets: &observer_passes,
         catalog: &catalog,
         actions: world.actions.as_ref(),
         events: &[],
@@ -184,11 +189,16 @@ fn fill_into(
             supplies,
         },
     };
+    let projection_passes = if matches!(&pass, PassStatus::Observed { .. }) {
+        &observer_passes
+    } else {
+        &passes
+    };
     let empty_builds = gang_insight::Builds::new(&gang_config::BuildsConfig::default());
     let inputs = Inputs {
         wall: ts(wall),
         pass,
-        fleets: &passes,
+        fleets: projection_passes,
         catalog: &catalog,
         actions: world.actions.as_ref(),
         events: &[],
@@ -997,11 +1007,9 @@ fn unplaceable_plus_charged_equals_queue_total() -> TestResult {
         let cur = fill(&mut builder, &blank(), u64::from(i), &world, 1_000, ok(0))?;
 
         assert_eq!(cur.queue.total, total);
-        assert_eq!(
-            cur.fleets[0].demand.queued + cur.fleets[1].demand.queued + cur.queue.unplaceable,
-            cur.queue.total,
-            "sweep case {i}"
-        );
+        assert_eq!(cur.queue.unplaceable, total);
+        assert_eq!(cur.fleets[0].demand.queued, first);
+        assert_eq!(cur.fleets[1].demand.queued, second);
         let oldest = if total == 0 { None } else { Some(ts(0)) };
         assert_eq!(cur.queue.oldest_queue_time, oldest);
     }
@@ -2359,7 +2367,8 @@ fn delayed_control_snapshot_does_not_replace_newer_observations() -> TestResult 
         Some("new")
     );
     assert_eq!(control.fleets[0].demand.running, 3);
-    assert_eq!(control.fleets[0].demand.queued, 1);
+    assert_eq!(passes[0].outlook.queued, 0);
+    assert_eq!(control.fleets[0].demand.queued, 0);
     assert_eq!(control.queue.total, 1);
     world.snapshot.completed = 22;
     let next = fill(
@@ -3525,4 +3534,358 @@ mod repeated_rebalance {
         }
         Ok(())
     }
+
+    #[test]
+    fn replacement_status_follows_physical_instance_across_worker_generations() -> TestResult {
+        let old = instance_id(1)?;
+        let new = instance_id(2)?;
+        let mut world =
+            sequential_world(&old, &new, true, InfrastructureTerminationReason::Rebalance)?;
+        world.snapshot.workers.clear();
+        world.supplies[0]
+            .instances
+            .push(fleet_instance(&old, InstanceLifecycle::InService, 0));
+        world.infrastructure = vec![launch("replacement", 2, &new, Some(old.clone()))?];
+        let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+        let instance = fill(&mut builder, &blank(), 1, &world, 10, ok(0))?;
+        let status = instance
+            .instances
+            .iter()
+            .find(|row| row.name == instance_name(&new))
+            .and_then(|row| row.infrastructure.clone())
+            .ok_or("replacement status")?;
+        let first_id = worker_on(&new)?;
+        world
+            .snapshot
+            .workers
+            .push(worker_state(&first_id, "alpha", 0, false, None)?);
+        let connected = fill(
+            &mut builder,
+            &instance,
+            2,
+            &world,
+            11,
+            super::Outcome::Observed {
+                known: true,
+                supplies: vec![true],
+            },
+        )?;
+        assert_eq!(connected.workers[0].infrastructure.as_ref(), Some(&status));
+        let second_id = gang_types::WorkerId::try_new(format!(
+            "{}6c5e4f3a-9b1d-4e2a-8f7c-000000000002",
+            new.worker_name()
+        ))?;
+        world.snapshot.workers[0] = worker_state(&second_id, "alpha", 0, false, None)?;
+        let rotated = fill(
+            &mut builder,
+            &connected,
+            3,
+            &world,
+            12,
+            super::Outcome::Observed {
+                known: true,
+                supplies: vec![true],
+            },
+        )?;
+        assert_eq!(rotated.workers[0].infrastructure.as_ref(), Some(&status));
+        Ok(())
+    }
+}
+
+#[test]
+fn unobserved_step_is_promoted_by_first_healthy_observation() -> TestResult {
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut world = World::default();
+    world.snapshot.queued.push(queued(0, FleetSet::default()));
+    let initial = builder.initial(ts(0), 7);
+    let pending = fill(
+        &mut builder,
+        &initial,
+        1,
+        &world,
+        1_000,
+        Outcome::Skipped(SkipReason::SchedulerUnavailable),
+    )?;
+    assert_eq!(pending.scheduler_known, None);
+    assert_eq!(
+        pending
+            .recent
+            .samples
+            .last()
+            .ok_or("sample")?
+            .scheduler_known,
+        Some(false)
+    );
+    let healthy = fill(
+        &mut builder,
+        &pending,
+        2,
+        &world,
+        1_001,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![],
+        },
+    )?;
+    assert_eq!(healthy.scheduler_known, Some(true));
+    assert_eq!(
+        healthy
+            .recent
+            .samples
+            .last()
+            .ok_or("sample")?
+            .scheduler_known,
+        Some(true)
+    );
+    Ok(())
+}
+
+#[test]
+fn scheduler_current_recovers_while_step_completeness_remains_sticky() -> TestResult {
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut world = World::default();
+    world.snapshot.queued.push(queued(0, FleetSet::default()));
+    let initial = builder.initial(ts(0), 7);
+    let healthy = fill(
+        &mut builder,
+        &initial,
+        2,
+        &world,
+        1_001,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![],
+        },
+    )?;
+    let failed = fill(
+        &mut builder,
+        &healthy,
+        3,
+        &world,
+        1_002,
+        Outcome::Observed {
+            known: false,
+            supplies: vec![],
+        },
+    )?;
+    let recovered = fill(
+        &mut builder,
+        &failed,
+        4,
+        &world,
+        1_003,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![],
+        },
+    )?;
+    assert_eq!(recovered.scheduler_known, Some(true));
+    assert_eq!(
+        recovered
+            .recent
+            .samples
+            .last()
+            .ok_or("sample")?
+            .scheduler_known,
+        Some(false)
+    );
+    assert_eq!(recovered.recent.samples.last().ok_or("sample")?.queued, 1);
+    let again = fill(
+        &mut builder,
+        &recovered,
+        5,
+        &world,
+        1_004,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![],
+        },
+    )?;
+    assert_eq!(
+        again.recent.samples.last().ok_or("sample")?.scheduler_known,
+        Some(false)
+    );
+    for (a, b) in [(&healthy, &failed), (&failed, &recovered)] {
+        let delta = diff(a, b).ok_or("delta")?;
+        let mut patched = a.clone();
+        gang_state::apply(&mut patched, &delta)?;
+        assert_eq!(&patched, b);
+    }
+    Ok(())
+}
+
+#[test]
+fn metadata_in_outage_opens_unknown_step_until_rebaselined() -> TestResult {
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let world = World::default();
+    let initial = builder.initial(ts(0), 7);
+    let outage = fill(
+        &mut builder,
+        &initial,
+        6,
+        &world,
+        11_000,
+        Outcome::Observed {
+            known: false,
+            supplies: vec![],
+        },
+    )?;
+    let metadata = fill(
+        &mut builder,
+        &outage,
+        7,
+        &world,
+        21_000,
+        Outcome::Skipped(SkipReason::SchedulerUnavailable),
+    )?;
+    assert_eq!(metadata.scheduler_known, Some(false));
+    assert_eq!(
+        metadata
+            .recent
+            .samples
+            .last()
+            .ok_or("sample")?
+            .scheduler_known,
+        Some(false)
+    );
+    let restored = fill(
+        &mut builder,
+        &metadata,
+        8,
+        &world,
+        21_001,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![],
+        },
+    )?;
+    assert_eq!(restored.scheduler_known, Some(true));
+    assert_eq!(
+        restored
+            .recent
+            .samples
+            .last()
+            .ok_or("sample")?
+            .scheduler_known,
+        Some(false)
+    );
+    for (a, b) in [(&outage, &metadata), (&metadata, &restored)] {
+        let delta = diff(a, b).ok_or("delta")?;
+        let mut patched = a.clone();
+        gang_state::apply(&mut patched, &delta)?;
+        assert_eq!(&patched, b);
+    }
+    Ok(())
+}
+
+#[test]
+fn observer_keeps_control_grace_and_filters_hosted_from_failed_supply() -> TestResult {
+    let mut world = World::default();
+    world.policies = vec![policy("alpha", 100, 4)?, policy("beta", 100, 4)?];
+    world.properties = world
+        .policies
+        .iter()
+        .map(|p| properties(p, Vec::new()))
+        .collect();
+    let id = instance_id(1)?;
+    world.supplies = vec![FleetSupply::default(), FleetSupply::default()];
+    world.supplies[1]
+        .instances
+        .push(fleet_instance(&id, InstanceLifecycle::InService, 0));
+    world.past_boot_grace = vec![vec![], vec![true]];
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let control = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
+    assert_eq!(past_grace(&control, &id), Some(true));
+    world.past_boot_grace.clear();
+    let observed = fill(
+        &mut builder,
+        &control,
+        2,
+        &world,
+        1_001,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![true, true],
+        },
+    )?;
+    assert_eq!(past_grace(&observed, &id), Some(true));
+    world.snapshot.workers.push(worker_state(
+        &worker_on(&id)?,
+        "beta",
+        0,
+        false,
+        NonZeroU32::new(4),
+    )?);
+    let connected = fill(
+        &mut builder,
+        &observed,
+        3,
+        &world,
+        1_002,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![true, false],
+        },
+    )?;
+    assert_eq!(past_grace(&connected, &id), None);
+    assert_eq!(connected.fleets[1].workers.unconnected, 0);
+    assert_eq!(connected.fleets[1].instances, observed.fleets[1].instances);
+    assert_eq!(connected.workers.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn observer_preserves_reconciler_spill_attribution() -> TestResult {
+    let mut world = World {
+        policies: vec![policy("alpha", 0, 2)?, policy("beta", 0, 10)?],
+        ..World::default()
+    };
+    for policy in &mut world.policies {
+        policy.target_actions_per_instance = gang_types::nonzero_u32(1);
+    }
+    world.properties = world
+        .policies
+        .iter()
+        .map(|p| properties(p, Vec::new()))
+        .collect();
+    world.supplies = vec![FleetSupply::default(), FleetSupply::default()];
+    let candidates = FleetSet::prefix(2)?;
+    world.snapshot.queued = (0..3).map(|i| queued(i, candidates)).collect();
+    let mut passes = world.passes();
+    let scaling = Arc::new(ScalingConfig::default());
+    let profiles = SourceProfiles::new(&scaling, ActionsConfig::default().history_window);
+    let mut reconciler = Reconciler::new(&world.policies, scaling, profiles);
+    let mut hosted = HostedSnapshot::default();
+    hosted.replace(&mut world.snapshot.clone());
+    let clock = TestClock::new(ts(1_000));
+    reconciler.reconcile(
+        &mut passes,
+        &hosted,
+        PassTime::read(&clock),
+        &mut Plan::new(),
+    );
+    assert_eq!((passes[0].outlook.queued, passes[1].outlook.queued), (2, 1));
+    world.passes = passes;
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let control = fill(&mut builder, &blank(), 1, &world, 1_000, ok(0))?;
+    let observed = fill(
+        &mut builder,
+        &control,
+        2,
+        &world,
+        1_001,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![true, true],
+        },
+    )?;
+    assert_eq!(
+        (
+            observed.fleets[0].demand.queued,
+            observed.fleets[1].demand.queued
+        ),
+        (2, 1)
+    );
+    assert_eq!((observed.queue.total, observed.queue.unplaceable), (3, 0));
+    Ok(())
 }

@@ -2821,7 +2821,136 @@ async fn worker_joins_recorded_in_a_pass_are_in_that_pass_state() -> TestResult 
 }
 
 #[tokio::test]
-async fn observation_continues_while_control_snapshot_is_held() -> TestResult {
+async fn healthy_observation_is_published_before_the_first_pass() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = FakeProvisioner::default();
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let hub = StateHub::new(
+        HubConfig {
+            max_viewers: NonZeroUsize::MIN,
+            retry_after: Duration::from_secs(5),
+            lag_frames: NonZeroUsize::new(8).expect("eight is nonzero"),
+            recent_events: NonZeroUsize::MIN,
+        },
+        initial_state(),
+    );
+    let mut viewer = hub.join().expect("viewer joins");
+    let control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    let mut run = pin!(control.run());
+    assert!(poll!(run.as_mut()).is_pending());
+
+    let crate::hub::Next::Frame(bytes) = viewer.next().await else {
+        panic!("first publication is delivered to the viewer");
+    };
+    let gang_wire::Frame::Delta(delta) = crate::test_support::decode_sse(&bytes) else {
+        panic!("first publication is a delta");
+    };
+    let recent = delta
+        .recent
+        .expect("first publication includes observation");
+    assert_eq!(recent.samples.last().unwrap().scheduler_known, Some(true));
+    assert_eq!(recent.samples.last().unwrap().passes, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn slow_pass_does_not_publish_a_known_zero_before_the_first_observation() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = FakeProvisioner::default();
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    let mut viewer = hub.join().expect("dashboard viewer joins");
+    let gang_wire::Frame::Snapshot(_) = crate::test_support::decode_sse(viewer.snapshot()) else {
+        panic!("viewer starts with a snapshot");
+    };
+    // The observer's first read is held while a real control pass crosses a history step.
+    let held_observer = scheduler.hold_snapshot();
+    let hook_clock = Arc::clone(&clock);
+    let delayed = AtomicBool::new(false);
+    fleet.on_converge(move || {
+        if !delayed.swap(true, Ordering::SeqCst) {
+            hook_clock.advance(Duration::from_secs(11));
+        }
+        Ok(())
+    });
+    let control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    let mut run = pin!(control.run());
+    assert!(poll!(run.as_mut()).is_pending());
+    let bytes = match viewer.next().await {
+        crate::hub::Next::Frame(bytes) | crate::hub::Next::Resync(bytes) => bytes,
+        crate::hub::Next::Closed => panic!("pass metadata reaches the open viewer"),
+    };
+    let recent = match crate::test_support::decode_sse(&bytes) {
+        gang_wire::Frame::Delta(delta) => delta.recent.expect("pass publishes history"),
+        gang_wire::Frame::Snapshot(state) => state.recent,
+        _ => panic!("pass publication is state"),
+    };
+    let sample = recent.samples.last().expect("pass sample");
+    assert_eq!(sample.scheduler_known, Some(false));
+    assert!(sample.passes >= 1);
+    let first_start = sample.start;
+
+    // The timed-out observer publishes unavailable data, then continues advancing history.
+    scheduler.fail_snapshot(true);
+    assert!(poll!(run.as_mut()).is_pending());
+    let _ = viewer.next().await;
+    clock.advance(Duration::from_secs(10));
+    assert!(poll!(run.as_mut()).is_pending());
+    let next = viewer.next().await;
+    let bytes = match next {
+        crate::hub::Next::Frame(bytes) | crate::hub::Next::Resync(bytes) => bytes,
+        crate::hub::Next::Closed => panic!("viewer stays connected"),
+    };
+    let recent = match crate::test_support::decode_sse(&bytes) {
+        gang_wire::Frame::Delta(delta) => delta.recent.expect("timeline advances"),
+        gang_wire::Frame::Snapshot(state) => state.recent,
+        _ => panic!("viewer receives state"),
+    };
+    let sample = recent.samples.last().expect("later sample");
+    assert!(sample.start > first_start);
+    assert_eq!(sample.scheduler_known, Some(false));
+    drop(held_observer);
+    Ok(())
+}
+
+#[tokio::test]
+async fn observation_recovers_after_scheduler_reads_time_out() -> TestResult {
     let clock = clock_at(1_000_000);
     let fleets = fleets();
     let fleet = FakeProvisioner::default();
@@ -2895,7 +3024,7 @@ async fn observation_continues_while_control_snapshot_is_held() -> TestResult {
     assert_eq!(sample.scheduler_known, Some(false));
     assert_eq!(sample.lookups, 4);
     assert_eq!(sample.hits, 3);
-    assert_eq!(sample.passes, 0);
+    assert!(sample.passes > 0);
     assert_eq!(during.recent.samples.len(), 2);
 
     scheduler.set_snapshot(SchedulerSnapshot {
@@ -2904,7 +3033,7 @@ async fn observation_continues_while_control_snapshot_is_held() -> TestResult {
     });
     scheduler.fail_snapshot(false);
     drop(held_observation);
-    release.send(()).expect("held snapshot is live");
+    drop(release);
     clock.advance(Duration::from_secs(9));
     assert!(poll!(run.as_mut()).is_pending());
     let recovered = served(&hub);

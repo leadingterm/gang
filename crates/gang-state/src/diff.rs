@@ -14,6 +14,9 @@ pub fn diff(prev: &State, cur: &State) -> Option<Delta> {
         base: prev.seq,
         update_time: cur.update_time,
         pass: changed(&prev.pass, &cur.pass).cloned(),
+        scheduler_known: (prev.scheduler_known != cur.scheduler_known)
+            .then_some(cur.scheduler_known)
+            .flatten(),
         queue: changed(&prev.queue, &cur.queue).cloned(),
         cache: changed(&prev.cache, &cur.cache).cloned(),
         connections: changed(&prev.connections, &cur.connections).copied(),

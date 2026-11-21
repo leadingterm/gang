@@ -1059,6 +1059,7 @@ pub(crate) fn state_frame(
         connections: gang_wire::Connections::default(),
         builds: Vec::new(),
         principals_epoch: 0,
+        scheduler_known: None,
     }
 }
 
@@ -1287,6 +1288,7 @@ impl Simulation {
                 connections: None,
                 builds: None,
                 principals_epoch: None,
+                scheduler_known: None,
             };
         Ok(vec![
             delta(

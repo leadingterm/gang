@@ -22,6 +22,9 @@ pub fn apply(state: &mut State, delta: &Delta) -> Result<(), ApplyError> {
     if let Some(pass) = &delta.pass {
         state.pass.clone_from(pass);
     }
+    if let Some(known) = delta.scheduler_known {
+        state.scheduler_known = Some(known);
+    }
     if let Some(queue) = &delta.queue {
         state.queue.clone_from(queue);
     }

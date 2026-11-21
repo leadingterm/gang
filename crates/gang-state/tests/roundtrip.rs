@@ -610,6 +610,7 @@ fn snapshot(world: &World) -> State {
         update_time: world.update_time,
         provisioner: "gang-test".to_owned(),
         pass: world.pass.clone(),
+        scheduler_known: None,
         queue: world.queue.clone(),
         fleets: world.fleets.clone(),
         workers: world.workers.iter().flatten().cloned().collect(),

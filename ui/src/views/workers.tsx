@@ -116,7 +116,7 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
         </dd>
         <dt>slots</dt>
         <dd class="mono">
-          {schedulerCurrent(state.recent) ? `${w.running}/${w.slots ?? "?"}` : "unknown"}
+          {schedulerCurrent(state) ? `${w.running}/${w.slots ?? "?"}` : "unknown"}
         </dd>
         {w.infrastructure && <><dt>infrastructure</dt><dd><Infrastructure status={w.infrastructure} /></dd></>}
       </dl>
@@ -160,7 +160,7 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
 const WorkerRow = ({ w, state, now }: { w: Worker; state: State; now: UnixMs }) => {
   const id = idOf(w.name);
   const instance = workerInstance(id);
-  const known = schedulerCurrent(state.recent);
+  const known = schedulerCurrent(state);
   const phase = known ? w.phase.toLowerCase() : "unknown";
   return (
     <div class="wrow">
@@ -246,7 +246,7 @@ export const Workers = () => {
     <>
       <div class="toolbar">
         <FleetFilter id="wfleet" fleets={state.fleets} value={fleet} onChange={setFleet} count={(f) => ws.filter((w) => w.fleet === f.name).length} />
-        {schedulerCurrent(state.recent) ? <Tally items={fleetTotals(state.fleets, state).filter(([s]) => TALLIED[s])} /> : <span>Scheduler unknown</span>}
+        {schedulerCurrent(state) ? <Tally items={fleetTotals(state.fleets, state).filter(([s]) => TALLIED[s])} /> : <span>Scheduler unknown</span>}
       </div>
       <div class="wgrid">
         <div class="wgrid__axis" aria-hidden="true">

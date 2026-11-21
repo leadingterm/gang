@@ -124,6 +124,10 @@ pub struct State {
     pub provisioner: String,
     /// The outcome of the last scheduling pass.
     pub pass: Pass,
+    /// Whether the latest scheduler observation succeeded; absent before the first observation
+    /// and on legacy frames. This is independent of recent-step counter completeness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_known: Option<bool>,
     /// The action queue.
     pub queue: Queue,
     /// Fleets in declaration order, which is preference order.
@@ -295,8 +299,9 @@ pub struct Sample {
     pub passes: u32,
     /// Control passes skipped during the step.
     pub skipped: u32,
-    /// Scheduler availability for the step. False is sticky within a step; absent on legacy
-    /// samples, where availability is inferred from `passes > 0`.
+    /// Whether scheduler history for this step is complete. An actual unavailable or
+    /// counter-unbaselined observation makes false sticky within the step; an unobserved
+    /// step is false until its first complete observation. Absent only on legacy samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler_known: Option<bool>,
     /// `GetActionResult` calls answered during the step.
@@ -361,6 +366,7 @@ impl Recent {
         match self.samples.last() {
             None => self.samples.push(Sample {
                 start: Timestamp::from_unix_millis(start),
+                scheduler_known: Some(false),
                 ..Sample::default()
             }),
             Some(last) => {
@@ -371,12 +377,14 @@ impl Recent {
                         self.samples.clear();
                         self.samples.push(Sample {
                             start: Timestamp::from_unix_millis(start),
+                            scheduler_known: Some(false),
                             ..Sample::default()
                         });
                     } else {
                         for offset in 1..=steps {
                             self.samples.push(Sample {
                                 start: Timestamp::from_unix_millis(last + offset * step),
+                                scheduler_known: Some(false),
                                 ..Sample::default()
                             });
                         }
@@ -511,7 +519,7 @@ impl Pass {
 #[serde(rename_all = "camelCase")]
 #[ts(optional_fields)]
 pub struct Queue {
-    /// The sum of every fleet's queued demand plus `unplaceable`.
+    /// Total queued actions in the latest scheduler observation.
     pub total: u32,
     /// Queued actions that no fleet accepts.
     pub unplaceable: u32,
@@ -693,7 +701,7 @@ pub struct WorkerCounts {
 pub struct Demand {
     /// Actions running on the fleet.
     pub running: u32,
-    /// Queued actions charged to this fleet only.
+    /// Queued actions attributed to this fleet by the latest completed control pass.
     pub queued: u32,
     /// Queued actions this fleet could run; overlaps across fleets.
     pub candidates: u32,
@@ -1072,6 +1080,7 @@ mod tests {
             recent.samples[1],
             Sample {
                 start: Timestamp::from_unix_millis(20_000),
+                scheduler_known: Some(false),
                 ..Sample::default()
             }
         );

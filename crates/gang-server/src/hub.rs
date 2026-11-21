@@ -222,6 +222,7 @@ impl StateHub {
             recent: None,
             builds: None,
             principals_epoch: Some(epoch),
+            scheduler_known: None,
         };
         match sse::encode(FrameRef::Delta(&delta)) {
             Ok(bytes) => {

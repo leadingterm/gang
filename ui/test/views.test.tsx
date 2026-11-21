@@ -574,6 +574,38 @@ test("a restarted server shows the time before its first sample as not recorded,
   }
 });
 
+test("startup distinguishes an unrecorded first step from an incomplete outage", (t) => {
+  const base = recentState(1);
+  const pending = { ...base, recent: { ...base.recent, samples: base.recent.samples.map((s) => ({ ...s, schedulerKnown: false })) } };
+  t.assert.match(visibleText(html({ state: pending }, <Overview />)), /not recorded yet/);
+  const outage = { ...pending, schedulerKnown: false };
+  t.assert.match(visibleText(html({ state: outage }, <Overview />)), /not available/);
+  const recovered = { ...pending, schedulerKnown: true };
+  t.assert.match(visibleText(html({ state: recovered }, <Overview />)), /not available/);
+});
+
+test("live scheduler readouts recover without resetting incomplete charts", (t) => {
+  const base = recentState(4);
+  const samples = base.recent.samples.map((s, i) => ({ ...s, schedulerKnown: i !== 3 }));
+  const outage = { ...base, schedulerKnown: false, queue: { ...base.queue, total: 17 }, recent: { ...base.recent, window: "40s", samples } };
+  const recovered = { ...outage, schedulerKnown: true };
+  const before = html({ state: outage }, <Overview />);
+  const after = html({ state: recovered }, <Overview />);
+  t.assert.match(visibleText(before), /Queue\s+unknown/);
+  t.assert.match(visibleText(after), /Queue\s+17/);
+  t.assert.doesNotMatch(visibleText(after), /Executing\s+unknown/);
+  for (const label of ["Queued", "Executing", "Done per minute", "Evicted per step"]) {
+    t.assert.equal(chart(after, label), chart(before, label), label);
+    t.assert.match(chart(after, label), /spark__unknown/, label);
+  }
+  t.assert.match(visibleText(before), /Used unknown/);
+  t.assert.doesNotMatch(visibleText(after), /Used unknown/);
+  const workersBefore = visibleText(html({ state: outage }, <Workers />));
+  const workersAfter = visibleText(html({ state: recovered }, <Workers />));
+  t.assert.match(workersBefore, /Scheduler unknown/);
+  t.assert.doesNotMatch(workersAfter, /Scheduler unknown/);
+});
+
 test("an interior scheduler outage is hatched without interrupting local cache or changing the chart timeline", (t) => {
   const base = recentState(4);
   const samples = base.recent.samples.map((sample, i) => ({

@@ -105,8 +105,12 @@ const Readouts = ({ state }: { state: State }) => {
     state.fleets.filter((f) => f.properties["capacity"] === "spot"),
     (f) => f.instances.inService,
   );
-  const known = schedulerCurrent(state.recent);
-  const done = known ? donePerMinute(state.recent) : null;
+  const known = schedulerCurrent(state);
+  const done = donePerMinute(state.recent);
+  const samples = state.recent.samples ?? [];
+  const awaitingFirstStep = state.schedulerKnown === undefined && samples.every((s) => s.schedulerKnown === false) ||
+    samples.length < 2 && state.schedulerKnown !== false &&
+      (samples.length === 0 || schedulerKnown(samples[0]!));
   const cache = cacheWindow(state.recent);
   const { queue } = state;
   const traffic = transferred(state.recent);
@@ -142,7 +146,7 @@ const Readouts = ({ state }: { state: State }) => {
       <Tile
         label="Done / min"
         value={done === null ? <span class="num live">–</span> : <Num value={done.perMinute} />}
-        caption={done === null ? "not available" : done.spanMs < 60 * 1000 && <>over <Duration ms={Math.round(done.spanMs / 1000) * 1000} /></>}
+        caption={done === null ? awaitingFirstStep ? "not recorded yet" : "not available" : done.spanMs < 60 * 1000 && <>over <Duration ms={Math.round(done.spanMs / 1000) * 1000} /></>}
         chart={<ChartFrame size="spark"><Spark values={doneSeries(state.recent)} label="Done per minute" recent={state.recent} scheduler /></ChartFrame>}
       />
       <Tile
@@ -161,7 +165,7 @@ const Cache = ({ state }: { state: State }) => {
   const stores = state.cache.stores ?? [];
   const bucket = state.cache.bucket;
   const samples = state.recent.samples ?? [];
-  const known = schedulerCurrent(state.recent);
+  const known = schedulerCurrent(state);
   const evicted = samples.every(schedulerKnown) ? sum(samples, (s) => s.evictedBytes) : null;
   return (
     <Section id="cache-h" title="Cache">
@@ -292,7 +296,7 @@ export const Overview = () => {
   const state = client.state.value;
   if (!state) return null;
   const recent = scalingLog(state.events, state.statusEvents ?? []).slice(-RECENT_EVENTS).reverse();
-  const known = schedulerCurrent(state.recent);
+  const known = schedulerCurrent(state);
   const idle = known && state.workers.length === 0 && state.queue.total === 0;
   return (
     <>

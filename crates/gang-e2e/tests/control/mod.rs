@@ -540,6 +540,7 @@ impl World {
             connections: gang_wire::Connections::default(),
             builds: Vec::new(),
             principals_epoch: 0,
+            scheduler_known: None,
         }
     }
 }

@@ -359,8 +359,8 @@ where
             };
             tokio::select! {
                 biased;
-                never = self.run_passes() => never,
                 never = observations => never,
+                never = self.run_passes() => never,
             }
         } else {
             self.run_passes().await

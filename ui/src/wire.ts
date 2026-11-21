@@ -307,6 +307,10 @@ updateTime: Timestamp,
  */
 pass?: Pass, 
 /**
+ * Current scheduler availability, when changed.
+ */
+schedulerKnown?: boolean, 
+/**
  * A new action queue.
  */
 queue?: Queue, 
@@ -366,7 +370,7 @@ export type Demand = {
  */
 running: number, 
 /**
- * Queued actions charged to this fleet only.
+ * Queued actions attributed to this fleet by the latest completed control pass.
  */
 queued: number, 
 /**
@@ -840,7 +844,7 @@ revokeTime?: Timestamp, };
 
 export type Queue = { 
 /**
- * The sum of every fleet's queued demand plus `unplaceable`.
+ * Total queued actions in the latest scheduler observation.
  */
 total: number, 
 /**
@@ -984,8 +988,9 @@ passes: number,
  */
 skipped: number, 
 /**
- * Scheduler availability for the step. False is sticky within a step; absent on legacy
- * samples, where availability is inferred from `passes > 0`.
+ * Whether scheduler history for this step is complete. An actual unavailable or
+ * counter-unbaselined observation makes false sticky within the step; an unobserved
+ * step is false until its first complete observation. Absent only on legacy samples.
  */
 schedulerKnown?: boolean, 
 /**
@@ -1194,6 +1199,11 @@ provisioner: string,
  * The outcome of the last scheduling pass.
  */
 pass: Pass, 
+/**
+ * Whether the latest scheduler observation succeeded; absent before the first observation
+ * and on legacy frames. This is independent of recent-step counter completeness.
+ */
+schedulerKnown?: boolean, 
 /**
  * The action queue.
  */

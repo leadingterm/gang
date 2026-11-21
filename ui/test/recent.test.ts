@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { applyRecent, bytesSeries, cacheWindow, donePerMinute, doneSeries, evictedSeries, passBars, queuedSeries, runningSeries, schedulerKnown, slots, transferred, unrecordedSlots } from "../src/recent.ts";
+import { applyRecent, bytesSeries, cacheWindow, donePerMinute, doneSeries, evictedSeries, passBars, queuedSeries, runningSeries, schedulerCurrent, schedulerKnown, slots, transferred, unrecordedSlots } from "../src/recent.ts";
 import type { Recent, Sample } from "../src/wire.ts";
-import { iso } from "./sse.ts";
+import { iso, load, snapshotOf } from "./sse.ts";
 
 const sample = (step: number, completed = 0): Sample => ({
   start: iso(step * 10000), completed, running: 0, queued: 0, passes: 1, skipped: 0, lookups: 0, hits: 0, uploadedBytes: 0, downloadedBytes: 0, evictedBytes: 0,
@@ -108,4 +108,13 @@ test("scheduler outages preserve the timeline without fabricating scheduler meas
   assert.deepEqual(cacheWindow(r).hitsPerStep, [8, 9, 10, 0]);
   const recovered = recent([...r.samples!, ...[4, 5, 6, 7, 8].map((i) => sample(i, 1))], "90s");
   assert.deepEqual(donePerMinute(recovered), { perMinute: 7, spanMs: 60000 });
+});
+
+test("current scheduler availability is independent of bucket completeness with legacy fallback", () => {
+  const state = snapshotOf(load("live"));
+  const unknown = recent([{ ...sample(0), schedulerKnown: false }]);
+  assert.equal(schedulerCurrent({ ...state, recent: unknown, schedulerKnown: true }), true);
+  assert.equal(schedulerCurrent({ ...state, recent: recent([sample(0)]), schedulerKnown: false }), false);
+  assert.equal(schedulerCurrent({ ...state, recent: unknown }), false);
+  assert.equal(schedulerCurrent({ ...state, recent: recent([sample(0)]) }), true);
 });

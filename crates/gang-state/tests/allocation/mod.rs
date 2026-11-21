@@ -511,3 +511,53 @@ fn steady_partial_observation_allocates_nothing() -> TestResult {
     assert_eq!(info.bytes_total, 0, "steady observation allocated bytes");
     Ok(())
 }
+
+#[test]
+fn observation_reuses_instance_buffers_across_identity_churn() -> TestResult {
+    let world = world()?;
+    let supplies = vec![true; world.passes.len()];
+    let mut observer_passes = world.passes.clone();
+    for pass in &mut observer_passes {
+        pass.outlook = FleetOutlook::default();
+        pass.past_boot_grace.clear();
+    }
+    let view = Inputs {
+        pass: PassStatus::Observed {
+            hosted: Some(&world.hosted),
+            supplies: &supplies,
+        },
+        fleets: &observer_passes,
+        actions: None,
+        ..inputs(&world)
+    };
+    let mut replacement = observer_passes.clone();
+    let row = replacement[0]
+        .supply
+        .instances
+        .iter_mut()
+        .find(|instance| instance.id == instance_id(24).expect("fixture id"))
+        .ok_or("fixture instance")?;
+    row.id = instance_id(90)?;
+    let changed = Inputs {
+        pass: PassStatus::Observed {
+            hosted: Some(&world.hosted),
+            supplies: &supplies,
+        },
+        fleets: &replacement,
+        actions: None,
+        ..inputs(&world)
+    };
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let mut cur = blank();
+    let mut prev = blank();
+    for seq in 1..=WARM_UP_PASSES as u64 {
+        builder.fill(&mut cur, &prev, seq, &view);
+        std::mem::swap(&mut cur, &mut prev);
+    }
+    let info = allocation_counter::measure(|| {
+        builder.fill(&mut cur, &prev, WARM_UP_PASSES as u64 + 1, &changed);
+    });
+    assert_eq!(info.count_total, 0, "identity churn allocated");
+    assert_eq!(info.bytes_total, 0, "identity churn allocated bytes");
+    Ok(())
+}

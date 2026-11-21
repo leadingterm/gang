@@ -2,7 +2,7 @@
 // the page has been open.
 import { sum } from "./format.ts";
 import { ms, seconds } from "./wire-parse.ts";
-import type { Recent, Sample } from "./wire.ts";
+import type { Recent, Sample, State } from "./wire.ts";
 
 export const stepMs = (r: Recent): number => seconds(r.step) * 1000;
 export const windowMs = (r: Recent): number => seconds(r.window) * 1000;
@@ -29,10 +29,10 @@ export const slots = (r: Recent): readonly (Sample | null)[] => {
 /** Whether scheduler measurements in this step are available, including legacy samples. */
 export const schedulerKnown = (s: Sample): boolean => s.schedulerKnown ?? (s.passes > 0);
 
-/** Whether the latest step has scheduler measurements. */
-export const schedulerCurrent = (r: Recent): boolean => {
-  const latest = r.samples?.at(-1);
-  return latest !== undefined && schedulerKnown(latest);
+/** Current scheduler availability, with a latest-sample fallback for older servers. */
+export const schedulerCurrent = (state: State): boolean => {
+  const latest = state.recent.samples?.at(-1);
+  return state.schedulerKnown ?? (latest !== undefined && schedulerKnown(latest));
 };
 
 
