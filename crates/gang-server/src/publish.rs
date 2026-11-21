@@ -71,6 +71,7 @@ impl StatePublisher {
         let cache = &self.cache;
         let builds = &self.builds;
         let traffic = self.sink.traffic();
+        let connections = self.sink.connections();
         let measured = self.usage.get();
         self.hub.publish(|cur, prev, seq, events| {
             let () = cache.read(|actions| {
@@ -95,6 +96,11 @@ impl StatePublisher {
                     );
                 });
             });
+            cur.connections = gang_wire::Connections {
+                active: connections.active,
+                limit: connections.limit,
+                refused: connections.refused,
+            };
         });
     }
 }

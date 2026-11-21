@@ -209,6 +209,7 @@ mod tests {
             pass: None,
             queue: None,
             cache: None,
+            connections: None,
             fleets: None,
             workers: None,
             instances: None,

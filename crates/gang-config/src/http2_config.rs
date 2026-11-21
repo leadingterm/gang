@@ -13,6 +13,9 @@ const MIN_RECEIVE_WINDOW: u64 = 65_535;
 /// The largest flow-control window HTTP/2 allows (RFC 9113, section 6.9.1).
 const MAX_RECEIVE_WINDOW: u64 = (1 << 31) - 1;
 
+/// Default public listener capacity, sufficient for 40 clients with 100 connections each.
+const DEFAULT_MAX_CONNECTIONS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4095);
+
 /// Bytes a client may send on a connection or stream before acknowledgement.
 pub type ReceiveWindow = BoundedBytes<1, MIN_RECEIVE_WINDOW, MAX_RECEIVE_WINDOW>;
 
@@ -27,7 +30,7 @@ pub type ReceiveWindow = BoundedBytes<1, MIN_RECEIVE_WINDOW, MAX_RECEIVE_WINDOW>
 pub struct Http2Config {
     /// Largest gRPC message a connection accepts. Default: `4MiB`.
     pub max_message_size: NonZeroBytes,
-    /// Maximum connections on the public listener. Default: 128.
+    /// Maximum connections on the public listener. Default: 4096.
     pub max_connections: NonZeroUsize,
     /// Shortest interval between a listener's refused-connection logs. Default: `60s`.
     pub refusal_log_interval: NonZeroDuration,
@@ -53,7 +56,7 @@ impl Default for Http2Config {
     fn default() -> Self {
         Self {
             max_message_size: NonZeroBytes::mib(4),
-            max_connections: NonZeroUsize::MIN.saturating_add(127),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             refusal_log_interval: NonZeroDuration::from_secs(60),
             unproven_idle_timeout: NonZeroDuration::from_secs(30),
             max_concurrent_streams: NonZeroU32::MIN.saturating_add(99),
@@ -69,6 +72,26 @@ impl Default for Http2Config {
 #[cfg(test)]
 mod tests {
     use super::Http2Config;
+
+    #[test]
+    fn max_connections_defaults_and_explicit_override() {
+        assert_eq!(Http2Config::default().max_connections.get(), 4096);
+        assert_eq!(
+            toml::from_str::<Http2Config>("")
+                .expect("empty configuration uses defaults")
+                .max_connections
+                .get(),
+            4096
+        );
+        assert_eq!(
+            toml::from_str::<Http2Config>("max_connections = 128")
+                .expect("nonzero explicit connection limit is valid")
+                .max_connections
+                .get(),
+            128
+        );
+        assert!(toml::from_str::<Http2Config>("max_connections = 0").is_err());
+    }
 
     #[test]
     fn receive_window_bounds_and_unknown_fields() {
