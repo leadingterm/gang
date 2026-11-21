@@ -47,6 +47,8 @@ wire_enum! {
         DrainFinished = "DRAIN_FINISHED",
         /// A draining worker reached the longest allowed wait and was retired anyway.
         MaxDrainWait = "MAX_DRAIN_WAIT",
+        /// A worker's release is outdated or unknown and must be replaced.
+        Outdated = "OUTDATED",
     }
 }
 
@@ -452,6 +454,19 @@ mod tests {
         }));
         assert_eq!(event.cause, Some(Cause::Minimum));
         assert_eq!(Cause::from(ScalingCause::Minimum), Cause::Minimum);
+    }
+
+    #[test]
+    fn outdated_cause_round_trips_and_maps_from_scaling_cause() {
+        let event = round_trip(&json!({
+            "name": "events/998",
+            "createTime": "2026-01-14T09:19:30.000Z",
+            "fleet": "fleets/workers-x86-64",
+            "cause": "OUTDATED",
+            "drainStarted": {"worker": "workers/w"},
+        }));
+        assert_eq!(event.cause, Some(Cause::Outdated));
+        assert_eq!(Cause::from(ScalingCause::Outdated), Cause::Outdated);
     }
 
     #[test]

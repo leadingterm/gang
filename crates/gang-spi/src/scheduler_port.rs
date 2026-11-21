@@ -235,6 +235,8 @@ pub struct InstanceCordon {
     pub fleet: usize,
     /// Immutable physical instance identity.
     pub instance: Arc<InstanceId>,
+    /// Whether this cordon permanently replaces an outdated worker build.
+    pub replacing: bool,
 }
 
 impl Clone for InstanceCordon {
@@ -242,12 +244,14 @@ impl Clone for InstanceCordon {
         Self {
             fleet: self.fleet,
             instance: Arc::clone(&self.instance),
+            replacing: self.replacing,
         }
     }
 
     fn clone_from(&mut self, source: &Self) {
         self.fleet = source.fleet;
         self.instance.clone_from(&source.instance);
+        self.replacing = source.replacing;
     }
 }
 
@@ -309,6 +313,8 @@ pub struct WorkerState {
     pub fleet: FleetName,
     /// The action environment actually served, if the worker reported a valid identity.
     pub environment: Option<ActionEnvironment>,
+    /// Whether the registered Gang package version matches this controller.
+    pub current_build: bool,
     /// Actions it is running.
     pub running_actions: u32,
     /// Actions it accepts at once; `None` when the worker accepts any number.
@@ -728,10 +734,12 @@ mod tests {
         let source = InstanceCordon {
             fleet: 3,
             instance: std::sync::Arc::new(gang_types::InstanceId::try_new("instance-a")?),
+            replacing: true,
         };
         let mut target = InstanceCordon {
             fleet: 1,
             instance: std::sync::Arc::new(gang_types::InstanceId::try_new("instance-b")?),
+            replacing: false,
         };
         target.clone_from(&source);
         assert_eq!(target, source);

@@ -33,6 +33,8 @@ pub(crate) struct Group {
     pub name: String,
     /// The desired capacity; a negative capacity reads as zero.
     pub desired: u32,
+    /// The group's current physical capacity limit.
+    pub max_size: u32,
     /// Every instance the group lists, in the order AWS lists them.
     pub members: Vec<Member>,
     /// Whether scale-in parks instances in the warm pool instead of terminating them.
@@ -82,6 +84,9 @@ impl Group {
         let desired = group
             .desired_capacity()
             .ok_or_else(|| AwsError::malformed(DESCRIBE_GROUPS, "desired capacity"))?;
+        let max_size = group
+            .max_size()
+            .ok_or_else(|| AwsError::malformed(DESCRIBE_GROUPS, "maximum size"))?;
         let template = group.launch_template().or_else(|| {
             group
                 .mixed_instances_policy()
@@ -96,6 +101,7 @@ impl Group {
         Ok(Self {
             name: name.to_owned(),
             desired: capacity_of(desired),
+            max_size: capacity_of(max_size),
             members,
             reuse_on_scale_in,
             protects_new_instances,
@@ -287,6 +293,7 @@ mod tests {
         AutoScalingGroup::builder()
             .auto_scaling_group_name(GROUP)
             .desired_capacity(desired)
+            .max_size(1000)
             .new_instances_protected_from_scale_in(protects)
             .warm_pool_configuration(
                 WarmPoolConfiguration::builder()

@@ -277,7 +277,7 @@ impl WorkerScheduler for ObservingWorkerScheduler {
                 "the controller is handing off"
             ));
         }
-        let _admission = self.cordons.admission(&*self.inner, &mut worker).await;
+        let _admission = self.cordons.admission(&*self.inner, &mut worker).await?;
         self.inner.add_worker(worker).await
     }
 
@@ -1360,6 +1360,10 @@ mod tests {
         summary
             .platform_properties
             .insert(gang_types::property::FLEET.to_owned(), "fleet-a".to_owned());
+        summary.platform_properties.insert(
+            gang_types::property::GANG_VERSION.to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+        );
         let mut healthy = summary.clone();
         healthy.id.clone_from(&new.0);
         *inner.workers.lock() = Some(vec![summary, healthy]);
@@ -1429,12 +1433,20 @@ mod tests {
         let worker = Worker::new(
             WorkerId("local-1-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b".to_owned()),
             nativelink_util::platform_properties::PlatformProperties {
-                properties: HashMap::from([(
-                    gang_types::property::FLEET.to_owned(),
-                    nativelink_util::platform_properties::PlatformPropertyValue::Exact(
-                        "fleet-a".to_owned(),
+                properties: HashMap::from([
+                    (
+                        gang_types::property::FLEET.to_owned(),
+                        nativelink_util::platform_properties::PlatformPropertyValue::Exact(
+                            "fleet-a".to_owned(),
+                        ),
                     ),
-                )]),
+                    (
+                        gang_types::property::GANG_VERSION.to_owned(),
+                        nativelink_util::platform_properties::PlatformPropertyValue::Ignore(
+                            env!("CARGO_PKG_VERSION").to_owned(),
+                        ),
+                    ),
+                ]),
             },
             sender,
             0,

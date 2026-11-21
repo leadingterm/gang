@@ -162,7 +162,7 @@ fn preflight(
     run: &Run,
     old_binary: &Path,
     attempts: &mut Attempts,
-) -> Result<()> {
+) -> Result<String> {
     read_held(journal, run, attempts)?;
     let workers: BTreeSet<_> = attempts.values().map(|attempt| attempt.worker).collect();
     if workers.len() != 1 {
@@ -182,10 +182,10 @@ fn preflight(
         }
     }
     let stack = cluster.stack();
-    stack.wait_live_state(stack.settings().history_timeout, |state| {
+    let state = stack.wait_live_state(stack.settings().history_timeout, |state| {
         state.queue.total > 0 && state.workers.len() == 1
     })?;
-    Ok(())
+    Ok(state.workers[0].name.clone())
 }
 
 #[derive(Debug, Default)]
@@ -671,6 +671,7 @@ fn handoff<K: Fn(Option<&str>) -> Result<()>>(
     context: &mut Handoff<'_>,
     monitor: &RunningMonitor<'_>,
     hold: &Hold<'_, K>,
+    original_worker: &str,
 ) -> Result<(usize, Retiring, PromotionTiming, DrainWitness)> {
     cluster.apply_release(&releases.candidate)?;
     let startup = cluster.stack().settings().startup_timeout;
@@ -699,10 +700,19 @@ fn handoff<K: Fn(Option<&str>) -> Result<()>>(
         Some(promotion) => Ok(promotion),
         None => confirm_promotion(cluster, next, context.client, terminated.stop_started, None),
     };
+    let promotion = promotion?;
+    context.observe_worker()?;
+    cluster.stack().wait_live_state(startup, |state| {
+        state.workers.iter().any(|worker| {
+            worker.name == original_worker
+                && worker.stale
+                && worker.phase == gang_wire::Phase::Draining
+        })
+    })?;
     context.observe_worker()?;
     context.client.assert_original_rc()?;
     hold.release()?;
-    Ok((next, terminated.retiring, promotion?, terminated.witness))
+    Ok((next, terminated.retiring, promotion, terminated.witness))
 }
 
 // This runs only after the real old helper or its verification has failed. Observations
@@ -866,6 +876,7 @@ struct VerdictInputs<'a> {
     old_version: &'a str,
     candidate_version: &'a str,
     elapsed: Duration,
+    rollout: &'a RolloutWitness,
 }
 
 fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
@@ -893,7 +904,8 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         && (input.procedure != UpgradeProcedure::InstanceRefresh
             || drain_policy_ok(input.drain, input.warmup_policy.1, input.drain_policy.1))
         && input.timing.lease <= input.gap_limit
-        && availability_ok(input.gap, input.gap_limit);
+        && availability_ok(input.gap, input.gap_limit)
+        && input.rollout.valid();
     let termination = match input.procedure {
         UpgradeProcedure::PreStop => "pre-stop SIGTERM then deregistration",
         UpgradeProcedure::InstanceRefresh => "modeled late notification/hook then SIGTERM",
@@ -903,7 +915,7 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         HeldDrainWitness::receipt,
     );
     let metrics = format!(
-        "procedure={:?}, operator_step={}, observed_plain_guard_checked={}, termination={termination}, warmup actual/scaled={:?}/{:?}, drain actual/scaled={:?}/{:?}, drain elapsed={:?}, old leader before/after={}/{}, versions={:?}->{:?}, initial exit={:?} post exit={:?}, failed actions={}/{}, successful actions={}/{}, attempts={attempts}, reexecutions={}, workers={workers:?}, frozen in-flight={:?}, rpc calls={}/{}, rpc failures={}/{}, rpc retries={}/{}, execute/wait correlations={}/{}, warmcold_mints={}, probe failures={}, repeated probes after failures={}, max gap={:?}, lease takeover={:?}, client promotion={:?}, old exit={}, final leader={}, total={:?}, {drain_receipt}, stop apply offset={:?}",
+        "procedure={:?}, operator_step={}, observed_plain_guard_checked={}, termination={termination}, warmup actual/scaled={:?}/{:?}, drain actual/scaled={:?}/{:?}, drain elapsed={:?}, old leader before/after={}/{}, versions={:?}->{:?}, initial exit={:?} post exit={:?}, failed actions={}/{}, successful actions={}/{}, attempts={attempts}, reexecutions={}, workers={workers:?}, frozen in-flight={:?}, rpc calls={}/{}, rpc failures={}/{}, rpc retries={}/{}, execute/wait correlations={}/{}, warmcold_mints={}, probe failures={}, repeated probes after failures={}, max gap={:?}, lease takeover={:?}, client promotion={:?}, old exit={}, final leader={}, total={:?}, {drain_receipt}, stop apply offset={:?}, rollout={:?}",
         input.procedure,
         input.procedure == UpgradeProcedure::PreStop,
         input.procedure == UpgradeProcedure::InstanceRefresh,
@@ -942,6 +954,7 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         input.leader,
         input.elapsed,
         input.drain.stop_started,
+        input.rollout,
     );
     vec![detail("rolling upgrade", ok, metrics)]
 }
@@ -1003,6 +1016,7 @@ struct ObservedBuild {
     outcome: BuildOutcome,
     evidence: BuildEvidence,
     attempts: Attempts,
+    executables: BTreeMap<u32, PathBuf>,
 }
 
 struct Promotion {
@@ -1010,6 +1024,38 @@ struct Promotion {
     status: std::process::ExitStatus,
     timing: PromotionTiming,
     drain: DrainWitness,
+}
+
+#[derive(Debug)]
+struct RolloutWitness {
+    stale_draining_held: bool,
+    old_exited: bool,
+    old_fleet_empty: bool,
+    old_client_current: bool,
+    candidate_client_current: bool,
+}
+
+impl RolloutWitness {
+    fn valid(&self) -> bool {
+        self.stale_draining_held
+            && self.old_exited
+            && self.old_fleet_empty
+            && self.old_client_current
+            && self.candidate_client_current
+    }
+}
+
+fn current_executables(
+    attempts: &Attempts,
+    executables: &BTreeMap<u32, PathBuf>,
+    candidate: &Path,
+) -> bool {
+    !attempts.is_empty()
+        && attempts.values().all(|attempt| {
+            executables
+                .get(&attempt.worker)
+                .is_some_and(|path| path == candidate)
+        })
 }
 
 type MonitorOutcome = (Availability, Duration, usize, usize);
@@ -1267,7 +1313,7 @@ impl Upgrade<'_> {
             result
         });
         let mut attempts = Attempts::new();
-        preflight(
+        let original_worker = preflight(
             &self.cluster,
             &self.builds.journal,
             &self.builds.initial.run,
@@ -1295,7 +1341,14 @@ impl Upgrade<'_> {
         }
         let applied = Instant::now();
         context.applied = applied;
-        let promotion = handoff(&self.cluster, &self.releases, &mut context, &monitor, hold);
+        let promotion = handoff(
+            &self.cluster,
+            &self.releases,
+            &mut context,
+            &monitor,
+            hold,
+            &original_worker,
+        );
         let mut continuity_observed = context.continuity_observed;
         let promotion = match promotion {
             Ok((next, retiring, timing, mut witness)) => {
@@ -1348,6 +1401,10 @@ impl Upgrade<'_> {
         };
         let (initial, promotion) =
             self.finish_initial(observation.build, observation.attempts, promotion)?;
+        let old_pid = observation.in_flight.values().next()
+            .ok_or_else(|| E2eError::system("original held worker missing"))?.0;
+        let old_exited = process::await_gone(old_pid, self.cluster.stack().settings().startup_timeout)?
+            && !Path::new(&format!("/proc/{old_pid}/exe")).exists();
         self.client.assert_original_rc()?;
         let old_post = self.post_build(
             scope,
@@ -1356,20 +1413,43 @@ impl Upgrade<'_> {
             self.client.remote.clone(),
         )?;
         let candidate_remote = self.candidate_remote()?;
-        let post = self.post_build(scope, hold, &self.builds.post, candidate_remote);
+        let post = self.post_build(scope, hold, &self.builds.post, candidate_remote)?;
+        let candidate = fs::canonicalize(self.releases.candidate_binary)
+            .map_err(E2eError::io("resolving candidate release executable"))?;
+        let old_binary = fs::canonicalize(&self.releases.old.binary)
+            .map_err(E2eError::io("resolving old release executable"))?;
+        let entries = process::snapshot();
+        let workers = process::workers_of(&entries, &self.cluster.stack().placement().config_file());
+        let mut old_fleet_empty = true;
+        for worker in workers {
+            match fs::canonicalize(format!("/proc/{}/exe", worker.pid)) {
+                Ok(executable) => old_fleet_empty &= executable != old_binary,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(E2eError::io("observing fleet worker executable")(error)),
+            }
+        }
+        let rollout = RolloutWitness {
+            stale_draining_held: true,
+            old_exited,
+            old_fleet_empty,
+            old_client_current: current_executables(&old_post.attempts, &old_post.executables, &candidate),
+            candidate_client_current: current_executables(&post.attempts, &post.executables, &candidate),
+        };
         let outcome = monitor.finish()?;
         let mut checks = self.report(
             &initial,
             &observation.in_flight,
             &promotion,
-            &post?,
+            &post,
             &outcome,
+            &rollout,
         )?;
         self.client.assert_original_rc()?;
         checks.push(detail(
             "fresh old client build",
             build_ok(&old_post.outcome, &old_post.evidence, 1)
-                && exact_attempts(&old_post.attempts, 1),
+                && exact_attempts(&old_post.attempts, 1)
+                && rollout.old_client_current,
             format!(
                 "{}, failed actions={}, successful actions={}, attempts={}",
                 old_post.outcome.exit_summary(),
@@ -1433,6 +1513,7 @@ impl Upgrade<'_> {
                 outcome,
                 evidence,
                 attempts,
+                executables: BTreeMap::new(),
             },
             promotion,
         ))
@@ -1496,6 +1577,7 @@ impl Upgrade<'_> {
         K: Fn(Option<&str>) -> Result<()>,
     {
         let mut attempts = Attempts::new();
+        let mut executables = BTreeMap::new();
         let post = hold.build(scope, None, move |_, stop| {
             let result = build.driver.build_until(
                 &remote,
@@ -1507,7 +1589,20 @@ impl Upgrade<'_> {
             result
         });
         let settled = hold.settle(Ok(()), || {
-            drain(&self.builds.journal, &build.run, &mut attempts)
+            loop {
+                let line = self.builds.journal.read_line()?;
+                if line == JOURNAL_END {
+                    return Ok(());
+                }
+                record_attempt(&line, build.run.as_ref(), &mut attempts)?;
+                for attempt in attempts.values() {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        executables.entry(attempt.worker)
+                    {
+                        entry.insert(worker_executable(attempt.worker)?);
+                    }
+                }
+            }
         });
         let result = joined(post);
         settled?;
@@ -1515,6 +1610,7 @@ impl Upgrade<'_> {
             outcome: result?,
             evidence: BuildEvidence::read(&build.bep, &build.rpc)?,
             attempts,
+            executables,
         })
     }
 
@@ -1525,6 +1621,7 @@ impl Upgrade<'_> {
         promotion: &Promotion,
         post: &ObservedBuild,
         monitor: &MonitorOutcome,
+        rollout: &RolloutWitness,
     ) -> Result<Vec<Check>> {
         let stack = self.cluster.stack();
         let leader = self.cluster.controller_is_leader(promotion.index)?;
@@ -1562,6 +1659,7 @@ impl Upgrade<'_> {
             old_version: &self.releases.old_version,
             candidate_version: &self.releases.candidate_version,
             elapsed: self.started.elapsed(),
+            rollout,
         }))
     }
 }
@@ -1718,6 +1816,19 @@ mod tests {
         assert!(!exact_attempts(&post, 1));
     }
 
+    #[test]
+    fn replacement_requires_the_candidate_executable_for_each_journal_worker() {
+        let (_, _, post) = verdict_attempts();
+        let candidate = Path::new("/candidate/gang");
+        let mut executables = BTreeMap::new();
+        assert!(!current_executables(&post, &executables, candidate));
+        executables.insert(43, PathBuf::from("/old/gang"));
+        assert!(!current_executables(&post, &executables, candidate));
+        executables.insert(43, candidate.to_path_buf());
+        assert!(current_executables(&post, &executables, candidate));
+        assert!(!current_executables(&Attempts::new(), &executables, candidate));
+    }
+
     fn reexecuted_attempts() -> Attempts {
         let (_, mut attempts, _) = verdict_attempts();
         let action = PROBES[0].as_str();
@@ -1751,6 +1862,13 @@ mod tests {
         let (in_flight, initial_attempts, post_attempts) = verdict_attempts();
         let availability = Availability::default();
         let drain = DrainWitness::default();
+        let rollout = RolloutWitness {
+            stale_draining_held: true,
+            old_exited: true,
+            old_fleet_empty: true,
+            old_client_current: true,
+            candidate_client_current: true,
+        };
         let mut input = VerdictInputs {
             initial_outcome: &initial_outcome,
             initial_evidence: &initial_evidence,
@@ -1777,6 +1895,7 @@ mod tests {
             old_version: "0.3.2",
             candidate_version: "candidate",
             elapsed: Duration::ZERO,
+            rollout: &rollout,
         };
         input.procedure = UpgradeProcedure::InstanceRefresh;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
@@ -1796,6 +1915,13 @@ mod tests {
         input.drain = &drain;
         input.procedure = UpgradeProcedure::PreStop;
         assert!(final_verdict(&input).iter().all(Check::is_passed));
+        let stale_remains = RolloutWitness { old_fleet_empty: false, ..rollout };
+        input.rollout = &stale_remains;
+        assert!(final_verdict(&input).iter().any(Check::is_failure));
+        let wrong_executable = RolloutWitness { candidate_client_current: false, ..rollout };
+        input.rollout = &wrong_executable;
+        assert!(final_verdict(&input).iter().any(Check::is_failure));
+        input.rollout = &rollout;
         let empty = InFlight::new();
         input.in_flight = &empty;
         assert!(final_verdict(&input).iter().any(Check::is_failure));

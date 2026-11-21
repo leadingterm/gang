@@ -65,6 +65,7 @@ data "aws_iam_policy_document" "this" {
     effect = "Allow"
     actions = [
       "autoscaling:SetDesiredCapacity",
+      "autoscaling:UpdateAutoScalingGroup",
       "autoscaling:TerminateInstanceInAutoScalingGroup",
       "autoscaling:SetInstanceProtection",
     ]

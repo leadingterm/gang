@@ -155,6 +155,8 @@ pub enum DrainReason {
     IdleTimeout,
     /// N−1 capacity held the load waterline for a full dwell.
     Utilization,
+    /// The instance hosts a worker from an outdated release.
+    Outdated,
 }
 
 impl From<DrainReason> for ScalingCause {
@@ -162,6 +164,7 @@ impl From<DrainReason> for ScalingCause {
         match reason {
             DrainReason::IdleTimeout => Self::IdleTimeout,
             DrainReason::Utilization => Self::Utilization,
+            DrainReason::Outdated => Self::Outdated,
         }
     }
 }

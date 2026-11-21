@@ -1072,6 +1072,7 @@ mod tests {
             cordons: vec![InstanceCordon {
                 fleet: 0,
                 instance: Arc::new(instance.clone()),
+                replacing: false,
             }],
             workers: vec![WorkerState {
                 id: worker.clone(),
@@ -1082,6 +1083,7 @@ mod tests {
                 capacity: None,
                 reserved: None,
                 cache: None,
+                current_build: true,
                 draining: true,
                 paused: false,
                 last_seen: clock.wall(),
@@ -1423,6 +1425,7 @@ mod tests {
                 capacity: None,
                 reserved: None,
                 cache: None,
+                current_build: true,
                 draining: false,
                 paused: false,
                 last_seen: clock.wall(),
@@ -1475,6 +1478,7 @@ mod tests {
             capacity: None,
             reserved: None,
             cache: None,
+            current_build: true,
             draining: false,
             paused: false,
             last_seen: at(),

@@ -271,7 +271,7 @@ bytes: number, };
 
 export type CacheStore = "CAS" | "AC";
 
-export type Cause = "DEMAND" | "MINIMUM" | "IDLE_TIMEOUT" | "UTILIZATION" | "ORPHAN" | "DRAIN_FINISHED" | "MAX_DRAIN_WAIT";
+export type Cause = "DEMAND" | "MINIMUM" | "IDLE_TIMEOUT" | "UTILIZATION" | "ORPHAN" | "DRAIN_FINISHED" | "MAX_DRAIN_WAIT" | "OUTDATED";
 
 export type Closed = { 
 /**
@@ -1409,6 +1409,10 @@ instance: string,
  * The worker's phase.
  */
 phase: Phase, 
+/**
+ * Whether the worker's release differs from the controller's or is unknown.
+ */
+stale: boolean, 
 /**
  * Derived infrastructure status of the worker's instance, when present.
  */

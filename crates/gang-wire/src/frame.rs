@@ -472,6 +472,7 @@ mod tests {
                 "fleet": "fleets/f",
                 "instance": "instances/i",
                 "phase": "IDLE",
+                "stale": false,
                 "phaseTime": "2026-01-14T09:19:32.000Z",
                 "running": 0,
                 "paused": false,

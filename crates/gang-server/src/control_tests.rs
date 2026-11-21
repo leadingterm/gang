@@ -317,6 +317,7 @@ fn owned_cordon(instance: &InstanceId) -> gang_spi::InstanceCordon {
     gang_spi::InstanceCordon {
         fleet: 0,
         instance: Arc::new(instance.clone()),
+        replacing: false,
     }
 }
 
@@ -358,6 +359,7 @@ fn idle_worker(instance: &InstanceId, last_seen: Timestamp) -> TestResult<Worker
         capacity: None,
         reserved: None,
         cache: None,
+        current_build: true,
         draining: false,
         last_seen,
         paused: false,

@@ -6,12 +6,13 @@ import type { Fleet, Instance, State, Worker } from "../wire.ts";
 import { gib } from "../format.ts";
 import { Disclosure, Duration, Ident } from "../ui.tsx";
 
-export type CellState = "busy" | "idle" | "draining" | "unconnected" | "pending" | "terminating" | "replacing" | "replacement" | "unknown" | "warm" | "empty";
+export type CellState = "busy" | "idle" | "draining" | "stale" | "unconnected" | "pending" | "terminating" | "replacing" | "replacement" | "unknown" | "warm" | "empty";
 
 export const STATE_NAME: Record<Counted, string> = {
   busy: "busy",
   idle: "idle",
   draining: "draining",
+  stale: "stale",
   unconnected: "no worker",
   pending: "pending",
   terminating: "terminating",
@@ -42,7 +43,7 @@ export const unhostedInstances = (f: Fleet, census: FleetCensus): Instance[] => 
 /** Count physical identities, not overlapping worker generations or provider lifecycles. */
 export const fleetCounts = (f: Fleet, census: FleetCensus): Counts => {
   const counts: Record<Counted, number> = {
-    busy: 0, idle: 0, draining: 0, unconnected: 0, pending: 0, terminating: 0,
+    busy: 0, idle: 0, draining: 0, stale: 0, unconnected: 0, pending: 0, terminating: 0,
     replacing: 0, replacement: 0, unknown: 0, warm: f.instances.warm,
   };
   const groups = new Map<string, Worker[]>();
@@ -57,6 +58,7 @@ export const fleetCounts = (f: Fleet, census: FleetCensus): Counts => {
     const phases = group.map((w) => w.infrastructure?.phase);
     const state: Counted = phases.includes("REPLACING") ? "replacing"
       : phases.includes("REPLACEMENT") ? "replacement"
+      : group.some((w) => w.stale) ? "stale"
       : group.every((w) => w.phase === "DRAINING") ? "draining"
       : group.some((w) => w.running > 0 || w.phase === "BUSY") ? "busy"
       : group.some((w) => w.phase === "IDLE") ? "idle" : "unknown";

@@ -11,6 +11,8 @@ crate::string_enum! {
         IdleTimeout = "idle_timeout",
         /// A worker was cordoned because measured fleet load stayed below the waterline for the dwell.
         Utilization = "utilization",
+        /// A worker runs a different Gang package version.
+        Outdated = "outdated",
         /// An in-service instance had no connected worker for its fleet's boot grace.
         Orphan = "orphan",
         /// A draining worker finished its work and was retired.
@@ -37,6 +39,13 @@ mod tests {
         assert_eq!("utilization".parse(), Ok(ScalingCause::Utilization));
         assert_eq!(ScalingCause::Utilization.as_str(), "utilization");
         assert!(ScalingCause::ALL.contains(&ScalingCause::Utilization));
+    }
+
+    #[test]
+    fn outdated_has_a_stable_storage_name_and_is_enumerated() {
+        assert_eq!("outdated".parse(), Ok(ScalingCause::Outdated));
+        assert_eq!(ScalingCause::Outdated.as_str(), "outdated");
+        assert!(ScalingCause::ALL.contains(&ScalingCause::Outdated));
     }
 
     #[test]

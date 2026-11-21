@@ -27,6 +27,7 @@
 //! - `autoscaling:DescribeLifecycleHooks`
 //! - `autoscaling:CompleteLifecycleAction`
 //! - `autoscaling:SetDesiredCapacity`
+//! - `autoscaling:UpdateAutoScalingGroup`
 //! - `autoscaling:SetInstanceProtection`
 //! - `autoscaling:TerminateInstanceInAutoScalingGroup`
 //! - `ec2:DescribeInstances`

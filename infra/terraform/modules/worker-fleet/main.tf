@@ -216,9 +216,10 @@ resource "aws_autoscaling_group" "this" {
     }
   }
 
-  # The controller owns desired capacity; Terraform sets it only at creation.
+  # The controller owns desired capacity and the physical maximum; max_instances is
+  # the logical bound and supplies only the bootstrap maximum at creation.
   lifecycle {
-    ignore_changes = [desired_capacity]
+    ignore_changes = [desired_capacity, max_size]
 
     precondition {
       condition     = length(local.fleet_subnet_ids[each.value.fleet]) > 0

@@ -38,6 +38,146 @@ fn mismatched_and_unknown_workers_supply_capacity_without_early_draining() -> Te
     Ok(())
 }
 
+#[test]
+fn stale_busy_instance_is_replaced_at_max_without_duplicate_purchase() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(2, NonZeroU32::new(2).unwrap())?;
+    let max_wait = policy.max_drain_wait;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-old", secs(60))?;
+    serve(&mut h, "local-current", secs(60))?;
+    h.set_running("local-old", 1)?;
+    h.snapshot.workers.iter_mut()
+        .find(|w| w.id.instance_name() == Some("local-old"))
+        .unwrap()
+        .current_build = false;
+
+    let first = changes(&h.run());
+    assert!(first.contains(&Change::Drain(X86, "local-old".into(), DrainReason::Outdated)));
+    assert!(first.contains(&Change::Scale(X86, 2, 3, NeedCause::Minimum)));
+    assert_eq!(h.outlook(X86)?.workers.running, 1);
+    assert!(h.snapshot.cordons[0].replacing);
+    assert!(!changes(&h.run()).iter().any(|change| matches!(
+        change, Change::Scale(..) | Change::Cancel(..)
+    )));
+
+    h.launch(X86, "local-new", InstanceLifecycle::InService, secs(0))?;
+    h.connect(X86, "local-new")?;
+    h.advance(max_wait + secs(1));
+    assert!(!changes(&h.run()).iter().any(|change| matches!(
+        change, Change::Terminate(..) | Change::Scale(..) | Change::Cancel(..)
+    )));
+    h.set_running("local-old", 0)?;
+    let finished = changes(&h.run());
+    assert!(finished.contains(&Change::Terminate(
+        X86, "local-old".into(), TerminationCause::DrainFinished
+    )));
+    assert!(!finished.iter().any(|change| matches!(change, Change::Scale(..))));
+    assert_eq!(h.supply(X86)?.desired, 2);
+    assert!(h.snapshot.workers.iter().all(|worker| worker.current_build));
+    assert!(!changes(&h.run()).iter().any(|change| matches!(change, Change::Scale(..))));
+    Ok(())
+}
+
+#[test]
+fn busy_stale_work_creates_replacement_demand_without_a_minimum() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(0, NonZeroU32::MIN)?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-old", secs(60))?;
+    h.set_running("local-old", 1)?;
+    h.snapshot.workers[0].current_build = false;
+
+    let first = changes(&h.run());
+    assert!(first.contains(&Change::Scale(X86, 1, 2, NeedCause::Demand)));
+    assert_eq!(h.outlook(X86)?.needed, 1);
+    assert!(!changes(&h.run()).iter().any(|change| matches!(change, Change::Scale(..))));
+
+    h.launch(X86, "local-new", InstanceLifecycle::InService, secs(0))?;
+    h.connect(X86, "local-new")?;
+    assert!(!changes(&h.run()).iter().any(|change| matches!(change, Change::Scale(..))));
+    assert_eq!(h.outlook(X86)?.needed, 1);
+    h.set_running("local-old", 0)?;
+    let finished = changes(&h.run());
+    assert!(finished.contains(&Change::Terminate(
+        X86, "local-old".into(), TerminationCause::DrainFinished
+    )));
+    assert!(!finished.iter().any(|change| matches!(change, Change::Scale(..))));
+    assert_eq!(h.outlook(X86)?.needed, 0);
+    assert_eq!(h.supply(X86)?.desired, 1);
+    Ok(())
+}
+
+#[test]
+fn replacement_intent_survives_current_reconnect_and_model_restart() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-old", secs(60))?;
+    h.set_running("local-old", 1)?;
+    h.snapshot.workers[0].current_build = false;
+    h.run();
+    h.disconnect("local-old")?;
+    h.connect(X86, "local-old")?;
+    h.snapshot.workers[0].draining = false;
+    h.set_running("local-old", 1)?;
+    h.restart();
+    let steps = changes(&h.run());
+    assert!(!steps.iter().any(|change| matches!(
+        change, Change::Cancel(..) | Change::Scale(..)
+    )));
+    assert!(steps.contains(&Change::Reinforce(X86, "local-old".into())));
+    Ok(())
+}
+
+#[test]
+fn disconnected_replacement_terminates_after_connection_grace_without_rebuying() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
+    let grace = policy.boot_grace;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-old", grace + secs(1))?;
+    h.set_running("local-old", 1)?;
+    h.snapshot.workers[0].current_build = false;
+    h.run();
+    h.disconnect("local-old")?;
+    h.launch(X86, "local-new", InstanceLifecycle::InService, secs(0))?;
+    h.connect(X86, "local-new")?;
+    assert!(!changes(&h.run()).iter().any(|change| matches!(change, Change::Terminate(..))));
+    h.advance(grace);
+    let steps = changes(&h.run());
+    assert!(steps.contains(&Change::Terminate(
+        X86, "local-old".into(), TerminationCause::Orphan
+    )));
+    assert!(!steps.iter().any(|change| matches!(change, Change::Scale(..))));
+    assert_eq!(h.supply(X86)?.desired, 1);
+    Ok(())
+}
+
+#[test]
+fn one_stale_connection_replaces_the_entire_physical_instance() -> TestResult {
+    let mut policy = policy()?;
+    policy.instances = InstanceBounds::try_new(1, NonZeroU32::MIN)?;
+    let mut h = Harness::with_policy(policy);
+    h.settle_term()?;
+    serve(&mut h, "local-old", secs(60))?;
+    h.set_running("local-old", 1)?;
+    let mut current = renewed(&h.snapshot.workers[0], 1)?;
+    current.running_actions = 0;
+    h.snapshot.workers[0].current_build = false;
+    h.snapshot.workers.push(current);
+    let steps = changes(&h.run());
+    assert!(steps.contains(&Change::Drain(X86, "local-old".into(), DrainReason::Outdated)));
+    assert!(steps.contains(&Change::Scale(X86, 1, 2, NeedCause::Minimum)));
+    assert!(h.snapshot.workers.iter().all(|worker| worker.draining));
+    assert_eq!(h.outlook(X86)?.workers.running, 1);
+    Ok(())
+}
+
 fn serve(h: &mut Harness, name: &str, launched_ago: Duration) -> TestResult {
     let desired = h.supply(X86)?.desired;
     h.launch(X86, name, InstanceLifecycle::InService, launched_ago)?;
@@ -1110,6 +1250,7 @@ fn absent_and_ordered_cordon_registry_entries_do_not_consume_live_budget() -> Te
     w.h.snapshot.cordons.push(gang_spi::InstanceCordon {
         fleet: X86,
         instance: std::sync::Arc::new(InstanceId::try_new("local-absent")?),
+        replacing: false,
     });
     settle_low(&mut w);
     w.h.advance(secs(300));

@@ -181,6 +181,7 @@ fn worker(slot: usize, phase: Phase, running: u32) -> Result<Worker, Box<dyn Err
         fleet: fleet_name("alpha")?,
         instance: instance_name(slot % INSTANCES)?,
         phase,
+        stale: false,
         phase_time: timestamped(1),
         running,
         slots: Some(4),
