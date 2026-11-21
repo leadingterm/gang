@@ -561,7 +561,7 @@ run "renders_scheduled_minimum" {
         min_instances      = 0
         vcpus_per_instance = 15
         disk_per_instance  = "200GiB"
-        scheduled_minimum  = [{
+        scheduled_minimum = [{
           instances = 1
           days      = ["mon", "tue", "wed", "thu", "fri"]
           start     = "07:55"
@@ -596,11 +596,11 @@ run "rejects_scheduled_minimum_at_min_instances" {
   command = plan
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 1, vcpus_per_instance = 15
-      disk_per_instance   = "200GiB"
-      scheduled_minimum   = [{ instances = 1, days = ["mon"], start = "07:55", end = "19:00", time_zone = "Europe/Paris" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 1, vcpus_per_instance = 15
+      disk_per_instance = "200GiB"
+      scheduled_minimum = [{ instances = 1, days = ["mon"], start = "07:55", end = "19:00", time_zone = "Europe/Paris" }]
     }]
   }
   expect_failures = [var.fleets]
@@ -610,11 +610,11 @@ run "rejects_scheduled_minimum_bad_day" {
   command = plan
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      disk_per_instance   = "200GiB"
-      scheduled_minimum   = [{ instances = 1, days = ["monday"], start = "07:55", end = "19:00", time_zone = "Europe/Paris" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 0, vcpus_per_instance = 15
+      disk_per_instance = "200GiB"
+      scheduled_minimum = [{ instances = 1, days = ["monday"], start = "07:55", end = "19:00", time_zone = "Europe/Paris" }]
     }]
   }
   expect_failures = [var.fleets]
@@ -624,11 +624,11 @@ run "rejects_scheduled_minimum_end_before_start" {
   command = plan
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      disk_per_instance   = "200GiB"
-      scheduled_minimum   = [{ instances = 1, days = ["mon"], start = "19:00", end = "08:00", time_zone = "Europe/Paris" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 0, vcpus_per_instance = 15
+      disk_per_instance = "200GiB"
+      scheduled_minimum = [{ instances = 1, days = ["mon"], start = "19:00", end = "08:00", time_zone = "Europe/Paris" }]
     }]
   }
   expect_failures = [var.fleets]
@@ -638,11 +638,11 @@ run "accepts_scheduled_minimum_until_midnight" {
   command = apply
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      disk_per_instance   = "200GiB"
-      scheduled_minimum   = [{ instances = 4, days = ["sat", "sun"], start = "22:00", end = "24:00", time_zone = "UTC" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 0, vcpus_per_instance = 15
+      disk_per_instance = "200GiB"
+      scheduled_minimum = [{ instances = 4, days = ["sat", "sun"], start = "22:00", end = "24:00", time_zone = "UTC" }]
     }]
   }
   assert {
@@ -655,11 +655,11 @@ run "rejects_scheduled_minimum_above_max_instances" {
   command = plan
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      disk_per_instance   = "200GiB"
-      scheduled_minimum   = [{ instances = 5, days = ["mon"], start = "07:55", end = "19:00", time_zone = "UTC" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 0, vcpus_per_instance = 15
+      disk_per_instance = "200GiB"
+      scheduled_minimum = [{ instances = 5, days = ["mon"], start = "07:55", end = "19:00", time_zone = "UTC" }]
     }]
   }
   expect_failures = [var.fleets]
@@ -669,11 +669,11 @@ run "rejects_scheduled_minimum_without_days" {
   command = plan
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      disk_per_instance   = "200GiB"
-      scheduled_minimum   = [{ instances = 1, days = [], start = "07:55", end = "19:00", time_zone = "UTC" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 0, vcpus_per_instance = 15
+      disk_per_instance = "200GiB"
+      scheduled_minimum = [{ instances = 1, days = [], start = "07:55", end = "19:00", time_zone = "UTC" }]
     }]
   }
   expect_failures = [var.fleets]
@@ -683,11 +683,11 @@ run "rejects_scheduled_minimum_with_a_repeated_day" {
   command = plan
   variables {
     fleets = [{
-      name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
-      instance_types      = ["c6id.4xlarge"]
-      max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      disk_per_instance   = "200GiB"
-      scheduled_minimum   = [{ instances = 1, days = ["mon", "mon"], start = "07:55", end = "19:00", time_zone = "UTC" }]
+      name              = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
+      instance_types    = ["c6id.4xlarge"]
+      max_instances     = 4, min_instances = 0, vcpus_per_instance = 15
+      disk_per_instance = "200GiB"
+      scheduled_minimum = [{ instances = 1, days = ["mon", "mon"], start = "07:55", end = "19:00", time_zone = "UTC" }]
     }]
   }
   expect_failures = [var.fleets]

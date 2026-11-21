@@ -577,16 +577,17 @@ impl FakeScheduler {
 
     /// Holds the configured control lock until the returned guard is dropped.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if this fake was not created with a control acquisition timeout.
-    pub async fn hold_control_acquisition(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.acquisition
+    /// Returns [`PortError::Config`] if this fake has no control acquisition timeout.
+    pub async fn hold_control_acquisition(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, PortError> {
+        let acquisition = self
+            .acquisition
             .as_ref()
-            .expect("control acquisition must be configured")
-            .mutex
-            .lock()
-            .await
+            .ok_or_else(|| PortError::config("control acquisition is not configured"))?;
+        Ok(acquisition.mutex.lock().await)
     }
 
     async fn acquire_control(&self) -> Result<Option<tokio::sync::MutexGuard<'_, ()>>, PortError> {
@@ -1195,6 +1196,17 @@ mod tests {
     use crate::TestResult;
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn holding_an_unconfigured_control_acquisition_returns_a_configuration_error()
+    -> TestResult {
+        let scheduler = FakeScheduler::new()?;
+        assert!(matches!(
+            scheduler.hold_control_acquisition().await,
+            Err(PortError::Config(_))
+        ));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn learned_history_roundtrip_preserves_order_and_expiry() -> TestResult {
@@ -2057,6 +2069,20 @@ mod tests {
         Ok(())
     }
 
+    fn empty_controller_connections() -> ControllerConnections<AdmitAll, AdmitAll, EmptyApi> {
+        ControllerConnections {
+            public: Listening {
+                connections: futures::stream::empty().boxed(),
+                gate: AdmitAll,
+            },
+            worker: Listening {
+                connections: futures::stream::empty().boxed(),
+                gate: AdmitAll,
+            },
+            api: EmptyApi,
+        }
+    }
+
     #[tokio::test]
     async fn refusals_do_not_publish_or_replace_a_draining_controller() -> TestResult {
         let fixture = WorkerFixture::new()?;
@@ -2080,19 +2106,8 @@ mod tests {
         };
         let scheduler = FakeScheduler::new()?;
         let release = scheduler.hold_drain();
-        let empty = || ControllerConnections {
-            public: Listening {
-                connections: futures::stream::empty().boxed(),
-                gate: AdmitAll,
-            },
-            worker: Listening {
-                connections: futures::stream::empty().boxed(),
-                gate: AdmitAll,
-            },
-            api: EmptyApi,
-        };
         let (ready, mut readiness) = ControllerReady::channel();
-        let controller = scheduler.run_controller(&spec, empty(), ready);
+        let controller = scheduler.run_controller(&spec, empty_controller_connections(), ready);
         futures::pin_mut!(controller);
         assert!(controller.as_mut().now_or_never().is_none());
         assert!(readiness.try_recv().is_ok());

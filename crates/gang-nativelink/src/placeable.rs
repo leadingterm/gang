@@ -423,7 +423,7 @@ mod tests {
             DiskMinReservation::from_units(2048),
         );
         for (value, expected, pre_fit_cpu) in
-            [("871000", "15000", 871000), ("12000", "12000", 12000)]
+            [("871000", "15000", 871_000), ("12000", "12000", 12_000)]
         {
             let _admission = admitted.insert(
                 operation(),
@@ -911,12 +911,12 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .cpu_before_memory_fit,
-            Some(15000)
+            Some(15_000)
         );
         assert_eq!(
             fitted.pre_fit_reservation,
             Some(ActionReservation {
-                cpu_millicores: 871000,
+                cpu_millicores: 871_000,
                 memory_bytes: 73_400_320 * 1024,
             })
         );

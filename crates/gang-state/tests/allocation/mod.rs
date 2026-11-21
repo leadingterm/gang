@@ -221,7 +221,7 @@ fn actions_sample() -> Result<ActionsSample, Box<dyn Error>> {
                 mnemonic: "Javac".to_owned(),
                 priority: 0,
                 build: None,
-                reservation: Default::default(),
+                reservation: ActionResources::default(),
                 learned_reservation: None,
             },
             worker: worker_on(&instance_id(index)?)?,
@@ -238,7 +238,7 @@ fn actions_sample() -> Result<ActionsSample, Box<dyn Error>> {
                 mnemonic: "Genrule".to_owned(),
                 priority: 0,
                 build: None,
-                reservation: Default::default(),
+                reservation: ActionResources::default(),
                 learned_reservation: None,
             },
             queued_since: ts(4_000 + index),
@@ -538,11 +538,12 @@ fn steady_hosted_inventory_observation_allocates_nothing() -> TestResult {
     let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
     let mut cur = blank();
     let mut prev = blank();
+    let hosted_count = usize::try_from(HOSTED)?;
     for seq in 1..=WARM_UP_PASSES as u64 {
         builder.fill(&mut cur, &prev, seq, &view);
         std::mem::swap(&mut cur, &mut prev);
     }
-    assert_eq!(prev.workers.len(), HOSTED as usize);
+    assert_eq!(prev.workers.len(), hosted_count);
     assert!(prev.instances.is_empty());
     let info = allocation_counter::measure(|| {
         builder.fill(&mut cur, &prev, WARM_UP_PASSES as u64 + 1, &view);
@@ -552,7 +553,7 @@ fn steady_hosted_inventory_observation_allocates_nothing() -> TestResult {
         info.bytes_total, 0,
         "steady hosted observation allocated bytes"
     );
-    assert_eq!(cur.workers.len(), HOSTED as usize);
+    assert_eq!(cur.workers.len(), hosted_count);
     assert!(cur.instances.is_empty());
     Ok(())
 }

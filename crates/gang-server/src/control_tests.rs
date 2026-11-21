@@ -1276,7 +1276,7 @@ async fn held_scheduler_acquisition_skips_and_next_pass_retries() -> TestResult 
     let repository = FakeRepository::default();
     let hub = hub();
     scheduler.set_snapshot(queued_snapshot()?);
-    let guard = scheduler.hold_control_acquisition().await;
+    let guard = scheduler.hold_control_acquisition().await?;
     let mut control = ControlLoop::new(
         &fleets,
         crate::control::ControlSettings::new(
@@ -3353,6 +3353,7 @@ async fn run_passes_at_once_then_once_per_poll_interval() -> Result<(), PortErro
     Ok(())
 }
 
+#[derive(Default)]
 struct EventProvisioner {
     inner: FakeProvisioner,
     acknowledgements: std::sync::atomic::AtomicUsize,
@@ -3463,10 +3464,7 @@ async fn infrastructure_delivery_retries_and_replays_without_audit_duplicates() 
     use gang_spi::{InfrastructureEvent, InfrastructureEventKind};
     let clock = clock_at(1_000_000);
     let fleets = fleets();
-    let fleet = EventProvisioner {
-        inner: FakeProvisioner::default(),
-        acknowledgements: std::sync::atomic::AtomicUsize::new(0),
-    };
+    let fleet = EventProvisioner::default();
     let scheduler = FakeScheduler::new()?;
     let repository = FakeRepository::default();
     let old = instance_id("local-1");
@@ -3569,10 +3567,7 @@ async fn capacity_status_preserves_launch_audit_through_redelivery_and_expiry() 
     use gang_spi::{InfrastructureEvent, InfrastructureEventKind};
     let clock = clock_at(1_000_000);
     let fleets = fleets();
-    let fleet = EventProvisioner {
-        inner: FakeProvisioner::default(),
-        acknowledgements: std::sync::atomic::AtomicUsize::new(0),
-    };
+    let fleet = EventProvisioner::default();
     let scheduler = FakeScheduler::new()?;
     let repository = FakeRepository::default();
     let mut supply = supply_with("local-1", clock.wall(), 3);

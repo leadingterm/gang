@@ -505,7 +505,6 @@ pub(crate) mod tests {
             ]),
             available_platform_properties: HashMap::new(),
             free_memory_kb: None,
-            latest_attempt_deadline: None,
         }
     }
 
@@ -754,7 +753,7 @@ pub(crate) mod tests {
                         mnemonic: "CppCompile".to_owned(),
                         priority: 5,
                         build: None,
-                        reservation: Default::default(),
+                        reservation: gang_types::ActionResources::default(),
                         learned_reservation: None,
                     },
                     worker: WorkerId::try_new(WORKER_A)?,
@@ -768,7 +767,7 @@ pub(crate) mod tests {
                         mnemonic: "Javac".to_owned(),
                         priority: 3,
                         build: None,
-                        reservation: Default::default(),
+                        reservation: gang_types::ActionResources::default(),
                         learned_reservation: None,
                     },
                     worker: WorkerId::try_new(WORKER_B)?,
@@ -810,7 +809,7 @@ pub(crate) mod tests {
                         mnemonic: "Genrule".to_owned(),
                         priority: 7,
                         build: None,
-                        reservation: Default::default(),
+                        reservation: gang_types::ActionResources::default(),
                         learned_reservation: None,
                     },
                     queued_since: Timestamp::from_unix_millis(4_000),
@@ -825,7 +824,7 @@ pub(crate) mod tests {
                         mnemonic: String::new(),
                         priority: 2,
                         build: None,
-                        reservation: Default::default(),
+                        reservation: gang_types::ActionResources::default(),
                         learned_reservation: None,
                     },
                     queued_since: Timestamp::from_unix_millis(5_000),

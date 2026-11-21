@@ -81,6 +81,8 @@ cp "$workflow" "$fixture"
 yq -i 'del(.jobs.linux-x86_64-bundle.steps[0].with.ref)' "$fixture"
 expect failure 'release binary checkout must use the PR head' "$guard" "$fixture"
 cp "$workflow" "$fixture"
+# Keep the GitHub expression literal so the mutation tests checkout-source validation.
+# shellcheck disable=SC2016
 yq -i '(.jobs.changes.steps[] | select(.id == "filter") | .env.HEAD) = "${{ github.sha }}"' "$fixture"
 expect failure 'release change classification must use the PR head' "$guard" "$fixture"
 for job in required changes nativelink-memory-tests; do

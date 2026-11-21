@@ -3960,9 +3960,6 @@ fn observer_preserves_reconciler_spill_attribution() -> TestResult {
         policies: vec![policy("alpha", 0, 2)?, policy("beta", 0, 10)?],
         ..World::default()
     };
-    for policy in &mut world.policies {
-        policy.target_actions_per_instance = gang_types::nonzero_u32(1);
-    }
     world.properties = world
         .policies
         .iter()
@@ -3970,11 +3967,24 @@ fn observer_preserves_reconciler_spill_attribution() -> TestResult {
         .collect();
     world.supplies = vec![FleetSupply::default(), FleetSupply::default()];
     let candidates = FleetSet::prefix(2)?;
-    world.snapshot.queued = (0..3).map(|i| queued(i, candidates)).collect();
+    let cpu_per_instance = u64::from(world.policies[0].vcpus_per_instance.get()) * 1_000;
+    // Each action reserves one whole instance with CPU oversubscription disabled below.
+    world.snapshot.queued = (0..3)
+        .map(|i| {
+            let mut action = queued(i, candidates);
+            action.resources.cpu_millicores = cpu_per_instance;
+            action
+        })
+        .collect();
     let mut passes = world.passes();
     let scaling = Arc::new(ScalingConfig::default());
     let profiles = SourceProfiles::new(&scaling, ActionsConfig::default().history_window);
-    let mut reconciler = Reconciler::new(&world.policies, scaling, profiles);
+    let mut reconciler = Reconciler::new(
+        &world.policies,
+        scaling,
+        profiles,
+        gang_types::nonzero_u32(1),
+    );
     let mut hosted = HostedSnapshot::default();
     hosted.replace(&mut world.snapshot.clone());
     let clock = TestClock::new(ts(1_000));

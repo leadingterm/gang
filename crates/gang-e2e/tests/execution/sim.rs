@@ -16,9 +16,7 @@ use gang_e2e::{
     FleetDisk, Generations, Host, Limits, PressureObservation, Probe, ProbeReport, Proc, Result,
     Role, Run, Sandbox, ScopeFacts, ServerExit, Signalled, System, Variant,
 };
-use gang_wire::{
-    Delta, Event, EventChange, Frame, Phase, State as WireState, Worker,
-};
+use gang_wire::{Delta, Event, EventChange, Frame, Phase, State as WireState, Worker};
 use parking_lot::{Condvar, Mutex};
 use tokio::sync::oneshot;
 
@@ -474,6 +472,17 @@ enum WorkerPhase {
     Killed,
 }
 
+/// The lifecycle of the caller-owned oversized build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FleetBuildPhase {
+    /// No build supplies demand, and no caller stop has been consumed.
+    Idle,
+    /// The build supplies demand while the scenario observes disk refusals.
+    Running,
+    /// The build consumed its caller's stop signal and no longer supplies demand.
+    Stopped,
+}
+
 /// The mutable state of an [`ExecSim`].
 struct State {
     /// The run of the held build in progress, empty for a build without one.
@@ -502,10 +511,8 @@ struct State {
     /// Whether every later build fails.
     failing: bool,
     report: Option<String>,
-    /// Whether the caller-owned oversized build still supplies demand.
-    fleet_build: bool,
-    /// Whether that build consumed its caller's stop signal.
-    fleet_stopped: bool,
+    /// Whether the oversized build supplies demand or consumed its caller's stop.
+    fleet_build: FleetBuildPhase,
     /// State-stream observations made while the build supplies demand.
     fleet_observations: u64,
 }
@@ -566,8 +573,7 @@ impl ExecSim {
                 preempted: false,
                 failing: false,
                 report: None,
-                fleet_build: false,
-                fleet_stopped: false,
+                fleet_build: FleetBuildPhase::Idle,
                 fleet_observations: 0,
             }),
             changed: Condvar::new(),
@@ -848,7 +854,7 @@ impl ExecSim {
     /// History persists after a refusing process was reaped before any state sample.
     fn refusal_history(&self) -> Vec<Event> {
         let state = self.state.lock();
-        if !state.fleet_build && !state.fleet_stopped {
+        if state.fleet_build == FleetBuildPhase::Idle {
             return Vec::new();
         }
         let mut history = vec![Event {
@@ -990,7 +996,7 @@ impl System for ExecSim {
         }
         {
             let mut state = self.state.lock();
-            while !state.fleet_build {
+            while state.fleet_build != FleetBuildPhase::Running {
                 self.changed.wait(&mut state);
             }
         }
@@ -1112,19 +1118,24 @@ impl System for ExecSim {
             return self.inner.build_until_stopped(probes, stop);
         }
         if probes != [Probe::Pinned] {
-            return Err(E2eError::system("the oversized fleet expects the pinned probe"));
+            return Err(E2eError::system(
+                "the oversized fleet expects the pinned probe",
+            ));
         }
         support::until_stopped(
             stop,
             |cancelled| {
                 let mut state = self.state.lock();
-                state.fleet_build = true;
+                state.fleet_build = FleetBuildPhase::Running;
                 self.changed.notify_all();
                 while !cancelled.load(Ordering::Acquire) && self.inner.server_pid().is_some() {
                     self.changed.wait(&mut state);
                 }
-                state.fleet_build = false;
-                state.fleet_stopped = cancelled.load(Ordering::Acquire);
+                state.fleet_build = if cancelled.load(Ordering::Acquire) {
+                    FleetBuildPhase::Stopped
+                } else {
+                    FleetBuildPhase::Idle
+                };
                 Ok(failed(Probe::Pinned, "the owned build stopped"))
             },
             || {
@@ -1552,7 +1563,7 @@ impl Execution for ExecSim {
 mod disk_refusal_tests {
     use gang_e2e::{Check, ExecutionKnobs, Sandbox, System, Variant, names, oversized_fleet};
 
-    use super::{Behaviour, ExecSim, FleetDiskCheck, FleetReplacement};
+    use super::{Behaviour, ExecSim, FleetBuildPhase, FleetDiskCheck, FleetReplacement};
     use crate::{assert_compliant, failures};
 
     /// Runs with no live instance rows and checks that every outcome stopped its owned demand.
@@ -1564,8 +1575,16 @@ mod disk_refusal_tests {
         let sim = ExecSim::new(&variant, behaviour);
         let checks = oversized_fleet(&sim, &sim);
         let state = sim.state.lock();
-        assert!(!state.fleet_build, "the scenario leaked build demand");
-        assert!(state.fleet_stopped, "the build did not consume its owner's stop");
+        assert_ne!(
+            state.fleet_build,
+            FleetBuildPhase::Running,
+            "the scenario leaked build demand"
+        );
+        assert_eq!(
+            state.fleet_build,
+            FleetBuildPhase::Stopped,
+            "the build did not consume its owner's stop"
+        );
         assert!(sim.server_pid().is_none(), "the scenario leaked its server");
         checks
     }
@@ -1582,7 +1601,10 @@ mod disk_refusal_tests {
             fleet_replacement: FleetReplacement::One,
             ..Behaviour::COMPLIANT
         })?;
-        assert_eq!(failures(&checks), [names::oversized_fleet::NO_WORKER_ENROLLS]);
+        assert_eq!(
+            failures(&checks),
+            [names::oversized_fleet::NO_WORKER_ENROLLS]
+        );
         Ok(())
     }
 
@@ -1592,7 +1614,10 @@ mod disk_refusal_tests {
             fleet_replacement: FleetReplacement::Same,
             ..Behaviour::COMPLIANT
         })?;
-        assert_eq!(failures(&checks), [names::oversized_fleet::NO_WORKER_ENROLLS]);
+        assert_eq!(
+            failures(&checks),
+            [names::oversized_fleet::NO_WORKER_ENROLLS]
+        );
         Ok(())
     }
 

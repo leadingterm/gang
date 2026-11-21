@@ -941,6 +941,9 @@ impl WorkerRoster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::poll;
+    use gang_reconciler::{NeedCause, ScaleDecision};
+    use gang_spi::{FleetInstance, FleetSupply, InstanceCordon, SchedulerSnapshot, WorkerState};
     use std::num::NonZeroU32;
 
     type TestControl<'a> = ControlLoop<
@@ -1041,12 +1044,6 @@ mod tests {
     #[tokio::test]
     async fn unavailable_drain_stops_plan_and_retries_unexecuted_termination()
     -> gang_testkit::TestResult {
-        use futures::poll;
-        use gang_reconciler::{NeedCause, ScaleDecision};
-        use gang_spi::{
-            FleetInstance, FleetSupply, InstanceCordon, SchedulerSnapshot, WorkerState,
-        };
-
         let fleets = crate::test_support::fleets();
         let provisioner = gang_testkit::FakeProvisioner::default();
         let clock = crate::test_support::clock_at(1_000_000);
@@ -1118,7 +1115,7 @@ mod tests {
                 },
             },
         );
-        let guard = scheduler.hold_control_acquisition().await;
+        let guard = scheduler.hold_control_acquisition().await?;
         {
             let apply = control.apply_plan();
             futures::pin_mut!(apply);
