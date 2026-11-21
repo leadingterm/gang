@@ -518,7 +518,7 @@ curl -N -H "Authorization: Bearer $TOKEN" https://gang.example.com/v1/state:watc
 ```sse
 event: snapshot
 id: 4812
-data: {"name":"state","seq":4812,"updateTime":"2026-01-14T09:20:02.000Z","provisioner":"aws","connections":{"active":24,"limit":4096,"refused":3},"pass":{"state":"OK","interval":"2s","applied":0,"failed":0},"queue":{"total":0,"unplaceable":0},"fleets":[],"workers":[],"instances":[],"events":[{"name":"events/996","createTime":"2026-01-14T09:19:58.000Z","fleet":"fleets/x86-64-spot","workerRegistered":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"eventsLimit":200,"completed":980,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":1,"skipped":0,"lookups":0,"hits":0,"uploadedBytes":0,"downloadedBytes":0,"evictedBytes":0}]},"cache":{},"builds":[],"principalsEpoch":3}
+data: {"name":"state","seq":4812,"updateTime":"2026-01-14T09:20:02.000Z","provisioner":"aws","pass":{"state":"OK","interval":"2s","applied":0,"failed":0},"queue":{"total":0,"unplaceable":0},"fleets":[],"workers":[],"instances":[],"events":[{"name":"events/996","createTime":"2026-01-14T09:19:58.000Z","fleet":"fleets/x86-64-spot","workerRegistered":{"worker":"workers/i-0e1000000000000a-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b"}}],"eventsLimit":200,"completed":980,"recent":{"window":"900s","step":"10s","samples":[{"start":"2026-01-14T09:20:00.000Z","completed":0,"running":0,"queued":0,"passes":1,"skipped":0,"lookups":0,"hits":0,"uploadedBytes":0,"downloadedBytes":0,"evictedBytes":0}]},"cache":{},"connections":{"active":0,"limit":0,"refused":0},"builds":[],"principalsEpoch":3}
 
 event: delta
 id: 4813

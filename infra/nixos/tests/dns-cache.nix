@@ -67,7 +67,6 @@ in
         # Leave eth1 without the test driver's generated static address.
         networking.interfaces.eth1.ipv4.addresses = pkgs.lib.mkForce [];
         networking.interfaces.eth1.useDHCP = true;
-        services.nscd.enable = false;
       };
     };
 

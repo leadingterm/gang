@@ -366,6 +366,7 @@ mod tests {
             "provisioner": "aws",
             "pass": {"state": "OK", "interval": "2s", "applied": 0, "failed": 0},
             "queue": {"total": 0, "unplaceable": 0},
+            "connections": {"active": 0, "limit": 0, "refused": 0},
             "fleets": [],
             "workers": [],
             "instances": [],
