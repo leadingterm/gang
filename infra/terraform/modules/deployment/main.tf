@@ -139,6 +139,7 @@ locals {
     events_queue_url                  = var.aws_events_enabled ? aws_sqs_queue.events[0].url : null
     public_port                       = local.public_port
     worker_port                       = local.worker_port
+    http2_max_connections             = var.http2_max_connections
     health_port                       = var.load_balancer == null ? null : module.network.health_port
     proxy_protocol_enabled            = local.group && var.load_balancer != null
     proxy_trusted_cidrs               = local.group && var.load_balancer != null ? module.load_balancer[0].proxy_protocol_trusted_cidrs : []

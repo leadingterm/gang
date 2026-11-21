@@ -7,6 +7,10 @@
 - Public egress now uses a per-action pasta network namespace and one host nftables policy scoped to the action cgroup subtree. NixOS prepares the policy and cgroup before worker startup; missing or mismatched prerequisites deny granted actions.
 - **Server configuration migration:** Remove `slirp4netns`, `nft`, `nsenter` and `ip` from `[sandbox.bwrap.egress]`; these old helper keys are rejected as unknown. The table now accepts only `program`, defaulting to `pasta`, resolved and pinned like `[sandbox.bwrap].program`. Keep the existing `[execution.egress]` policy and fleet grants.
 
+### Fixed
+
+- Expose the public listener connection limit in the deployment module, defaulting to 4096. The module now owns `[server.http2]` for all backends; SQLite callers must remove any appended `[server.http2]` table and move their `max_connections` override to `http2_max_connections`.
+
 ## 0.3.4
 
 ### Added
