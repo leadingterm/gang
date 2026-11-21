@@ -681,7 +681,11 @@ mod tests {
             .as_object()
             .expect("capacity minimum map");
         assert!(!minimum.contains_key(property::CPU_COUNT));
-        assert_eq!(minimum.get(property::CPU_MILLICORES), Some(&json!(15000)));
+        assert_eq!(minimum.get(property::CPU_MILLICORES), Some(&json!(30000)));
+        assert_eq!(
+            escalation["capacities"][0]["action_ceilings"][property::CPU_MILLICORES],
+            json!(15000)
+        );
     }
 
     #[test]
@@ -866,7 +870,12 @@ mod tests {
                 capacities[0]["minimum"][property::CPU_MILLICORES],
                 json!(4000 * factor)
             );
-            assert_eq!(capacities[0]["minimum"][property::CPU_COUNT], json!(4));
+            assert!(
+                !capacities[0]["minimum"]
+                    .as_object()
+                    .expect("capacity minimum map")
+                    .contains_key(property::CPU_COUNT)
+            );
             assert_eq!(
                 capacities[0]["minimum"][property::MEMORY_KB],
                 json!(8_388_608)
