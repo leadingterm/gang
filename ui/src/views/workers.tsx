@@ -72,25 +72,6 @@ const Lane = ({ w, now, recent }: { w: Worker; now: UnixMs; recent: Recent }) =>
   );
 };
 
-const Pips = ({ w }: { w: Worker }) => (
-  <span class="slots">
-    {w.slots === undefined ? (
-      <span>{`${w.running} running`}</span>
-    ) : (
-      <>
-        <span class={w.phase === "DRAINING" ? "slots__pips is-draining" : "slots__pips"} aria-hidden="true">
-          {Array.from({ length: w.slots }, (_, i) => (
-            <i key={i} class={i < w.running ? "on" : undefined} />
-          ))}
-        </span>
-        <span class="visually-hidden">
-          {w.running} of {w.slots} slots
-        </span>
-      </>
-    )}
-  </span>
-);
-
 const Infrastructure = ({ status }: { status: InfrastructureStatus }) => (
   <span>
     {status.phase.toLowerCase()} · {status.reason.toLowerCase().replaceAll("_", " ")}
@@ -137,9 +118,9 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
         <dd class="mono">
           <span class="clause"><Since t={launched} /></span>{" · "}<span class="clause">since <Clock t={launched} /></span>
         </dd>
-        <dt>{w.slots === undefined ? "running" : "slots"}</dt>
+        <dt>running</dt>
         <dd class="mono">
-          {schedulerCurrent(state) ? w.slots === undefined ? w.running : `${w.running}/${w.slots}` : "unknown"}
+          {schedulerCurrent(state) ? w.running : "unknown"}
         </dd>
         <dt>reservation</dt>
         <dd class="mono">{schedulerCurrent(state) ? ledger(w) : "unknown"}</dd>
@@ -205,10 +186,10 @@ const WorkerRow = ({ w, state, now }: { w: Worker; state: State; now: UnixMs }) 
               </svg>
               <span class="wrow__inst">
                 <Ident text={instance} />
-                <span class="dim" role="group" title="Reserved / admission capacity" aria-label={ledger(w)}>
+                {known ? <span class="dim" role="group" title="Reserved / admission capacity" aria-label={ledger(w)}>
                   <span style={{ display: "block" }}>CPU {w.reserved?.cpuMillicores ?? "—"} / {w.capacity?.cpuMillicores ?? "—"} mCPU</span>
                   <span style={{ display: "block" }}>Memory {w.reserved ? bytes(w.reserved.memory) : "—"} / {w.capacity ? bytes(w.capacity.memory) : "—"}</span>
-                </span>
+                </span> : <span class="dim">Reservation unknown</span>}
               </span>
             </span>
             <span class={`phase phase--${phase}`}>
@@ -219,7 +200,7 @@ const WorkerRow = ({ w, state, now }: { w: Worker; state: State; now: UnixMs }) 
               {w.infrastructure && <> · <Infrastructure status={w.infrastructure} /></>}
               {w.paused && <span class="paused">paused</span>}
             </span>
-            {known ? <Pips w={w} /> : <span>unknown</span>}
+            <span>{known ? `${w.running} running` : "unknown"}</span>
             <Lane w={w} now={now} recent={state.recent} />
           </>
         }

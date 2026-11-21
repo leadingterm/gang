@@ -313,6 +313,7 @@ where
                 let mut incoming_supplies: Vec<_> =
                     configs.iter().map(|_| FleetSupply::default()).collect();
                 let mut supplies = vec![false; configs.len()];
+                let mut fresh_supplies = vec![false; configs.len()];
                 let mut hosted = HostedSnapshot::default();
                 let mut incoming = SchedulerSnapshot::default();
                 let mut ticks = Interval::new(clock, clock.monotonic(), poll_interval);
@@ -322,13 +323,14 @@ where
                     let read_scheduler =
                         clock.timeout_at(deadline, scheduler.snapshot(&mut incoming));
                     let read_supplies = async {
-                        for (((config, pass), scratch), known) in configs
+                        for ((((config, pass), scratch), known), fresh) in configs
                             .iter()
                             .zip(&mut passes)
                             .zip(&mut incoming_supplies)
                             .zip(&mut supplies)
+                            .zip(&mut fresh_supplies)
                         {
-                            if matches!(
+                            *fresh = matches!(
                                 clock
                                     .timeout_at(
                                         deadline,
@@ -336,7 +338,8 @@ where
                                     )
                                     .await,
                                 Ok(Ok(()))
-                            ) {
+                            );
+                            if *fresh {
                                 *known = true;
                                 std::mem::swap(&mut pass.supply, scratch);
                             }
@@ -352,6 +355,7 @@ where
                         PassStatus::Observed {
                             hosted: known.then_some(&hosted),
                             supplies: &supplies,
+                            fresh_supplies: &fresh_supplies,
                         },
                         &passes,
                         fleets.catalog(),

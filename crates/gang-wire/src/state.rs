@@ -359,18 +359,7 @@ pub struct Recent {
 }
 
 /// One step of [`Recent`].
-#[derive(
-    gang_macros::Known,
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    Default,
-    ts_rs::TS,
-)]
+#[derive(gang_macros::Known, Debug, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(optional_fields)]
 pub struct Sample {
@@ -393,6 +382,12 @@ pub struct Sample {
     /// step is false until its first complete observation. Absent only on legacy samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler_known: Option<bool>,
+    /// Latest independent supply observation for each successfully read fleet in this step.
+    /// A missing fleet is unknown, including in legacy or unobserved steps; a present all-zero
+    /// entry is a measurement. Later failed reads remove the fleet from this step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<FleetInstanceSample>>", optional)]
+    pub fleets: Vec<FleetInstanceSample>,
     /// `GetActionResult` calls answered during the step.
     pub lookups: u32,
     /// Of `lookups`, remote cache hits.
@@ -409,6 +404,74 @@ pub struct Sample {
     #[serde(default)]
     #[ts(type = "number")]
     pub evicted_bytes: u64,
+}
+
+/// A fleet's instance census and scaling bounds at the time of a supply observation.
+#[derive(gang_macros::Known, Debug, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FleetInstanceSample {
+    /// Fleet resource name, `fleets/{fleet}`.
+    pub name: String,
+    /// Observed instances by lifecycle.
+    pub instances: InstanceCounts,
+    /// Desired instances at observation time.
+    pub desired: u32,
+    /// Maximum instances at observation time.
+    pub max: u32,
+}
+
+impl Clone for FleetInstanceSample {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            instances: self.instances,
+            desired: self.desired,
+            max: self.max,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.name.clone_from(&source.name);
+        self.instances = source.instances;
+        self.desired = source.desired;
+        self.max = source.max;
+    }
+}
+
+impl Clone for Sample {
+    fn clone(&self) -> Self {
+        Self {
+            start: self.start,
+            completed: self.completed,
+            running: self.running,
+            queued: self.queued,
+            passes: self.passes,
+            skipped: self.skipped,
+            scheduler_known: self.scheduler_known,
+            fleets: self.fleets.clone(),
+            lookups: self.lookups,
+            hits: self.hits,
+            uploaded_bytes: self.uploaded_bytes,
+            downloaded_bytes: self.downloaded_bytes,
+            evicted_bytes: self.evicted_bytes,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.start = source.start;
+        self.completed = source.completed;
+        self.running = source.running;
+        self.queued = source.queued;
+        self.passes = source.passes;
+        self.skipped = source.skipped;
+        self.scheduler_known = source.scheduler_known;
+        self.fleets.clone_from(&source.fleets);
+        self.lookups = source.lookups;
+        self.hits = source.hits;
+        self.uploaded_bytes = source.uploaded_bytes;
+        self.downloaded_bytes = source.downloaded_bytes;
+        self.evicted_bytes = source.evicted_bytes;
+    }
 }
 
 /// A phase a worker was in, from `start` until the next span's start (the last one lasts).
@@ -1128,6 +1191,13 @@ mod tests {
             "queued": 0, "passes": 0, "skipped": 0, "lookups": 0, "hits": 0
         }))
         .expect("old sample parses");
+        assert!(sample.fleets.is_empty());
+        assert!(
+            serde_json::to_value(&sample)
+                .expect("sample serializes")
+                .get("fleets")
+                .is_none()
+        );
         assert_eq!(
             (
                 sample.uploaded_bytes,
@@ -1250,9 +1320,31 @@ mod tests {
     }
 
     #[test]
+    fn fleet_samples_distinguish_unknown_from_measured_zero() {
+        let sample = Sample {
+            fleets: vec![FleetInstanceSample {
+                name: "fleets/alpha".to_owned(),
+                ..FleetInstanceSample::default()
+            }],
+            ..Sample::default()
+        };
+        let value = serde_json::to_value(&sample).expect("sample serializes");
+        assert_eq!(
+            value["fleets"],
+            json!([{"name": "fleets/alpha", "instances": {
+                "pending": 0, "inService": 0, "terminating": 0, "warm": 0
+            }, "desired": 0, "max": 0}])
+        );
+        assert_eq!(
+            serde_json::from_value::<Sample>(value).expect("sample parses"),
+            sample
+        );
+    }
+
+    #[test]
     fn scheduler_availability_is_optional_on_the_wire() {
         let sample = Sample::default();
-        let legacy = serde_json::to_value(sample).expect("sample serializes");
+        let legacy = serde_json::to_value(&sample).expect("sample serializes");
         assert!(legacy.get("schedulerKnown").is_none());
         assert_eq!(
             serde_json::from_value::<Sample>(legacy)
@@ -1264,7 +1356,7 @@ mod tests {
             scheduler_known: Some(false),
             ..sample
         };
-        let value = serde_json::to_value(unknown).expect("sample serializes");
+        let value = serde_json::to_value(&unknown).expect("sample serializes");
         assert_eq!(value["schedulerKnown"], false);
         assert_eq!(
             serde_json::from_value::<Sample>(value).expect("sample deserializes"),
@@ -1290,6 +1382,7 @@ mod tests {
                 downloaded_bytes: 9,
                 evicted_bytes: 10,
                 scheduler_known: None,
+                fleets: Vec::new(),
             };
         });
         let state = State {

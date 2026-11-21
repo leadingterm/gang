@@ -44,6 +44,9 @@ pub enum PassStatus<'a> {
         /// Whether a complete supply has been read successfully for each fleet, in fleet order.
         /// A later failed read retains the last successful supply.
         supplies: &'a [bool],
+        /// Whether each fleet's supply read succeeded on this independent observation tick,
+        /// in fleet order. Unlike `supplies`, this is not retained across failed reads.
+        fresh_supplies: &'a [bool],
     },
 }
 
