@@ -237,7 +237,11 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
       grep -F '"DesiredCapacity":2' "$scratch/out" >/dev/null ;;
     worker_pending) [[ -e $PENDING_MARKER-worker-one && -e $PENDING_MARKER-worker-two ]] ;;
     throttle_*)
-      [[ $(<"$ATTEMPTS") == 8 ]]
+      if [[ $CASE == throttle_worker ]]; then
+        [[ $(<"$ATTEMPTS") == 9 ]]
+      else
+        [[ $(<"$ATTEMPTS") == 8 ]]
+      fi
       [[ $(<"$TIMEOUTS") == *$'2400\n2399\n2397\n2393\n2385\n2369\n2339\n2309'* ]]
       [[ $(<"$SLEEPS") == $'1\n2\n4\n8\n16\n30\n30\n5\n5' ]]
       grep -F 'fixture throttle' "$scratch/out" >/dev/null
