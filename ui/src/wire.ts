@@ -762,7 +762,8 @@ applied: number,
  */
 failed: number, 
 /**
- * First fleet-attributed provider operation or observation diagnostic of this pass, if any.
+ * First fleet-attributed provider diagnostic of this pass, if any. An authoritative pass or
+ * step failure takes priority over a best-effort observation warning.
  */
 error?: string, 
 /**

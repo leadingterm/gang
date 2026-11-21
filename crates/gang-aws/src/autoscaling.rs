@@ -179,6 +179,155 @@ mod tests {
         future.poll(&mut Context::from_waker(Waker::noop()))
     }
 
+    #[derive(Debug)]
+    struct RecordingClient {
+        inner: SharedHttpClient,
+        clock: Arc<TestClock>,
+        starts: Arc<StdMutex<Vec<Tick>>>,
+    }
+
+    impl HttpClient for RecordingClient {
+        fn http_connector(
+            &self,
+            settings: &HttpConnectorSettings,
+            components: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(RecordingReplayConnector {
+                inner: self.inner.http_connector(settings, components),
+                clock: Arc::clone(&self.clock),
+                starts: Arc::clone(&self.starts),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingReplayConnector {
+        inner: SharedHttpConnector,
+        clock: Arc<TestClock>,
+        starts: Arc<StdMutex<Vec<Tick>>>,
+    }
+
+    impl HttpConnector for RecordingReplayConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            self.starts.lock().push(self.clock.monotonic());
+            self.inner.call(request)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ControlledSleep {
+        starts: Arc<StdMutex<Vec<Tick>>>,
+        backoffs: Arc<StdMutex<Vec<(Duration, usize)>>>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl aws_sdk_autoscaling::config::AsyncSleep for ControlledSleep {
+        fn sleep(&self, duration: Duration) -> aws_sdk_autoscaling::config::Sleep {
+            use aws_sdk_autoscaling::config::Sleep;
+
+            if duration > Duration::from_secs(1) {
+                // The loader's operation and attempt deadlines must not expire.
+                return Sleep::new(std::future::pending());
+            }
+            let starts = Arc::clone(&self.starts);
+            let backoffs = Arc::clone(&self.backoffs);
+            let release = Arc::clone(&self.release);
+            Sleep::new(async move {
+                backoffs.lock().push((duration, starts.lock().len()));
+                release.notified().await;
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_retries_and_client_clones_share_the_attempt_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use aws_credential_types::Credentials;
+        use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+        use aws_smithy_runtime_api::http::{Request, Response};
+        use gang_aws_sdk::{ClientSettings, Region, loader};
+
+        const NS: &str = "http://autoscaling.amazonaws.com/doc/2011-01-01/";
+        let throttled = format!(
+            "<ErrorResponse xmlns=\"{NS}\"><Error><Type>Sender</Type><Code>Throttling</Code><Message>Rate exceeded</Message></Error><RequestId>test</RequestId></ErrorResponse>"
+        );
+        let success = format!(
+            "<DescribeAutoScalingGroupsResponse xmlns=\"{NS}\"><DescribeAutoScalingGroupsResult><AutoScalingGroups/></DescribeAutoScalingGroupsResult><ResponseMetadata><RequestId>test</RequestId></ResponseMetadata></DescribeAutoScalingGroupsResponse>"
+        );
+        let event =
+            |status: u16, body: String| -> Result<ReplayEvent, Box<dyn std::error::Error>> {
+                Ok(ReplayEvent::new(
+                    Request::new(SdkBody::empty()),
+                    Response::new(StatusCode::try_from(status)?, SdkBody::from(body)),
+                ))
+            };
+        let replay = StaticReplayClient::new(vec![
+            event(400, throttled)?,
+            event(200, success.clone())?,
+            event(200, success)?,
+        ]);
+        let clock = Arc::new(TestClock::default());
+        let starts = Arc::new(StdMutex::new(Vec::new()));
+        let backoffs = Arc::new(StdMutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let region = Region::try_new("us-east-1")?;
+        let sdk = loader(&region, &ClientSettings::default())
+            .credentials_provider(Credentials::new("AKID", "SECRET", None, None, "test"))
+            .http_client(RecordingClient {
+                inner: SharedHttpClient::new(replay.clone()),
+                clock: Arc::clone(&clock),
+                starts: Arc::clone(&starts),
+            })
+            .sleep_impl(ControlledSleep {
+                starts: Arc::clone(&starts),
+                backoffs: Arc::clone(&backoffs),
+                release: Arc::clone(&release),
+            })
+            .load()
+            .await;
+        let client = super::client(&sdk, clock.clone(), INTERVAL);
+        let first = client.clone();
+        let second = client.clone();
+        let mut first_call = Box::pin(first.describe_auto_scaling_groups().send());
+        let mut second_call = Box::pin(second.describe_auto_scaling_groups().send());
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // The first response is throttled and the SDK parks in its own backoff.
+        assert!(first_call.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(starts.lock().len(), 1);
+        {
+            let backoffs = backoffs.lock();
+            assert!(
+                backoffs
+                    .iter()
+                    .any(|(duration, requests)| *requests == 1
+                        && *duration <= Duration::from_secs(1)),
+                "expected a controlled sleep after the first request; recorded sleeps: {backoffs:?}"
+            );
+        }
+        // Start the other clone while the first operation is still in flight.
+        assert!(second_call.as_mut().poll(&mut cx).is_pending());
+        release.notify_waiters();
+        assert!(first_call.as_mut().poll(&mut cx).is_pending());
+        clock.advance(INTERVAL);
+        assert!(matches!(
+            second_call.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+        assert!(first_call.as_mut().poll(&mut cx).is_pending());
+        clock.advance(INTERVAL);
+        assert!(matches!(
+            first_call.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+
+        let starts = starts.lock();
+        assert_eq!(starts.len(), 3);
+        assert!(starts.windows(2).all(|pair| pair[1] >= pair[0] + INTERVAL));
+        assert_eq!(replay.actual_requests().count(), 3);
+        Ok(())
+    }
+
     #[test]
     fn simultaneous_calls_and_retry_attempt_share_one_budget() {
         let (clock, starts, first, second) = setup();

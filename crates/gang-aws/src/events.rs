@@ -75,15 +75,22 @@ enum GroupAdmission {
     Group(Option<String>),
 }
 
-/// Delivery metadata only: the canonical repository owns the immutable observation payload.
+/// Bounded transport state; the canonical repository owns persisted observations.
 struct ActivityDelivery {
     at: Timestamp,
     acknowledged: bool,
     seen: bool,
+    pending: Option<InfrastructureEvent>,
+}
+
+enum CachedActivityDelivery {
+    Acknowledged,
+    Pending(InfrastructureEvent),
 }
 
 struct ActivityHistory {
     fleet: String,
+    managed: bool,
     deliveries: HashMap<String, ActivityDelivery>,
 }
 
@@ -159,11 +166,12 @@ impl Events {
         config: &AwsConfig,
         clock: Arc<dyn Clock>,
         managed: Arc<Managed>,
+        autoscaling: aws_sdk_autoscaling::Client,
     ) -> Self {
         Self {
             sqs: aws_sdk_sqs::Client::new(sdk),
             ec2: aws_sdk_ec2::Client::new(sdk),
-            autoscaling: aws_sdk_autoscaling::Client::new(sdk),
+            autoscaling,
             queue: config.events_queue_url.as_ref().map(ToString::to_string),
             batch: i32::from(config.event_batch_limit),
             visibility: config.event_visibility_timeout.get(),
@@ -178,11 +186,6 @@ impl Events {
             activity_errors: RwLock::new(HashMap::new()),
             error_sequence: AtomicU64::new(0),
         }
-    }
-
-    pub(crate) fn with_autoscaling(mut self, client: aws_sdk_autoscaling::Client) -> Self {
-        self.autoscaling = client;
-        self
     }
 
     pub(crate) fn managed(&self) -> &Arc<Managed> {
@@ -463,6 +466,7 @@ impl Events {
                     && delivery.at > since
                 {
                     delivery.acknowledged = true;
+                    delivery.pending = None;
                 }
             }
             return Ok(());
@@ -502,6 +506,7 @@ impl Events {
                 if poll.attempts.get(group).is_some_and(|last| {
                     now.saturating_duration_since(last.at) < self.activity_poll_interval
                 }) {
+                    self.replay_activity_history(fleet, group, out);
                     continue;
                 }
                 let pending_delivery = self.history.read().get(group).is_some_and(|history| {
@@ -517,8 +522,11 @@ impl Events {
                     && !pending_delivery
                     && !self.activity_errors.read().contains_key(group)
                 {
+                    self.replay_activity_history(fleet, group, out);
                     continue;
                 }
+                let start = out.len();
+                let result = self.activities(fleet, group, out).await;
                 poll.attempts.insert(
                     group.to_owned(),
                     ActivityAttempt {
@@ -526,9 +534,7 @@ impl Events {
                         managed: self.managed.0.read().contains_key(group),
                     },
                 );
-                let start = out.len();
-                let result = self.activities(fleet, group, out).await;
-                self.finish_activity_history(group, &out[start..], result.is_ok());
+                self.finish_activity_history(group, out, start, result.is_ok());
                 {
                     let mut errors = self.activity_errors.write();
                     match &result {
@@ -554,6 +560,7 @@ impl Events {
                         }
                     }
                 }
+                self.replay_activity_history(fleet, group, out);
                 result?;
             }
         }
@@ -574,7 +581,14 @@ impl Events {
         poll.groups.retain(|group, _| managed.contains_key(group));
         self.history.write().retain(|group, history| {
             history.deliveries.retain(|_, delivery| delivery.at > since);
-            managed.get(group) == Some(&history.fleet)
+            match managed.get(group) {
+                Some(fleet) if fleet == &history.fleet => {
+                    history.managed = true;
+                    true
+                }
+                Some(_) => false,
+                None => !history.managed,
+            }
         });
         self.activity_errors
             .write()
@@ -597,20 +611,21 @@ impl Events {
         let since = (self.clock.wall() - self.window).to_rfc3339();
         {
             let managed = self.managed.0.read();
-            if managed.get(group).is_some_and(|name| name == fleet) {
+            let is_managed = managed.get(group).is_some_and(|name| name == fleet);
+            if managed.get(group).is_none_or(|name| name == fleet) {
                 let mut histories = self.history.write();
-                if let Some(history) = histories.get_mut(group) {
+                let history =
+                    histories
+                        .entry(group.to_owned())
+                        .or_insert_with(|| ActivityHistory {
+                            fleet: fleet.to_owned(),
+                            managed: is_managed,
+                            deliveries: HashMap::new(),
+                        });
+                if history.fleet == fleet {
                     for delivery in history.deliveries.values_mut() {
                         delivery.seen = false;
                     }
-                } else {
-                    histories.insert(
-                        group.to_owned(),
-                        ActivityHistory {
-                            fleet: fleet.to_owned(),
-                            deliveries: HashMap::new(),
-                        },
-                    );
                 }
             }
         }
@@ -638,17 +653,25 @@ impl Events {
             remaining = remaining
                 .saturating_sub(u32::try_from(response.activities().len()).unwrap_or(remaining));
             for activity in response.activities() {
-                if activity
+                match activity
                     .activity_id()
-                    .is_some_and(|id| self.activity_acknowledged(group, id))
+                    .and_then(|id| self.activity_delivery(group, id))
                 {
-                    continue;
+                    Some(CachedActivityDelivery::Pending(event)) => {
+                        out.push(event);
+                        continue;
+                    }
+                    Some(CachedActivityDelivery::Acknowledged) => continue,
+                    None => {}
                 }
                 if let Some(mut event) = activity_event(activity, false) {
                     if event.at + self.window <= self.clock.wall() {
                         continue;
                     }
                     self.enrich_termination(&mut event.kind).await;
+                    if let Some(history) = self.history.write().get_mut(group) {
+                        Self::record_activity(history, &event, self.limit);
+                    }
                     out.push(event);
                 }
             }
@@ -660,43 +683,91 @@ impl Events {
         Ok(())
     }
 
-    fn activity_acknowledged(&self, group: &str, id: &str) -> bool {
+    fn activity_delivery(&self, group: &str, id: &str) -> Option<CachedActivityDelivery> {
         let mut histories = self.history.write();
-        let Some(delivery) = histories
-            .get_mut(group)
-            .and_then(|history| history.deliveries.get_mut(id))
-        else {
-            return false;
-        };
+        let delivery = histories.get_mut(group)?.deliveries.get_mut(id)?;
         delivery.seen = true;
-        delivery.acknowledged
+        Some(match &delivery.pending {
+            Some(event) => CachedActivityDelivery::Pending(event.clone()),
+            None => CachedActivityDelivery::Acknowledged,
+        })
     }
 
-    /// Keep only the current bounded page-set after a complete poll. A failed poll must not
-    /// discard acknowledgements for activities on pages it could not read.
-    fn finish_activity_history(&self, group: &str, events: &[InfrastructureEvent], complete: bool) {
+    fn record_activity(history: &mut ActivityHistory, event: &InfrastructureEvent, limit: u32) {
+        if history.deliveries.contains_key(&event.id)
+            || u32::try_from(history.deliveries.len()).unwrap_or(limit) >= limit
+        {
+            return;
+        }
+        history.deliveries.insert(
+            event.id.clone(),
+            ActivityDelivery {
+                at: event.at,
+                acknowledged: false,
+                seen: true,
+                pending: Some(event.clone()),
+            },
+        );
+    }
+
+    /// Keep pending observations until acknowledgement or expiry. Failed polls also retain
+    /// acknowledgements for activities on pages they could not read.
+    fn finish_activity_history(
+        &self,
+        group: &str,
+        events: &mut Vec<InfrastructureEvent>,
+        start: usize,
+        complete: bool,
+    ) {
         let mut histories = self.history.write();
         let Some(history) = histories.get_mut(group) else {
             return;
         };
         if complete {
-            history.deliveries.retain(|_, delivery| delivery.seen);
+            history
+                .deliveries
+                .retain(|_, delivery| delivery.seen || !delivery.acknowledged);
         }
-        for event in events {
-            if history.deliveries.contains_key(&event.id) {
-                continue;
+        for event in &events[start..] {
+            Self::record_activity(history, event, self.limit);
+        }
+        // An event that did not fit must wait for a later poll rather than be
+        // exposed without a replayable payload.
+        let mut index = 0;
+        events.retain(|event| {
+            let keep = index < start
+                || history
+                    .deliveries
+                    .get(&event.id)
+                    .is_some_and(|delivery| delivery.pending.is_some());
+            index += 1;
+            keep
+        });
+    }
+
+    fn replay_activity_history(
+        &self,
+        fleet: &str,
+        group: &str,
+        out: &mut Vec<InfrastructureEvent>,
+    ) {
+        let histories = self.history.read();
+        let Some(history) = histories
+            .get(group)
+            .filter(|history| history.fleet == fleet)
+        else {
+            return;
+        };
+        let since = self.clock.wall() - self.window;
+        for event in history
+            .deliveries
+            .values()
+            .filter(|delivery| delivery.at > since)
+            .filter_map(|delivery| delivery.pending.as_ref())
+        {
+            if !out.iter().any(|existing| existing.id == event.id) {
+                out.push(event.clone());
             }
-            if u32::try_from(history.deliveries.len()).unwrap_or(self.limit) >= self.limit {
-                break;
-            }
-            history.deliveries.insert(
-                event.id.clone(),
-                ActivityDelivery {
-                    at: event.at,
-                    acknowledged: false,
-                    seen: true,
-                },
-            );
         }
     }
 
@@ -988,6 +1059,49 @@ mod tests {
         );
     }
 
+    fn seed_failed_activity(
+        fake: &FakeAws,
+        id: &str,
+        time: &str,
+        description: &str,
+        cause: &str,
+        message: &str,
+    ) {
+        seed_activity(fake, id, time, description, cause);
+        if let Some(activity) = fake.state().activities.last_mut() {
+            activity.status_code = "Failed".to_owned();
+            activity.message = Some(message.to_owned());
+        }
+    }
+
+    async fn assert_failed_poll_retains_acknowledgements(
+        fake: &FakeAws,
+        events: &Events,
+        clock: &TestClock,
+        out: &mut Vec<InfrastructureEvent>,
+    ) -> Result<(), AwsError> {
+        fake.state().failures.insert(
+            "DescribeScalingActivities",
+            FakeFailure {
+                status: 400,
+                code: "Throttling",
+                message: "activity history throttled",
+            },
+        );
+        clock.advance(Duration::from_mins(1));
+        assert!(
+            events
+                .supply(FLEET, std::iter::once(FLEET), out)
+                .await
+                .is_err()
+        );
+        fake.state().failures.remove("DescribeScalingActivities");
+        clock.advance(Duration::from_mins(1));
+        events.supply(FLEET, std::iter::once(FLEET), out).await?;
+        assert!(out.is_empty(), "failed polls must retain acknowledgements");
+        Ok(())
+    }
+
     async fn replay_setup() -> Result<(FakeAws, Arc<TestClock>, Fleets), Box<dyn Error>> {
         let fake = FakeAws::start().await?;
         fake.state()
@@ -1007,8 +1121,20 @@ mod tests {
         let config = config(None)?;
         let managed = Arc::new(Managed::default());
         managed.add(fleet(FLEET)?.view());
-        let events = Events::new(&sdk, &config, clock.clone(), managed);
-        let fleets = Fleets::new(&sdk, clock.clone(), config.set_capacity_cooldown, events);
+        let events = Events::new(
+            &sdk,
+            &config,
+            clock.clone(),
+            managed,
+            aws_sdk_autoscaling::Client::new(&sdk),
+        );
+        let fleets = Fleets::new(
+            &sdk,
+            clock.clone(),
+            config.set_capacity_cooldown,
+            events,
+            aws_sdk_autoscaling::Client::new(&sdk),
+        );
         Ok((fake, clock, fleets))
     }
 
@@ -1170,12 +1296,13 @@ mod tests {
         })
         .await?;
         fleets.supply(fleet(FLEET)?.view(), &mut supply).await?;
-        assert!(supply.events.is_empty());
+        assert_eq!(supply.events.len(), first.len());
+        assert!(first.iter().all(|event| supply.events.contains(event)));
         assert_eq!(enrichments(), 1);
         clock.advance(Duration::from_mins(1));
         fleets.supply(fleet(FLEET)?.view(), &mut supply).await?;
         assert_eq!(supply.events, first);
-        assert_eq!(enrichments(), 2);
+        assert_eq!(enrichments(), 1);
         gang_testkit::fence::with_held(async |held| {
             for event in &supply.events {
                 fleets.events().acknowledge(held, FLEET, &event.id).await?;
@@ -1189,19 +1316,159 @@ mod tests {
             assert!(supply.events.is_empty());
             assert_eq!((supply.requested, supply.desired), (Some(1), 1));
         }
-        assert_eq!(enrichments(), 2);
+        assert_eq!(enrichments(), 1);
 
-        // Only transport acknowledgements are cached; a fresh provider replays source facts.
+        // A fresh provider replays source facts.
         let sdk = fake.sdk_config().await;
         let managed = Arc::new(Managed::default());
         managed.add(fleet(FLEET)?.view());
-        let restarted = Events::new(&sdk, &config(None)?, clock, managed);
+        let restarted = Events::new(
+            &sdk,
+            &config(None)?,
+            clock,
+            managed,
+            aws_sdk_autoscaling::Client::new(&sdk),
+        );
         let mut replay = Vec::new();
         restarted
             .supply(FLEET, std::iter::once(FLEET), &mut replay)
             .await?;
         assert_eq!(replay, first);
-        assert_eq!(enrichments(), 3);
+        assert_eq!(enrichments(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observer_cannot_consume_control_delivery() -> Result<(), Box<dyn Error>> {
+        let (fake, clock, fleets) = replay_setup().await?;
+        let events = fleets.events();
+        let calls = || {
+            fake.state()
+                .requests
+                .iter()
+                .filter(|request| request.operation == "DescribeScalingActivities")
+                .count()
+        };
+        let mut observer = FleetSupply::default();
+        fleets.supply(fleet(FLEET)?.view(), &mut observer).await?;
+        assert_eq!(observer.events.len(), 1);
+        assert_eq!(calls(), 1);
+        let mut control = FleetSupply::default();
+        fleets.supply(fleet(FLEET)?.view(), &mut control).await?;
+        assert_eq!(control.events, observer.events);
+        assert_eq!(calls(), 1);
+
+        // Simulate a failed canonical insert: no acknowledgement reaches transport.
+        fleets.supply(fleet(FLEET)?.view(), &mut control).await?;
+        assert_eq!(control.events, observer.events);
+        assert_eq!(calls(), 1);
+        gang_testkit::fence::with_held(async |held| {
+            events.acknowledge(held, FLEET, &control.events[0].id).await
+        })
+        .await?;
+        assert!(
+            events.history.read()[FLEET].deliveries[&control.events[0].id]
+                .pending
+                .is_none()
+        );
+        fleets.supply(fleet(FLEET)?.view(), &mut control).await?;
+        assert!(control.events.is_empty());
+        clock.advance(Duration::from_mins(1));
+        fleets.supply(fleet(FLEET)?.view(), &mut control).await?;
+        assert!(control.events.is_empty());
+        assert_eq!(calls(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_page_failure_retains_pending_and_acknowledgements()
+    -> Result<(), Box<dyn Error>> {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let fake = FakeAws::start().await?;
+        seed_activity(
+            &fake,
+            "acknowledged",
+            "2026-11-19T09:50:00Z",
+            &format!("Launching a new EC2 instance: {OLD}"),
+            "ordinary launch",
+        );
+        let sdk = fake.sdk_config().await;
+        let clock = Arc::new(TestClock::new(Timestamp::from_rfc3339(
+            "2026-11-19T09:51:00Z",
+        )?));
+        let mut config = config(None)?;
+        config.activity_limit = 101;
+        let managed = Arc::new(Managed::default());
+        managed.add(fleet(FLEET)?.view());
+        let events = Events::new(
+            &sdk,
+            &config,
+            clock.clone(),
+            managed,
+            aws_sdk_autoscaling::Client::new(&sdk),
+        );
+        let mut first = Vec::new();
+        events
+            .supply(FLEET, std::iter::once(FLEET), &mut first)
+            .await?;
+        gang_testkit::fence::with_held(async |held| {
+            events.acknowledge(held, FLEET, "acknowledged").await
+        })
+        .await?;
+        for index in 0..100 {
+            seed_activity(
+                &fake,
+                &format!("new-{index}"),
+                "2026-11-19T09:51:00Z",
+                &format!("Launching a new EC2 instance: {NEW}"),
+                "ordinary launch",
+            );
+        }
+        clock.advance(Duration::from_mins(1));
+        let mut partial = Vec::new();
+        let mut poll = Box::pin(events.supply(FLEET, std::iter::once(FLEET), &mut partial));
+        poll_fn(|cx| {
+            assert!(matches!(poll.as_mut().poll(cx), Poll::Pending));
+            if events.history.read()[FLEET].deliveries.len() == 101 {
+                // The first page has been processed; the current-thread executor has
+                // not yet served the next request.
+                fake.state().failures.insert(
+                    "DescribeScalingActivities",
+                    FakeFailure {
+                        status: 400,
+                        code: "ValidationError",
+                        message: "second page failed",
+                    },
+                );
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        assert!(poll.await.is_err());
+        assert_eq!(partial.len(), 100);
+        assert!(events.history.read()[FLEET].deliveries["acknowledged"].acknowledged);
+        fake.state().failures.remove("DescribeScalingActivities");
+        let mut replay = Vec::new();
+        events
+            .supply(FLEET, std::iter::once(FLEET), &mut replay)
+            .await?;
+        assert_eq!(replay.len(), 100);
+        assert!(partial.iter().all(|event| replay.contains(event)));
+        gang_testkit::fence::with_held(async |held| {
+            events.acknowledge(held, FLEET, &replay[0].id).await
+        })
+        .await?;
+        let acknowledged_id = replay[0].id.clone();
+        events
+            .supply(FLEET, std::iter::once(FLEET), &mut replay)
+            .await?;
+        assert_eq!(replay.len(), 99);
+        assert!(!replay.iter().any(|event| event.id == acknowledged_id));
+        assert!(events.history.read()[FLEET].deliveries["acknowledged"].acknowledged);
         Ok(())
     }
 
@@ -1384,8 +1651,10 @@ mod tests {
         a?;
         b?;
         assert_eq!(calls(), 1);
-        assert_eq!(left.len() + right.len(), 2);
-        let first = if left.is_empty() { &right } else { &left };
+        assert_eq!(left.len(), 2);
+        assert_eq!(right.len(), 2);
+        assert!(left.iter().all(|event| right.contains(event)));
+        let first = &left;
         gang_testkit::fence::with_held(async |held| {
             events.acknowledge(held, FLEET, LAUNCH_ID).await
         })
@@ -1395,7 +1664,9 @@ mod tests {
         events
             .supply(FLEET, std::iter::once(FLEET), &mut replay)
             .await?;
-        assert!(replay.is_empty());
+        assert_eq!(replay.len(), 1);
+        assert_ne!(replay[0].id, LAUNCH_ID);
+        assert!(first.contains(&replay[0]));
         assert_eq!(calls(), 1);
         clock.advance(Duration::from_secs(1));
         events
@@ -1411,6 +1682,13 @@ mod tests {
     #[tokio::test]
     async fn unconfigured_group_polling_is_also_rate_limited() -> Result<(), Box<dyn Error>> {
         let fake = FakeAws::start().await?;
+        seed_activity(
+            &fake,
+            "unconfigured",
+            "2026-11-19T09:50:15.786Z",
+            &format!("Launching a new EC2 instance: {NEW}"),
+            "ordinary launch",
+        );
         let sdk = fake.sdk_config().await;
         let clock = Arc::new(TestClock::new(Timestamp::from_rfc3339(
             "2026-11-19T09:50:15.786Z",
@@ -1420,6 +1698,7 @@ mod tests {
             &config(None)?,
             clock.clone(),
             Arc::new(Managed::default()),
+            aws_sdk_autoscaling::Client::new(&sdk),
         );
         let mut out = Vec::new();
         let calls = || {
@@ -1432,9 +1711,12 @@ mod tests {
         events
             .supply(FLEET, std::iter::once(FLEET), &mut out)
             .await?;
+        let first = out.clone();
+        assert_eq!(first.len(), 1);
         events
             .supply(FLEET, std::iter::once(FLEET), &mut out)
             .await?;
+        assert_eq!(out, first);
         assert_eq!(calls(), 1);
         clock.advance(Duration::from_mins(1));
         events
@@ -1498,6 +1780,42 @@ mod tests {
                 .await
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_history_read_does_not_consume_poll_budget() -> Result<(), Box<dyn Error>> {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let (_fake, _clock, fleets) = replay_setup().await?;
+        let events = fleets.events();
+        let mut cancelled_out = Vec::new();
+        let mut first = Box::pin(events.supply(FLEET, std::iter::once(FLEET), &mut cancelled_out));
+        poll_fn(|cx| {
+            assert!(matches!(first.as_mut().poll(cx), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        drop(first);
+        assert!(
+            !events
+                .activity_poll
+                .lock()
+                .await
+                .attempts
+                .contains_key(FLEET)
+        );
+        let mut control = Vec::new();
+        events
+            .supply(FLEET, std::iter::once(FLEET), &mut control)
+            .await?;
+        assert_eq!(control.len(), 1);
+        gang_testkit::fence::with_held(async |held| {
+            events.acknowledge(held, FLEET, &control[0].id).await
+        })
+        .await?;
+        assert!(events.history.read()[FLEET].deliveries[&control[0].id].acknowledged);
         Ok(())
     }
 
@@ -1575,7 +1893,13 @@ mod tests {
         config.activity_limit = 2;
         let managed = Arc::new(Managed::default());
         managed.add(fleet(FLEET)?.view());
-        let events = Events::new(&sdk, &config, clock.clone(), managed.clone());
+        let events = Events::new(
+            &sdk,
+            &config,
+            clock.clone(),
+            managed.clone(),
+            aws_sdk_autoscaling::Client::new(&sdk),
+        );
         let mut out = Vec::new();
         events
             .supply(FLEET, std::iter::once(FLEET), &mut out)
@@ -1616,27 +1940,7 @@ mod tests {
             .await?;
         assert!(out.is_empty());
 
-        fake.state().failures.insert(
-            "DescribeScalingActivities",
-            FakeFailure {
-                status: 400,
-                code: "Throttling",
-                message: "activity history throttled",
-            },
-        );
-        clock.advance(Duration::from_mins(1));
-        assert!(
-            events
-                .supply(FLEET, std::iter::once(FLEET), &mut out)
-                .await
-                .is_err()
-        );
-        fake.state().failures.remove("DescribeScalingActivities");
-        clock.advance(Duration::from_mins(1));
-        events
-            .supply(FLEET, std::iter::once(FLEET), &mut out)
-            .await?;
-        assert!(out.is_empty(), "failed polls must retain acknowledgements");
+        assert_failed_poll_retains_acknowledgements(&fake, &events, &clock, &mut out).await?;
 
         managed.clear();
         events.supply(FLEET, std::iter::empty(), &mut out).await?;
@@ -1698,7 +2002,13 @@ mod tests {
         let managed = Arc::new(Managed::default());
         managed.add(fleet(FLEET)?.view());
         let config = config(Some(fake.queue_url()))?;
-        let events = Events::new(&sdk, &config, clock, managed);
+        let events = Events::new(
+            &sdk,
+            &config,
+            clock,
+            managed,
+            aws_sdk_autoscaling::Client::new(&sdk),
+        );
         gang_testkit::fence::with_held(async |held| {
             events.receive(held).await?;
             let mut out = Vec::new();
@@ -1748,7 +2058,13 @@ mod tests {
         )?));
         let managed = Arc::new(Managed::default());
         managed.add(fleet(FLEET)?.view());
-        let events = Events::new(&sdk, &config(Some(fake.queue_url()))?, clock, managed);
+        let events = Events::new(
+            &sdk,
+            &config(Some(fake.queue_url()))?,
+            clock,
+            managed,
+            aws_sdk_autoscaling::Client::new(&sdk),
+        );
         gang_testkit::fence::with_held(async |held| {
             events.receive(held).await?;
             let mut out = Vec::new();
@@ -1793,7 +2109,13 @@ mod tests {
         config.activity_limit = 101;
         let managed = Arc::new(Managed::default());
         managed.add(fleet(FLEET)?.view());
-        let events = Events::new(&sdk, &config, clock.clone(), managed);
+        let events = Events::new(
+            &sdk,
+            &config,
+            clock.clone(),
+            managed,
+            aws_sdk_autoscaling::Client::new(&sdk),
+        );
         let mut out = Vec::new();
         events
             .supply(FLEET, std::iter::once(FLEET), &mut out)
@@ -1866,6 +2188,7 @@ mod tests {
             &config(Some(fake.queue_url()))?,
             clock.clone(),
             managed,
+            aws_sdk_autoscaling::Client::new(&sdk),
         );
         gang_testkit::fence::with_held(async |held| {
             events.receive(held).await?;
@@ -1918,7 +2241,13 @@ mod tests {
         )?));
         let managed = Arc::new(Managed::default());
         managed.add(fleet(FLEET)?.view());
-        let events = Events::new(&sdk, &config(Some(fake.queue_url()))?, clock, managed);
+        let events = Events::new(
+            &sdk,
+            &config(Some(fake.queue_url()))?,
+            clock,
+            managed,
+            aws_sdk_autoscaling::Client::new(&sdk),
+        );
         gang_testkit::fence::with_held(async |held| {
             events.receive(held).await?;
             assert_eq!(fake.state().messages.len(), 1);
@@ -1989,33 +2318,33 @@ mod tests {
             &format!("Terminating EC2 instance: {OLD}"),
             "an instance was taken out of service in response to an EC2 instance rebalance recommendation",
         );
-        seed_activity(
+        seed_failed_activity(
             &fake,
             "failed-termination",
             "2026-11-19T09:51:02Z",
             &format!("Terminating EC2 instance: {OLD}"),
             "termination failed",
+            "termination failed",
         );
-        if let Some(activity) = fake.state().activities.last_mut() {
-            activity.status_code = "Failed".to_owned();
-            activity.message = Some("termination failed".to_owned());
-        }
-        seed_activity(
+        seed_failed_activity(
             &fake,
             "failed-launch",
             "2026-11-19T09:51:03Z",
             "Launching a new EC2 instance",
             "launch failed",
+            "insufficient capacity",
         );
-        if let Some(activity) = fake.state().activities.last_mut() {
-            activity.status_code = "Failed".to_owned();
-            activity.message = Some("insufficient capacity".to_owned());
-        }
         let sdk = fake.sdk_config().await;
         let clock = Arc::new(TestClock::new(Timestamp::from_rfc3339(
             "2026-11-19T09:52:00Z",
         )?));
-        let events = Events::new(&sdk, &config(None)?, clock, Arc::new(Managed::default()));
+        let events = Events::new(
+            &sdk,
+            &config(None)?,
+            clock,
+            Arc::new(Managed::default()),
+            aws_sdk_autoscaling::Client::new(&sdk),
+        );
         let mut out = Vec::new();
         events
             .supply(FLEET, std::iter::once(FLEET), &mut out)

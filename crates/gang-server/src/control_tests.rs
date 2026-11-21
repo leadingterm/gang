@@ -21,6 +21,7 @@ use gang_types::{
     ScalingCause,
 };
 use gang_wire::{EventChange, Pass, PassState, SkipReason, State, name};
+use parking_lot::Mutex;
 
 use crate::test_support::{clock_at, fleets, fleets_of, queued_demand};
 use gang_testkit::{
@@ -109,6 +110,81 @@ impl ProvisionerPort for DiagnosticProvisioner {
             .observation_error
             .load(Ordering::SeqCst)
             .then(|| "Throttling: activity rate exceeded".to_owned()))
+    }
+
+    async fn set_desired_capacity(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        desired: u32,
+    ) -> Result<(), PortError> {
+        self.inner.set_desired_capacity(held, fleet, desired).await
+    }
+
+    async fn terminate(
+        &self,
+        held: &Held,
+        fleet: Fleet<'_, Opaque>,
+        instance: &InstanceId,
+    ) -> Result<(), PortError> {
+        self.inner.terminate(held, fleet, instance).await
+    }
+
+    fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
+        self.inner.worker_lifetime()
+    }
+}
+
+#[derive(Default)]
+struct RegistrationProvisioner {
+    inner: FakeProvisioner,
+    registered: Mutex<Vec<FleetName>>,
+    observed_sets: Mutex<Vec<Vec<FleetName>>>,
+    fail_configuration: AtomicBool,
+    fail_second_supply: AtomicBool,
+    warn_first: AtomicBool,
+}
+
+impl ProvisionerPort for RegistrationProvisioner {
+    type FleetOptions = Opaque;
+
+    fn reset_configured_fleets(&self) {
+        self.registered.lock().clear();
+    }
+
+    fn configure_fleet(&self, fleet: Fleet<'_, Opaque>) -> Result<(), PortError> {
+        if self.fail_configuration.load(Ordering::SeqCst) && fleet.name.as_str() == "first" {
+            return Err(PortError::unavailable("configuration failed"));
+        }
+        self.registered.lock().push(fleet.name.clone());
+        Ok(())
+    }
+
+    async fn supply(
+        &self,
+        fleet: Fleet<'_, Opaque>,
+        into: &mut FleetSupply,
+    ) -> Result<(), PortError> {
+        self.observed_sets
+            .lock()
+            .push(self.registered.lock().clone());
+        if self.fail_second_supply.load(Ordering::SeqCst) && fleet.name.as_str() == "first" {
+            return Err(PortError::unavailable(
+                "AWS fatal supply throttling: full message",
+            ));
+        }
+        self.inner.supply(fleet, into).await
+    }
+
+    fn observation_error(&self, fleet: Fleet<'_, Opaque>) -> Result<Option<String>, PortError> {
+        if self.warn_first.load(Ordering::SeqCst) && fleet.name.as_str() == "second" {
+            return Err(PortError::unavailable("history warning"));
+        }
+        Ok(None)
+    }
+
+    async fn converge(&self, held: &Held, fleet: Fleet<'_, Opaque>) -> Result<(), PortError> {
+        self.inner.converge(held, fleet).await
     }
 
     async fn set_desired_capacity(
@@ -2994,12 +3070,8 @@ async fn observation_and_mutation_diagnostics_clear_on_recovery() -> TestResult 
     let error = served(&hub)
         .pass
         .error
-        .expect("observation error is published");
-    assert!(
-        error.contains("observation")
-            && error.contains("Throttling")
-            && error.contains("activity rate exceeded")
-    );
+        .expect("mutation failure takes precedence over observation warning");
+    assert!(error.contains("ScaleOut") && error.contains(&fleet_name().to_string()));
     fleet.observation_error.store(false, Ordering::SeqCst);
     assert_eq!(
         control.pass().await,
@@ -3215,8 +3287,8 @@ async fn worker_joins_recorded_in_a_pass_are_in_that_pass_state() -> TestResult 
 #[tokio::test]
 async fn healthy_observation_is_published_before_the_first_pass() -> TestResult {
     let clock = clock_at(1_000_000);
-    let fleets = fleets();
-    let fleet = FakeProvisioner::default();
+    let fleets = fleets_of(vec![("second", 4), ("first", 4)]);
+    let fleet = RegistrationProvisioner::default();
     let scheduler = FakeScheduler::new()?;
     let repository = FakeRepository::default();
     let hub = StateHub::new(
@@ -3249,6 +3321,12 @@ async fn healthy_observation_is_published_before_the_first_pass() -> TestResult 
     .with_publisher(publisher(&hub));
     let mut run = pin!(control.run());
     assert!(poll!(run.as_mut()).is_pending());
+    let expected = vec![FleetName::try_new("second")?, FleetName::try_new("first")?];
+    assert_eq!(fleet.observed_sets.lock().first(), Some(&expected));
+    assert!(matches!(
+        fleet.inner.fleet_calls().first(),
+        Some(FleetCall::Supply(_))
+    ));
 
     let crate::hub::Next::Frame(bytes) = viewer.next().await else {
         panic!("first publication is delivered to the viewer");
@@ -3261,6 +3339,113 @@ async fn healthy_observation_is_published_before_the_first_pass() -> TestResult 
         .expect("first publication includes observation");
     assert_eq!(recent.samples.last().unwrap().scheduler_known, Some(true));
     assert_eq!(recent.samples.last().unwrap().passes, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn configuration_failure_retries_then_starts_observer_before_control() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets_of(vec![("second", 4), ("first", 4)]);
+    let fleet = RegistrationProvisioner::default();
+    fleet.fail_configuration.store(true, Ordering::SeqCst);
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    let control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    let mut run = pin!(control.run());
+    assert!(poll!(run.as_mut()).is_pending());
+    assert!(fleet.observed_sets.lock().is_empty());
+    assert!(
+        served(&hub)
+            .pass
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("configuration failed")
+    );
+    fleet.fail_configuration.store(false, Ordering::SeqCst);
+    clock.advance(BEFORE_POLL);
+    assert!(poll!(run.as_mut()).is_pending());
+    assert!(fleet.observed_sets.lock().is_empty());
+    clock.advance(TICK);
+    assert!(poll!(run.as_mut()).is_pending());
+    let expected = vec![FleetName::try_new("second")?, FleetName::try_new("first")?];
+    assert_eq!(fleet.observed_sets.lock().first(), Some(&expected));
+    assert_eq!(
+        &fleet.inner.fleet_calls()[..2],
+        &[
+            FleetCall::Supply(expected[0].clone()),
+            FleetCall::Supply(expected[1].clone()),
+        ]
+    );
+    assert_eq!(served(&hub).pass.error, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn later_fatal_supply_error_takes_precedence_over_history_warning() -> TestResult {
+    let clock = clock_at(1_000_000);
+    let fleets = fleets_of(vec![("second", 4), ("first", 4)]);
+    let fleet = RegistrationProvisioner::default();
+    fleet.warn_first.store(true, Ordering::SeqCst);
+    fleet.fail_second_supply.store(true, Ordering::SeqCst);
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        ),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(publisher(&hub));
+    assert_eq!(
+        control.pass().await,
+        PassOutcome::Skipped(SkipReason::ProvisionerUnavailable)
+    );
+    let error = served(&hub).pass.error.unwrap();
+    assert!(error.contains("fleet first supply"));
+    assert!(error.contains("AWS fatal supply throttling: full message"));
+    fleet.fail_second_supply.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        control.pass().await,
+        PassOutcome::Completed { failed: 0, .. }
+    ));
+    assert!(served(&hub).pass.error.unwrap().contains("history warning"));
+    fleet.warn_first.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        control.pass().await,
+        PassOutcome::Completed { failed: 0, .. }
+    ));
+    assert_eq!(served(&hub).pass.error, None);
     Ok(())
 }
 

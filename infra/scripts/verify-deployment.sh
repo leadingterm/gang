@@ -61,6 +61,14 @@ aws_read() {
   done
 }
 
+# Sleep only while there is time for another readiness read.
+readiness_sleep() {
+  local end=$1 remaining
+  remaining=$((end - $(date +%s)))
+  if (( remaining > 0 )); then sleep "$((remaining < 5 ? remaining : 5))"; fi
+  (( $(date +%s) < end ))
+}
+
 if [[ -n $asg ]]; then
   while :; do
     if ! refresh=$(aws_read "$deadline" --region "$region" autoscaling describe-instance-refreshes --auto-scaling-group-name "$asg" --max-records 1 --no-paginate --output json); then
@@ -70,9 +78,7 @@ if [[ -n $asg ]]; then
     case $status in
       None|Successful) break ;;
       Pending|InProgress|Baking|Cancelling|RollbackInProgress)
-        if (( $(date +%s) >= deadline )); then echo "::error::controller instance refresh timed out: $status" >&2; exit 1; fi
-        remaining=$((deadline - $(date +%s)))
-        if (( remaining > 0 )); then sleep "$((remaining < 5 ? remaining : 5))"; fi ;;
+        if ! readiness_sleep "$deadline"; then echo "::error::controller instance refresh timed out: $status" >&2; exit 1; fi ;;
       *) reason=$(jq -r '.InstanceRefreshes[0].StatusReason // ""' <<<"$refresh")
         echo "::error::controller instance refresh $status: $reason" >&2; exit 1 ;;
     esac
@@ -89,12 +95,10 @@ if [[ -n $asg ]]; then
     | select(all(.Instances[]; .HealthStatus == "Healthy" and .LifecycleState == "InService" and .LaunchTemplate.LaunchTemplateId == $template.LaunchTemplateId and (.LaunchTemplate.Version | tostring) == $template.Version and (.InstanceId | type == "string" and length > 0)))
     | [.Instances[].InstanceId] | sort | select(length == (unique | length))
     ' <<<"$groups"); then break; fi
-    if (( $(date +%s) >= deadline )); then
+    if ! readiness_sleep "$deadline"; then
       jq -c '[.AutoScalingGroups[]? | {AutoScalingGroupName, DesiredCapacity, LaunchTemplate, Instances: [.Instances[]? | {InstanceId, HealthStatus, LifecycleState, LaunchTemplate}]}]' <<<"$groups" >&2
       echo "::error::controller Auto Scaling group $asg is not healthy on its current launch template" >&2; exit 1
     fi
-    remaining=$((deadline - $(date +%s)))
-    if (( remaining > 0 )); then sleep "$((remaining < 5 ? remaining : 5))"; fi
   done
 elif [[ -n $targets ]]; then
   controller_ids=$(jq -ec '[.controller_instance_id | select(type == "string" and length > 0)] | select(length == 1)' <<<"$gang")
@@ -112,12 +116,10 @@ if [[ -n $targets ]]; then
           and ([.[] | select(.TargetHealth.State == "healthy")] | length == 1)
           and all(.[]; .TargetHealth.State == "healthy" or (.TargetHealth.State == "unhealthy" and .TargetHealth.Reason == "Target.FailedHealthChecks"))
       ' <<<"$health" >/dev/null; then break; fi
-      if (( $(date +%s) >= deadline )); then
+      if ! readiness_sleep "$deadline"; then
         printf '%s\n' "$health" >&2
         echo "::error::controller targets did not reach leader/passive readiness in $arn" >&2; exit 1
       fi
-      remaining=$((deadline - $(date +%s)))
-      if (( remaining > 0 )); then sleep "$((remaining < 5 ? remaining : 5))"; fi
     done
   done <<<"$targets"
 fi
@@ -144,12 +146,10 @@ if [[ -n $workers ]]; then
         ready) break ;;
         missing|unhealthy) echo "::error::worker Auto Scaling group $worker is $state" >&2; exit 1 ;;
         *)
-          if (( $(date +%s) >= worker_deadline )); then
+          if ! readiness_sleep "$worker_deadline"; then
             jq -c '.AutoScalingGroups[] | {AutoScalingGroupName, DesiredCapacity, Instances: [.Instances[] | {InstanceId, HealthStatus, LifecycleState}]}' <<<"$groups" >&2
             echo "::error::worker Auto Scaling group $worker did not reach desired healthy capacity" >&2; exit 1
-          fi
-          remaining=$((worker_deadline - $(date +%s)))
-          if (( remaining > 0 )); then sleep "$((remaining < 5 ? remaining : 5))"; fi ;;
+          fi ;;
       esac
     done
   done <<<"$workers"

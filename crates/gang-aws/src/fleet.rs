@@ -76,9 +76,10 @@ impl Fleets {
         clock: Arc<dyn Clock>,
         cooldown: CooldownPolicy,
         events: Events,
+        autoscaling: aws_sdk_autoscaling::Client,
     ) -> Self {
         Self {
-            autoscaling: aws_sdk_autoscaling::Client::new(sdk),
+            autoscaling,
             ec2: aws_sdk_ec2::Client::new(sdk),
             clock,
             cooldown,
@@ -86,11 +87,6 @@ impl Fleets {
             observation_interval: DEFAULT_SUPPLY_POLL_INTERVAL.get(),
             observation: Mutex::new(None),
         }
-    }
-
-    pub(crate) fn with_autoscaling(mut self, autoscaling: aws_sdk_autoscaling::Client) -> Self {
-        self.autoscaling = autoscaling;
-        self
     }
 
     pub(crate) fn with_observation_interval(mut self, interval: Duration) -> Self {
@@ -447,7 +443,7 @@ impl Fleets {
         self.events.observe_groups(&output).await;
         *cached = Some(Observation {
             output: Arc::clone(&output),
-            observed: now,
+            observed: self.clock.monotonic(),
             revision,
         });
         Ok(output)
@@ -640,6 +636,8 @@ mod tests {
     use crate::fake_aws::{FakeFailure, FakeGroup};
     use crate::fleet_harness::{FLEET, Harness, NOW_MILLIS, fleet, fleet_with};
     use std::error::Error;
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
     use std::time::Duration;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -672,6 +670,34 @@ mod tests {
         harness.clock.advance(Duration::from_millis(1));
         harness.fleets.supply(second.view(), &mut observer).await?;
         assert_eq!(harness.requests(DESCRIBE_GROUPS), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn slow_batch_is_fresh_when_completed() -> TestResult {
+        let harness = Harness::start().await?;
+        let first = fleet(FLEET)?;
+        let second = fleet("second")?;
+        harness.add_group(FLEET, 0, &[]);
+        harness.add_group("second", 0, &[]);
+        harness.fleets.events().managed().add(first.view());
+        harness.fleets.events().managed().add(second.view());
+
+        let mut supply = FleetSupply::default();
+        {
+            let fetch = harness.fleets.supply(first.view(), &mut supply);
+            tokio::pin!(fetch);
+            poll_fn(|cx| match fetch.as_mut().poll(cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("the fake AWS request must yield before completing"),
+            })
+            .await;
+            harness.clock.advance(Duration::from_secs(1));
+            fetch.await?;
+        }
+
+        harness.fleets.supply(second.view(), &mut supply).await?;
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 1);
         Ok(())
     }
 

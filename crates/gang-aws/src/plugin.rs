@@ -87,12 +87,22 @@ impl Runtime {
             Arc::clone(&clock),
             config.autoscaling_request_interval.get(),
         );
-        let events = Events::new(sdk, config, Arc::clone(&clock), Arc::clone(managed))
-            .with_autoscaling(autoscaling.clone());
+        let events = Events::new(
+            sdk,
+            config,
+            Arc::clone(&clock),
+            Arc::clone(managed),
+            autoscaling.clone(),
+        );
         Self {
-            fleets: Fleets::new(sdk, clock, config.set_capacity_cooldown, events)
-                .with_autoscaling(autoscaling.clone())
-                .with_observation_interval(config.supply_poll_interval.get()),
+            fleets: Fleets::new(
+                sdk,
+                clock,
+                config.set_capacity_cooldown,
+                events,
+                autoscaling.clone(),
+            )
+            .with_observation_interval(config.supply_poll_interval.get()),
             autoscaling,
             metadata: Metadata::new(imds, config.fleet_tag_key.as_str()),
             web_identity: WebIdentity::new(sdk, config),

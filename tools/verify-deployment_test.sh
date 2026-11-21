@@ -44,6 +44,11 @@ aws() {
     *describe-auto-scaling-groups*worker-one*) site=worker ;;
   esac
   if [[ $CASE == global_worker && $* == *describe-target-health*arn:two* ]]; then echo 2397 >"$CLOCK"; fi
+  if [[ $CASE == boundary_refresh && $site == refresh || $CASE == boundary_controller && $site == controller || $CASE == boundary_target && $site == target ]]; then
+    echo 2397 >"$CLOCK"
+  elif [[ $CASE == boundary_worker && $site == worker ]]; then
+    echo 177 >"$CLOCK"
+  fi
   if [[ $CASE == "throttle_$site" || ( $CASE == global_exhaust && $site == refresh ) || ( $CASE == worker_exhaust && $site == worker ) || ( $CASE == global_worker && $site == worker ) || ( $CASE == expired && $site == refresh ) || ( $CASE == worker_expired && $site == worker ) || ( $CASE == permanent && $site == refresh ) || ( $CASE == late && $site == refresh ) ]]; then
     local count
     count=$(<"$ATTEMPTS")
@@ -68,23 +73,23 @@ aws() {
   case "$*" in
     '--region region-1 autoscaling describe-instance-refreshes --auto-scaling-group-name controller --max-records 1 --no-paginate --output json')
       if [[ $CASE == aws_failure ]]; then return 1; fi
-      if [[ $CASE == refresh_failed ]]; then echo '{"InstanceRefreshes":[{"Status":"Failed","StatusReason":"fixture failure"}]}'; else echo '{"InstanceRefreshes":[{"Status":"Successful"}]}'; fi ;;
+      if [[ $CASE == refresh_failed ]]; then echo '{"InstanceRefreshes":[{"Status":"Failed","StatusReason":"fixture failure"}]}'; elif [[ $CASE == boundary_refresh ]]; then echo '{"InstanceRefreshes":[{"Status":"InProgress"}]}'; else echo '{"InstanceRefreshes":[{"Status":"Successful"}]}'; fi ;;
     '--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names controller --output json')
       local version=7 lifecycle=InService
-      if [[ $CASE == old_template ]]; then version=6; fi
+      if [[ $CASE == old_template || $CASE == boundary_controller ]]; then version=6; fi
       if [[ $CASE == controller_terminating && ! -e $PENDING_MARKER-controller ]]; then lifecycle=Terminating; : >"$PENDING_MARKER-controller"; fi
       printf '{"AutoScalingGroups":[{"AutoScalingGroupName":"controller","DesiredCapacity":2,"LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"7"},"Instances":[{"InstanceId":"i-one","HealthStatus":"Healthy","LifecycleState":"InService","LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"7"}},{"InstanceId":"i-two","HealthStatus":"Healthy","LifecycleState":"%s","LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"%s"}}]}]}\n' "$lifecycle" "$version" ;;
     '--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-one --output json'|'--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-two --output json')
       if [[ $CASE == worker_missing ]]; then echo '{"AutoScalingGroups":[]}'; return; fi
       local name=${6} state=Healthy desired=1 lifecycle=InService
       if [[ $CASE == worker_unhealthy ]]; then state=Unhealthy; fi
-      if [[ $CASE == worker_short ]]; then desired=2; fi
+      if [[ $CASE == worker_short || $CASE == boundary_worker ]]; then desired=2; fi
       if [[ $CASE == worker_pending && ! -e $PENDING_MARKER-$name ]]; then lifecycle=Pending; : >"$PENDING_MARKER-$name"; fi
       if [[ $CASE == worker_terminating ]]; then desired=0; lifecycle=Terminating:Wait; state=Unhealthy; fi
       printf '{"AutoScalingGroups":[{"AutoScalingGroupName":"%s","DesiredCapacity":%s,"Instances":[{"HealthStatus":"%s","LifecycleState":"%s"}]}]}\n' "$name" "$desired" "$state" "$lifecycle" ;;
     '--region region-1 elbv2 describe-target-health --target-group-arn arn:one --output json'|'--region region-1 elbv2 describe-target-health --target-group-arn arn:two --output json')
       local leader=healthy
-      if [[ $CASE == unhealthy ]]; then leader=unhealthy; fi
+      if [[ $CASE == unhealthy || $CASE == boundary_target ]]; then leader=unhealthy; fi
       if [[ $CASE == sqlite_lb ]]; then echo '{"TargetHealthDescriptions":[{"Target":{"Id":"i-one"},"TargetHealth":{"State":"healthy"}}]}'; return; fi
       printf '{"TargetHealthDescriptions":[{"Target":{"Id":"i-one"},"TargetHealth":{"State":"%s"}},{"Target":{"Id":"i-two"},"TargetHealth":{"State":"unhealthy","Reason":"Target.FailedHealthChecks","Description":"Health checks failed"}}]}\n' "$leader" ;;
     *) return 1 ;;
@@ -132,7 +137,7 @@ sleep() {
   echo "$now" >"$CLOCK"
 }
 export -f tofu aws gang openssl curl sleep date timeout
-for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unhealthy old_template controller_terminating missing aws_failure refresh_failed worker_missing worker_unhealthy worker_short worker_pending worker_terminating throttle_refresh throttle_controller throttle_target throttle_worker global_exhaust worker_exhaust global_worker expired worker_expired permanent late cli_timeout; do
+for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unhealthy old_template controller_terminating missing aws_failure refresh_failed worker_missing worker_unhealthy worker_short worker_pending worker_terminating boundary_refresh boundary_controller boundary_target boundary_worker throttle_refresh throttle_controller throttle_target throttle_worker global_exhaust worker_exhaust global_worker expired worker_expired permanent late cli_timeout; do
   : >"$CALLS"
   : >"$CURL_CALLS"
   echo 0 >"$CLOCK"
@@ -146,18 +151,25 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
   case $CASE in
     healthy) [[ $(wc -l <"$CALLS") -eq 6 ]] && grep -Fx -- '--region region-1 elbv2 describe-target-health --target-group-arn arn:one --output json' "$CALLS" >/dev/null && grep -Fx -- '--region region-1 elbv2 describe-target-health --target-group-arn arn:two --output json' "$CALLS" >/dev/null && grep -Fx -- '--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-two --output json' "$CALLS" >/dev/null ;;
     sqlite) [[ ! -s $CALLS ]] ;;
-    unhealthy) grep -F '::error::failed to describe target health in arn:one' "$scratch/out" >/dev/null ;;
-    old_template) grep -F '::error::failed to describe controller Auto Scaling group controller' "$scratch/out" >/dev/null ;;
+    unhealthy|boundary_target)
+      grep -F '::error::controller targets did not reach leader/passive readiness in arn:one' "$scratch/out" >/dev/null
+      grep -F '"State":"unhealthy"' "$scratch/out" >/dev/null ;;
+    old_template|boundary_controller)
+      grep -F '::error::controller Auto Scaling group controller is not healthy on its current launch template' "$scratch/out" >/dev/null
+      grep -F '"Version":"6"' "$scratch/out" >/dev/null ;;
     wrong_pin) grep -F 'controller CA pin mismatch' "$scratch/out" >/dev/null && [[ $(wc -l <"$CURL_CALLS") -eq 1 ]] ;;
     aws_failure) grep -F '::error::failed to describe controller instance refreshes' "$scratch/out" >/dev/null ;;
     refresh_failed) grep -F 'controller instance refresh Failed: fixture failure' "$scratch/out" >/dev/null ;;
+    boundary_refresh) grep -F '::error::controller instance refresh timed out: InProgress' "$scratch/out" >/dev/null ;;
     wrong) grep -F 'server version mismatch: expected 1.2.3, observed 0.0.0' "$scratch/out" >/dev/null ;;
     no_version) grep -F 'server response has no version' "$scratch/out" >/dev/null ;;
     http_failure) grep -F 'failed to query server version' "$scratch/out" >/dev/null ;;
     worker_missing) grep -F 'worker Auto Scaling group worker-one is missing' "$scratch/out" >/dev/null ;;
     worker_unhealthy) grep -F 'worker Auto Scaling group worker-one is unhealthy' "$scratch/out" >/dev/null ;;
     controller_terminating) [[ -e $PENDING_MARKER-controller ]] ;;
-    worker_short) grep -F '::error::failed to describe worker Auto Scaling group worker-one' "$scratch/out" >/dev/null ;;
+    worker_short|boundary_worker)
+      grep -F '::error::worker Auto Scaling group worker-one did not reach desired healthy capacity' "$scratch/out" >/dev/null
+      grep -F '"DesiredCapacity":2' "$scratch/out" >/dev/null ;;
     worker_pending) [[ -e $PENDING_MARKER-worker-one && -e $PENDING_MARKER-worker-two ]] ;;
     throttle_*)
       [[ $(<"$ATTEMPTS") == 8 ]]
@@ -190,4 +202,13 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
       [[ $(<"$ATTEMPTS") == 1 && ! -s $SLEEPS ]]
       grep -F 'AWS read deadline expired' "$scratch/out" >/dev/null ;;
   esac
+  case $CASE in
+    boundary_refresh) expected_calls=1 ;;
+    boundary_controller) expected_calls=2 ;;
+    boundary_target) expected_calls=3 ;;
+    boundary_worker) expected_calls=5 ;;
+    *) continue ;;
+  esac
+  [[ $(<"$SLEEPS") == 3 && $(wc -l <"$TIMEOUTS") -eq $expected_calls ]]
+  if [[ $CASE == boundary_worker ]]; then [[ $(<"$CLOCK") == 180 ]]; else [[ $(<"$CLOCK") == 2400 ]]; fi
 done

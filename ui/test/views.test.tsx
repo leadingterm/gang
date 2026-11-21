@@ -151,7 +151,11 @@ test("pass diagnostics are displayed as text and disappear on recovery", (t) => 
   const nonfatal = screen("overview", {
     state: {
       ...live,
-      fleets: live.fleets.map((fleet) => ({ ...fleet, launchFailure: undefined })),
+      fleets: live.fleets.map((fleet) => {
+        const copy = { ...fleet };
+        delete copy.launchFailure;
+        return copy;
+      }),
       pass: { ...live.pass, state: "OK", error: diagnostic },
     },
   }, <Overview />);

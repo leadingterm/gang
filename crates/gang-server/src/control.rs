@@ -76,8 +76,10 @@ pub(crate) struct ControlLoop<'a, P: PluginSet, F, S, R, C> {
     hosted: HostedSnapshot,
     /// Reusable buffer for supply reads that may fail after partially writing.
     incoming_supply: FleetSupply,
-    /// First diagnostic observed during the current control pass.
+    /// First authoritative failure during the current control pass.
     pass_error: Option<String>,
+    /// First best-effort observation diagnostic, used only when the pass has no failure.
+    observation_error: Option<String>,
     /// Buffer for the next scheduler snapshot.
     incoming: SchedulerSnapshot,
     /// Workers seen in the previous completed pass.
@@ -158,6 +160,7 @@ where
             incoming: SchedulerSnapshot::default(),
             incoming_supply: FleetSupply::default(),
             pass_error: None,
+            observation_error: None,
             roster: WorkerRoster::default(),
             roster_pending: WorkerRoster::default(),
             worker_changes: Vec::new(),
@@ -198,13 +201,21 @@ where
     /// during a drain skips the pass. Other failed steps do not stop the others.
     pub(crate) async fn pass(&mut self) -> PassOutcome {
         self.pass_error = None;
-        let (mut wall, outcome) = match self.plan_pass().await {
+        self.observation_error = None;
+        let (wall, outcome) = match self.plan_pass().await {
             Ok(time) => (time.wall, self.apply_plan().await),
             Err(reason) => (
                 PassTime::read(self.clock).wall,
                 PassOutcome::Skipped(reason),
             ),
         };
+        self.finish_pass(wall, outcome)
+    }
+
+    fn finish_pass(&mut self, mut wall: Timestamp, outcome: PassOutcome) -> PassOutcome {
+        if self.pass_error.is_none() {
+            self.pass_error = self.observation_error.take();
+        }
         if matches!(outcome, PassOutcome::Skipped(_)) {
             wall = PassTime::read(self.clock).wall;
             self.reconciler.interrupt();
@@ -308,6 +319,24 @@ where
 
     /// Runs passes and, when enabled, independent dashboard observations for this term.
     pub(crate) async fn run(mut self) -> Infallible {
+        // Register the complete set before the observer's first (biased) supply read.
+        // Failed configuration is published as a skipped pass and retried at poll cadence.
+        let mut retries = Interval::new(
+            self.clock,
+            self.clock.monotonic() + self.poll_interval.get(),
+            self.poll_interval,
+        );
+        loop {
+            self.pass_error = None;
+            match self.configure_fleets() {
+                Ok(()) => break,
+                Err(reason) => {
+                    let wall = PassTime::read(self.clock).wall;
+                    self.finish_pass(wall, PassOutcome::Skipped(reason));
+                    retries.tick().await;
+                }
+            }
+        }
         let publisher = self.publisher.clone();
         let fleets = self.fleets;
         let provisioner = self.provisioner;
@@ -653,8 +682,8 @@ where
         }
     }
 
-    /// Converges then reads each fleet's supply, or returns why the pass must be skipped.
-    async fn refresh_supplies(&mut self) -> Result<(), SkipReason> {
+    /// Registers the whole fleet set before either control or observation reads supply.
+    fn configure_fleets(&mut self) -> Result<(), SkipReason> {
         if !self.configured_fleets {
             self.provisioner.reset_configured_fleets();
             for config in &self.configs {
@@ -668,6 +697,12 @@ where
             }
             self.configured_fleets = true;
         }
+        Ok(())
+    }
+
+    /// Converges then reads each fleet's supply, or returns why the pass must be skipped.
+    async fn refresh_supplies(&mut self) -> Result<(), SkipReason> {
+        self.configure_fleets()?;
         for (config, pass) in self.configs.iter().zip(self.passes.iter_mut()) {
             let provisioner = self.provisioner;
             let fleet = config.fleet();
@@ -712,7 +747,7 @@ where
                 Err(error) => Some(error.to_string()),
             };
             if let Some(error) = diagnostic {
-                self.pass_error.get_or_insert_with(|| {
+                self.observation_error.get_or_insert_with(|| {
                     format!("fleet {} observation: {error}", config.policy.name)
                 });
             }

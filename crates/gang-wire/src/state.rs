@@ -460,7 +460,8 @@ pub struct Pass {
     pub applied: u32,
     /// Steps the pass failed to apply; 0 when skipped.
     pub failed: u32,
-    /// First fleet-attributed provider operation or observation diagnostic of this pass, if any.
+    /// First fleet-attributed provider diagnostic of this pass, if any. An authoritative pass or
+    /// step failure takes priority over a best-effort observation warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Why the pass was skipped.
