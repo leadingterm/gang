@@ -449,6 +449,7 @@ fn spot_abandoned_withdrawal_precedes_exact_twin_raise() -> TestResult {
     w.h.supply_mut(0)?.abandoned = 3;
     w.h.queue_candidates(FleetSet::prefix(2)?, 3);
     for row in &mut w.h.snapshot.queued {
+        row.resources.cpu_millicores = 1000;
         row.source = Some(source(1)?);
         row.expected = Some(secs(3600));
     }

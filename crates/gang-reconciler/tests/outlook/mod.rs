@@ -111,11 +111,14 @@ fn counts_workers_and_unconnected_instances() -> TestResult {
 fn queued_is_exclusive_while_candidates_overlap() -> TestResult {
     let mut h = harness()?;
     h.queue_candidates(FleetSet::prefix(2)?, 20);
+    for row in &mut h.snapshot.queued {
+        row.resources = x86_resources(1000);
+    }
     h.reconcile();
 
     let x86 = h.outlook(X86)?;
     let arm = h.outlook(ARM)?;
-    // The first fleet takes actions until its four instances are full, which is 16 actions.
+    // One vCPU per action fills the first fleet's four 4-vCPU instances with 16 actions.
     assert_eq!(x86.queued, 16);
     assert_eq!(arm.queued, 4);
     assert_eq!(x86.candidates, 20);
