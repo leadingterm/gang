@@ -17,6 +17,30 @@ queue. Merges are squash merges. You do not need to rebase or update your branch
 just because `main` advanced: the queue validates your change against current
 `main` and any earlier queued changes.
 
+## Related pull requests
+
+Independent pull requests use ordinary auto-merge as described above. Related
+or stacked pull requests carrying earlier unmerged changes must enter the build
+window together, before the parent merge group exists. Allow enough build-window
+capacity for the whole batch, and submit it in one batch enqueue operation:
+one GraphQL mutation with an aliased `enqueuePullRequest` field per PR, or
+native-stack **Enqueue stack** when applicable. Sequential `gh pr merge --auto`
+calls are not an atomic batch submission.
+
+A [public bug report](https://github.com/github/gh-stack/discussions/223) describes
+late children being ejected with `invalid_merge_commit` under squash merging.
+Batch submission is a reported workaround, not a GitHub-guaranteed fix. That
+removal is not itself a CI failure. Do not blindly retry, edit code, weaken
+signed linear history, squash or required checks, or reorder entries already
+building. Leave existing builds alone and re-enqueue the unchanged child after
+its referenced prefix lands; do not repeat branch updates and primary CI just
+because `main` advanced. Do not normally merge temporary `gh-readonly-queue`
+refs into source branches as a generic conflict fix: they are ephemeral and
+create backend-sensitive ancestry.
+
+The [merge queue settings](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue) for minimum merges and wait time control merging,
+not a delay before creating builds.
+
 ## Checks and failures
 
 Pull request checks validate the PR checkout. Queue checks run on a

@@ -596,6 +596,24 @@ workerCache: FleetWorkerCache,
  */
 demand: Demand, };
 
+export type FleetInstanceSample = { 
+/**
+ * Fleet resource name, `fleets/{fleet}`.
+ */
+name: string, 
+/**
+ * Observed instances by lifecycle.
+ */
+instances: InstanceCounts, 
+/**
+ * Desired instances at observation time.
+ */
+desired: number, 
+/**
+ * Maximum instances at observation time.
+ */
+max: number, };
+
 export type FleetWorkerCache = { 
 /**
  * Connected workers that report cache measurements.
@@ -1043,6 +1061,12 @@ skipped: number,
  * step is false until its first complete observation. Absent only on legacy samples.
  */
 schedulerKnown?: boolean, 
+/**
+ * Latest independent supply observation for each successfully read fleet in this step.
+ * A missing fleet is unknown, including in legacy or unobserved steps; a present all-zero
+ * entry is a measurement. Later failed reads remove the fleet from this step.
+ */
+fleets?: Array<FleetInstanceSample>, 
 /**
  * `GetActionResult` calls answered during the step.
  */

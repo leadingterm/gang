@@ -1,6 +1,7 @@
 // Overview: five readouts, the fleets in preference order, the control pass and recent scaling.
+import { useId } from "preact/hooks";
 import { eventKind, idOf, ms, scalingLog } from "../wire-parse.ts";
-import type { Cause, Fleet, Recent, ScalingEvent, State } from "../wire.ts";
+import type { Cause, Fleet, FleetInstanceSample, Recent, ScalingEvent, State } from "../wire.ts";
 import { bytesSeries, cacheWindow, donePerMinute, doneSeries, evictedSeries, passBars, queuedSeries, runningSeries, schedulerCurrent, schedulerKnown, slots as recentSlots, transferred, unrecordedSlots, windowMs } from "../recent.ts";
 import { bytes, humanize, percent, sum } from "../format.ts";
 import { Cell, ChartFrame, Clock, Columns, Duration, Empty, EVENT_VIEW, EventWhat, Glyph, Ident, Num, Row, Section, Since, Table, Tile, Tiles, useClient, useEnter } from "../ui.tsx";
@@ -13,20 +14,25 @@ const SPARK_W = 300;
 const SPARK_H = 44;
 const SPARK_POINT_RADIUS = 2;
 
-const Spark = ({ values, areaValues, secondary, label, recent, scheduler = false }: {
+type SparkSeries = { name: string; values: readonly (number | null)[]; reference?: boolean };
+
+const Spark = ({ values, areaValues, secondary, series, unknown, label, recent, scheduler = false }: {
   values: readonly (number | null)[];
   areaValues?: readonly (number | null)[];
   secondary?: readonly (number | null)[];
+  series?: readonly SparkSeries[];
+  unknown?: readonly boolean[];
   label: string;
   recent: Recent;
   scheduler?: boolean;
 }) => {
   const missing = unrecordedSlots(recent);
-  const hatch = `spark-hatch-${label.replaceAll(" ", "-")}`;
+  const hatch = `spark-hatch-${useId()}`;
   let peak = 1;
   for (const value of values) if (value !== null) peak = Math.max(peak, value);
   if (areaValues) for (const value of areaValues) if (value !== null) peak = Math.max(peak, value);
   if (secondary) for (const value of secondary) if (value !== null) peak = Math.max(peak, value);
+  if (series) for (const line of series) for (const value of line.values) if (value !== null) peak = Math.max(peak, value);
   const x = (i: number): number => values.length > 1 ? SPARK_POINT_RADIUS + (i / (values.length - 1)) * (SPARK_W - 2 * SPARK_POINT_RADIUS) : SPARK_POINT_RADIUS;
   const y = (value: number): number => SPARK_H - SPARK_POINT_RADIUS - (value / peak) * (SPARK_H - 2 * SPARK_POINT_RADIUS);
   const trace = (series: readonly (number | null)[], fillToBaseline = false): string => {
@@ -63,7 +69,7 @@ const Spark = ({ values, areaValues, secondary, label, recent, scheduler = false
           <path d="M0 0V6" stroke="var(--color-rule-2)" stroke-width="3" />
         </pattern>
       </defs>
-      {missing > 0 && (
+      {!unknown && missing > 0 && (
         <rect class="spark__unrecorded" x="0" y="0" width={values.length ? missing / values.length * SPARK_W : 0} height={SPARK_H} fill={`url(#${hatch})`}>
           <title>not recorded</title>
         </rect>
@@ -75,14 +81,29 @@ const Spark = ({ values, areaValues, secondary, label, recent, scheduler = false
           <title>scheduler unknown</title>
         </rect>
       ))}
+      {unknown?.map((missingSlot, i) => missingSlot && (
+        <rect key={i} class="spark__unknown" x={i === 0 ? 0 : (x(i - 1) + x(i)) / 2} y="0"
+          width={(i === values.length - 1 ? SPARK_W : (x(i) + x(i + 1)) / 2) - (i === 0 ? 0 : (x(i - 1) + x(i)) / 2)}
+          height={SPARK_H} fill={`url(#${hatch})`}>
+          <title>not recorded</title>
+        </rect>
+      ))}
       {areaValues && <path class="spark__area" d={trace(areaValues, true)} />}
-      <path class="spark__run" d={path} />
+      {!series && <path class="spark__run" d={path} />}
       {secondary && <path class="spark__run spark__run--secondary" d={trace(secondary)} />}
-      {values.map((value, i) => value !== null && values[i - 1] == null && values[i + 1] == null && (
+      {!series && values.map((value, i) => value !== null && values[i - 1] == null && values[i + 1] == null && (
         <circle key={i} class="spark__point" cx={x(i)} cy={y(value)} r={SPARK_POINT_RADIUS} />
       ))}
       {secondary?.map((value, i) => value !== null && secondary[i - 1] == null && secondary[i + 1] == null && (
         <circle key={i} class="spark__point spark__point--secondary" cx={x(i)} cy={y(value)} r={SPARK_POINT_RADIUS} />
+      ))}
+      {series?.map((line) => (
+        <g key={line.name} class={`spark__series spark__series--${line.name}${line.reference ? " spark__series--reference" : ""}`}>
+          <path data-series={line.name} class={`spark__run${line.reference ? " spark__run--reference" : ""}`} d={trace(line.values)} />
+          {line.values.map((value, i) => value !== null && line.values[i - 1] == null && line.values[i + 1] == null && (
+            <circle key={i} class="spark__point" cx={x(i)} cy={y(value)} r={SPARK_POINT_RADIUS} />
+          ))}
+        </g>
       ))}
     </svg>
   );
@@ -98,9 +119,6 @@ const Meter = ({ f, g, label }: { f?: number; g: number; label?: string }) => (
 
 const Readouts = ({ state }: { state: State }) => {
   const running = sum(state.fleets, (f) => f.demand.running);
-  const slots = state.workers.length > 0 && state.workers.every((w) => w.slots !== undefined)
-    ? sum(state.workers, (w) => w.slots ?? 0)
-    : undefined;
   const inService = sum(state.fleets, (f) => f.instances.inService);
   const max = sum(state.fleets, (f) => f.policy.max);
   const spot = sum(
@@ -135,14 +153,13 @@ const Readouts = ({ state }: { state: State }) => {
       />
       <Tile
         label="Executing"
-        value={known ? <><Num value={running} />{slots !== undefined && <span class="readout__of">/{slots}</span>}</> : "unknown"}
-        meter={known && slots !== undefined ? <Meter g={slots ? running / slots : 0} /> : undefined}
+        value={known ? <Num value={running} /> : "unknown"}
         chart={<ChartFrame size="spark"><Spark values={runningSeries(state.recent)} label="Executing" recent={state.recent} scheduler /></ChartFrame>}
       />
       <Tile
         label="Instances"
-        value={<><Num value={inService} /><span class="readout__of">/{max}</span></>}
-        meter={<Meter f={max ? inService / max : 0} g={max ? spot / max : 0} label={`${spot} spot, ${inService - spot} on-demand`} />}
+        value={<><Num value={inService} />{max > 0 && <span class="readout__of">/{max}</span>}</>}
+        meter={max > 0 ? <Meter f={inService / max} g={spot / max} label={`${spot} spot, ${inService - spot} on-demand`} /> : undefined}
         caption={<span class="fern">{spot} spot</span>}
       />
       <Tile
@@ -200,13 +217,25 @@ const Cache = ({ state }: { state: State }) => {
   );
 };
 
-const FleetRow = ({ f, ordinal, events, census, known }: { f: Fleet; ordinal: number; events: readonly ScalingEvent[]; census: FleetCensus; known: boolean }) => {
+const FleetRow = ({ f, ordinal, events, census, known, recent }: { f: Fleet; ordinal: number; events: readonly ScalingEvent[]; census: FleetCensus; known: boolean; recent: Recent }) => {
   const capacity = f.properties["capacity"];
   const idle = f.instances.inService === 0 && f.instances.pending === 0;
   const cold =
     f.instances.pending > 0 && f.instances.inService === 0
       ? events.findLast((e) => e.fleet === f.name && "scaledOut" in e)
       : undefined;
+  const samples: readonly (FleetInstanceSample | undefined)[] = recentSlots(recent).map((sample) => sample?.fleets?.find((fleet) => fleet.name === f.name));
+  const fields = [
+    { name: "pending", label: "Pending", value: (sample: FleetInstanceSample) => sample.instances.pending },
+    { name: "inService", label: "In service", value: (sample: FleetInstanceSample) => sample.instances.inService },
+    { name: "terminating", label: "Terminating", value: (sample: FleetInstanceSample) => sample.instances.terminating },
+    { name: "warm", label: "Warm", value: (sample: FleetInstanceSample) => sample.instances.warm },
+    { name: "desired", label: "Desired", value: (sample: FleetInstanceSample) => sample.desired, reference: true },
+    { name: "max", label: "Max", value: (sample: FleetInstanceSample) => sample.max, reference: true },
+  ];
+  const series = fields.map((field) => ({ ...field, values: samples.map((sample) => sample ? field.value(sample) : null) }));
+  const latest = samples.at(-1);
+  const historyLabel = `Instance history for ${f.name}; latest sample: ${latest ? fields.map((field) => `${field.label} ${field.value(latest)}`).join(", ") : "not recorded"}`;
   return (
     <li class={idle ? "fleet is-idle" : "fleet"}>
       <div class="fleet__id">
@@ -243,6 +272,14 @@ const FleetRow = ({ f, ordinal, events, census, known }: { f: Fleet; ordinal: nu
           </dd>
         </div>
       </dl>
+      <div class="fleet__history">
+        <ChartFrame size="spark" title="Instance history" legend={<div class="legend" aria-label="Instance history legend">
+          {fields.map((field) => <span key={field.name} class="legend__item"><i class={`fleet__history-swatch spark__series--${field.name}${field.reference ? " spark__series--reference" : ""}`} aria-hidden="true" />{field.label}</span>)}
+        </div>}>
+          <Spark values={series[0]!.values} series={series} unknown={samples.map((sample) => !sample)} label={historyLabel} recent={recent} />
+        </ChartFrame>
+        {samples.every((sample) => !sample) && <p class="dim">not recorded</p>}
+      </div>
     </li>
   );
 };
@@ -311,7 +348,7 @@ export const Overview = () => {
       <Section id="fleets-h" title="Fleets" legend={<Legend />}>
         <ol class="fleets">
           {state.fleets.map((f, i) => (
-            <FleetRow key={f.name} f={f} ordinal={i + 1} events={state.events} census={state} known={known} />
+            <FleetRow key={f.name} f={f} ordinal={i + 1} events={state.events} census={state} known={known} recent={state.recent} />
           ))}
         </ol>
       </Section>

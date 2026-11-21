@@ -162,6 +162,7 @@ fn fill_into(
         pass: PassStatus::Observed {
             hosted: Some(&hosted),
             supplies: &fresh,
+            fresh_supplies: &fresh,
         },
         fleets: &observer_passes,
         catalog: &catalog,
@@ -189,6 +190,7 @@ fn fill_into(
         } => PassStatus::Observed {
             hosted: known.then_some(&hosted),
             supplies,
+            fresh_supplies: supplies,
         },
     };
     let projection_passes = if matches!(&pass, PassStatus::Observed { .. }) {
@@ -2072,6 +2074,175 @@ fn running_outlook(running: u32) -> FleetOutlook {
     }
 }
 
+fn history_world() -> Result<World, Box<dyn Error>> {
+    let mut world = World::default();
+    world.policies = vec![policy("alpha", 100, 4)?, policy("beta", 100, 7)?];
+    world.properties = world
+        .policies
+        .iter()
+        .map(|p| properties(p, Vec::new()))
+        .collect();
+    world.supplies = vec![
+        FleetSupply {
+            desired: 3,
+            warm: 1,
+            instances: vec![fleet_instance(
+                &instance_id(1)?,
+                InstanceLifecycle::Pending,
+                0,
+            )],
+            ..FleetSupply::default()
+        },
+        FleetSupply::default(),
+    ];
+    Ok(world)
+}
+
+fn history_control(
+    builder: &mut Builder,
+    prev: &State,
+    world: &World,
+) -> Result<State, Box<dyn Error>> {
+    let passes = world.passes();
+    let catalog = FleetCatalog::try_new(world.properties.clone())?;
+    let builds = gang_insight::Builds::new(&gang_config::BuildsConfig::default());
+    let inputs = Inputs {
+        wall: ts(3_500),
+        pass: PassStatus::Ok {
+            applied: 0,
+            failed: 0,
+        },
+        fleets: &passes,
+        catalog: &catalog,
+        actions: None,
+        events: &[],
+        infrastructure: &[],
+        builds: &builds,
+        traffic: Traffic::default(),
+        measured: None,
+        principals_epoch: 7,
+    };
+    let mut control = blank();
+    builder.fill(&mut control, prev, 4, &inputs);
+    Ok(control)
+}
+
+fn fleet_census(state: &State) -> Vec<gang_wire::FleetInstanceSample> {
+    state
+        .fleets
+        .iter()
+        .map(|fleet| gang_wire::FleetInstanceSample {
+            name: fleet.name.clone(),
+            instances: fleet.instances,
+            desired: fleet.desired,
+            max: fleet.policy.max,
+        })
+        .collect()
+}
+
+#[test]
+fn fleet_history_tracks_independent_supply_observations() -> TestResult {
+    let mut world = history_world()?;
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let initial = builder.initial(ts(0), 7);
+    let first = fill(
+        &mut builder,
+        &initial,
+        1,
+        &world,
+        1_000,
+        Outcome::Observed {
+            known: false,
+            supplies: vec![true, false],
+        },
+    )?;
+    let sample = first.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!(sample.scheduler_known, Some(false));
+    assert_eq!(sample.fleets.len(), 1);
+    assert_eq!(sample.fleets[0].name, "fleets/alpha");
+    assert_eq!(sample.fleets[0].instances.pending, 1);
+    assert_eq!(sample.fleets[0].instances.warm, 1);
+    assert_eq!(sample.fleets[0].desired, 3);
+    assert_eq!(sample.fleets[0].max, first.fleets[0].policy.max);
+
+    let second = fill(
+        &mut builder,
+        &first,
+        2,
+        &world,
+        2_000,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![false, true],
+        },
+    )?;
+    let sample = second.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!(second.fleets[0].instances.pending, 1);
+    assert_eq!(sample.fleets.len(), 1);
+    assert_eq!(sample.fleets[0].name, "fleets/beta");
+    assert_eq!(
+        sample.fleets[0].instances,
+        gang_wire::InstanceCounts::default()
+    );
+    assert_eq!(sample.fleets[0].desired, 0);
+
+    world.supplies[0].desired = 2;
+    let recovered = fill(
+        &mut builder,
+        &second,
+        3,
+        &world,
+        3_000,
+        Outcome::Observed {
+            known: false,
+            supplies: vec![true, true],
+        },
+    )?;
+    let sample = recovered.recent.samples.last().ok_or("missing sample")?;
+    assert_eq!(sample.fleets.len(), 2);
+    assert_eq!(sample.fleets[0].desired, 2);
+    assert_eq!(sample.fleets[1].name, "fleets/beta");
+    let control = history_control(&mut builder, &recovered, &world)?;
+    assert_eq!(control.recent.samples[0].fleets, sample.fleets);
+    let skipped = fill(
+        &mut builder,
+        &control,
+        5,
+        &world,
+        4_000,
+        Outcome::Skipped(SkipReason::SchedulerUnavailable),
+    )?;
+    assert_eq!(skipped.recent.samples[0].fleets, sample.fleets);
+    let later = fill(
+        &mut builder,
+        &skipped,
+        6,
+        &world,
+        30_000,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![true, false],
+        },
+    )?;
+    assert!(later.recent.samples[1].fleets.is_empty());
+    assert!(later.recent.samples[2].fleets.is_empty());
+    assert_eq!(later.recent.samples[3].fleets[0].name, "fleets/alpha");
+    for (before, after) in [
+        (&initial, &first),
+        (&first, &second),
+        (&second, &recovered),
+        (&recovered, &control),
+        (&control, &skipped),
+        (&skipped, &later),
+    ] {
+        let delta = diff(before, after).ok_or("missing delta")?;
+        let mut applied = before.clone();
+        gang_state::apply(&mut applied, &delta)?;
+        assert_eq!(&applied, after);
+    }
+    Ok(())
+}
+
 #[test]
 fn recent_samples_follow_completed_passes_and_restarts() -> TestResult {
     let mut world = World::default();
@@ -2120,6 +2291,7 @@ fn recent_samples_follow_completed_passes_and_restarts() -> TestResult {
                 lookups: 0,
                 hits: 0,
                 scheduler_known: Some(true),
+                fleets: fleet_census(&prev),
                 ..gang_wire::Sample::default()
             },
             gang_wire::Sample {
@@ -2132,6 +2304,7 @@ fn recent_samples_follow_completed_passes_and_restarts() -> TestResult {
                 lookups: 0,
                 hits: 0,
                 scheduler_known: Some(true),
+                fleets: fleet_census(&prev),
                 ..gang_wire::Sample::default()
             },
         ]

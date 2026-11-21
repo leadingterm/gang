@@ -11,7 +11,6 @@ hashed, precompressed bundle that the server embeds and serves under `/ui`. It r
 | --- | --- |
 | `src/wire.ts` | The wire format: state, deltas, ticks, `closed`, session, principals, roles, events |
 | `src/store.ts` | The keyed reducer: a snapshot replaced by deltas; a foreign `base` asks for a resync |
-| `src/history.ts` | What the browser keeps from frames it saw: phase lanes, pass outages, the done rate |
 | `src/client.ts` | The one client of the state API: the SSE stream, the server clock, failure handling |
 | `src/views/` | The screens: Overview, Actions, Workers, Activity, Access, sign-in and errors |
 | `fixtures/` | Recorded streams (`*.sse`, each frame after an `: at <ms>` send time) and JSON bodies |
@@ -87,7 +86,7 @@ Row spacing lives inside each tile. Shared `Tiles` encloses the grid with hairli
 tile fill an incomplete row at both desktop and two-column phone widths, so any tile count has clean borders.
 Action cache shows the lookup-weighted hit rate and lookup count over the server's configured recent window, or `no lookups` when there are none.
 Its chart plots lookups as a faint area and hits as a solid line on one shared count scale; recorded zero-lookup steps are zero, and only absent history is hatched.
-Charts fit the content width and contain their markers; Instances keeps an empty history slot.
+Charts fit the content width and contain their markers. Fleet instance charts draw lifecycle counts and historical desired and maximum references from the server's recent samples; see [the dashboard specification](../docs/SPECIFICATION.md#52-live-state-and-dashboard-gang-state-gang-server-gang-ui-gang-embed) and [state API](../docs/API.md#state).
 Event icons align with the first line when messages wrap, including when narrow layouts reflow details.
 `//ui:layout_test` enforces the screen layout; `//ui:overview_layout_test` covers the Overview tiles.
 

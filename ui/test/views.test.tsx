@@ -460,52 +460,37 @@ for (const [name, caps] of [
   });
 }
 
-test("overview retains executing capacity and meters for bounded workers", (t) => {
+test("overview executing count ignores worker slots even at scale", (t) => {
   const fleet = live.fleets[0];
   const worker = live.workers[0];
   if (!fleet || !worker) throw new Error("the live recording has a fleet and worker");
-  for (const [caps, running, capacity, fraction] of [
-    [[4, 8], 6, 12, 0.5],
-    [[1], 1, 1, 1],
-    [[0], 0, 0, 0],
-  ] as const) {
+  const { slots: _slots, ...uncapped } = worker;
+  for (const slots of [undefined, 0, 1, 16]) {
     const state = {
       ...live,
-      fleets: [{ ...fleet, demand: { ...fleet.demand, running } }],
-      workers: caps.map((slots, i) => ({ ...worker, name: `workers/executing-${i}`, slots })),
+      fleets: [{ ...fleet, demand: { ...fleet.demand, running: 120 } }],
+      workers: Array.from({ length: 120 }, (_, i) => ({
+        ...uncapped, name: `workers/executing-${i}`, running: 1, ...(slots !== undefined ? { slots } : {}),
+      })),
     };
     const readout = executingReadout(state);
-    t.assert.match(readout, new RegExp(`<div class="readout__big"><span[^>]*>${running}</span><span class="readout__of">/${capacity}</span></div>`));
-    t.assert.match(readout, /class="meter"/);
-    t.assert.match(readout, new RegExp(`--g:\\s*${fraction}(?:;|")`));
+    t.assert.match(readout, /<div class="readout__big"><span[^>]*>120<\/span><\/div>/);
+    t.assert.doesNotMatch(readout, /readout__of|class="meter"|\/0|slots/i);
   }
 });
 
-test("worker rows and details show running counts without an observed cap", (t) => {
+test("worker rows and details show only running counts regardless of slots", (t) => {
   const worker = live.workers[0];
   if (!worker) throw new Error("the live recording has a worker");
   const { slots: _slots, ...uncapped } = worker;
-  const unlimited = { ...uncapped, running: 3 };
-  const state = { ...live, workers: [unlimited] };
-  const row = html({ state }, <Workers />);
-  const detail = html({ state }, <WorkerDetail w={unlimited} state={state} />);
-  t.assert.match(row, /<span class="slots"><span>3 running<\/span><\/span>/);
-  t.assert.doesNotMatch(row, /unknown slots|slots__pips/);
-  t.assert.match(detail, /<dt>running<\/dt><dd class="mono">3<\/dd>/);
-  t.assert.doesNotMatch(detail, /<dt>slots<\/dt>|3\/\?/);
-});
-
-test("workers with observed caps retain pips and slot details", (t) => {
-  const worker = live.workers[0];
-  if (!worker) throw new Error("the live recording has a worker");
-  for (const slots of [4, 1]) {
-    const bounded = { ...worker, slots, running: 1 };
-    const state = { ...live, workers: [bounded] };
+  for (const slots of [undefined, 0, 1, 16]) {
+    const w = { ...uncapped, running: 3, ...(slots !== undefined ? { slots } : {}) };
+    const state = { ...live, workers: [w] };
     const row = html({ state }, <Workers />);
-    const detail = html({ state }, <WorkerDetail w={bounded} state={state} />);
-    t.assert.match(row, new RegExp(`1(?:<!-- -->)? of (?:<!-- -->)?${slots}(?:<!-- -->)? slots`));
-    t.assert.equal((row.match(/<i(?: class="on")?><\/i>/g) ?? []).length, slots);
-    t.assert.match(detail, new RegExp(`<dt>slots</dt><dd class="mono">1/${slots}</dd>`));
+    const detail = html({ state }, <WorkerDetail w={w} state={state} />);
+    t.assert.match(row, /<span>3 running<\/span>/);
+    t.assert.match(detail, /<dt>running<\/dt><dd class="mono">3<\/dd>/);
+    t.assert.doesNotMatch(row + detail, /slots|\/0|<i(?: class="on")?><\/i>/i);
   }
 });
 
@@ -538,6 +523,19 @@ test("worker ledger totals show admission capacity independently of slots and sa
   t.assert.match(partialRow, /CPU 0 \/ — mCPU/);
   t.assert.match(partialRow, /Memory 0 B \/ —/);
   t.assert.match(visibleText(html({ state: partial }, <WorkerDetail w={zero} state={partial} />)), /CPU admission 0 millicores \/ — · memory 0 B \/ —/);
+
+  const capacityOnly = { ...unknown, capacity: { cpuMillicores: 0, memory: 0 } };
+  const capacityState = { ...live, workers: [capacityOnly] };
+  const capacityRow = visibleText(html({ state: capacityState }, <Workers />));
+  t.assert.match(capacityRow, /CPU — \/ 0 mCPU/);
+  t.assert.match(capacityRow, /Memory — \/ 0 B/);
+  t.assert.match(visibleText(html({ state: capacityState }, <WorkerDetail w={capacityOnly} state={capacityState} />)), /CPU admission — \/ 0 millicores · memory — \/ 0 B/);
+
+  const outage = { ...state, schedulerKnown: false };
+  const outageRow = html({ state: outage }, <Workers />);
+  t.assert.match(visibleText(outageRow), /Reservation unknown/);
+  t.assert.doesNotMatch(outageRow, /6000|8000|Reserved \/ admission capacity/);
+  t.assert.match(visibleText(html({ state: outage }, <WorkerDetail w={measured} state={outage} />)), /reservation\s*unknown/);
 });
 
 test("worker cache distinguishes measured, zero, missing and stale reports", (t) => {
@@ -680,6 +678,67 @@ const chart = (markup: string, label: string): string =>
 
 const passStrip = (markup: string): string =>
   /<div class="passbar"[^>]*>[\s\S]*?<\/div>/.exec(markup)?.[0] ?? "";
+
+test("fleet instance histories retain independent observed series through missing samples", (t) => {
+  const fleet = live.fleets[0];
+  if (!fleet) throw new Error("the live recording has a fleet");
+  const base = recentState(5);
+  const first = { ...fleet, name: "fleets/history-a" };
+  const second = { ...fleet, name: "fleets/history-b" };
+  const observation = (name: string, count: number, max: number) => ({
+    name, instances: { pending: count, inService: count, terminating: count, warm: count }, desired: count, max,
+  });
+  const samples = base.recent.samples.map((sample, i) => ({
+    ...sample,
+    schedulerKnown: false,
+    ...(i === 1 ? {} : { fleets: i === 3
+      ? [observation(second.name, 1, 4)]
+      : [observation(first.name, i === 2 ? 0 : 1, 2), observation(second.name, 1, 4)] }),
+  }));
+  const state = { ...base, schedulerKnown: false, fleets: [first, second], recent: { ...base.recent, window: "50s", samples } };
+  const markup = html({ state }, <Overview />);
+  const a = chart(markup, `Instance history for ${first.name}; latest sample: Pending 1, In service 1, Terminating 1, Warm 1, Desired 1, Max 2`);
+  const b = chart(markup, `Instance history for ${second.name}; latest sample: Pending 1, In service 1, Terminating 1, Warm 1, Desired 1, Max 4`);
+  t.assert.equal(Boolean(a && b), true);
+  const series = (svg: string, name: string): string =>
+    new RegExp(`<g\\b[^>]*class="[^"]*\\bspark__series--${name}\\b[^"]*"[^>]*>[\\s\\S]*?</g>`).exec(svg)?.[0] ?? "";
+  const path = (group: string, name: string): string =>
+    new RegExp(`<path\\b(?=[^>]*\\bdata-series="${name}")[^>]*>`).exec(group)?.[0] ?? "";
+  for (const name of ["pending", "inService", "terminating", "warm", "desired", "max"]) {
+    const line = series(a, name);
+    t.assert.match(path(line, name), /\bd="[^"]*M[^"]*M[^"]*M/);
+    t.assert.match(line, /<circle\b[^>]*class="spark__point"/);
+    t.assert.match(path(series(b, name), name), /\bd="[^"]*M[^"]*M/);
+  }
+  for (const name of ["desired", "max"]) {
+    t.assert.match(path(series(a, name), name), /\bclass="[^"]*\bspark__run--reference\b/);
+  }
+  t.assert.match(a, /<title>not recorded<\/title>/);
+  t.assert.match(series(a, "pending"), /<circle class="spark__point"[^>]*cy="42"/);
+  t.assert.notEqual(series(a, "pending"), series(b, "pending"));
+  const aId = /<pattern id="([^"]+)"/.exec(a)?.[1];
+  const bId = /<pattern id="([^"]+)"/.exec(b)?.[1];
+  t.assert.equal(Boolean(aId && bId), true);
+  t.assert.notEqual(aId, bId);
+});
+
+test("legacy fleet samples show not recorded instead of zero", (t) => {
+  const fleet = live.fleets[0];
+  if (!fleet) throw new Error("the live recording has a fleet");
+  const base = recentState(2);
+  const state = { ...base, fleets: [fleet] };
+  const markup = html({ state }, <Overview />);
+  const svg = chart(markup, `Instance history for ${fleet.name}; latest sample: not recorded`);
+  t.assert.equal(Boolean(svg), true);
+  t.assert.match(svg, /<title>not recorded<\/title>/);
+  t.assert.match(visibleText(markup), /not recorded/);
+  t.assert.doesNotMatch(svg, /<circle\b[^>]*class="spark__point"/);
+  for (const name of ["pending", "inService", "terminating", "warm", "desired", "max"]) {
+    const path = new RegExp(`<path\\b(?=[^>]*\\bdata-series="${name}")[^>]*>`).exec(svg)?.[0] ?? "";
+    t.assert.notEqual(path, "");
+    t.assert.doesNotMatch(path, /\bd="[^"]+"/);
+  }
+});
 
 test("action cache describes lookup counts and the configured window", (t) => {
   const base = recentState(3);
