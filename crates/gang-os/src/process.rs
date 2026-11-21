@@ -410,6 +410,8 @@ mod tests {
     async fn cancelling_owned_pipe_reader_closes_reader() -> Result<(), Box<dyn Error>> {
         use std::task::{Context, Poll, Waker};
 
+        // A concurrent fork would retain the pipe's reader until exec, even after cancellation.
+        let _guard = gang_testkit::fork_gate::lock_user();
         let (reader, mut writer) = std::io::pipe()?;
         let mut future = Box::pin(async move {
             let reader = PipeReader::new(reader.into())?;
