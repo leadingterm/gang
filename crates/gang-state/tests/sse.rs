@@ -109,6 +109,60 @@ fn json(text: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str(text)
 }
 
+/// Older fixtures predate fleet cache totals, which deserialize to an explicit default.
+fn add_default_fleet_cache(event: &str, expected: &mut Value) {
+    let fleets = match event {
+        "snapshot" => expected.get_mut("fleets"),
+        "delta" => expected
+            .get_mut("fleets")
+            .and_then(|fleets| fleets.get_mut("upsert")),
+        _ => None,
+    };
+    if let Some(fleets) = fleets.and_then(Value::as_array_mut) {
+        for fleet in fleets {
+            if let Some(fleet) = fleet.as_object_mut() {
+                fleet
+                    .entry("workerCache")
+                    .or_insert_with(|| serde_json::json!(gang_wire::FleetWorkerCache::default()));
+            }
+        }
+    }
+}
+
+#[test]
+fn fleet_cache_fixture_defaults_preserve_present_values() {
+    let default = serde_json::json!(gang_wire::FleetWorkerCache::default());
+    let present = serde_json::json!({"reporting": 7, "extra": "preserved"});
+    let fleets = serde_json::json!([
+        {"name": "missing"},
+        {"workerCache": present}
+    ]);
+    let normalized = serde_json::json!([
+        {"name": "missing", "workerCache": default},
+        {"workerCache": present}
+    ]);
+    for (event, mut input, expected) in [
+        (
+            "snapshot",
+            serde_json::json!({"fleets": fleets}),
+            serde_json::json!({"fleets": normalized}),
+        ),
+        (
+            "delta",
+            serde_json::json!({"fleets": {"upsert": fleets}}),
+            serde_json::json!({"fleets": {"upsert": normalized}}),
+        ),
+        (
+            "tick",
+            serde_json::json!({"fleets": [{"name": "missing"}]}),
+            serde_json::json!({"fleets": [{"name": "missing"}]}),
+        ),
+    ] {
+        add_default_fleet_cache(event, &mut input);
+        assert_eq!(input, expected, "{event}");
+    }
+}
+
 /// Decodes `text` as a whole stream.
 fn decode(text: &str) -> Result<Vec<Frame>, DecodeError> {
     Decoder::new().push(text.as_bytes())
@@ -208,9 +262,11 @@ fn fixture_frames_reproduce_through_the_codec() -> Result<(), Box<dyn Error>> {
             let produced = single(text)?;
             assert_eq!(produced.event, expected.event, "{name}: event");
             assert_eq!(produced.id, expected.id, "{name}: {} id", expected.event);
+            let mut expected_data = json(&expected.data)?;
+            add_default_fleet_cache(&expected.event, &mut expected_data);
             assert_eq!(
                 json(&produced.data)?,
-                json(&expected.data)?,
+                expected_data,
                 "{name}: {} data",
                 expected.event
             );

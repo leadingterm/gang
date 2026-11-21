@@ -2,7 +2,7 @@
 // instances without a worker sit under their fleet as counts.
 import { useState } from "preact/hooks";
 import { idOf, ms, type UnixMs } from "../wire-parse.ts";
-import type { Fleet, InfrastructureStatus, Instance, Phase, Recent, State, Worker } from "../wire.ts";
+import type { Fleet, InfrastructureStatus, Instance, Phase, Recent, State, Worker, WorkerCache } from "../wire.ts";
 import { schedulerCurrent, schedulerKnown, stepMs, windowMs } from "../recent.ts";
 import { bytes, sum, workerInstance } from "../format.ts";
 import { Cell, Clock, Disclosure, Duration, Empty, FleetFilter, Ident, Row, Section, Since, Table, Target, useClient, useNowStep } from "../ui.tsx";
@@ -82,6 +82,20 @@ const Infrastructure = ({ status }: { status: InfrastructureStatus }) => (
 const ledger = (w: Worker): string =>
   `CPU admission ${w.reserved ? `${w.reserved.cpuMillicores} millicores` : "—"} / ${w.capacity ? `${w.capacity.cpuMillicores} millicores` : "—"} · memory ${w.reserved ? bytes(w.reserved.memory) : "—"} / ${w.capacity ? bytes(w.capacity.memory) : "—"} reserved / capacity`;
 
+/** Store counters are cumulative for the lifetime of the worker's store. */
+const CacheMetrics = ({ cache }: { cache: WorkerCache | undefined }) => (
+  <dl class="kv kv--tight">
+    <dt>local reads</dt>
+    <dd class="mono">{cache ? `${cache.local.requests} requests · ${bytes(cache.local.bytes)}` : "unknown"}</dd>
+    <dt>slow-store fetches</dt>
+    <dd class="mono">{cache ? `${cache.remote.requests} requests · ${bytes(cache.remote.bytes)}` : "unknown"}</dd>
+    <dt>evictions</dt>
+    <dd class="mono">{cache ? `${cache.evictions} · ${bytes(cache.evicted)}` : "unknown"}</dd>
+    <dt>used / budget</dt>
+    <dd class="mono">{cache ? `${bytes(cache.used)} / ${bytes(cache.budget)}` : "unknown"}</dd>
+  </dl>
+);
+
 export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
   const client = useClient();
   const acts = state.actions?.running.filter((a) => a.worker === w.name) ?? [];
@@ -112,6 +126,9 @@ export const WorkerDetail = ({ w, state }: { w: Worker; state: State }) => {
         <dd class="mono">{schedulerCurrent(state) ? ledger(w) : "unknown"}</dd>
         {w.infrastructure && <><dt>infrastructure</dt><dd><Infrastructure status={w.infrastructure} /></dd></>}
       </dl>
+      <h3>Worker cache</h3>
+      <p class="quiet">Cumulative store-lifetime counters.</p>
+      <CacheMetrics cache={schedulerCurrent(state) ? w.cache : undefined} />
       {segments.length > 0 && (
         <ol class="phases" aria-label="Phase history">
           {segments.map((s) => (
@@ -266,6 +283,12 @@ export const Workers = () => {
           if (rows.length === 0 && gs.length === 0 && marked.length === 0) return null;
           return (
             <Section key={f.name} id={`wg-${idOf(f.name)}`} title={idOf(f.name)} count={rows.length} mono variant="plain" cls="wgroup" hidden={fleet !== "" && fleet !== f.name}>
+              <div class="section__legend">
+                <h3>Worker cache totals</h3>
+                <p class="quiet">Cumulative store-lifetime counters for connected workers reporting cache metrics.</p>
+                <p>{schedulerCurrent(state) && f.workerCache ? `${f.workerCache.reporting} / ${f.workerCache.workers} workers reporting` : "Reporting coverage unknown"}</p>
+                <CacheMetrics cache={schedulerCurrent(state) && f.workerCache?.reporting ? f.workerCache.totals : undefined} />
+              </div>
               {rows.map((w) => (
                 <WorkerRow key={w.name} w={w} state={state} now={now} />
               ))}

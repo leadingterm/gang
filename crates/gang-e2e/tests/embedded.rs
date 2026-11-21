@@ -3128,6 +3128,7 @@ async fn observe_worker_keepalives(
                 running_operations: Some(worker_wire::RunningOperations {
                     operation_ids: vec![operation],
                 }),
+                cache_stats: None,
             },
         ))?;
         wire_kill_barrier(stream, &pressure.operation).await?;

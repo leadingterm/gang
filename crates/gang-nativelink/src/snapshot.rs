@@ -11,7 +11,8 @@ use futures::StreamExt;
 
 use gang_clock::Timestamp;
 use gang_spi::{
-    ExecutingDemand, FleetMemoryCapacity, QueuedDemand, SchedulerSnapshot, WorkerState,
+    ExecutingDemand, FleetMemoryCapacity, QueuedDemand, SchedulerSnapshot, WorkerCacheStats,
+    WorkerState,
 };
 use gang_types::{
     ActionResources, Bytes, FleetCatalog, FleetName, FleetSet, NonZeroBytes, Refusal, SourceId,
@@ -67,6 +68,16 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
         capacity: ledger.map(|(capacity, _)| capacity),
         reserved: ledger.map(|(_, reserved)| reserved),
         paused: summary.is_paused,
+        cache: summary.cache.as_ref().map(|cache| WorkerCacheStats {
+            local_read_requests: cache.local_read_requests,
+            local_read_bytes: cache.local_read_bytes,
+            slow_read_requests: cache.slow_read_requests,
+            slow_read_bytes: cache.slow_read_bytes,
+            evictions: cache.evictions,
+            evicted_bytes: cache.evicted_bytes,
+            size_bytes: cache.size_bytes,
+            budget_bytes: cache.budget_bytes,
+        }),
         last_seen: Timestamp::from_unix_millis(
             summary
                 .last_update_timestamp
@@ -448,6 +459,7 @@ pub(crate) mod tests {
             ]),
             available_platform_properties: HashMap::new(),
             free_memory_kb: None,
+            cache: None,
         }
     }
 
@@ -581,8 +593,63 @@ pub(crate) mod tests {
                 paused: false,
                 capacity: None,
                 reserved: None,
+                cache: None,
                 last_seen: Timestamp::from_unix_millis(1_700_000_000_000),
             }
+        );
+    }
+
+    #[test]
+    fn worker_cache_preserves_measured_values_and_missing_reports() {
+        let mut listing = summary(WORKER);
+        assert_eq!(worker_state(&listing).expect("managed worker").cache, None);
+
+        listing.cache = Some(nativelink_scheduler::worker_scheduler::WorkerCacheStats {
+            local_read_requests: 11,
+            local_read_bytes: 22,
+            slow_read_requests: 33,
+            slow_read_bytes: 44,
+            evictions: 55,
+            evicted_bytes: 66,
+            size_bytes: 77,
+            budget_bytes: 88,
+        });
+        assert_eq!(
+            worker_state(&listing).expect("managed worker").cache,
+            Some(WorkerCacheStats {
+                local_read_requests: 11,
+                local_read_bytes: 22,
+                slow_read_requests: 33,
+                slow_read_bytes: 44,
+                evictions: 55,
+                evicted_bytes: 66,
+                size_bytes: 77,
+                budget_bytes: 88,
+            })
+        );
+
+        listing.cache = Some(nativelink_scheduler::worker_scheduler::WorkerCacheStats {
+            local_read_requests: 0,
+            local_read_bytes: 0,
+            slow_read_requests: 0,
+            slow_read_bytes: 0,
+            evictions: 0,
+            evicted_bytes: 0,
+            size_bytes: 0,
+            budget_bytes: 0,
+        });
+        assert_eq!(
+            worker_state(&listing).expect("managed worker").cache,
+            Some(WorkerCacheStats {
+                local_read_requests: 0,
+                local_read_bytes: 0,
+                slow_read_requests: 0,
+                slow_read_bytes: 0,
+                evictions: 0,
+                evicted_bytes: 0,
+                size_bytes: 0,
+                budget_bytes: 0,
+            })
         );
     }
 

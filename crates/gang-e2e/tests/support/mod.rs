@@ -1220,6 +1220,10 @@ impl Simulation {
                 draining,
                 unconnected: 0,
             },
+            worker_cache: gang_wire::FleetWorkerCache {
+                workers: count,
+                ..gang_wire::FleetWorkerCache::default()
+            },
             demand: Demand {
                 running: 0,
                 queued: 0,
@@ -1252,6 +1256,7 @@ impl Simulation {
             launch_time: at(0),
             phases: Vec::new(),
             infrastructure: None,
+            cache: None,
         })
     }
 

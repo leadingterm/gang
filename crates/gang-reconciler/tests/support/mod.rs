@@ -310,6 +310,7 @@ impl Harness {
             max_inflight_actions: None,
             capacity: None,
             reserved: None,
+            cache: None,
             paused: false,
             draining,
             last_seen,

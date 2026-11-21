@@ -7,6 +7,10 @@
 - Show executing counts without slot denominators and display worker reservations against scheduler admission capacity, preserving unknown values.
 - Show per-fleet instance lifecycle history with historical desired and maximum reference lines, leaving unavailable observations as gaps.
 
+### Added
+
+- Show worker FastSlowStore cache reads, evictions and capacity in live state and the dashboard, with fleet reporting coverage.
+
 ## 0.3.5 — 2026-11-21
 
 ### Added
