@@ -64,10 +64,14 @@ impl Workload {
         expected: Option<Duration>,
     ) -> TestResult {
         let start = self.h.snapshot.queued.len();
-        self.h.queue_sized(fleet, count, ActionResources {
-            cpu_millicores: 1000,
-            ..ActionResources::default()
-        })?;
+        self.h.queue_sized(
+            fleet,
+            count,
+            ActionResources {
+                cpu_millicores: 1000,
+                ..ActionResources::default()
+            },
+        )?;
         for row in &mut self.h.snapshot.queued[start..] {
             row.source = source;
             row.expected = expected;
@@ -262,11 +266,14 @@ fn cold_burst_scales_to_resource_bound() -> TestResult {
             "queued CPU reservations determine capacity"
         );
     }
-    assert_eq!(purchases(&steps), vec![
-        (X86, 0, 1, NeedCause::Demand),
-        (X86, 1, 3, NeedCause::Demand),
-        (X86, 3, 6, NeedCause::Demand),
-    ]);
+    assert_eq!(
+        purchases(&steps),
+        vec![
+            (X86, 0, 1, NeedCause::Demand),
+            (X86, 1, 3, NeedCause::Demand),
+            (X86, 3, 6, NeedCause::Demand),
+        ]
+    );
     assert_eq!(w.h.supply(X86)?.desired, 6);
     Ok(())
 }
@@ -278,7 +285,11 @@ fn burst_resource_bound_is_independent_of_payback() -> TestResult {
         w.h.set_desired_capacity(X86, 1);
         w.h.launch(X86, "local-1", InstanceLifecycle::Pending, Duration::ZERO)?;
         w.queue(Some(source(1)?), X86, 160, Some(secs(60)))?;
-        assert_eq!(purchases(&w.pass()), vec![(X86, 1, 6, NeedCause::Demand)], "payback={percent}");
+        assert_eq!(
+            purchases(&w.pass()),
+            vec![(X86, 1, 6, NeedCause::Demand)],
+            "payback={percent}"
+        );
     }
     Ok(())
 }
@@ -312,7 +323,10 @@ fn young_dump_is_transient_and_static_batch_never_fabricates_refill() -> TestRes
                 known,
             )?;
             let steps = w.pass();
-            assert_eq!(w.h.outlook(X86)?.needed, u32::try_from((start + w.h.snapshot.queued.len()).div_ceil(16))?.min(6));
+            assert_eq!(
+                w.h.outlook(X86)?.needed,
+                u32::try_from((start + w.h.snapshot.queued.len()).div_ceil(16))?.min(6)
+            );
             let _ = steps;
             assert_eq!(
                 w.h.outlook(X86)?.load,
@@ -385,13 +399,7 @@ fn closed_loop_aged_source_keeps_resource_bound() -> TestResult {
     w.pass();
     for _ in 0..13 {
         w.h.advance(secs(30));
-        w.complete(
-            Some(source(1)?),
-            X86,
-            16,
-            Some(secs(30)),
-            cpu_reservation(),
-        );
+        w.complete(Some(source(1)?), X86, 16, Some(secs(30)), cpu_reservation());
         w.running(
             "local-1",
             16,
@@ -423,13 +431,7 @@ fn steady_ci_stream_scales_stepwise_and_bounded() -> TestResult {
         4, 8, 12, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240,
     ] {
         w.h.advance(secs(20));
-        w.complete(
-            Some(source(1)?),
-            X86,
-            16,
-            Some(secs(20)),
-            cpu_reservation(),
-        );
+        w.complete(Some(source(1)?), X86, 16, Some(secs(20)), cpu_reservation());
         w.running(
             "local-1",
             16,
@@ -463,7 +465,10 @@ fn steady_ci_stream_scales_stepwise_and_bounded() -> TestResult {
         }
         all_steps.extend(steps);
     }
-    assert_eq!(purchases(&all_steps).last(), Some(&(X86, 5, 6, NeedCause::Demand)));
+    assert_eq!(
+        purchases(&all_steps).last(),
+        Some(&(X86, 5, 6, NeedCause::Demand))
+    );
     assert_eq!(w.h.supply(X86)?.desired, 6);
     Ok(())
 }
@@ -483,13 +488,7 @@ fn two_sources_share_capacity_without_cross_attribution() -> TestResult {
     w.pass();
     for _ in 0..120 {
         w.h.advance(secs(5));
-        w.complete(
-            Some(source(1)?),
-            X86,
-            3,
-            Some(secs(20)),
-            cpu_reservation(),
-        );
+        w.complete(Some(source(1)?), X86, 3, Some(secs(20)), cpu_reservation());
         w.pass();
     }
     w.queue(Some(source(2)?), X86, 200, Some(secs(30)))?;
@@ -502,21 +501,9 @@ fn two_sources_share_capacity_without_cross_attribution() -> TestResult {
     );
     for tick in 1..=78 {
         w.h.advance(secs(5));
-        w.complete(
-            Some(source(1)?),
-            X86,
-            3,
-            Some(secs(20)),
-            cpu_reservation(),
-        );
+        w.complete(Some(source(1)?), X86, 3, Some(secs(20)), cpu_reservation());
         if tick % 6 == 0 {
-            w.complete(
-                Some(source(2)?),
-                X86,
-                4,
-                Some(secs(30)),
-                cpu_reservation(),
-            );
+            w.complete(Some(source(2)?), X86, 4, Some(secs(30)), cpu_reservation());
         }
         w.pass();
     }
@@ -682,13 +669,7 @@ fn source_rates_use_the_already_advanced_shared_clock() -> TestResult {
     w.h.advance(secs(4 * 3600));
     w.pass();
     w.h.advance(secs(1));
-    w.complete(
-        Some(source(1)?),
-        X86,
-        16,
-        Some(secs(30)),
-        cpu_reservation(),
-    );
+    w.complete(Some(source(1)?), X86, 16, Some(secs(30)), cpu_reservation());
     w.pass();
     assert!(w.h.snapshot.source_rates[0].created_at >= Tick::from_elapsed(secs(4 * 3600)));
     assert!(w.h.outlook(X86)?.backlog.unwrap_or_default().is_zero());
@@ -713,13 +694,7 @@ fn open_loop_backlog_scales_with_resource_demand() -> TestResult {
     for batch in 1..=44 {
         let queue = batch * 4;
         w.h.advance(secs(20));
-        w.complete(
-            Some(source(1)?),
-            X86,
-            16,
-            Some(secs(20)),
-            cpu_reservation(),
-        );
+        w.complete(Some(source(1)?), X86, 16, Some(secs(20)), cpu_reservation());
         w.h.snapshot.queued.clear();
         // Each running and queued reservation consumes one vCPU.
         w.running(
@@ -735,8 +710,16 @@ fn open_loop_backlog_scales_with_resource_demand() -> TestResult {
         let steps = w.run();
         assert_eq!(w.h.outlook(X86)?.needed, needed);
         if needed > from {
-            assert_eq!(purchases(&steps), vec![(X86, from, needed, NeedCause::Demand)]);
-            w.h.launch(X86, &format!("pending-{needed}"), InstanceLifecycle::Pending, Duration::ZERO)?;
+            assert_eq!(
+                purchases(&steps),
+                vec![(X86, from, needed, NeedCause::Demand)]
+            );
+            w.h.launch(
+                X86,
+                &format!("pending-{needed}"),
+                InstanceLifecycle::Pending,
+                Duration::ZERO,
+            )?;
         } else {
             assert!(
                 purchases(&steps).is_empty(),
@@ -745,7 +728,10 @@ fn open_loop_backlog_scales_with_resource_demand() -> TestResult {
         }
         all_steps.extend(steps);
     }
-    assert_eq!(purchases(&all_steps).last(), Some(&(X86, 5, 6, NeedCause::Demand)));
+    assert_eq!(
+        purchases(&all_steps).last(),
+        Some(&(X86, 5, 6, NeedCause::Demand))
+    );
     assert_eq!(w.h.supply(X86)?.desired, 6);
     Ok(())
 }
@@ -828,7 +814,13 @@ fn final_dispatch_queue_order_changes_wait_but_not_scale_decisions() -> TestResu
         decisions.push(purchases(&w.pass()));
         waits.push(w.h.outlook(X86)?.expected_wait);
     }
-    assert_eq!(decisions, vec![vec![(X86, 1, 2, NeedCause::Demand)], vec![(X86, 1, 2, NeedCause::Demand)]]);
+    assert_eq!(
+        decisions,
+        vec![
+            vec![(X86, 1, 2, NeedCause::Demand)],
+            vec![(X86, 1, 2, NeedCause::Demand)]
+        ]
+    );
     assert_eq!(waits, vec![Some(secs(45)), Some(secs(1))]);
     Ok(())
 }

@@ -1545,7 +1545,8 @@ mod tests {
         scene.member(0, "busy", InstanceLifecycle::InService, true);
         let mut running = executing(0, Some(Duration::from_secs(100)));
         running.resources.cpu_millicores = MILLICORES_PER_CORE;
-        let mut waiting = queued(&[0], None);
+        // Keep work beyond readiness so both instance buffers contain reservations.
+        let mut waiting = queued(&[0], Some(Duration::from_secs(100)));
         waiting.resources.cpu_millicores = MILLICORES_PER_CORE;
         scene.snapshot(
             SchedulerSnapshot {

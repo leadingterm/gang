@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-use gang_types::{AuthenticationSettings, CaPin, Isa, NonZeroDuration, ProviderName, Url, property};
+use gang_types::{
+    AuthenticationSettings, CaPin, Isa, NonZeroDuration, ProviderName, Url, property,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::actions::ActionsConfig;
