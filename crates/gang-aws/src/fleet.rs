@@ -1156,13 +1156,21 @@ mod tests {
                 "scratch_mount_point": "/mnt/scratch",
                 "activity_limit": 101
             }))?;
+            let autoscaling = aws_sdk_autoscaling::Client::new(&sdk);
             let events = Events::new(
                 &sdk,
                 &config,
                 harness.clock.clone(),
                 Arc::new(crate::events::Managed::default()),
+                autoscaling.clone(),
             );
-            let fleets = Fleets::new(&sdk, harness.clock.clone(), CooldownPolicy::Ignore, events);
+            let fleets = Fleets::new(
+                &sdk,
+                harness.clock.clone(),
+                CooldownPolicy::Ignore,
+                events,
+                autoscaling,
+            );
             fleets.supply(fleet.view(), &mut supply).await?;
             assert_eq!(supply.launch_failure, None);
             assert_eq!(supply.abandoned, 0);
