@@ -25,6 +25,7 @@ In production a viewer signs in through `[dashboard.login]` and sees data only w
 - [`docs/PLAN.md`](docs/PLAN.md): architecture pillars, crate graph, and implementation sequence with its verification gates.
 - [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md): configuration, ports, plugins, identity, the reconciler, and the gates.
 - [`docs/API.md`](docs/API.md): the HTTP API reference: routes, bodies, examples, and errors.
+- [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md): contributor workflow and merging with GitHub's merge queue.
 - [`docs/adr`](docs/adr): the architecture decision records.
 
 ## Build
