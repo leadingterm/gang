@@ -38,6 +38,15 @@ output "load_balancer_dns_name" {
   value       = one(module.load_balancer[*].dns_name)
 }
 
+output "controller_target_group_arns" {
+  description = "Controller target groups checked after deploy."
+  value = var.load_balancer == null ? [] : compact([
+    module.load_balancer[0].serve_target_group_arn,
+    module.load_balancer[0].internal_serve_target_group_arn,
+    module.load_balancer[0].workers_target_group_arn,
+  ])
+}
+
 output "certificate_validation_records" {
   description = "DNS records that validate the endpoint certificate; publish them where the hostname's zone is served. Empty without load_balancer."
   value       = var.load_balancer == null ? [] : module.load_balancer[0].certificate_validation_records

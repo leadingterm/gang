@@ -17,11 +17,12 @@
 #         plan_prefix: plans
 #         runner: ubuntu-24.04-arm
 #         gang_sha256: <SHA-256 of gang-aarch64-unknown-linux-musl, from the release's SHA256SUMS>
+#         remote_build_workflow: remote-build.yml
 #       permissions:
 #         contents: read
 #         id-token: write
 #         pull-requests: write
-#         actions: read
+#         actions: write
 #
 # One call per repository; the manifest, comment marker and plan key do not name a root.
 # The specification (docs/SPECIFICATION.md 8.5) describes the plan and apply jobs.
@@ -87,6 +88,10 @@ on:
         description: "Runner label of every job."
         type: string
         default: ubuntu-24.04
+      remote_build_workflow:
+        description: "Caller workflow_dispatch filename that accepts a salt input and performs a real remote build."
+        type: string
+        default: remote-build.yml
 
 permissions:
   contents: read
@@ -197,7 +202,7 @@ jobs:
     permissions: &apply_permissions
       contents: read
       id-token: write
-      actions: read
+      actions: write
       pull-requests: read
     concurrency: &apply_concurrency
       group: deploy-apply-${{ github.repository }}
@@ -248,6 +253,17 @@ jobs:
         run: .gang/infra/scripts/reviewed-plan.sh apply
       - name: Confirm convergence
         run: .gang/infra/scripts/reviewed-plan.sh converge
+      - name: Verify server version and controller targets
+        timeout-minutes: 45
+        env:
+          GANG_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: .gang/infra/scripts/verify-deployment.sh
+      - name: Verify a real remote build
+        timeout-minutes: 125
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REMOTE_BUILD_WORKFLOW: ${{ inputs.remote_build_workflow }}
+        run: .gang/infra/scripts/verify-remote-build.sh
 
   apply_without_environment:
     needs: validate
