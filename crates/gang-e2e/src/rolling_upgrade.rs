@@ -1021,7 +1021,7 @@ struct Promotion {
 #[derive(Debug)]
 struct RolloutWitness {
     old_exited: bool,
-    old_fleet_empty: bool,
+    old_workers_remaining: usize,
     old_client_current: bool,
     candidate_client_current: bool,
 }
@@ -1029,7 +1029,7 @@ struct RolloutWitness {
 impl RolloutWitness {
     fn valid(&self) -> bool {
         self.old_exited
-            && self.old_fleet_empty
+            && self.old_workers_remaining == 0
             && self.old_client_current
             && self.candidate_client_current
     }
@@ -1409,17 +1409,21 @@ impl Upgrade<'_> {
         let entries = process::snapshot();
         let workers =
             process::workers_of(&entries, &self.cluster.stack().placement().config_file());
-        let mut old_fleet_empty = true;
+        let mut old_workers_remaining = 0;
         for worker in workers {
             match fs::canonicalize(format!("/proc/{}/exe", worker.pid)) {
-                Ok(executable) => old_fleet_empty &= executable != old_binary,
+                Ok(executable) => {
+                    if executable == old_binary {
+                        old_workers_remaining += 1;
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(E2eError::io("observing fleet worker executable")(error)),
             }
         }
         let rollout = RolloutWitness {
             old_exited,
-            old_fleet_empty,
+            old_workers_remaining,
             old_client_current: current_executables(
                 &old_post.attempts,
                 &old_post.executables,
@@ -1864,7 +1868,7 @@ mod tests {
         let drain = DrainWitness::default();
         let rollout = RolloutWitness {
             old_exited: true,
-            old_fleet_empty: true,
+            old_workers_remaining: 0,
             old_client_current: true,
             candidate_client_current: true,
         };
@@ -1915,7 +1919,7 @@ mod tests {
         input.procedure = UpgradeProcedure::PreStop;
         assert!(final_verdict(&input).iter().all(Check::is_passed));
         let stale_remains = RolloutWitness {
-            old_fleet_empty: false,
+            old_workers_remaining: 1,
             ..rollout
         };
         input.rollout = &stale_remains;

@@ -641,18 +641,11 @@ fn query_operation(
     params: &Parameters,
 ) -> Result<String, FakeFailure> {
     match action {
-        "DescribeLifecycleHooks" => {
-            let group = required(params, "AutoScalingGroupName")?;
-            let mut hooks = String::new();
-            for (name, transition) in state.lifecycle_hooks.get(group).into_iter().flatten() {
-                write!(hooks, "<member><LifecycleHookName>{name}</LifecycleHookName><AutoScalingGroupName>{group}</AutoScalingGroupName><LifecycleTransition>{transition}</LifecycleTransition></member>").expect("writing to a String cannot fail");
-            }
-            Ok(query_ok(
-                QueryService::AutoScaling,
-                action,
-                Some(&format!("<LifecycleHooks>{hooks}</LifecycleHooks>")),
-            ))
-        }
+        "DescribeLifecycleHooks" => Ok(query_ok(
+            QueryService::AutoScaling,
+            action,
+            Some(&describe_lifecycle_hooks(state, params)?),
+        )),
         "CompleteLifecycleAction" => {
             let no_action = || invalid("no active lifecycle action");
             let group_name = params.get("AutoScalingGroupName").ok_or_else(no_action)?;
@@ -742,6 +735,15 @@ fn query_operation(
             message: UNKNOWN_OPERATION,
         }),
     }
+}
+
+fn describe_lifecycle_hooks(state: &FakeState, params: &Parameters) -> Result<String, FakeFailure> {
+    let group = required(params, "AutoScalingGroupName")?;
+    let mut hooks = String::new();
+    for (name, transition) in state.lifecycle_hooks.get(group).into_iter().flatten() {
+        write!(hooks, "<member><LifecycleHookName>{name}</LifecycleHookName><AutoScalingGroupName>{group}</AutoScalingGroupName><LifecycleTransition>{transition}</LifecycleTransition></member>").expect("writing to a String cannot fail");
+    }
+    Ok(format!("<LifecycleHooks>{hooks}</LifecycleHooks>"))
 }
 
 fn describe_groups(state: &FakeState, params: &Parameters) -> String {
