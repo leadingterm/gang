@@ -1900,6 +1900,69 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn configured_cpu_percentile_shapes_restored_history() -> TestResult {
+        let config = default_config();
+        let fleets = x86_and_arm_fleets();
+        let median_actions = Arc::new(gang_config::ActionsConfig::default());
+        let high_actions = Arc::new(gang_config::ActionsConfig {
+            cpu_reservation_percentile: gang_types::Percent::from_percent(95),
+            ..Default::default()
+        });
+        let median = stack_with_actions(&fleets, &config, None, &median_actions)?.0;
+        let key = SketchKey::for_attempt(Some("bursty"), None, "");
+        for index in 0..20 {
+            let observation = Observation {
+                cpu_millicores: Some(if index < 18 { 500 } else { 12_000 }),
+                peak_memory_kb: 20_000,
+                peak_disk_kb: 1_536,
+                killed: index == 0,
+                killed_peak_memory_kb: (index == 0).then_some(40_000),
+                now_s: 100,
+                ..Default::default()
+            };
+            assert!(median.sketch.observe(key.clone(), &observation));
+        }
+        let entry = median.sketch.lookup(&key, 100).expect("bursty history");
+        let median_shape = median.sketch.shape(&entry);
+        assert_eq!(median_shape.cpu_count, 1_200);
+        assert_eq!(median_shape.memory_kb, 48_000);
+        assert_eq!(median_shape.disk_kb, 1_844);
+
+        let steady_key = SketchKey::for_attempt(Some("steady"), None, "");
+        assert!(median.sketch.observe(
+            steady_key.clone(),
+            &Observation {
+                cpu_millicores: Some(1_500),
+                now_s: 100,
+                ..Default::default()
+            },
+        ));
+        let steady_entry = median
+            .sketch
+            .lookup(&steady_key, 100)
+            .expect("steady history");
+        assert_eq!(median.sketch.shape(&steady_entry).cpu_count, 1_800);
+
+        let durations = || {
+            Arc::new(Mutex::new(ActionDurations::new(
+                NonZeroUsize::MIN,
+                gang_config::HistoryWindow::from_units(1),
+            )))
+        };
+        let now = gang_clock::Timestamp::from_unix_millis(100_000);
+        let mut records = Vec::new();
+        Histories::new(Arc::clone(&median.sketch), durations()).snapshot(now, &mut records)?;
+        let high = stack_with_actions(&fleets, &config, None, &high_actions)?.0;
+        Histories::new(Arc::clone(&high.sketch), durations()).restore(now, &records)?;
+        let high_entry = high.sketch.lookup(&key, 100).expect("restored history");
+        let high_shape = high.sketch.shape(&high_entry);
+        assert_eq!(high_shape.cpu_count, 14_400);
+        assert_eq!(high_shape.memory_kb, median_shape.memory_kb);
+        assert_eq!(high_shape.disk_kb, median_shape.disk_kb);
+        Ok(())
+    }
+
     fn seed_controller_history(history: &Histories, now: gang_clock::Timestamp) {
         let now_s = now.as_unix_millis() / 1000;
         let key = SketchKey::for_attempt(Some("target"), Some("compile"), "");

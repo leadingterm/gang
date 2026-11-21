@@ -65,6 +65,7 @@ pub(crate) fn scheduler(
         "learn_from_workers": true,
         "cpu_property_name": property::CPU_MILLICORES,
         "headroom_percent": spec.actions.reservation_headroom_percent,
+        "cpu_reservation_percentile": spec.actions.cpu_reservation_percentile,
         "window_days": spec.actions.history_window.as_units(),
         "memory_budget_bytes": spec.actions.history_memory_budget.get().get(),
         "scheduler": { "simple": simple },
@@ -624,14 +625,17 @@ mod tests {
         let content = memory_store();
         let action = memory_store();
         let fleets = catalog();
-        let scheduler =
-            scheduler(&config(), &controller_spec(&content, &action, &fleets)).expect("scheduler");
+        let mut spec = controller_spec(&content, &action, &fleets);
+        std::sync::Arc::make_mut(&mut spec.actions).cpu_reservation_percentile =
+            gang_types::Percent::from_percent(75);
+        let scheduler = scheduler(&config(), &spec).expect("scheduler");
         assert_eq!(scheduler.name, "MAIN_SCHEDULER");
         let SchedulerSpec::HistoricalResource(historical) = &scheduler.spec else {
             panic!("expected historical_resource, got {:?}", scheduler.spec);
         };
         assert!(historical.learn_from_workers);
         assert_eq!(historical.headroom_percent, 20);
+        assert_eq!(historical.cpu_reservation_percentile, 75);
         assert_eq!(historical.window_days, 7);
         assert_eq!(historical.cpu_property_name, property::CPU_MILLICORES);
         assert_eq!(

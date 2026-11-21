@@ -107,6 +107,7 @@ pub fn source_with_cap(
 pub fn tiny_source() -> HistoryFixture {
     let policy = Policy {
         headroom_percent: 25,
+        cpu_reservation_percentile: 95,
         classes: Vec::new(),
         reserve_cpu: true,
         reserve_memory: true,

@@ -158,6 +158,7 @@ mod tests {
         let resource = ResourceSketch::with_shards(
             Policy {
                 headroom_percent: 0,
+                cpu_reservation_percentile: 95,
                 classes: vec![],
                 reserve_cpu: true,
                 reserve_memory: true,

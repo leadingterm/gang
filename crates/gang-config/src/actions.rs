@@ -4,7 +4,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 
 use gang_types::{
     BoundedDuration, EnvironmentName, HeadroomPercent, NANOS_PER_SECOND, NonZeroBytes,
-    NonZeroDuration,
+    NonZeroDuration, Percent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -23,8 +23,12 @@ pub struct ActionsConfig {
     /// Server-owned action-cache environment version. Default: `default/1` (existing warm cache).
     /// Bump only when action-visible software changes, never for security-only image rebuilds.
     pub environment: EnvironmentName,
-    /// Percentage added to measured peaks for learning and resource escalation. Default: 20.
+    /// Percentage added to the selected CPU statistic and memory/disk peaks for learning,
+    /// and to measured peaks for resource escalation. Default: 20.
     pub reservation_headroom_percent: HeadroomPercent,
+    /// Percentile (1–100) of completed attempts' lifetime-average CPU used for reservations.
+    /// Default: 50 (median).
+    pub cpu_reservation_percentile: Percent,
     /// Multiplier for the worker's physical CPU reservation capacity. Default: 2.
     pub cpu_oversubscription: NonZeroU32,
     /// History retention, in whole days, at least one day. Default: `7d`.
@@ -57,6 +61,7 @@ impl Default for ActionsConfig {
         Self {
             environment: EnvironmentName::default(),
             reservation_headroom_percent: HeadroomPercent::from_percent(20),
+            cpu_reservation_percentile: Percent::from_percent(50),
             cpu_oversubscription: NonZeroU32::MIN.saturating_add(1),
             history_window: HistoryWindow::from_units(7),
             history_keys: NonZeroUsize::MIN.saturating_add(65_535),

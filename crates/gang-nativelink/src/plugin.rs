@@ -363,6 +363,7 @@ mod tests {
         let sketch = Arc::new(ResourceSketch::with_shards(
             Policy {
                 headroom_percent: 0,
+                cpu_reservation_percentile: 95,
                 classes: Vec::new(),
                 reserve_cpu: true,
                 reserve_memory: true,
