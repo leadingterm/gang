@@ -1331,7 +1331,7 @@ phaseTime: Timestamp,
  */
 running: number, 
 /**
- * How many actions the worker may run at once; absent when unknown.
+ * Optional observed action cap; absent for unlimited long-lived workers.
  */
 slots?: number, 
 /**

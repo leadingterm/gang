@@ -559,7 +559,11 @@ fn zero_horizon_fractional_demand_reopens_busy_drain_above_waterline() -> TestRe
     assert_eq!(w.h.outlook(X86)?.needed, 1);
     assert_eq!(
         changes(&steps),
-        vec![Change::Cancel(X86, "local-draining".into(), NeedCause::Demand)]
+        vec![Change::Cancel(
+            X86,
+            "local-draining".into(),
+            NeedCause::Demand
+        )]
     );
     Ok(())
 }
@@ -608,7 +612,11 @@ fn projected_wait_resumes_only_owned_unordered_nonterminating_workers() -> TestR
             })
             .collect();
         assert_eq!(resumed, vec!["local-owned"], "{excluded}");
-        assert_eq!(w.h.outlook(X86)?.expected_wait, Some(secs(30)), "{excluded}");
+        assert_eq!(
+            w.h.outlook(X86)?.expected_wait,
+            Some(secs(30)),
+            "{excluded}"
+        );
     }
     Ok(())
 }
@@ -649,7 +657,11 @@ fn projected_wait_and_rescue_share_busiest_release_and_worker_id_order() -> Test
             vec![Change::Cancel(X86, "local-1".into(), NeedCause::Demand)],
             "{priority}",
         );
-        assert_eq!(w.h.outlook(X86)?.expected_wait, Some(secs(30)), "{priority}");
+        assert_eq!(
+            w.h.outlook(X86)?.expected_wait,
+            Some(secs(30)),
+            "{priority}"
+        );
     }
     Ok(())
 }

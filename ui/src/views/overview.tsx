@@ -90,7 +90,9 @@ const Meter = ({ f, g, label }: { f?: number; g: number; label?: string }) => (
 
 const Readouts = ({ state }: { state: State }) => {
   const running = sum(state.fleets, (f) => f.demand.running);
-  const slots = sum(state.workers, (w) => w.slots ?? 0);
+  const slots = state.workers.length > 0 && state.workers.every((w) => w.slots !== undefined)
+    ? sum(state.workers, (w) => w.slots ?? 0)
+    : undefined;
   const inService = sum(state.fleets, (f) => f.instances.inService);
   const max = sum(state.fleets, (f) => f.policy.max);
   const spot = sum(
@@ -120,8 +122,8 @@ const Readouts = ({ state }: { state: State }) => {
       />
       <Tile
         label="Executing"
-        value={<><Num value={running} /><span class="readout__of">/{slots}</span></>}
-        meter={<Meter g={slots ? running / slots : 0} />}
+        value={<><Num value={running} />{slots !== undefined && <span class="readout__of">/{slots}</span>}</>}
+        meter={slots !== undefined ? <Meter g={slots ? running / slots : 0} /> : undefined}
         chart={<ChartFrame size="spark"><Spark values={runningSeries(state.recent)} label="Executing" recent={state.recent} /></ChartFrame>}
       />
       <Tile

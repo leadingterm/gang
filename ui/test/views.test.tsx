@@ -403,10 +403,57 @@ test("fleet details show rate diagnostics independently, preserving zero and uni
   t.assert.doesNotMatch(details(undefined, undefined, 1), /<dt>load<\/dt>|<dt>backlog<\/dt>/);
 });
 
+const executingReadout = (state: typeof live): string =>
+  /<h2 class="label">Executing<\/h2>[\s\S]*?(?=<div class="readout">)/.exec(html({ state }, <Overview />))?.[0] ?? "";
+
+for (const [name, caps] of [
+  ["unlimited workers", [undefined]],
+  ["mixed bounded and unlimited workers", [1, undefined]],
+  ["no workers", []],
+] as const) {
+  test(`overview shows only the executing count with ${name}`, (t) => {
+    const fleet = live.fleets[0];
+    const worker = live.workers[0];
+    if (!fleet || !worker) throw new Error("the live recording has a fleet and worker");
+    const { slots: _slots, ...unlimited } = worker;
+    const state = {
+      ...live,
+      fleets: [{ ...fleet, demand: { ...fleet.demand, running: 24 } }],
+      workers: caps.map((slots, i) => ({ ...unlimited, name: `workers/executing-${i}`, ...(slots !== undefined ? { slots } : {}) })),
+    };
+    const readout = executingReadout(state);
+    t.assert.match(readout, /<div class="readout__big"><span[^>]*>24<\/span><\/div>/);
+    t.assert.doesNotMatch(readout, /readout__of|class="meter"/);
+    t.assert.match(readout, /aria-label="Executing"/);
+  });
+}
+
+test("overview retains executing capacity and meters for bounded workers", (t) => {
+  const fleet = live.fleets[0];
+  const worker = live.workers[0];
+  if (!fleet || !worker) throw new Error("the live recording has a fleet and worker");
+  for (const [caps, running, capacity, fraction] of [
+    [[4, 8], 6, 12, 0.5],
+    [[1], 1, 1, 1],
+    [[0], 0, 0, 0],
+  ] as const) {
+    const state = {
+      ...live,
+      fleets: [{ ...fleet, demand: { ...fleet.demand, running } }],
+      workers: caps.map((slots, i) => ({ ...worker, name: `workers/executing-${i}`, slots })),
+    };
+    const readout = executingReadout(state);
+    t.assert.match(readout, new RegExp(`<div class="readout__big"><span[^>]*>${running}</span><span class="readout__of">/${capacity}</span></div>`));
+    t.assert.match(readout, /class="meter"/);
+    t.assert.match(readout, new RegExp(`--g:\\s*${fraction}(?:;|")`));
+  }
+});
+
 test("worker rows and details show running counts without an observed cap", (t) => {
   const worker = live.workers[0];
   if (!worker) throw new Error("the live recording has a worker");
-  const unlimited = { ...worker, slots: undefined, running: 3 };
+  const { slots: _slots, ...uncapped } = worker;
+  const unlimited = { ...uncapped, running: 3 };
   const state = { ...live, workers: [unlimited] };
   const row = html({ state }, <Workers />);
   const detail = html({ state }, <WorkerDetail w={unlimited} state={state} />);
