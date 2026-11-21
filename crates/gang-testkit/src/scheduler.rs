@@ -16,10 +16,10 @@ use gang_spi::{
     ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService, BoxedConnection,
     ControllerConnections, ControllerEndpoints, ControllerReady, ControllerSpec, FleetSupply,
     GateDecision, LeaderUnavailable, LearnedHistory, Listening, ListingLimits, Peer, PortError,
-    RecordKind, Rejection, RequestGate, RequestScope, SchedulerPort, SchedulerSnapshot, Slots,
+    RecordKind, Rejection, RequestGate, RequestScope, SchedulerPort, SchedulerSnapshot,
     WorkerSpec, WorkerTls, full_body,
 };
-use gang_types::{Bytes, FleetName, FleetProperties, InstanceId};
+use gang_types::{Bytes, FleetName, FleetProperties, InstanceId, WorkerLifetime};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot, watch};
 use url::Url;
@@ -312,8 +312,8 @@ pub struct RecordedSpec {
     pub instance: InstanceId,
     /// The properties the worker registers with the scheduler.
     pub properties: FleetProperties,
-    /// How many actions the worker takes at once and whether it serves one only.
-    pub slots: Slots,
+    /// Whether the worker serves one action or remains available for more.
+    pub lifetime: WorkerLifetime,
     /// The directory actions are built in.
     pub work_directory: PathBuf,
     /// The fast content-addressed store directory.
@@ -1091,7 +1091,7 @@ impl SchedulerPort for FakeScheduler {
                 memory_pool: spec.memory_pool.clone(),
                 instance: spec.instance.clone(),
                 properties: spec.properties.clone(),
-                slots: spec.slots,
+                lifetime: spec.lifetime,
                 work_directory: spec.work_directory.clone(),
                 fast_cas_directory: spec.fast_cas_directory.clone(),
                 fast_cas_budget: spec.fast_cas_budget,
@@ -1127,7 +1127,6 @@ impl SchedulerPort for FakeScheduler {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
     use std::path::Path;
 
     use futures::FutureExt;
@@ -1218,7 +1217,7 @@ mod tests {
                 memory_pool: None,
                 instance: self.instance.clone(),
                 properties: self.properties.clone(),
-                slots: Slots::LongLived(NonZeroU32::MIN.saturating_add(3)),
+                lifetime: WorkerLifetime::LongLived,
                 work_directory: PathBuf::from("/work"),
                 fast_cas_directory: PathBuf::from("/cas"),
                 fast_cas_budget: Bytes::new(GIB),
@@ -1654,10 +1653,7 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         let first = recorded.first().ok_or("one spec is recorded")?;
         assert_eq!(first.instance, fixture.instance);
-        assert_eq!(
-            first.slots,
-            Slots::LongLived(NonZeroU32::MIN.saturating_add(3))
-        );
+        assert_eq!(first.lifetime, WorkerLifetime::LongLived);
         assert_eq!(first.work_directory, Path::new("/work"));
         assert_eq!(first.tls, RecordedTls::Plain);
         Ok(())

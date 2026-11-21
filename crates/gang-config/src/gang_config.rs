@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-use gang_types::{AuthenticationSettings, CaPin, Isa, NonZeroDuration, ProviderName, Url};
+use gang_types::{AuthenticationSettings, CaPin, Isa, NonZeroDuration, ProviderName, Url, property};
 use serde::{Deserialize, Serialize};
 
 use crate::actions::ActionsConfig;
@@ -264,13 +264,14 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
         let cold = &actions.cold_start;
         let fits = fleets.policies().iter().any(|fleet| {
             let effective = fleet.actions.resources.effective(fleet.instance());
-            effective.vcpus >= cold.cpu_count.get()
+            u64::from(effective.vcpus) * property::MILLICORES_PER_CORE
+                >= u64::from(cold.cpu_millicores.get())
                 && effective.memory.get() >= cold.memory.as_units() * 1024
                 && effective.disk.get() >= cold.disk.as_units() * 1024
         });
         if cold.enabled && !fits {
             return Err(ConfigError::ColdStartFitsNoFleet {
-                cpu_count: cold.cpu_count.get(),
+                cpu_millicores: cold.cpu_millicores.get(),
                 memory_kb: cold.memory.as_units(),
                 disk_kb: cold.disk.as_units(),
             });

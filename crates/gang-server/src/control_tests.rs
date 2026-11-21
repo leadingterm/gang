@@ -2128,16 +2128,14 @@ async fn audit_failure_still_counts_the_step_as_applied() -> Result<(), PortErro
 }
 
 #[tokio::test]
-async fn overflow_purchase_depends_on_queued_work_not_other_fleet_execution_duration() -> TestResult
-{
-    // The first candidate is reachable, so there is no floor purchase on the second fleet.
-    // Its 10s unknown backlog is below s*H = 4 * (30s + 15s) / 2 = 90 action-seconds;
-    // a known 120s queued action exceeds that threshold, regardless of the first fleet's work.
-    for (seconds, queued_duration, applied) in [
-        (2, None, 0),
-        (60, None, 0),
-        (2, Some(Duration::from_mins(2)), 1),
-        (60, Some(Duration::from_mins(2)), 1),
+async fn overflow_resource_demand_is_independent_of_execution_duration() -> TestResult {
+    // Four vCPUs of reservations fill the first worker without oversubscription.
+    // Doubling its CPU capacity keeps the queued reservation on that worker instead.
+    for (seconds, queued_duration, factor, applied) in [
+        (2, None, 1, 1),
+        (60, Some(Duration::from_mins(2)), 1, 1),
+        (2, None, 2, 0),
+        (60, Some(Duration::from_mins(2)), 2, 0),
     ] {
         let clock = clock_at(1_000_000);
         let fleet = FakeProvisioner::default();
@@ -2149,6 +2147,7 @@ async fn overflow_purchase_depends_on_queued_work_not_other_fleet_execution_dura
         fleet.set_supply(&first, supply_with("first-1", clock.wall(), 1));
         let mut queued = queued_demand(FleetSet::prefix(2).map_err(PortError::backend)?);
         queued.expected = queued_duration;
+        queued.resources.cpu_millicores = 1_000;
         scheduler.set_snapshot(SchedulerSnapshot {
             workers: vec![WorkerState {
                 fleet: first.clone(),
@@ -2160,7 +2159,10 @@ async fn overflow_purchase_depends_on_queued_work_not_other_fleet_execution_dura
                 .map(|_| ExecutingDemand {
                     source: None,
                     candidates: FleetSet::prefix(1).expect("one fleet is valid"),
-                    resources: gang_types::ActionResources::default(),
+                    resources: gang_types::ActionResources {
+                        cpu_millicores: 1_000,
+                        ..Default::default()
+                    },
                     worker: 0,
                     started: clock.wall(),
                     expected: Some(Duration::from_secs(seconds)),
@@ -2168,12 +2170,14 @@ async fn overflow_purchase_depends_on_queued_work_not_other_fleet_execution_dura
                 .collect(),
             ..SchedulerSnapshot::default()
         });
+        let mut settings = crate::control::ControlSettings::new(
+            POLL_INTERVAL,
+            &gang_config::DashboardConfig::default(),
+        );
+        settings.cpu_oversubscription = gang_types::nonzero_u32(factor);
         let mut control = ControlLoop::new(
             &fleets,
-            crate::control::ControlSettings::new(
-                POLL_INTERVAL,
-                &gang_config::DashboardConfig::default(),
-            ),
+            settings,
             Arc::new(gang_config::ScalingConfig::default()),
             source_profiles(),
             &crate::control::ControlPorts {

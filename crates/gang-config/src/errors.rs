@@ -60,12 +60,12 @@ pub enum ConfigError {
     },
     /// No fleet can fit the configured cold-start reservation.
     #[error(
-        "actions.cold_start cpu_count {cpu_count}, memory {memory_kb} KiB and disk {disk_kb} KiB fit no fleet"
+        "actions.cold_start cpu_millicores {cpu_millicores}, memory {memory_kb} KiB and disk {disk_kb} KiB fit no fleet"
     )]
     #[fix("lower the cold-start reservation or configure a fleet that fits it")]
     ColdStartFitsNoFleet {
-        /// Reserved CPUs.
-        cpu_count: u32,
+        /// Reserved CPU in millicores.
+        cpu_millicores: u32,
         /// Reserved memory in KiB.
         memory_kb: u64,
         /// Reserved disk in KiB.

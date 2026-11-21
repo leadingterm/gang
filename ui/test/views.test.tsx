@@ -283,7 +283,7 @@ test("a minimum cause is shown without caution styling", (t) => {
 });
 
 test("a utilization cordon explains the dwell without caution styling", (t) => {
-  const row = render(<EventRow withCause e={{ ...common, cause: "UTILIZATION", drainStarted: { worker: `workers/${WORKER}`, detail: "load 0.0 slots" } }} />);
+  const row = render(<EventRow withCause e={{ ...common, cause: "UTILIZATION", drainStarted: { worker: `workers/${WORKER}`, detail: "load 0.0 worker-equivalents" } }} />);
   t.assert.match(row, /<span class="event__cause">measured fleet load stayed below the waterline for the dwell<\/span>/);
   t.assert.doesNotMatch(row, /caution/);
 });
@@ -390,12 +390,12 @@ test("fleet details show rate diagnostics independently, preserving zero and uni
       ...(utilization !== undefined ? { utilization } : {}),
     } }} />);
   const all = details(125, "42s", 735);
-  t.assert.match(all, /<dt>load<\/dt><dd>12\.5 slots<\/dd>/);
-  t.assert.match(all, /<dt>backlog<\/dt><dd><time>42s<\/time><\/dd>/);
+  t.assert.match(all, /<dt>load<\/dt><dd>12\.5 worker-equivalents<\/dd>/);
+  t.assert.match(all, /<dt>backlog<\/dt><dd>42 worker-equivalent-seconds<\/dd>/);
   t.assert.match(all, /<dt>utilization<\/dt><dd>73\.5%<\/dd>/);
   const zero = details(0, "0s", 0);
-  t.assert.match(zero, /<dt>load<\/dt><dd>0\.0 slots<\/dd>/);
-  t.assert.match(zero, /<dt>backlog<\/dt><dd><time>0s<\/time><\/dd>/);
+  t.assert.match(zero, /<dt>load<\/dt><dd>0\.0 worker-equivalents<\/dd>/);
+  t.assert.match(zero, /<dt>backlog<\/dt><dd>0 worker-equivalent-seconds<\/dd>/);
   t.assert.match(zero, /<dt>utilization<\/dt><dd>0%<\/dd>/);
   t.assert.doesNotMatch(details(), /<dt>load<\/dt>|<dt>backlog<\/dt>|<dt>utilization<\/dt>/);
   t.assert.doesNotMatch(details(1), /<dt>backlog<\/dt>|<dt>utilization<\/dt>/);

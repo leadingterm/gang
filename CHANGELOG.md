@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Scale out to the greater of the fleet minimum and the CPU, memory, or disk reservation need, capped by the fleet maximum. CPU capacity includes `[actions] cpu_oversubscription` (default `2`); rate and payback estimates no longer hold scale-out below resource demand. Expected wait and N−1 scale-in use resource capacity, not nominal action slots.
+
+### Removed
+
+- Remove `target_actions_per_instance` from fleet configuration and Terraform fleet inputs, and remove `targetActions` from the fleet policy state API. Operators must delete the setting from existing configuration and Terraform inputs before upgrading; dashboard/API clients must stop reading `targetActions`. There is no replacement action-count limit. Long-lived workers have no fixed in-flight limit; single-use workers retain their lifecycle.
+
 ## 0.3.4
 
 ### Added

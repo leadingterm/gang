@@ -139,7 +139,6 @@ variables {
     vcpus_per_instance          = 2
     memory_per_instance         = "4GiB"
     disk_per_instance           = "20GiB"
-    target_actions_per_instance = 2
   }]
 }
 

@@ -439,10 +439,7 @@ fn leader_failover_preset_renders_only_the_service_prior() -> gang_e2e::Result<(
     for (fleet, before) in leader.fleets.iter().zip(&baseline.fleets) {
         assert_eq!(fleet.min_instances, before.min_instances);
         assert_eq!(fleet.max_instances, before.max_instances);
-        assert_eq!(
-            fleet.target_actions_per_instance,
-            before.target_actions_per_instance
-        );
+        assert_eq!(fleet.vcpus_per_instance, before.vcpus_per_instance);
         assert_eq!(fleet.idle_timeout, before.idle_timeout);
         assert_eq!(fleet.boot_grace, before.boot_grace);
         assert_eq!(fleet.max_drain_wait, before.max_drain_wait);
@@ -515,8 +512,8 @@ fn rate_scaling_presets_render_typed_knobs() -> gang_e2e::Result<()> {
             control.idle_timeout.expect("preset idle timeout")
         );
         assert_eq!(
-            document.fleets[0].target_actions_per_instance.get(),
-            control.target_actions_per_instance.expect("preset target")
+            document.fleets[0].vcpus_per_instance.get(),
+            control.vcpus_per_instance.expect("preset vcpus")
         );
     }
     Ok(())
@@ -537,16 +534,6 @@ fn database_outage_preset_justifies_follower_work_before_partition_heals() -> ga
         document.dashboard.detail_interval.get(),
         std::time::Duration::from_secs(1),
     );
-    for fleet in &document.fleets {
-        assert_eq!(fleet.target_actions_per_instance.get(), 2);
-        let boot = document.scaling.readiness_prior.get().min(fleet.boot_grace);
-        let horizon = (boot + fleet.idle_timeout) / 2;
-        // Conservatively credit two two-slot instances throughout B and H.
-        // Four unknown queued actions must still pay for another two-slot worker.
-        let work = 4 * document.scaling.unknown_action_duration.get().as_nanos();
-        let credited = 4 * (boot + horizon).as_nanos();
-        assert!(work > credited + 2 * horizon.as_nanos());
-    }
     Ok(())
 }
 
@@ -1190,13 +1177,6 @@ fn fleets_preset_justifies_overflow_without_changing_placement_or_polling() -> g
             assert_eq!(fleet.idle_timeout, std::time::Duration::from_secs(2));
             assert_eq!(fleet.max_drain_wait, before.max_drain_wait);
             assert_eq!(fleet.boot_grace, before.boot_grace);
-            assert_eq!(fleet.target_actions_per_instance.get(), 1);
-            let boot = tuned.scaling.readiness_prior.get().min(fleet.boot_grace);
-            let horizon = (boot + fleet.idle_timeout) / 2;
-            assert!(
-                tuned.scaling.unknown_action_duration.get().as_nanos() >= 2 * horizon.as_nanos(),
-                "one queued action must justify another whole slot after crediting the planned slot",
-            );
         }
         let ProvisionerConfig::Local(local) = tuned.provisioner else {
             panic!("local provisioner expected");
@@ -1384,7 +1364,6 @@ fn placement_small_fleet_keeps_the_base_sizing_and_holds_one_instance() -> gang_
     assert_eq!(small.disk_per_instance, gang_types::NonZeroBytes::gib(20));
     assert_eq!(small.min_instances, 0);
     assert_eq!(small.max_instances.get(), 1);
-    assert_eq!(small.target_actions_per_instance.get(), 1);
     Ok(())
 }
 
@@ -1399,7 +1378,6 @@ fn placement_large_fleet_doubles_the_size_under_the_same_sandbox() -> gang_e2e::
     assert_eq!(large.disk_per_instance, gang_types::NonZeroBytes::gib(20));
     assert_eq!(large.min_instances, 0);
     assert_eq!(large.max_instances.get(), 2);
-    assert_eq!(large.target_actions_per_instance.get(), 1);
     Ok(())
 }
 
@@ -1413,7 +1391,6 @@ fn placement_noop_fleet_has_the_small_size_under_the_noop_sandbox() -> gang_e2e:
     assert_eq!(noop.memory_per_instance, gang_types::NonZeroBytes::gib(8));
     assert_eq!(noop.disk_per_instance, gang_types::NonZeroBytes::gib(20));
     assert_eq!(noop.max_instances.get(), 1);
-    assert_eq!(noop.target_actions_per_instance.get(), 1);
     Ok(())
 }
 

@@ -401,8 +401,8 @@ struct SimFleet {
     memory_kb: u64,
     /// The most instances the fleet runs.
     max_instances: u32,
-    /// The concurrent actions one instance runs.
-    actions_per_instance: u32,
+    /// Physical vCPUs per instance; each simulated action reserves one vCPU.
+    vcpus_per_instance: u32,
 }
 
 impl SimFleet {
@@ -411,14 +411,14 @@ impl SimFleet {
         sandbox: Sandbox,
         memory_kb: u64,
         max_instances: u32,
-        actions_per_instance: u32,
+        vcpus_per_instance: u32,
     ) -> Self {
         Self {
             name,
             sandbox,
             memory_kb,
             max_instances,
-            actions_per_instance,
+            vcpus_per_instance,
         }
     }
 
@@ -431,9 +431,9 @@ impl SimFleet {
                 .is_none_or(|sandbox| sandbox == self.sandbox)
     }
 
-    /// How many actions the fleet runs at its instance limit.
+    /// Fleet CPU capacity, in simulated one-vCPU reservations.
     fn capacity(&self) -> u32 {
-        self.max_instances * self.actions_per_instance
+        self.max_instances * self.vcpus_per_instance
     }
 }
 
@@ -896,7 +896,7 @@ impl Simulation {
                 continue;
             }
             let needed = assigned
-                .div_ceil(fleet.actions_per_instance)
+                .div_ceil(fleet.vcpus_per_instance)
                 .min(fleet.max_instances);
             let numbers: Vec<u32> = (0..needed)
                 .map(|_| {
@@ -1155,13 +1155,12 @@ impl Simulation {
             sandbox: fleet.sandbox.key().to_owned(),
             properties: BTreeMap::new(),
             instance_size: Some(InstanceSize {
-                vcpus: fleet.actions_per_instance,
+                vcpus: fleet.vcpus_per_instance,
                 memory: fleet.memory_kb * 1024,
             }),
             policy: Policy {
                 min: 0,
                 max: fleet.max_instances,
-                target_actions: fleet.actions_per_instance,
                 idle_timeout: Duration::from_secs(15),
                 max_drain_wait: Duration::from_mins(1),
                 boot_grace: Duration::from_secs(30),
@@ -1205,7 +1204,7 @@ impl Simulation {
             phase,
             phase_time: at(0),
             running: 0,
-            slots: Some(fleet.actions_per_instance),
+            slots: None,
             paused: false,
             launch_time: at(0),
             phases: Vec::new(),

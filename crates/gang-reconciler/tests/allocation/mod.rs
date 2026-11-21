@@ -49,7 +49,12 @@ impl World {
             snapshot,
             hosted,
             clock: TestClock::new(h.clock.wall()),
-            reconciler: Reconciler::new(&policies, Arc::clone(&h.scaling), h.profiles.clone()),
+            reconciler: Reconciler::new(
+                &policies,
+                Arc::clone(&h.scaling),
+                h.profiles.clone(),
+                std::num::NonZeroU32::MIN,
+            ),
             plan: Plan::new(),
         }
     }
@@ -227,7 +232,6 @@ fn queued_vector_planning_and_final_dispatch_do_not_allocate_after_warmup() -> T
     let mut primary = policy()?;
     primary.instances =
         InstanceBounds::try_new(0, std::num::NonZeroU32::new(20).ok_or("zero maximum")?)?;
-    primary.target_actions_per_instance = std::num::NonZeroU32::new(16).ok_or("zero target")?;
     primary.boot_grace = Duration::from_secs(150);
     let mut h = Harness::with_policy(primary);
     for name in ["local-1", "local-2"] {

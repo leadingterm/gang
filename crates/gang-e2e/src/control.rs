@@ -3,6 +3,7 @@
 
 use std::fs::{self, DirBuilder};
 use std::io;
+use std::num::NonZeroU32;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::thread;
@@ -34,10 +35,10 @@ pub struct ControlKnobs {
     pub min_instances: Option<u32>,
     /// `max_instances` of every `[[fleets]]` entry.
     pub max_instances: Option<u32>,
-    /// Concurrent actions targeted per instance in every fleet.
-    pub target_actions_per_instance: Option<u32>,
     /// Virtual CPUs advertised per instance in every fleet.
     pub vcpus_per_instance: Option<u32>,
+    /// `[actions]` CPU reservation capacity multiplier.
+    pub cpu_oversubscription: Option<NonZeroU32>,
     /// A `[[fleets.scheduled_minimum]]` window in force at every instant (all seven `days`,
     /// `00:00` to `24:00`, `time_zone = "Asia/Kathmandu"`) with this many `instances`, on every
     /// `[[fleets]]` entry.
@@ -81,8 +82,8 @@ impl ControlKnobs {
         max_drain_wait: None,
         min_instances: None,
         max_instances: None,
-        target_actions_per_instance: None,
         vcpus_per_instance: None,
+        cpu_oversubscription: None,
         scheduled_minimum: None,
         terminate_grace: None,
         detail_interval: None,
@@ -175,7 +176,6 @@ impl ControlKnobs {
         idle_timeout: Some(Duration::from_secs(5)),
         min_instances: Some(0),
         max_instances: Some(6),
-        target_actions_per_instance: Some(16),
         vcpus_per_instance: Some(16),
         // All 160 pending Execute RPCs must fit on one connection before launch release;
         // the default limit of 100 can strand the last 60.
@@ -184,13 +184,7 @@ impl ControlKnobs {
         ..Self::NONE
     };
 
-    /// An untrained burst keeps the default scaling prior and a realistic payback horizon.
-    /// The 64 MiB request is raised to the 1 GiB disk minimum; on an 8 GiB fleet
-    /// with 16 slots it weighs two slots, so 160 unknown 10s actions contribute 3200
-    /// slot-seconds.
-    /// The default 90s readiness prior is clamped by the 60s boot grace; with a 10 minute
-    /// idle timeout, the default 50% payback gives a 330s horizon, so 3200/330 is less
-    /// than the first worker's 16 slots.
+    /// An untrained burst uses resource reservations even while the first worker boots.
     pub const COLD_BURST_FROM_ZERO: Self = Self {
         idle_timeout: Some(Duration::from_mins(10)),
         ..Self::BURST_FROM_ZERO
@@ -202,8 +196,8 @@ impl ControlKnobs {
         boot_grace: Some(Duration::from_mins(1)),
         min_instances: Some(1),
         max_instances: Some(3),
-        target_actions_per_instance: Some(2),
         vcpus_per_instance: Some(2),
+        cpu_oversubscription: Some(NonZeroU32::MIN),
         holdable_launches: true,
         ..Self::NONE
     };
@@ -214,7 +208,6 @@ impl ControlKnobs {
         boot_grace: Some(Duration::from_mins(1)),
         min_instances: Some(0),
         max_instances: Some(3),
-        target_actions_per_instance: Some(1),
         vcpus_per_instance: Some(1),
         holdable_launches: true,
         unknown_action_duration: Some(Duration::from_mins(10)),
@@ -230,7 +223,6 @@ impl ControlKnobs {
         idle_timeout: Some(Duration::from_secs(20)),
         min_instances: Some(0),
         max_instances: Some(3),
-        target_actions_per_instance: Some(4),
         vcpus_per_instance: Some(4),
         payback_percent: Some(50),
         load_half_life: Some(Duration::from_secs(2)),
@@ -254,8 +246,8 @@ impl ControlKnobs {
         idle_timeout: Some(Duration::from_mins(5)),
         unknown_action_duration: Some(Duration::from_mins(10)),
         min_instances: Some(1),
-        target_actions_per_instance: Some(8),
         vcpus_per_instance: Some(8),
+        cpu_oversubscription: Some(NonZeroU32::MIN),
         max_drain_wait: Some(Duration::from_mins(3)),
         ..Self::SUSTAINED_STREAM
     };
@@ -266,16 +258,9 @@ impl ControlKnobs {
         ..Self::NONE
     };
 
-    /// Database outage/partition builds: cost-justified held demand makes the follower
-    /// demonstrate a real purchase before the bounded partition heals.
+    /// Database outage/partition builds retain held demand across leader changes.
     pub const DATABASE_OUTAGE: Self = Self {
-        // Partition probes use a fresh mnemonic, so the completed outage build cannot
-        // replace this prior through target or mnemonic duration history.
-        // Cold B=min(90s,60s)=60s and idle=15s give H=50%*(60+15)=37.5s.
-        // Each 600s unknown contributes 16 slots of work/H. Even four remaining
-        // queued probes justify another two-slot instance after existing capacity credit.
         unknown_action_duration: Some(Duration::from_mins(10)),
-        target_actions_per_instance: Some(2),
         detail_interval: Some(Duration::from_secs(1)),
         ..Self::NONE
     };

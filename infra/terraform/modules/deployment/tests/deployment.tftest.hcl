@@ -205,7 +205,6 @@ variables {
       vcpus_per_instance          = 15
       memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
     },
     {
       name                        = "gang-worker-aarch64"
@@ -216,7 +215,6 @@ variables {
       vcpus_per_instance          = 15
       memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
     },
   ]
 }
@@ -265,7 +263,7 @@ run "network_grant_requires_egress" {
       name              = "worker", isa = "x86-64", capacity = "spot"
       instance_types    = ["c6id.4xlarge"]
       max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
-      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      disk_per_instance = "200GiB"
       actions           = { grants = ["network"] }
     }]
   }
@@ -279,7 +277,7 @@ run "rejects_unknown_capability" {
       name              = "worker", isa = "x86-64", capacity = "spot"
       instance_types    = ["c6id.4xlarge"]
       max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
-      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      disk_per_instance = "200GiB"
       actions           = { grants = ["unknown"] }
     }]
   }
@@ -293,7 +291,7 @@ run "rejects_invalid_action_cpu" {
       name              = "worker", isa = "x86-64", capacity = "spot"
       instance_types    = ["c6id.4xlarge"]
       max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
-      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      disk_per_instance = "200GiB"
       actions           = { resources = { cpu_count = 0 } }
     }]
   }
@@ -322,7 +320,7 @@ run "protects_assigned_addresses_with_empty_additional_networks" {
       name              = "worker", isa = "x86-64", capacity = "spot"
       instance_types    = ["c6id.4xlarge"]
       max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
-      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      disk_per_instance = "200GiB"
       actions           = { grants = ["network"], resources = { cpu_count = 2, memory = "1GiB", disk = "2GiB" } }
     }]
   }
@@ -359,7 +357,7 @@ run "network_grant_defaults_additional_networks_to_empty" {
       name              = "worker", isa = "x86-64", capacity = "spot"
       instance_types    = ["c6id.4xlarge"]
       max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
-      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      disk_per_instance = "200GiB"
       actions           = { grants = ["network"] }
     }]
   }
@@ -384,7 +382,7 @@ run "resource_ceilings_without_grants_omit_grants_table" {
       name              = "worker", isa = "x86-64", capacity = "spot"
       instance_types    = ["c6id.4xlarge"]
       max_instances     = 4, vcpus_per_instance = 15, memory_per_instance = "29GiB"
-      disk_per_instance = "200GiB", target_actions_per_instance = 16
+      disk_per_instance = "200GiB"
       actions           = { resources = { cpu_count = 2 } }
     }]
   }
@@ -515,7 +513,6 @@ run "renders_scheduled_minimum" {
         vcpus_per_instance          = 15
         memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
-        target_actions_per_instance = 16
         scheduled_minimum = [{
           instances = 1
           days      = ["mon", "tue", "wed", "thu", "fri"]
@@ -533,7 +530,6 @@ run "renders_scheduled_minimum" {
         vcpus_per_instance          = 15
         memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
-        target_actions_per_instance = 16
       },
     ]
   }
@@ -556,7 +552,7 @@ run "rejects_scheduled_minimum_at_min_instances" {
       name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
       instance_types      = ["c6id.4xlarge"]
       max_instances       = 4, min_instances = 1, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB"
       scheduled_minimum   = [{ instances = 1, days = ["mon"], start = "07:55", end = "19:00", time_zone = "Europe/Paris" }]
     }]
   }
@@ -570,7 +566,7 @@ run "rejects_scheduled_minimum_bad_day" {
       name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
       instance_types      = ["c6id.4xlarge"]
       max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB"
       scheduled_minimum   = [{ instances = 1, days = ["monday"], start = "07:55", end = "19:00", time_zone = "Europe/Paris" }]
     }]
   }
@@ -584,7 +580,7 @@ run "rejects_scheduled_minimum_end_before_start" {
       name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
       instance_types      = ["c6id.4xlarge"]
       max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB"
       scheduled_minimum   = [{ instances = 1, days = ["mon"], start = "19:00", end = "08:00", time_zone = "Europe/Paris" }]
     }]
   }
@@ -598,7 +594,7 @@ run "accepts_scheduled_minimum_until_midnight" {
       name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
       instance_types      = ["c6id.4xlarge"]
       max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB"
       scheduled_minimum   = [{ instances = 4, days = ["sat", "sun"], start = "22:00", end = "24:00", time_zone = "UTC" }]
     }]
   }
@@ -615,7 +611,7 @@ run "rejects_scheduled_minimum_above_max_instances" {
       name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
       instance_types      = ["c6id.4xlarge"]
       max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB"
       scheduled_minimum   = [{ instances = 5, days = ["mon"], start = "07:55", end = "19:00", time_zone = "UTC" }]
     }]
   }
@@ -629,7 +625,7 @@ run "rejects_scheduled_minimum_without_days" {
       name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
       instance_types      = ["c6id.4xlarge"]
       max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB"
       scheduled_minimum   = [{ instances = 1, days = [], start = "07:55", end = "19:00", time_zone = "UTC" }]
     }]
   }
@@ -643,7 +639,7 @@ run "rejects_scheduled_minimum_with_a_repeated_day" {
       name                = "gang-worker-x86-64", isa = "x86-64", capacity = "spot"
       instance_types      = ["c6id.4xlarge"]
       max_instances       = 4, min_instances = 0, vcpus_per_instance = 15
-      memory_per_instance = "29GiB", disk_per_instance = "200GiB", target_actions_per_instance = 16
+      memory_per_instance = "29GiB", disk_per_instance = "200GiB"
       scheduled_minimum   = [{ instances = 1, days = ["mon", "mon"], start = "07:55", end = "19:00", time_zone = "UTC" }]
     }]
   }
@@ -755,7 +751,6 @@ run "rejects_fleet_isa_outside_pattern" {
         vcpus_per_instance          = 15
         memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
-        target_actions_per_instance = 16
       },
     ]
   }
@@ -779,7 +774,6 @@ run "rejects_disk_per_instance_without_unit" {
         vcpus_per_instance          = 15
         memory_per_instance         = "29GiB"
         disk_per_instance           = "200"
-        target_actions_per_instance = 16
       },
     ]
   }
@@ -890,7 +884,6 @@ run "fallback_fleet_gets_an_on_demand_twin" {
         vcpus_per_instance          = 15
         memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
-        target_actions_per_instance = 16
         fallback                    = {}
       },
       {
@@ -902,7 +895,6 @@ run "fallback_fleet_gets_an_on_demand_twin" {
         vcpus_per_instance          = 15
         memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
-        target_actions_per_instance = 16
         warm_pool_size              = 2
       },
     ]
@@ -973,7 +965,6 @@ run "rejects_fallback_on_on_demand_fleet" {
         vcpus_per_instance          = 15
         memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
-        target_actions_per_instance = 16
         fallback                    = {}
       },
     ]
@@ -998,7 +989,6 @@ run "rejects_warm_pool_without_on_demand_group" {
         vcpus_per_instance          = 15
         memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
-        target_actions_per_instance = 16
         warm_pool_size              = 2
       },
     ]
@@ -1109,7 +1099,6 @@ run "rejects_unknown_fleet_isa" {
       vcpus_per_instance          = 15
       memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
     }]
   }
 
@@ -1129,7 +1118,6 @@ run "rejects_zero_fleet_disk" {
       vcpus_per_instance          = 15
       memory_per_instance         = "29GiB"
       disk_per_instance           = "0B"
-      target_actions_per_instance = 16
     }]
   }
 
@@ -1149,7 +1137,6 @@ run "rejects_zero_fleet_memory" {
       vcpus_per_instance          = 15
       memory_per_instance         = "0B"
       disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
     }]
   }
 
@@ -1169,7 +1156,6 @@ run "rejects_fleet_memory_below_min_reservation" {
       vcpus_per_instance          = 15
       memory_per_instance         = "67108863B"
       disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
     }]
   }
 
@@ -1189,7 +1175,6 @@ run "accepts_fleet_memory_equal_to_min_reservation" {
       vcpus_per_instance          = 15
       memory_per_instance         = "64MiB"
       disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
     }]
   }
 }
@@ -1207,7 +1192,6 @@ run "rejects_overflowing_fleet_size" {
       vcpus_per_instance          = 15
       memory_per_instance         = "29GiB"
       disk_per_instance           = "16777216TiB"
-      target_actions_per_instance = 16
     }]
   }
 
@@ -1227,7 +1211,6 @@ run "accepts_nonzero_sizes_with_leading_zeroes" {
       vcpus_per_instance          = 15
       memory_per_instance         = "0001GiB"
       disk_per_instance           = "0001B"
-      target_actions_per_instance = 16
     }]
   }
 }
@@ -1247,7 +1230,6 @@ run "rejects_min_instances_above_max_instances" {
         vcpus_per_instance          = 15
         memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
-        target_actions_per_instance = 16
       },
     ]
   }
@@ -1271,7 +1253,6 @@ run "rejects_zero_vcpus_per_instance" {
         vcpus_per_instance          = 0
         memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
-        target_actions_per_instance = 16
       },
     ]
   }
@@ -1281,7 +1262,7 @@ run "rejects_zero_vcpus_per_instance" {
   ]
 }
 
-run "rejects_zero_target_actions_per_instance" {
+run "rejects_vcpus_per_instance_above_u32" {
   command = plan
 
   variables {
@@ -1292,10 +1273,9 @@ run "rejects_zero_target_actions_per_instance" {
         capacity                    = "spot"
         instance_types              = ["c6id.4xlarge"]
         max_instances               = 4
-        vcpus_per_instance          = 15
+        vcpus_per_instance          = 4294967296
         memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
-        target_actions_per_instance = 0
       },
     ]
   }
@@ -1319,7 +1299,6 @@ run "rejects_zero_max_instances" {
         vcpus_per_instance          = 15
         memory_per_instance         = "29GiB"
         disk_per_instance           = "200GiB"
-        target_actions_per_instance = 16
       },
     ]
   }
@@ -1447,7 +1426,6 @@ run "single_architecture_uses_matching_digest" {
       vcpus_per_instance          = 15
       memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
     }]
   }
 
@@ -1612,7 +1590,6 @@ run "fleet_image_override" {
       vcpus_per_instance          = 15
       memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
     }]
   }
 
@@ -1707,7 +1684,6 @@ run "fleet_named_controller_rejected" {
       vcpus_per_instance          = 15
       memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
     }]
   }
 

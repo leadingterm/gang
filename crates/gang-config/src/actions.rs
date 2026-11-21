@@ -25,6 +25,8 @@ pub struct ActionsConfig {
     pub environment: EnvironmentName,
     /// Percentage added to measured peaks for learning and resource escalation. Default: 20.
     pub reservation_headroom_percent: HeadroomPercent,
+    /// Multiplier for the worker's physical CPU reservation capacity. Default: 2.
+    pub cpu_oversubscription: NonZeroU32,
     /// History retention, in whole days, at least one day. Default: `7d`.
     pub history_window: HistoryWindow,
     /// Maximum target/mnemonic duration-cache keys, at least one. Default: 65536.
@@ -55,6 +57,7 @@ impl Default for ActionsConfig {
         Self {
             environment: EnvironmentName::default(),
             reservation_headroom_percent: HeadroomPercent::from_percent(20),
+            cpu_oversubscription: NonZeroU32::MIN.saturating_add(1),
             history_window: HistoryWindow::from_units(7),
             history_keys: NonZeroUsize::MIN.saturating_add(65_535),
             history_memory_budget: NonZeroBytes::mib(512),

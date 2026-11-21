@@ -376,11 +376,11 @@ readiness?: Duration,
  */
 expectedWait?: Duration, 
 /**
- * Persistent load in integer deci-slots, absent until measured; zero is a measurement.
+ * Persistent load in tenths of a worker-equivalent, absent until measured; zero is a measurement.
  */
 load?: number, 
 /**
- * Transient queued slot-time before readiness subtraction, rounded to whole seconds.
+ * Transient queued worker-equivalent-seconds before readiness subtraction, rounded to whole seconds.
  */
 backlog?: Duration, 
 /**
@@ -777,10 +777,6 @@ min: number,
  * The most instances the fleet runs.
  */
 max: number, 
-/**
- * The number of actions one instance is expected to take.
- */
-targetActions: number, 
 /**
  * How long a worker may stay idle before it drains.
  */

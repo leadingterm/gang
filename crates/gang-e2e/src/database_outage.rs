@@ -744,12 +744,11 @@ fn observe_partition(
             fenced &= *original == controller_workers(cluster, old);
             follower_acted |= !controller_workers(cluster, follower).is_empty();
         }
-        // Fresh E2ePartition probes use the typed 10m unknown prior, not the outage
-        // build's learned E2eProbe durations. At cold B=60s and idle=15s,
-        // H=50%*(60+15)=37.5s; even four queued probes supply 2400 slot-seconds,
-        // exceeding two instances' capacity credit plus a new worker's payback.
-        // This is immediate transient-work evidence: no completion-rate seed or
-        // persistence age is required. The 50s settle gates drains, not purchases.
+        // The partition fixture has two physical vCPUs per worker and CPU factor one.
+        // Its held probes reserve one vCPU each, so four running and four queued
+        // probes exceed the four-vCPU capacity of two workers and require the
+        // configured maximum of three. Completion history and payback do not
+        // reduce that resource bound; the settle interval only gates drains.
         let elapsed = clock.monotonic().saturating_duration_since(started);
         elapsed >= OUTAGE && (follower_acted || elapsed >= OUTAGE.saturating_mul(2))
     };

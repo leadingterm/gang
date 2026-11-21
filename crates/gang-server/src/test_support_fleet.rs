@@ -41,7 +41,6 @@ fn fleet_member(name: &str, max_instances: u32) -> FleetMember<TestPlugins> {
         vcpus_per_instance: NonZeroU32::new(4).expect("four vCPUs is non-zero"),
         memory_per_instance: NonZeroBytes::gib(8),
         disk_per_instance: NonZeroBytes::gib(100),
-        target_actions_per_instance: NonZeroU32::new(4).expect("four actions is non-zero"),
         idle_timeout: Duration::from_secs(15),
         max_drain_wait: Duration::from_mins(1),
         boot_grace: Duration::from_secs(30),

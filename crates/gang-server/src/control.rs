@@ -2,7 +2,7 @@
 //! and applies the resulting plan through the ports.
 
 use std::convert::Infallible;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,6 +42,7 @@ pub(crate) enum PassOutcome {
 #[derive(Clone, Copy)]
 pub(crate) struct ControlSettings {
     pub(crate) poll_interval: NonZeroDuration,
+    pub(crate) cpu_oversubscription: NonZeroU32,
     infrastructure_window: Duration,
     infrastructure_limit: NonZeroUsize,
 }
@@ -50,6 +51,7 @@ impl ControlSettings {
     pub(crate) fn new(poll_interval: NonZeroDuration, dashboard: &DashboardConfig) -> Self {
         Self {
             poll_interval,
+            cpu_oversubscription: gang_config::ActionsConfig::default().cpu_oversubscription,
             infrastructure_window: dashboard.history_window.get(),
             infrastructure_limit: dashboard.recent_events,
         }
@@ -143,7 +145,12 @@ where
             .map(|policy| policy.boot_grace)
             .max()
             .unwrap_or_default();
-        let reconciler = Reconciler::new(fleets.policies(), scaling, profiles);
+        let reconciler = Reconciler::new(
+            fleets.policies(),
+            scaling,
+            profiles,
+            settings.cpu_oversubscription,
+        );
         Self {
             fleets,
             configs,
@@ -995,7 +1002,7 @@ mod tests {
                     to: 1,
                     need: NeedCause::Demand,
                     summary: ScaleDecision {
-                        slots: 4,
+                        needed: 1,
                         reliable: 0,
                         ..ScaleDecision::default()
                     },
@@ -1031,7 +1038,7 @@ mod tests {
             } => detail,
             kind => panic!("missing purchase detail: {kind:?}"),
         };
-        assert!(detail.contains("slots=4"));
+        assert!(detail.contains("needed=1"));
         assert!(detail.contains("reliable=0"));
         let purchase = crate::events::wire_event(RecordedScalingEvent {
             seq: gang_spi::ScalingEventSeq::new(1),

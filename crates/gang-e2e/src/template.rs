@@ -216,9 +216,6 @@ fn render_resource_policy(
     if let Some(vcpus) = policy.fleet_vcpus {
         for fleet in &mut document.fleets {
             fleet.vcpus_per_instance = vcpus;
-            fleet.target_actions_per_instance = fleet
-                .target_actions_per_instance
-                .max(NonZeroU32::MIN.saturating_add(1));
         }
     }
     if let Some(cold_start) = policy.cold_start {
@@ -610,7 +607,6 @@ fn placement_fleet(
         vcpus_per_instance: base.vcpus_per_instance,
         memory_per_instance: base.memory_per_instance,
         disk_per_instance: base.disk_per_instance,
-        target_actions_per_instance: NonZeroU32::MIN,
         idle_timeout: base.idle_timeout,
         max_drain_wait: base.max_drain_wait,
         boot_grace: base.boot_grace,
@@ -761,6 +757,9 @@ fn render_identity(document: &mut Document<Plugins>, knobs: IdentityKnobs) -> Re
 
 /// Applies control-loop tuning to the configuration.
 fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Result<()> {
+    if let Some(factor) = knobs.cpu_oversubscription {
+        document.actions.cpu_oversubscription = factor;
+    }
     if let Some(interval) = knobs.poll_interval {
         document.poll_interval = NonZeroDuration::try_new(interval).map_err(template_error)?;
     }
@@ -823,10 +822,6 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
         if let Some(max) = knobs.max_instances {
             fleet.max_instances = NonZeroU32::new(max)
                 .ok_or_else(|| template_error("max instances must be nonzero"))?;
-        }
-        if let Some(target) = knobs.target_actions_per_instance {
-            fleet.target_actions_per_instance = NonZeroU32::new(target)
-                .ok_or_else(|| template_error("target actions per instance must be nonzero"))?;
         }
         if let Some(vcpus) = knobs.vcpus_per_instance {
             fleet.vcpus_per_instance = NonZeroU32::new(vcpus)
@@ -899,4 +894,31 @@ fn render_server(document: &mut Document<Plugins>, knobs: ServerKnobs) -> Result
         document.server.certificate_backdate = CERTIFICATE_BACKDATE;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_cpu_reservation_factor_renders_without_changing_other_action_policy() {
+        let path = std::env::var("GANG_E2E_BASE_CONFIG").expect("base config runfile");
+        let config = std::fs::read_to_string(path).expect("base config");
+        for (knobs, expected) in [
+            (ControlKnobs::NONE, 3),
+            (ControlKnobs::LEADER_FAILOVER, 3),
+            (ControlKnobs::QUEUED_BEHIND_SHORT_WORK, 1),
+            (ControlKnobs::UTILIZATION_SCALE_IN, 1),
+        ] {
+            let mut document = Document::<Plugins>::parse(&config).expect("base config parses");
+            document.actions.cpu_oversubscription = NonZeroU32::new(3).expect("3 is nonzero");
+            let mut expected_actions = document.actions.clone();
+            expected_actions.cpu_oversubscription =
+                NonZeroU32::new(expected).expect("expected factor is nonzero");
+            render_control(&mut document, &knobs).expect("control renders");
+            let rendered = document.to_toml().expect("document serializes");
+            let parsed = Document::<Plugins>::parse(&rendered).expect("rendered config parses");
+            assert_eq!(parsed.actions, expected_actions);
+        }
+    }
 }

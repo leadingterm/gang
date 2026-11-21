@@ -1,19 +1,18 @@
-//! Fleet-independent reservations and their componentwise nominal-slot projection.
+//! Fleet-independent reservations and per-instance resource projections.
 
+use std::num::NonZeroU32;
 use std::ops::{Add, AddAssign};
 use std::time::Duration;
 
 use gang_config::{FleetPolicy, PaybackPercent};
 use gang_spi::ResourceRates;
-use gang_types::ActionResources;
+use gang_types::{ActionResources, property::MILLICORES_PER_CORE};
 
 /// The limiting resource of a scaling decision; ties prefer this declaration order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScalingDimension {
-    /// Action concurrency.
-    #[default]
-    Actions,
     /// Reserved CPU.
+    #[default]
     Cpu,
     /// Reserved memory.
     Memory,
@@ -26,7 +25,6 @@ impl ScalingDimension {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Actions => "actions",
             Self::Cpu => "cpu",
             Self::Memory => "memory",
             Self::Disk => "disk",
@@ -43,10 +41,9 @@ pub(crate) struct ResourceVector {
     pub disk: f64,
 }
 
-/// Each coordinate is nominal slots (or slot-seconds), never a per-action maximum.
+/// Each coordinate is a fraction of one physical worker (or worker-seconds).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct SlotVector {
-    pub actions: f64,
+pub(crate) struct CapacityVector {
     pub cpu: f64,
     pub memory: f64,
     pub disk: f64,
@@ -103,7 +100,7 @@ macro_rules! vector_ops {
 }
 
 vector_ops!(ResourceVector, actions, cpu_millicores, memory, disk);
-vector_ops!(SlotVector, actions, cpu, memory, disk);
+vector_ops!(CapacityVector, cpu, memory, disk);
 
 impl ResourceVector {
     pub fn from_action(resources: ActionResources) -> Self {
@@ -124,43 +121,34 @@ impl ResourceVector {
         }
     }
 
-    pub fn normalized(self, policy: &FleetPolicy) -> SlotVector {
-        let slots = f64::from(policy.target_actions_per_instance.get());
-        SlotVector {
-            actions: self.actions,
-            cpu: product(
-                self.cpu_millicores,
-                slots / (1000.0 * f64::from(policy.vcpus_per_instance.get())),
-            ),
-            memory: product(
-                self.memory,
-                slots / u64_to_f64(policy.memory_per_instance.get().get()),
-            ),
-            disk: product(
-                self.disk,
-                slots / u64_to_f64(policy.disk_per_instance.get().get()),
-            ),
+    pub fn normalized(
+        self,
+        policy: &FleetPolicy,
+        cpu_oversubscription: NonZeroU32,
+    ) -> CapacityVector {
+        let cpu_capacity = u64::from(policy.vcpus_per_instance.get())
+            .saturating_mul(MILLICORES_PER_CORE)
+            .saturating_mul(u64::from(cpu_oversubscription.get()));
+        CapacityVector {
+            cpu: self.cpu_millicores / u64_to_f64(cpu_capacity),
+            memory: self.memory / u64_to_f64(policy.memory_per_instance.get().get()),
+            disk: self.disk / u64_to_f64(policy.disk_per_instance.get().get()),
         }
     }
 }
 
-impl SlotVector {
+impl CapacityVector {
+    pub const ONE: Self = Self {
+        cpu: 1.0,
+        memory: 1.0,
+        disk: 1.0,
+    };
+
     pub fn component_min(self, rhs: Self) -> Self {
         Self {
-            actions: self.actions.min(rhs.actions),
             cpu: self.cpu.min(rhs.cpu),
             memory: self.memory.min(rhs.memory),
             disk: self.disk.min(rhs.disk),
-        }
-    }
-
-    pub fn slot_gate(self, slots: u32) -> Self {
-        let bound = product(self.actions, f64::from(slots));
-        Self {
-            actions: self.actions,
-            cpu: self.cpu.min(bound),
-            memory: self.memory.min(bound),
-            disk: self.disk.min(bound),
         }
     }
 
@@ -169,12 +157,8 @@ impl SlotVector {
     }
 
     pub fn max_dimension(self) -> ScalingDimension {
-        let mut dimension = ScalingDimension::Actions;
-        for next in [
-            ScalingDimension::Cpu,
-            ScalingDimension::Memory,
-            ScalingDimension::Disk,
-        ] {
+        let mut dimension = ScalingDimension::Cpu;
+        for next in [ScalingDimension::Memory, ScalingDimension::Disk] {
             if self.get(next) > self.get(dimension) {
                 dimension = next;
             }
@@ -184,7 +168,6 @@ impl SlotVector {
 
     pub fn get(self, dimension: ScalingDimension) -> f64 {
         match dimension {
-            ScalingDimension::Actions => self.actions,
             ScalingDimension::Cpu => self.cpu,
             ScalingDimension::Memory => self.memory,
             ScalingDimension::Disk => self.disk,
@@ -193,14 +176,13 @@ impl SlotVector {
 
     pub fn within(self, cap: Self, fraction: f64) -> bool {
         let cap = cap.scaled(fraction);
-        self.actions <= cap.actions
-            && self.cpu <= cap.cpu
+        self.cpu <= cap.cpu
             && self.memory <= cap.memory
             && self.disk <= cap.disk
     }
 
     pub fn utilization(self, cap: Self) -> Option<f64> {
-        if cap.actions == 0.0 {
+        if cap == Self::default() {
             return None;
         }
         let ratio = |load: f64, capacity: f64| {
@@ -213,15 +195,14 @@ impl SlotVector {
             }
         };
         Some(
-            ratio(self.actions, cap.actions)
-                .max(ratio(self.cpu, cap.cpu))
+            ratio(self.cpu, cap.cpu)
                 .max(ratio(self.memory, cap.memory))
                 .max(ratio(self.disk, cap.disk)),
         )
     }
 }
 
-/// One exact payback horizon shared by classification, purchases and cordons.
+/// One exact horizon shared by classification and scale-in safety.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Horizon {
     pub readiness: Duration,
@@ -264,7 +245,8 @@ mod tests {
         let policy = fleet_policy("workers").unwrap();
         let cpu = ResourceVector {
             actions: 1.0,
-            cpu_millicores: 1000.0 * f64::from(policy.vcpus_per_instance.get()),
+            cpu_millicores: u64_to_f64(MILLICORES_PER_CORE)
+                * f64::from(policy.vcpus_per_instance.get()),
             ..ResourceVector::default()
         };
         let memory = ResourceVector {
@@ -272,88 +254,39 @@ mod tests {
             memory: u64_to_f64(policy.memory_per_instance.get().get()),
             ..ResourceVector::default()
         };
-        let slots = f64::from(policy.target_actions_per_instance.get());
         exact(
-            (cpu + memory).normalized(&policy).max_component(),
-            slots.max(2.0),
+            (cpu + memory).normalized(&policy, NonZeroU32::MIN).max_component(),
+            1.0,
         );
         exact(
-            cpu.normalized(&policy).max_component() + memory.normalized(&policy).max_component(),
-            2.0 * slots,
+            cpu.normalized(&policy, NonZeroU32::MIN).max_component()
+                + memory.normalized(&policy, NonZeroU32::MIN).max_component(),
+            2.0,
         );
     }
 
     #[test]
-    fn action_cap_and_slot_gate_preserve_separate_dimensions() {
-        let cap = SlotVector {
-            actions: 2.0,
-            cpu: 16.0,
-            memory: 16.0,
-            disk: 16.0,
-        };
-        assert!(
-            !SlotVector {
-                actions: 3.0,
-                ..SlotVector::default()
-            }
-            .within(cap, 1.0)
-        );
-        assert!(
-            SlotVector {
-                cpu: 10.0,
-                ..SlotVector::default()
-            }
-            .within(cap, 1.0)
-        );
-        assert_eq!(
-            SlotVector {
-                actions: 0.0,
-                ..cap
-            }
-            .slot_gate(16),
-            SlotVector::default()
-        );
-        exact(
-            SlotVector {
-                actions: 0.5,
-                ..cap
-            }
-            .slot_gate(16)
-            .memory,
-            8.0,
-        );
-    }
-
-    #[test]
-    fn dimensions_tie_stably_and_utilization_has_no_zero_division() {
-        let equal = SlotVector {
-            actions: 1.0,
+    fn capacity_and_utilization_use_resource_fractions() {
+        let cap = CapacityVector::ONE.scaled(2.0);
+        let load = CapacityVector {
             cpu: 1.0,
-            memory: 1.0,
-            disk: 1.0,
+            memory: 1.5,
+            disk: 0.5,
         };
-        assert_eq!(equal.max_dimension(), ScalingDimension::Actions);
-        assert_eq!(
-            SlotVector {
-                actions: 0.0,
-                ..equal
-            }
-            .max_dimension(),
-            ScalingDimension::Cpu
-        );
-        assert_eq!(equal.utilization(SlotVector::default()), None);
-        assert_eq!(
-            equal.utilization(equal.scaled(2.0)).map(f64::to_bits),
-            Some(0.5_f64.to_bits())
-        );
-        assert_eq!(
-            equal
-                .utilization(SlotVector {
-                    actions: 2.0,
-                    ..SlotVector::default()
-                })
-                .map(f64::to_bits),
-            Some(1.0_f64.to_bits())
+        assert!(load.within(cap, 1.0));
+        assert!(!load.within(cap, 0.5));
+        exact(load.utilization(cap).unwrap(), 0.75);
+        assert_eq!(load.utilization(CapacityVector::default()), None);
+        assert_eq!(CapacityVector::ONE.max_dimension(), ScalingDimension::Cpu);
+        assert_eq!(load.max_dimension(), ScalingDimension::Memory);
+        exact(
+            load.utilization(CapacityVector {
+                cpu: 2.0,
+                memory: 0.0,
+                disk: 2.0,
+            })
+            .unwrap(),
+            1.0,
         );
     }
 

@@ -824,9 +824,11 @@ async fn lead_work<D: Deployment>(
     context.readiness.lead();
     let sidecar = retry_sidecar(context);
     let clock = &context.core.host.clock;
+    let mut control_settings = context.control_settings;
+    control_settings.cpu_oversubscription = context.actions.cpu_oversubscription;
     let control = ControlLoop::new(
         context.fleets,
-        context.control_settings,
+        control_settings,
         Arc::clone(context.scaling),
         profiles.clone(),
         &crate::control::ControlPorts {
@@ -2796,6 +2798,7 @@ mod tests {
             policies,
             std::sync::Arc::clone(&settings.scaling),
             profiles.clone(),
+            settings.actions.cpu_oversubscription,
         );
         let mut fleets: Vec<_> = policies.iter().cloned().map(FleetPass::new).collect();
         let mut queued = crate::test_support::queued_demand(gang_types::FleetSet::prefix(1)?);

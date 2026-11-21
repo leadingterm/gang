@@ -185,8 +185,8 @@ impl Default for DiskTuning {
 pub struct ColdStartTuning {
     /// Whether to reserve resources for unmeasured actions. Default: true.
     pub enabled: bool,
-    /// Reserved whole CPUs, at least one. Default: 1.
-    pub cpu_count: NonZeroU32,
+    /// Reserved CPU in millicores, nonzero. Default: 250.
+    pub cpu_millicores: NonZeroU32,
     /// Reserved memory, nonzero whole KiB. Default: `4GiB`.
     pub memory: WholeKib,
     /// Reserved disk, nonzero whole KiB. Default: `4GiB`.
@@ -196,7 +196,7 @@ impl Default for ColdStartTuning {
     fn default() -> Self {
         Self {
             enabled: true,
-            cpu_count: NonZeroU32::MIN,
+            cpu_millicores: NonZeroU32::MIN.saturating_add(249),
             memory: WholeKib::from_units(4 * 1024 * 1024),
             disk: WholeKib::from_units(4 * 1024 * 1024),
         }

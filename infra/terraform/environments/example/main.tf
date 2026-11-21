@@ -40,7 +40,6 @@ module "gang" {
       vcpus_per_instance          = 15
       memory_per_instance         = "61GiB"
       disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
     },
     {
       name                        = "gang-worker-aarch64"
@@ -51,7 +50,6 @@ module "gang" {
       vcpus_per_instance          = 15
       memory_per_instance         = "61GiB"
       disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
     },
     # Optional: a spot fleet with an on-demand twin. `fallback` adds the group <name>-on-demand, which takes
     # capacity while Spot is unavailable. Presence opts in; the values shown are the defaults.
@@ -64,7 +62,6 @@ module "gang" {
     #   vcpus_per_instance          = 15
     #   memory_per_instance         = "61GiB"
     #   disk_per_instance           = "200GiB"
-    #   target_actions_per_instance = 16
     #   fallback                    = { retry_spot_after = "5m" }
     # },
     # Optional: an on-demand fleet with a warm pool. `warm_pool_size` keeps stopped standby instances on its group.
@@ -77,7 +74,6 @@ module "gang" {
     #   vcpus_per_instance          = 15
     #   memory_per_instance         = "61GiB"
     #   disk_per_instance           = "200GiB"
-    #   target_actions_per_instance = 16
     #   warm_pool_size              = 2
     # },
   ]

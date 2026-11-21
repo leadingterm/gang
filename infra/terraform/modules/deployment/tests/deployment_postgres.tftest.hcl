@@ -203,7 +203,6 @@ variables {
       vcpus_per_instance          = 15
       memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
     },
     {
       name                        = "gang-worker-aarch64"
@@ -214,7 +213,6 @@ variables {
       vcpus_per_instance          = 15
       memory_per_instance         = "29GiB"
       disk_per_instance           = "200GiB"
-      target_actions_per_instance = 16
     },
   ]
 }

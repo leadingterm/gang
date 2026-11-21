@@ -61,7 +61,6 @@ pub fn policy(
             0,
             NonZeroU32::new(max_instances).ok_or("zero maximum")?,
         )?,
-        target_actions_per_instance: gang_types::nonzero_u32(2),
         idle_timeout: Duration::from_mins(1),
         max_drain_wait: Duration::from_mins(5),
         boot_grace: Duration::from_millis(boot_grace_ms),

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for v0.3.4. Supersedes ADR-56's candidate-count payback simulation, stream rule, readiness-based unknown duration and `boot_grace` readiness prior. Keeps measured readiness, the reachability floor and one final display-only queued-start projection. Detailed behavior and configuration: [SPECIFICATION §§1.2, 5](../SPECIFICATION.md#5-autoscaler-state--restart).
+Accepted for v0.3.4; its payback purchase, nominal slot and scale-out claims below are superseded. Current resource-only scaling, resource wait simulation, retained rate profiles and N−1 scale-in are specified in [SPECIFICATION §§1.2, 5](../SPECIFICATION.md#5-autoscaler-state--restart).
 
 ## Context
 

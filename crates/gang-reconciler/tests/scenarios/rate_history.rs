@@ -15,6 +15,13 @@ use gang_types::{ActionResources, Bytes, InstanceLifecycle, SourceId};
 use super::work_aware::{Workload, purchases, secs, source, summary};
 use crate::support::{Harness, X86};
 
+fn cpu_reservation() -> ActionResources {
+    ActionResources {
+        cpu_millicores: 1000,
+        ..ActionResources::default()
+    }
+}
+
 fn aged() -> TestResult<Workload> {
     let mut w = Workload::new(6, 16, 50)?;
     w.learn_profile(source(1)?, secs(1800))?;
@@ -37,7 +44,7 @@ fn inflight_gauge_survives_first_completion_row_birth() -> TestResult {
         X86,
         16,
         Some(secs(30)),
-        ActionResources::default(),
+        cpu_reservation(),
     );
     w.pass();
     assert_eq!(
@@ -58,7 +65,7 @@ fn brand_new_all_subpass_source_has_positive_load() -> TestResult {
         X86,
         16,
         Some(secs(30)),
-        ActionResources::default(),
+        cpu_reservation(),
     );
     w.pass();
     assert!(w.h.outlook(X86)?.load.is_some_and(|load| load > 0));
@@ -75,7 +82,7 @@ fn term_first_pass_discards_preexisting_completion_rows() -> TestResult {
         X86,
         64,
         Some(secs(30)),
-        ActionResources::default(),
+        cpu_reservation(),
     );
     w.h.restart();
     w.pass();
@@ -88,7 +95,7 @@ fn term_first_pass_discards_preexisting_completion_rows() -> TestResult {
         X86,
         8,
         Some(secs(30)),
-        ActionResources::default(),
+        cpu_reservation(),
     );
     w.pass();
     assert!(w.h.outlook(X86)?.load.is_some_and(|load| load > 0));
@@ -110,7 +117,7 @@ fn adapter_generation_reuse_preserves_known_gauge_history() -> TestResult {
             X86,
             16,
             Some(secs(30)),
-            ActionResources::default(),
+            cpu_reservation(),
         );
         w.h.snapshot.source_rates[0].generation = generation;
         w.pass();
@@ -135,7 +142,7 @@ fn live_source_eviction_cold_seeds_returning_gauge() -> TestResult {
         w.h.snapshot.queued.clear();
         w.queue(Some(source(id)?), X86, 160, None)?;
         w.h.advance(secs(1));
-        assert!(purchases(&w.pass()).is_empty());
+        assert_eq!(purchases(&w.pass()), vec![(X86, 1, 6, NeedCause::Demand)]);
         assert_eq!(w.h.outlook(X86)?.load, Some(0));
     }
     Ok(())
@@ -151,7 +158,7 @@ fn new_period_cancels_old_decayed_tail_and_keeps_first_new_completion() -> TestR
         X86,
         64,
         Some(secs(30)),
-        ActionResources::default(),
+        cpu_reservation(),
     );
     w.pass();
     assert!(w.h.outlook(X86)?.load.is_some_and(|load| load > 0));
@@ -170,10 +177,10 @@ fn new_period_cancels_old_decayed_tail_and_keeps_first_new_completion() -> TestR
         X86,
         1,
         Some(secs(30)),
-        ActionResources::default(),
+        cpu_reservation(),
     );
     w.pass();
-    let expected_deci = (std::f64::consts::LN_2 / 60.0 * 30.0 * 10.0).round() as u32;
+    let expected_deci = (std::f64::consts::LN_2 / 60.0 * 30.0 * 10.0 / 16.0).round() as u32;
     assert_eq!(w.h.outlook(X86)?.load, Some(expected_deci));
     Ok(())
 }
@@ -208,7 +215,7 @@ fn skipped_nonzero_gauge_keeps_arrivals_across_unobserved_gap() -> TestResult {
     w.h.advance(secs(120));
     w.queue(Some(source(1)?), X86, 144, None)?;
     w.pass();
-    let expected = (std::f64::consts::LN_2 / 60.0 * 144.0 * 10.0 * 10.0).round() as u32;
+    let expected = (std::f64::consts::LN_2 / 60.0 * 144.0 * 10.0 * 10.0 / 16.0).round() as u32;
     assert_eq!(w.h.outlook(X86)?.load, Some(expected));
     Ok(())
 }
@@ -223,7 +230,7 @@ fn quiet_closure_requires_good_passes_and_short_lull_keeps_period() -> TestResul
         X86,
         16,
         Some(secs(30)),
-        ActionResources::default(),
+        cpu_reservation(),
     );
     w.pass();
     w.h.advance(secs(1));
@@ -251,11 +258,11 @@ fn equal_ticks_accept_newest_gauge_without_division() -> TestResult {
     w.pass();
     w.queue(Some(source(1)?), X86, 16, None)?;
     w.pass();
-    assert!(w.h.outlook(X86)?.load.is_some_and(|load| load <= 960));
+    assert!(w.h.outlook(X86)?.load.is_some_and(|load| load <= 60));
     w.h.advance(secs(60));
     w.pass();
     // nbar(60)=16/2+32/2=24, so lambda_A=kappa*8 with 10s prior.
-    let expected = (std::f64::consts::LN_2 / 60.0 * 8.0 * 10.0 * 10.0).round() as u32;
+    let expected = (std::f64::consts::LN_2 / 60.0 * 8.0 * 10.0 * 10.0 / 16.0).round() as u32;
     assert_eq!(w.h.outlook(X86)?.load, Some(expected));
     Ok(())
 }
@@ -273,7 +280,7 @@ fn skipped_rate_frame_spans_gap_instead_of_reseeding() -> TestResult {
         X86,
         16,
         Some(secs(30)),
-        ActionResources::default(),
+        cpu_reservation(),
     );
     w.pass();
     assert_eq!(w.h.outlook(X86)?.load, Some(0));
@@ -294,7 +301,7 @@ fn row_read_tick_not_later_pass_tick_admits_completion_during_scan() -> TestResu
         X86,
         16,
         Some(secs(30)),
-        ActionResources::default(),
+        cpu_reservation(),
     );
     w.h.snapshot.source_rates[0].created_at = during_scan;
     w.h.snapshot.source_rates[0].at = during_scan;
@@ -317,7 +324,7 @@ fn closed_loop_step_down_64_to_60_and_32_keeps_refilling() -> TestResult {
                 X86,
                 64,
                 Some(secs(30)),
-                ActionResources::default(),
+                cpu_reservation(),
             );
             w.pass();
         }
@@ -329,7 +336,7 @@ fn closed_loop_step_down_64_to_60_and_32_keeps_refilling() -> TestResult {
                 X86,
                 u32::try_from(concurrency)?,
                 Some(secs(30)),
-                ActionResources::default(),
+                cpu_reservation(),
             );
             w.pass();
             assert!(
@@ -417,16 +424,16 @@ fn actual_overflow_is_charged_on_actual_fleet_including_busy_drains() -> TestRes
             0,
             8,
             Some(secs(30)),
-            ActionResources::default(),
+            cpu_reservation(),
         );
         w.pass();
     }
     // Batch receipt makes the exponential service rate exceed its long-run mean
     // immediately after a completion wave. Only actual overflow (8) is subtracted.
     let rho = w.h.snapshot.source_rates[0].work.actions.get();
-    let preferred_deci = ((rho - 8.0).max(0.0) * 10.0).round() as u32;
+    let preferred_deci = ((rho - 8.0).max(0.0) * 10.0 / 16.0).round() as u32;
     assert_eq!(w.h.outlook(0)?.load, Some(preferred_deci));
-    assert!(w.h.outlook(1)?.load.is_some_and(|load| load >= 80));
+    assert!(w.h.outlook(1)?.load.is_some_and(|load| load >= 5));
     assert_eq!(
         w.h.outlook(1)?.utilization,
         None,
@@ -447,7 +454,7 @@ fn interval_trace(interval: u64) -> TestResult<(u32, gang_spi::CompletionRates)>
             X86,
             2,
             Some(secs(20)),
-            ActionResources::default(),
+            cpu_reservation(),
         );
         if t % interval == 0 {
             w.pass();
@@ -487,7 +494,7 @@ fn snapshot_alias_error_stays_within_documented_step_bound() -> TestResult {
                 X86,
                 2,
                 Some(secs(20)),
-                ActionResources::default(),
+                cpu_reservation(),
             );
             if t % interval == 0 {
                 w.pass();
@@ -501,8 +508,10 @@ fn snapshot_alias_error_stays_within_documented_step_bound() -> TestResult {
     let five = trace(5)?;
     let count_step = 1.0;
     let duration = 20.0;
-    let bound_deci_slots = kappa * 5.0 * count_step * duration * 10.0 + 1.0;
-    assert!((f64::from(one) - f64::from(five)).abs() <= bound_deci_slots);
+    // The fixture uses 16 physical vCPUs per worker, CPU factor one, and a
+    // 1000m reservation per action: one action is 1/16 worker-equivalent.
+    let bound_deci_workers = kappa * 5.0 * count_step * duration * 10.0 / 16.0 + 1.0;
+    assert!((f64::from(one) - f64::from(five)).abs() <= bound_deci_workers);
     Ok(())
 }
 
@@ -520,8 +529,8 @@ fn first_build_checkpoint_retains_source_admission_after_model_replacement() -> 
         .restore(gang_reconciler::PassTime::read(&w.h.clock), &records);
     w.h.restart();
     let steps = w.pass();
-    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
-    assert_eq!(summary(&steps)?.persistent_streams, 1);
+    assert_eq!(purchases(&steps), vec![(X86, 0, 3, NeedCause::Demand)]);
+    assert_eq!(summary(&steps)?.needed, 3);
     Ok(())
 }
 
@@ -553,8 +562,8 @@ fn source_period_flush_settles_unobserved_checkpoint_once() -> TestResult {
     w.h.restart();
     w.queue(Some(source(1)?), X86, 40, None)?;
     let steps = w.pass();
-    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
-    assert_eq!(summary(&steps)?.persistent_streams, 1);
+    assert_eq!(purchases(&steps), vec![(X86, 0, 3, NeedCause::Demand)]);
+    assert_eq!(summary(&steps)?.needed, 3);
     Ok(())
 }
 
@@ -576,7 +585,7 @@ fn run_long_activity(src: SourceId) -> TestResult<Workload> {
             X86,
             1,
             Some(secs(600)),
-            ActionResources::default(),
+            cpu_reservation(),
         );
         w.running(
             "trained-worker",
@@ -622,14 +631,8 @@ fn retained_long_source_short_static_batch_buys_only_reachability_without_ratche
     // Keep the authenticated principal and long mean; only this batch's known duration changes.
     w.queue(Some(src), X86, 160, Some(secs(1)))?;
     let mut steps = w.run();
-    let decision = summary(&steps)?;
-    assert_eq!(
-        decision.persistent_streams, 1,
-        "restored history must admit the short batch as persistent, not transient"
-    );
-    assert_eq!(decision.readiness, secs(45));
-    assert_eq!(decision.horizon, Duration::from_millis(322_500));
-    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
+    assert_eq!(summary(&steps)?.needed, 6);
+    assert_eq!(purchases(&steps), vec![(X86, 0, 6, NeedCause::Demand)]);
     w.h.launch(
         X86,
         "new-worker",
@@ -647,13 +650,13 @@ fn retained_long_source_short_static_batch_buys_only_reachability_without_ratche
         assert_eq!(w.h.outlook(X86)?.load, Some(0), "static is not sustained");
         assert_eq!(
             w.h.outlook(X86)?.needed,
-            1,
-            "pending capacity cannot ratchet"
+            6,
+            "pending capacity cannot change the resource bound"
         );
     }
     steps.extend(serve_finite_cohort(&mut w, src)?);
-    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
-    assert_eq!(w.h.supply(X86)?.desired, 1);
+    assert_eq!(purchases(&steps), vec![(X86, 0, 6, NeedCause::Demand)]);
+    assert_eq!(w.h.supply(X86)?.desired, 6);
     Ok(())
 }
 
@@ -671,10 +674,10 @@ fn serve_finite_cohort(w: &mut Workload, src: SourceId) -> TestResult<Vec<PlanSt
     steps.extend(w.run());
     assert_eq!(
         w.h.outlook(X86)?.load,
-        Some(160),
+        Some(10),
         "actual load fills the worker"
     );
-    assert_eq!(w.h.outlook(X86)?.needed, 1);
+    assert_eq!(w.h.outlook(X86)?.needed, 6);
     for remaining in [128, 112, 96] {
         w.h.advance(secs(1));
         w.complete(
@@ -682,16 +685,16 @@ fn serve_finite_cohort(w: &mut Workload, src: SourceId) -> TestResult<Vec<PlanSt
             X86,
             16,
             Some(secs(1)),
-            ActionResources::default(),
+            cpu_reservation(),
         );
         w.h.snapshot.queued.truncate(remaining);
         w.running("new-worker", 16, Some(src), Duration::ZERO, Some(secs(1)))?;
         steps.extend(w.run());
-        assert_eq!(w.h.outlook(X86)?.load, Some(160));
+        assert_eq!(w.h.outlook(X86)?.load, Some(10));
         assert_eq!(
             w.h.outlook(X86)?.needed,
-            1,
-            "serving a finite cohort cannot justify imaginary future arrivals"
+            6,
+            "live queued and running reservations set the bound"
         );
     }
     Ok(steps)
@@ -720,8 +723,8 @@ fn same_term_long_mean_static_upload_across_passes_never_forecasts_refill() -> T
     let frame = w.h.snapshot.source_rates[0];
     w.queue(Some(src), X86, 40, Some(secs(1)))?;
     let mut steps = w.run();
-    assert_eq!(summary(&steps)?.persistent_streams, 1);
-    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
+    assert_eq!(summary(&steps)?.needed, 3);
+    assert_eq!(purchases(&steps), vec![(X86, 0, 3, NeedCause::Demand)]);
     w.h.launch(
         X86,
         "upload-worker",
@@ -732,7 +735,7 @@ fn same_term_long_mean_static_upload_across_passes_never_forecasts_refill() -> T
     w.queue(Some(src), X86, 120, Some(secs(1)))?;
     w.h.advance(Duration::from_millis(4950));
     steps.extend(w.run());
-    assert_eq!(w.h.outlook(X86)?.needed, 1);
+    assert_eq!(w.h.outlook(X86)?.needed, 6);
     for _ in 0..6 {
         w.h.advance(secs(5));
         steps.extend(w.run());
@@ -744,12 +747,12 @@ fn same_term_long_mean_static_upload_across_passes_never_forecasts_refill() -> T
         );
         assert_eq!(
             w.h.outlook(X86)?.needed,
-            1,
-            "static upload is not future arrivals"
+            6,
+            "static reservations remain bounded by the fleet maximum"
         );
     }
-    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
-    assert_eq!(w.h.supply(X86)?.desired, 1);
+    assert_eq!(purchases(&steps), vec![(X86, 0, 3, NeedCause::Demand), (X86, 3, 6, NeedCause::Demand)]);
+    assert_eq!(w.h.supply(X86)?.desired, 6);
     Ok(())
 }
 
@@ -763,7 +766,7 @@ fn restored_unknown_disk_batch_uploaded_across_passes_never_forecasts_refill() -
     assert_eq!(
         disk_per_action.get() * 8,
         disk_capacity,
-        "each action takes two of 16 disk slots"
+        "each action takes one eighth of the instance disk"
     );
     let mut steps = Vec::new();
     for total in [20, 90, 160] {
@@ -777,8 +780,7 @@ fn restored_unknown_disk_batch_uploaded_across_passes_never_forecasts_refill() -
         }
         let pass = w.run();
         if total == 20 {
-            assert_eq!(summary(&pass)?.persistent_streams, 1);
-            assert_eq!(summary(&pass)?.horizon, Duration::from_millis(322_500));
+            assert_eq!(summary(&pass)?.needed, 3);
             w.h.launch(
                 X86,
                 "upload-worker",
@@ -787,10 +789,9 @@ fn restored_unknown_disk_batch_uploaded_across_passes_never_forecasts_refill() -
             )?;
         }
         steps.extend(pass);
-        assert_eq!(w.h.outlook(X86)?.needed, 1);
+        assert_eq!(w.h.outlook(X86)?.needed, u32::try_from(total.div_ceil(8))?.min(6));
     }
-    // Unknown work uses the 10-second prior: 160 * 2 * 10 = 3200 disk-slot-seconds,
-    // less than one worker's 16 * 322.5 = 5160. No completion backs a refill forecast.
+    // Disk reservations, not a refill forecast, determine the bound.
     for _ in 0..6 {
         w.h.advance(secs(5));
         steps.extend(w.run());
@@ -802,11 +803,11 @@ fn restored_unknown_disk_batch_uploaded_across_passes_never_forecasts_refill() -
         );
         assert_eq!(
             w.h.outlook(X86)?.needed,
-            1,
-            "upload steps cannot fund another worker"
+            6,
+            "the maximum caps disk demand"
         );
     }
-    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
-    assert_eq!(w.h.supply(X86)?.desired, 1);
+    assert_eq!(purchases(&steps), vec![(X86, 0, 3, NeedCause::Demand), (X86, 3, 6, NeedCause::Demand)]);
+    assert_eq!(w.h.supply(X86)?.desired, 6);
     Ok(())
 }

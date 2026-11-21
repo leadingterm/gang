@@ -160,8 +160,8 @@ fn boundary(stack: &Stack<'_>) -> Result<u64> {
         .map_or(Ok(0), crate::event_log::sequence)
 }
 
-/// Judges the single purchase for eight closed-loop lanes sharing four slots.
-/// Refill replaces completions; it does not add offered work beyond serving capacity.
+/// Judges scale-outs for eight closed-loop lanes against their two-worker cold resource bound.
+/// Refill replaces completions; it does not add reservations beyond those lanes.
 #[must_use]
 pub fn stream_checks(events: &[Event], refilled: bool) -> Vec<Check> {
     let purchases: Vec<_> = events
@@ -177,12 +177,8 @@ pub fn stream_checks(events: &[Event], refilled: bool) -> Vec<Check> {
         }),
         Check::expect(
             names::STREAM_STEPS,
-            purchases
-                .iter()
-                .map(|(from, to, _)| (*from, *to))
-                .collect::<Vec<_>>()
-                == [(0, 1)],
-            || format!("expected only 0->1 for bounded refill; got {purchases:?}"),
+            !purchases.is_empty() && purchases.iter().all(|(_, to, _)| *to <= 2),
+            || format!("expected at most two workers for bounded refill; got {purchases:?}"),
         ),
         Check::expect(
             names::DECISION_DETAIL,
@@ -216,9 +212,9 @@ pub fn sustained_stream(stack: &Stack<'_>) -> Result<Vec<Check>> {
         let mut started = None;
         let mut completed = None;
         let mut ceiling = true;
-        let observation = wait(stack, "sustained stream holds one worker", |state| {
+        let observation = wait(stack, "sustained stream remains resource bounded", |state| {
             refill(directory, state)?;
-            ceiling &= desired(state) <= 1;
+            ceiling &= desired(state) <= 2;
             if running(state) > 0 {
                 started.get_or_insert(state.update_time.as_unix_millis());
                 completed.get_or_insert(state.completed);
@@ -227,7 +223,7 @@ pub fn sustained_stream(stack: &Stack<'_>) -> Result<Vec<Check>> {
                 elapsed(state, start) > horizon(state)
                     && elapsed(state, start) >= Duration::from_secs(30)
             }) && completed.is_some_and(|count| state.completed >= count.saturating_add(16))
-                && desired(state) == 1)
+                && (1..=2).contains(&desired(state)))
         });
         let observed = hold.settle(observation, || Ok(()));
         let outcome = joined(build);
@@ -236,7 +232,7 @@ pub fn sustained_stream(stack: &Stack<'_>) -> Result<Vec<Check>> {
         let outcome = outcome?;
         let mut checks = stream_checks(&after(stack, since)?, true);
         checks.push(Check::expect(names::STREAM_CEILING, ceiling, || {
-            "desired capacity exceeded one while lanes refilled".to_owned()
+            "desired capacity exceeded the two-worker cold resource bound".to_owned()
         }));
         checks.push(Check::expect(
             names::STREAM_BUILD,
@@ -280,7 +276,7 @@ fn has_both_builds(state: &State, principal_a: &str, principal_b: &str) -> bool 
             .any(|build| build.principal == principal_b)
 }
 
-/// Two authenticated closed-loop streams share one worker after each matures.
+/// Two authenticated closed-loop streams remain within their combined resource bound.
 ///
 /// # Errors
 /// Returns login, deployment, observation or build errors after releasing/cancelling and joining.
@@ -341,12 +337,12 @@ pub fn two_sources(system: &Secured<'_>) -> Result<Vec<Check>> {
             if b_seen {
                 start_b.get_or_insert(state.update_time.as_unix_millis());
             }
-            isolated &= desired(state) <= 1;
+            isolated &= desired(state) <= 2;
             Ok(start_b.is_some_and(|start| {
                 elapsed(state, start) > horizon(state)
                     && elapsed(state, start) >= Duration::from_secs(30)
             }) && b_targets.len() >= 10
-                && desired(state) == 1)
+                && (1..=2).contains(&desired(state)))
         });
         let observed = hold.settle(observation, || Ok(()));
         let outcome_a = joined(a);
@@ -593,7 +589,7 @@ mod tests {
                 .all(|check| !check.is_failure())
         );
         assert!(
-            stream_checks(&[scale(0, 2, None)], true)
+            stream_checks(&[scale(0, 3, None)], true)
                 .iter()
                 .filter(|check| check.is_failure())
                 .count()
@@ -603,7 +599,7 @@ mod tests {
             stream_checks(
                 &[
                     scale(0, 1, Some("floor".to_owned())),
-                    scale(1, 2, Some("extra".to_owned())),
+                    scale(1, 3, Some("extra".to_owned())),
                 ],
                 true,
             )[1]
@@ -662,7 +658,7 @@ mod tests {
     #[test]
     fn utilization_fixture_cannot_expire_idle_before_its_observation_deadline() {
         let knobs = crate::control::ControlKnobs::UTILIZATION_SCALE_IN;
-        let target = knobs.target_actions_per_instance.expect("fixture slots");
+        let target = knobs.vcpus_per_instance.expect("fixture vcpus");
         let waterline = u32::from(
             gang_config::ScalingConfig::default()
                 .scale_in_waterline_percent
