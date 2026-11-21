@@ -205,6 +205,7 @@ where
             action_directory: &directory.path,
             working_directory: &directory.working_directory,
             network,
+            memory_cgroup: None,
             launcher: &[],
         },
         limits: properties.limits,
@@ -226,6 +227,8 @@ where
         )
         .await
     });
+    // Cancelled DNS lookups may still occupy the blocking pool; do not wait for them on exit.
+    runtime.shutdown_background();
     match execution {
         Ok(execution) => {
             side_channel::report(invocation.environment, &directory.path, execution.usage);

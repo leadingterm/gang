@@ -129,16 +129,6 @@ pub(crate) fn sample_parameters(
         large_memory_kb: PLACEMENT_LARGE_MEMORY.as_u64() / 1024,
         requested_sandbox: Sandbox::Noop,
         glibc_tool: invocation.action_tools.glibc_tool.clone(),
-        egress_probe: invocation
-            .action_tools
-            .egress
-            .as_ref()
-            .map(|tools| tools.probe.clone()),
-        egress_targets: invocation
-            .action_tools
-            .egress
-            .as_ref()
-            .and_then(|tools| tools.targets.clone()),
     }
 }
 

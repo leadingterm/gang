@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+
+- Public egress now uses a per-action pasta network namespace and one host nftables policy scoped to the action cgroup subtree. NixOS prepares the policy and cgroup before worker startup; missing or mismatched prerequisites deny granted actions.
+- **Server configuration migration:** Remove `slirp4netns`, `nft`, `nsenter` and `ip` from `[sandbox.bwrap.egress]`; these old helper keys are rejected as unknown. The table now accepts only `program`, defaulting to `pasta`, resolved and pinned like `[sandbox.bwrap].program`. Keep the existing `[execution.egress]` policy and fleet grants.
+
 ### Fixed
 
 - Fix startup on nominal 64 GiB workers whose measured memory, less reserve, is smaller than the fleet estimate; workers advertise their actual available action-pool capacity.

@@ -78,9 +78,5 @@ name = "local"
 path = "src/main.rs"
 
 [[bin]]
-name = "egress_probe"
-path = "src/egress_probe_main.rs"
-
-[[bin]]
-name = "egress_peer"
-path = "src/egress_peer_main.rs"
+name = "action_network"
+path = "src/action_network_main.rs"

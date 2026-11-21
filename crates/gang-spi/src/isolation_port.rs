@@ -179,6 +179,8 @@ pub struct ActionExecutionSpec<'a> {
     pub working_directory: &'a Path,
     /// The selected fleet's effective network access.
     pub network: NetworkAccess<'a>,
+    /// The action's memory cgroup, when limits created a scope.
+    pub memory_cgroup: Option<&'a Path>,
     /// The command prefix the sandbox starts its own first process through: empty without a
     /// limits plugin; otherwise [`crate::ActionLimitsPort::launcher`], which starts that process
     /// inside the action's limits scope. The sandbox runs `launcher` followed by the command it

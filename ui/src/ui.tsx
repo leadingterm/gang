@@ -1,5 +1,5 @@
 // Shared view primitives: live durations, tweened numbers, event glyphs, section frames and filters.
-import { createContext, type ComponentChildren } from "preact";
+import { createContext, toChildArray, type ComponentChildren } from "preact";
 import { useContext, useEffect, useRef, useState } from "preact/hooks";
 import { useComputed } from "@preact/signals";
 import type { StateClient } from "./client.ts";
@@ -313,9 +313,11 @@ export const Stack = ({ children, as = "div", gap = "xl" }: {
 };
 
 /** A group of aligned readouts. */
-export const Tiles = ({ children, columns = 5 }: { children: ComponentChildren; columns?: number }) => (
-  <div class="readouts" style={{ "--tile-columns": columns }}>{children}</div>
-);
+export const Tiles = ({ children, columns = 5 }: { children: ComponentChildren; columns?: number }) => {
+  const items = toChildArray(children);
+  const lastSpan = items.length ? columns - ((items.length - 1) % columns) : 1;
+  return <div class="readouts" style={{ "--tile-columns": columns, "--tile-last-span": lastSpan }}>{items}</div>;
+};
 
 /** A readout reserves the same five slots as its siblings. */
 export const Tile = ({ label, value, meter, caption, chart, heading = 2, valueStyle = "metric" }: {

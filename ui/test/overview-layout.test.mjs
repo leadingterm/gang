@@ -43,6 +43,44 @@ const probe = async (scenario) => {
   const elements = [...container.querySelectorAll(":scope > .readout")];
   const expected = ["Queue", "Executing", "Instances", "Done / min", "Action cache"];
   if (elements.length !== expected.length) add(`expected five tiles, got ${elements.length}`);
+  if (container.style.getPropertyValue("--tile-columns").trim() !== "5" ||
+      container.style.getPropertyValue("--tile-last-span").trim() !== "1") add("Overview Tiles did not set the expected column and last-span properties");
+  const checkGrid = (group, description) => {
+    const style = getComputedStyle(group);
+    const box = rect(group);
+    const hair = parseFloat(style.columnGap);
+    const rule = style.backgroundColor;
+    const border = (node, side, expectedWidth, color) => {
+      const s = getComputedStyle(node);
+      return equal(parseFloat(s[`border${side}Width`]), expectedWidth) &&
+        s[`border${side}Style`] === "solid" && s[`border${side}Color`] === color;
+    };
+    if (!(hair > 0)) add(`${description}: missing column hairline`);
+    if (!border(group, "Left", hair, rule) || !border(group, "Right", hair, rule) ||
+        !border(group, "Bottom", hair, rule)) add(`${description}: outer borders are not continuous rule-colored hairlines`);
+    const items = [...group.querySelectorAll(":scope > .readout")].map((node) => ({ node, box: rect(node) }));
+    const rows = [];
+    for (const item of items) {
+      let row = rows.find((entries) => equal(entries[0].box.top, item.box.top));
+      if (!row) rows.push(row = []);
+      row.push(item);
+      const s = getComputedStyle(item.node);
+      if (!border(item.node, "Top", hair, rule)) add(`${description}: tile has no visible top/row separator`);
+      if (s.backgroundColor === rule || s.backgroundColor === "rgba(0, 0, 0, 0)") add(`${description}: tile does not cover the rule background`);
+    }
+    rows.sort((a, b) => a[0].box.top - b[0].box.top);
+    for (const [index, row] of rows.entries()) {
+      row.sort((a, b) => a.box.left - b.box.left);
+      if (!equal(row[0].box.left, box.left + hair) || !equal(row.at(-1).box.right, box.right - hair)) add(`${description}: row ${index} does not fill its inner edges`);
+      if (row.some((item) => !equal(item.box.top, row[0].box.top) || !equal(item.box.bottom, row[0].box.bottom))) add(`${description}: row ${index} has discontinuous top or bottom`);
+      for (let i = 1; i < row.length; i++) {
+        if (!equal(row[i].box.left - row[i - 1].box.right, hair)) add(`${description}: row ${index} divider is not one hairline`);
+      }
+      if (index && !equal(rows[index - 1][0].box.bottom, row[0].box.top)) add(`${description}: row ${index} does not meet the preceding row`);
+    }
+    if (rows.length && (!equal(rows[0][0].box.top, box.top) || !equal(rows.at(-1)[0].box.bottom, box.bottom - hair))) add(`${description}: top or bottom edge is incomplete`);
+  };
+  checkGrid(container, "Overview");
   let isolatedMarkers = 0;
   const tiles = elements.map((element, index) => {
     const label = element.querySelector(".label");
@@ -193,6 +231,19 @@ const probe = async (scenario) => {
       if (!equal(edges[0], page.left) || !equal(edges[3], page.right)) add("column outer edges differ from page grid");
       if (referenceEdges && edges.some((edge, i) => !equal(edge, referenceEdges[i]))) add(`column edges differ: ${edges} vs ${referenceEdges}`);
       referenceEdges ??= edges;
+    }
+  }
+  // Clone the real readouts for CSS geometry; the browser bundle does not expose Tiles.
+  // Explicit spans are independent test cases, not a duplicate of the primitive's calculation.
+  for (const [columns, spans] of [[4, [4, 2, 4, 3, 2]], [5, [5, 3, 1, 5, 4]]]) {
+    for (const [index, count] of [1, 3, 5, 6, 7].entries()) {
+      const group = container.cloneNode(false);
+      group.style.setProperty("--tile-columns", columns);
+      group.style.setProperty("--tile-last-span", spans[index]);
+      for (let i = 0; i < count; i++) group.append(elements[i % elements.length].cloneNode(true));
+      container.parentElement.append(group);
+      checkGrid(group, `synthetic ${columns} columns/${count} tiles`);
+      group.remove();
     }
   }
   return { violations, tiles, clip: rect(container) };

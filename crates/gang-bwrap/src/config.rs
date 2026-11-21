@@ -20,27 +20,18 @@ pub struct BwrapConfig {
     pub program: PathBuf,
 }
 
-/// Host programs used to configure a public-egress network namespace.
+/// Host program used to create a public-egress network namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EgressPrograms {
-    /// User-mode network stack.
-    pub slirp4netns: PathBuf,
-    /// Firewall configuration program.
-    pub nft: PathBuf,
-    /// Namespace entry program.
-    pub nsenter: PathBuf,
-    /// Host interface inventory program.
-    pub ip: PathBuf,
+    /// User-mode network stack, resolved through the worker's PATH.
+    pub program: PathBuf,
 }
 
 impl Default for EgressPrograms {
     fn default() -> Self {
         Self {
-            slirp4netns: PathBuf::from("slirp4netns"),
-            nft: PathBuf::from("nft"),
-            nsenter: PathBuf::from("nsenter"),
-            ip: PathBuf::from("ip"),
+            program: PathBuf::from("pasta"),
         }
     }
 }
@@ -61,10 +52,7 @@ impl SandboxPrograms for BwrapConfig {
     ) -> Result<(), E> {
         visit(&mut self.program)?;
         if let Some(egress) = &mut self.egress {
-            visit(&mut egress.slirp4netns)?;
-            visit(&mut egress.nft)?;
-            visit(&mut egress.nsenter)?;
-            visit(&mut egress.ip)?;
+            visit(&mut egress.program)?;
         }
         Ok(())
     }
@@ -94,6 +82,14 @@ mod tests {
         assert!(with.supports_capability(Capability::Network));
         assert_eq!(with.egress, Some(EgressPrograms::default()));
         assert!(toml::from_str::<BwrapConfig>("root = '/rootfs'\n[egress]\nunknown = 1").is_err());
+        for key in ["slirp4netns", "nft", "nsenter", "ip"] {
+            assert!(
+                toml::from_str::<BwrapConfig>(&format!(
+                    "root = '/rootfs'\n[egress]\n{key} = '/bin/helper'"
+                ))
+                .is_err()
+            );
+        }
         assert!(
             toml::from_str::<BwrapConfig>("root = '/rootfs'\npermit_network_property = true")
                 .is_err()
@@ -173,12 +169,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        assert_eq!(visited, ["bwrap", "pasta"].map(PathBuf::from));
         assert_eq!(
-            visited,
-            ["bwrap", "slirp4netns", "nft", "nsenter", "ip"].map(PathBuf::from)
+            config.egress.unwrap().program,
+            PathBuf::from("/resolved/pasta")
         );
-        let egress = config.egress.unwrap();
-        assert_eq!(egress.nft, PathBuf::from("/resolved/nft"));
-        assert_eq!(egress.ip, PathBuf::from("/resolved/ip"));
     }
 }

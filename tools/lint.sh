@@ -34,12 +34,18 @@ portable() {
   nix eval --raw .#packages.aarch64-darwin.darwin-check.drvPath >/dev/null
 }
 
-nix_vm() {
+nix_vm() (
   if [[ $(uname -sm) != 'Linux x86_64' ]]; then
     echo 'The Nix VM checks require Linux x86_64.' >&2
     return 1
   fi
-  local names name
+  local names name staged
+  staged=$(mktemp -d)
+  trap 'rm -rf "$staged"' EXIT
+  "${BAZEL:-bazel}" build -c opt //:gang //crates/gang-e2e:action_network
+  mkdir -p "$staged/x86_64-linux"
+  cp "$("${BAZEL:-bazel}" cquery -c opt --output=files //:gang)" "$staged/x86_64-linux/gang"
+  cp "$("${BAZEL:-bazel}" cquery -c opt --output=files //crates/gang-e2e:action_network)" "$staged/x86_64-linux/action_network"
   local -a checks=() link_args=(--no-link)
   names=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames | jq -er '.[]')
   if [[ -z $names ]]; then
@@ -52,8 +58,8 @@ nix_vm() {
   if [[ -n ${NIX_CHECK_RESULTS:-} ]]; then
     link_args=(--out-link "$NIX_CHECK_RESULTS")
   fi
-  nix build "${link_args[@]}" --print-build-logs "${checks[@]}"
-}
+  nix build "${link_args[@]}" --print-build-logs --no-write-lock-file --override-input gang-binaries "path:$staged" "${checks[@]}"
+)
 
 if (( $# == 0 )); then
   portable

@@ -151,68 +151,14 @@ impl Bazel {
     /// Runs a build command with an optional early-abort signal.
     fn build_command(
         &self,
-        mut command: Command,
+        command: Command,
         abort: Option<oneshot::Receiver<String>>,
     ) -> Result<BuildOutcome> {
-        self.offline_repositories(&mut command);
         let output = match abort {
             Some(abort) => process::run_until(command, None, self.settings.build_timeout, abort)?,
             None => process::run(command, None, self.settings.build_timeout)?,
         };
         Ok(BuildOutcome::new(output.code, output.combined()))
-    }
-
-    fn offline_repositories(&self, command: &mut Command) {
-        if let Some(cache) = self
-            .action_tools
-            .egress
-            .as_ref()
-            .and_then(|tools| tools.repository_cache.as_deref())
-        {
-            command
-                .arg(path_flag("--repository_cache=", cache))
-                .arg("--lockfile_mode=error");
-        }
-    }
-
-    /// Resolves the staged sample online before its isolated fixture starts.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if resolution fails, exceeds its deadline, or server cleanup fails.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn prefetch(&self, cache: &Path) -> Result<()> {
-        let command = self.prefetch_command(&prefetch_args(&self.output_user_root, cache));
-        let output = process::run(command, None, self.settings.build_timeout);
-        let shutdown = self.prefetch_command(&[
-            path_flag("--output_user_root=", &self.output_user_root),
-            "--nohome_rc".into(),
-            "--nosystem_rc".into(),
-            "shutdown".into(),
-        ]);
-        let _ = process::run(shutdown, None, self.settings.command_timeout);
-        let cleanup = self.kill_servers();
-        let output = output?;
-        if !output.succeeded() {
-            return Err(E2eError::Command {
-                program: self.program.display().to_string(),
-                outcome: format!("prefetch exited with {:?}", output.code),
-                output: output.combined(),
-            });
-        }
-        cleanup
-    }
-
-    #[cfg(target_os = "linux")]
-    fn prefetch_command(&self, arguments: &[OsString]) -> Command {
-        let mut command = Command::new(&self.program);
-        command
-            .current_dir(&self.workspace)
-            .args(arguments)
-            .env("PATH", &self.action_tools.path);
-        scrub_environment(&mut command);
-        client_home(&mut command, &self.workspace);
-        command
     }
 
     /// The pinned tool path used by Bazel clients.
@@ -348,27 +294,6 @@ impl Bazel {
     }
 }
 
-/// The online analysis command; its explicit mode overrides the sample rc's disabled lockfile.
-#[cfg(any(target_os = "linux", test))]
-fn prefetch_args(output_user_root: &Path, cache: &Path) -> [OsString; 8] {
-    [
-        path_flag("--output_user_root=", output_user_root),
-        "--nohome_rc".into(),
-        "--nosystem_rc".into(),
-        "build".into(),
-        "--nobuild".into(),
-        "//...".into(),
-        path_flag("--repository_cache=", cache),
-        "--lockfile_mode=update".into(),
-    ]
-}
-
-fn path_flag(prefix: &str, path: &Path) -> OsString {
-    let mut flag = OsString::from(prefix);
-    flag.push(path);
-    flag
-}
-
 /// Whether a process's exact arguments identify the specified Bazel output base.
 fn serves(arguments: &[OsString], output_base: &Path) -> bool {
     arguments.iter().any(|argument| {
@@ -395,7 +320,6 @@ mod tests {
                 bwrap: None,
                 glibc_tool: None,
                 action_rootfs: None,
-                egress: None,
             },
             PathBuf::from("/workspace"),
             output_user_root,
@@ -463,79 +387,6 @@ mod tests {
             assert_eq!(driver.settings.build_timeout, bazel.settings.build_timeout);
         }
         assert_eq!(bazel.settings.bazel_flags, ["--remote_timeout=37"]);
-    }
-
-    #[test]
-    fn fixture_builds_override_lockfile_mode_with_the_prefetched_cache() {
-        let mut bazel = bazel(PathBuf::from("/output"));
-        bazel.action_tools.egress = Some(crate::settings::EgressTools {
-            slirp4netns: "/tools/slirp4netns".into(),
-            nft: "/tools/nft".into(),
-            nsenter: "/tools/nsenter".into(),
-            ip: "/tools/ip".into(),
-            unshare: "/tools/unshare".into(),
-            probe: "/tools/probe".into(),
-            peer: "/tools/peer".into(),
-            policy: None,
-            targets: None,
-            repository_cache: Some("/repository cache".into()),
-        });
-        let mut command = Command::new("/tools/bazel");
-        command.args(["build", "--lockfile_mode=off", "//:probe"]);
-        bazel.offline_repositories(&mut command);
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            [
-                "build",
-                "--lockfile_mode=off",
-                "//:probe",
-                "--repository_cache=/repository cache",
-                "--lockfile_mode=error",
-            ]
-        );
-        if let Some(tools) = &mut bazel.action_tools.egress {
-            tools.repository_cache = None;
-        }
-        let mut command = Command::new("/tools/bazel");
-        command.args(["build", "--lockfile_mode=off", "//:probe"]);
-        bazel.offline_repositories(&mut command);
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            ["build", "--lockfile_mode=off", "//:probe"]
-        );
-    }
-
-    #[test]
-    fn ordinary_build_arguments_remain_unchanged() {
-        let bazel = bazel(PathBuf::from("/output"));
-        let mut command = Command::new("/tools/bazel");
-        command.args(["build", "--lockfile_mode=off", "//:probe"]);
-        bazel.offline_repositories(&mut command);
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            ["build", "--lockfile_mode=off", "//:probe"]
-        );
-    }
-
-    #[test]
-    fn prefetch_arguments_analyze_every_sample_target_and_update_the_lockfile() {
-        assert_eq!(
-            prefetch_args(
-                Path::new("/prefetch output"),
-                Path::new("/repository cache")
-            ),
-            [
-                "--output_user_root=/prefetch output",
-                "--nohome_rc",
-                "--nosystem_rc",
-                "build",
-                "--nobuild",
-                "//...",
-                "--repository_cache=/repository cache",
-                "--lockfile_mode=update",
-            ]
-            .map(OsString::from)
-        );
     }
 
     #[test]

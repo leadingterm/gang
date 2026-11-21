@@ -115,7 +115,6 @@ pub(crate) fn register_execution_gate(
     // including when into_inner consumes the registration.
     Ok(unsafe { tokio::io::unix::AsyncFd::register(gate) }?)
 }
-
 /// An asynchronously readable owned pipe. Dropping the reader closes its descriptor.
 pub struct PipeReader {
     fd: tokio::io::unix::AsyncFd<OwnedFd>,

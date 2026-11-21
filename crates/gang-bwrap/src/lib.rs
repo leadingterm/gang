@@ -20,11 +20,9 @@
 mod bwrap;
 mod command_line;
 mod config;
-#[cfg(target_os = "linux")]
-mod egress;
-#[cfg(target_os = "linux")]
-mod egress_policy;
 mod errors;
+#[cfg(target_os = "linux")]
+pub mod host_egress;
 mod relay;
 
 pub use bwrap::Bwrap;

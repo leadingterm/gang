@@ -171,8 +171,6 @@ gang_types::string_enum! {
         /// Records the net and mnt namespaces, the visibility of a stand-in for the CAS, and whether
         /// its working directory is writable.
         Isolated = "isolated",
-        /// Probes network access without requesting the network capability.
-        NetworkIsolated = "network_isolated",
         /// Probes network access with `network = requested`.
         NetworkRequested = "network_requested",
         /// Records that it ran; sets the `ISA` exec property explicitly.

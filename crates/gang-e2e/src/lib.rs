@@ -21,6 +21,7 @@ mod access_verdict;
 mod action_environment_probe;
 #[cfg(target_os = "linux")]
 mod action_ipc;
+mod action_network;
 mod administrator;
 mod admission;
 mod balancer;
@@ -116,11 +117,6 @@ mod upgrade_fixture;
 mod upgrade_probe;
 mod work_aware;
 
-/// Isolated fixture for the public-egress scenario.
-pub mod egress_fixture;
-/// Real public-egress helper lifecycle fault checks.
-pub mod egress_lifecycle;
-pub mod egress_wire;
 pub mod flags;
 pub mod launch_failure;
 pub mod names;
@@ -142,6 +138,7 @@ pub use access_verdict::{
     status_is,
 };
 pub use action_environment_probe::action_environment_probe;
+pub use action_network::run_action_network;
 pub use administrator::{ADMINISTRATOR, Administrator};
 pub use admission::{cold_start_misfit, memory_escalation, oversized_fleet, unplaceable_disk};
 pub use balancer::{Balancer, Frontend, Probe as BalancerProbe};
@@ -170,7 +167,6 @@ pub use device_verdict::{
 };
 pub use disk::disk;
 pub use drain_cancel::drain_cancel;
-pub use egress_wire::{EgressTargets, PeerCommand, PeerMessage};
 pub use errors::{E2eError, Result};
 pub use event_log::EventFollower;
 pub use execution::{
@@ -235,15 +231,14 @@ pub use server_scenarios::{api, certificate_rotation, event_paging, request_limi
 pub use server_stack::ServerStream;
 pub use session::{SessionCookie, TokenUsage, cookie_name, session_cookie, signed_token};
 pub use settings::{
-    ActionTools, DeploymentInputs, EgressTools, ReleaseInput, Settings, UpgradeInputs,
-    UpgradeProcedure,
+    ActionTools, DeploymentInputs, ReleaseInput, Settings, UpgradeInputs, UpgradeProcedure,
 };
 pub use skipped_pass::skipped_pass;
 pub use sse::EventStream;
 pub use stack::Stack;
 pub use stale_scope::stale_scope;
 pub use state_api::{StateApi, StateStream};
-pub use suite::{Gate, Invocation, Scenario, UnknownGate, egress_worker, run, unknown_scenarios};
+pub use suite::{Gate, Invocation, Scenario, UnknownGate, run, unknown_scenarios};
 pub use system::{
     ActionLimits, AttemptRecord, FleetLayout, HOLD_CPU_COUNT, HOLD_MEMORY_KB, LARGE_FLEET,
     LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, Limits, NOOP_FLEET, PLACEMENT_LARGE_MEMORY,

@@ -8,7 +8,7 @@ Status: Accepted. Complements ADR-17; abandoned limit-scope recovery remains in 
 
 ## Decision
 - `gang exec` owns termination observation and relay. A request before action start prevents the start; a later request reaches the running sandbox through `SandboxedAction::relay`.
-- After noop starts, `gang exec` moves to the worker group so the action-group kill spares cleanup. With bwrap it stays in the original group to relay signals; the outer bwrap blocks TERM/INT and `gang-reset` clears the action's inherited mask.
+- After noop starts, `gang exec` moves to the worker group so the action-group kill spares cleanup. With bwrap it stays in the original group to relay signals. Offline, the outer bwrap stays in that group and blocks TERM/INT; with a network grant, pasta and the outer bwrap join the worker group, excluded from NativeLink's signals. `gang-reset` clears the action's inherited mask.
 - TERM/INT use handlers, not ignored dispositions. Normal completion leaves the limit scope; PID-targeted death is covered by ADR-19's guardian.
 
 ## Consequences
