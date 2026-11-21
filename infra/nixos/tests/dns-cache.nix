@@ -4,6 +4,7 @@
   dig = "${pkgs.dnsutils}/bin/dig";
   getent = "${pkgs.glibc.bin}/bin/getent";
   grep = "${pkgs.gnugrep}/bin/grep";
+  busctl = "${pkgs.systemd}/bin/busctl";
   resolvectl = "${pkgs.systemd}/bin/resolvectl";
 in
   pkgs.testers.runNixOSTest {
@@ -81,14 +82,19 @@ in
       client.wait_until_succeeds("${pkgs.iproute2}/bin/ip -4 address show dev eth1 | ${grep} -q 'inet 192.168.77.'", timeout=timedelta(seconds=30))
       client.wait_until_succeeds("${resolvectl} dns eth1 | ${grep} -Fq '${upstreamIP}'", timeout=timedelta(seconds=30))
       client.wait_until_succeeds("${resolvectl} domain eth1 | ${grep} -Fq 'cache.test'", timeout=timedelta(seconds=30))
+      client.wait_until_succeeds("${grep} -Eq '^search[[:space:]]+([^[:space:]]+[[:space:]]+)*cache\\.test([[:space:]]|$)' /etc/resolv.conf", timeout=timedelta(seconds=30))
       client.succeed("${grep} -Eq '^nameserver[[:space:]]+127\\.0\\.0\\.53$' /etc/resolv.conf")
+      manager = "${busctl} get-property org.freedesktop.resolve1 /org/freedesktop/resolve1 org.freedesktop.resolve1.Manager"
+      assert client.succeed(f"{manager} DNSSEC").strip() == 's "no"'
+      assert client.succeed(f"{manager} DNSOverTLS").strip() == 's "no"'
+      assert client.succeed(f"{manager} FallbackDNS").strip() == "a(iiay) 0"
 
       assert client.succeed("${dig} +time=1 +tries=1 +short @${upstreamIP} cached.cache.test A").strip() == "192.0.2.80"
       assert "192.0.2.80" in client.succeed("${getent} ahostsv4 cached")
-      assert client.succeed("${dig} +time=1 +tries=1 +short stub.cache.test A").strip() == "192.0.2.81"
+      assert client.succeed("${dig} +search +time=1 +tries=1 +short stub A").strip() == "192.0.2.81"
 
       upstream.succeed("${pkgs.systemd}/bin/systemctl stop dns-fixture.service")
       assert "192.0.2.80" in client.succeed("${getent} ahostsv4 cached")
-      assert client.succeed("${dig} +time=1 +tries=1 +short stub.cache.test A").strip() == "192.0.2.81"
+      assert client.succeed("${dig} +search +time=1 +tries=1 +short stub A").strip() == "192.0.2.81"
     '';
   }
