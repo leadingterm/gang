@@ -29,6 +29,7 @@
 - **v0.3.4:** Declare rate probes explicitly so the checked-in sample passes harness validation.
 - **v0.3.4:** Credit pending and reliable requested capacity without repeatedly raising desired size; keep transient credential-refresh gaps separate from serving surplus and preserve failed-request withdrawal.
 - **v0.3.4:** Keep controller cordons across reconnects and overlapping worker generations within the live engine; do not adopt worker self-drain flags as controller intent. Reset N−1 dwell after skipped passes and keep repeated cordon reinforcement out of audit history.
+- Report rejected OpenTofu upgrade-fixture event types and messages without dumping plan or state values.
 
 ### Removed
 

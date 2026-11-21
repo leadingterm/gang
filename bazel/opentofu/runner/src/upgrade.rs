@@ -237,7 +237,12 @@ fn record_diagnostic(event: &Value, forgotten_notice: &mut bool) -> Result<bool>
         return Ok(true);
     }
     if matches!(event["@level"].as_str(), Some("error" | "warn" | "warning")) {
-        return Err("OpenTofu emitted an error or warning".into());
+        return Err(format!(
+            "OpenTofu emitted an error or warning ({}): {}",
+            event["type"].as_str().unwrap_or("unknown"),
+            event["@message"].as_str().unwrap_or("no message")
+        )
+        .into());
     }
     Ok(false)
 }
@@ -1597,6 +1602,18 @@ mod tests {
                 assert!(selected_evidence(&encode_events(&events)).is_err());
             }
         }
+    }
+
+    #[test]
+    fn reports_warning_context_without_dumping_plan_values() {
+        let event = json!({
+            "type":"log", "@level":"warn", "@message":"provider shutdown failed",
+            "test_plan":{"secret":"must not appear"}
+        });
+        let error = record_diagnostic(&event, &mut false).expect_err("warning is rejected");
+        let message = error.to_string();
+        assert!(message.contains("(log): provider shutdown failed"));
+        assert!(!message.contains("must not appear"));
     }
 
     #[test]
