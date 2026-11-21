@@ -9,7 +9,7 @@
 
 ### Fixed
 
-- Expose the public listener connection limit in the deployment module, defaulting to 4096.
+- Expose the public listener connection limit in the deployment module, defaulting to 4096. The module now owns `[server.http2]` for all backends; SQLite callers must remove any appended `[server.http2]` table and move their `max_connections` override to `http2_max_connections`.
 
 ## 0.3.4
 
