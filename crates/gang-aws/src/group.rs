@@ -3,8 +3,8 @@
 
 use aws_sdk_autoscaling::operation::describe_auto_scaling_groups::DescribeAutoScalingGroupsOutput;
 use aws_sdk_autoscaling::types::{
-    AutoScalingGroup, Instance as AutoScalingInstance, InstanceReusePolicy, LaunchTemplateOverrides,
-    LifecycleState,
+    AutoScalingGroup, Instance as AutoScalingInstance, InstanceReusePolicy,
+    LaunchTemplateOverrides, LifecycleState,
 };
 use gang_types::{FleetName, InstanceId, InstanceLifecycle};
 
@@ -454,7 +454,11 @@ mod tests {
             &["us-east-1a", "us-east-1b", "us-east-1a"],
             vec![explicit("c7g.large"), explicit("m7g.large")],
         );
-        let zones_ptr = raw.availability_zones.as_ref().ok_or("missing zones")?.as_ptr();
+        let zones_ptr = raw
+            .availability_zones
+            .as_ref()
+            .ok_or("missing zones")?
+            .as_ptr();
         let overrides_ptr = raw
             .mixed_instances_policy
             .as_ref()

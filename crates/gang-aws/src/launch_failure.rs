@@ -59,7 +59,9 @@ pub(crate) fn blocked_reason<'a>(
     if newest.status_code() != Some(&ScalingActivityStatusCode::Failed) {
         return None;
     }
-    let reason = newest.status_message().filter(|message| !message.is_empty())?;
+    let reason = newest
+        .status_message()
+        .filter(|message| !message.is_empty())?;
     if blocks_growth(newest, candidate_count) {
         return Some(reason);
     }
@@ -79,7 +81,9 @@ pub(crate) fn blocked_reason<'a>(
         .all(|(instance_type, zone)| {
             attempts.iter().any(|attempt| {
                 attempt.zone == zone
-                    && attempt.instance_type.is_none_or(|actual| actual == instance_type)
+                    && attempt
+                        .instance_type
+                        .is_none_or(|actual| actual == instance_type)
             })
         })
         .then_some(reason)
@@ -120,8 +124,12 @@ fn classify_attempt<'a>(
     candidates: &crate::group::LaunchCandidates,
 ) -> Option<Attempt<'a>> {
     let message = activity.status_message()?;
-    let capacity = tokens(message)
-        .any(|token| matches!(token, "InsufficientInstanceCapacity" | "UnfulfillableCapacity"));
+    let capacity = tokens(message).any(|token| {
+        matches!(
+            token,
+            "InsufficientInstanceCapacity" | "UnfulfillableCapacity"
+        )
+    });
     let invalid = tokens(message).any(|token| token == "InvalidFleetConfiguration");
     if !capacity && !invalid {
         return None;
@@ -139,7 +147,10 @@ fn classify_attempt<'a>(
         Some(zone) => zone,
         None => unique_match(&|token| candidates.pairs().any(|(_, zone)| zone == token))?,
     };
-    if !candidates.pairs().any(|(_, candidate_zone)| candidate_zone == zone) {
+    if !candidates
+        .pairs()
+        .any(|(_, candidate_zone)| candidate_zone == zone)
+    {
         return None;
     }
     let instance_type = match details.as_ref().and_then(|details| details.instance_type) {
@@ -153,7 +164,10 @@ fn classify_attempt<'a>(
     } else if invalid || tokens(message).any(looks_like_instance_type) {
         return None;
     }
-    Some(Attempt { zone, instance_type })
+    Some(Attempt {
+        zone,
+        instance_type,
+    })
 }
 
 fn looks_like_instance_type(token: &str) -> bool {
@@ -161,8 +175,10 @@ fn looks_like_instance_type(token: &str) -> bool {
         return false;
     };
     family.bytes().any(|byte| byte.is_ascii_digit())
-        && (matches!(size, "nano" | "micro" | "small" | "medium" | "large" | "metal")
-            || size.ends_with("xlarge")
+        && (matches!(
+            size,
+            "nano" | "micro" | "small" | "medium" | "large" | "metal"
+        ) || size.ends_with("xlarge")
             || size.starts_with("metal-"))
 }
 
@@ -216,14 +232,24 @@ mod tests {
                 MixedInstancesPolicy::builder()
                     .launch_template(
                         LaunchTemplate::builder()
-                            .overrides(LaunchTemplateOverrides::builder().instance_type("c7g.large").build())
-                            .overrides(LaunchTemplateOverrides::builder().instance_type("m7g.large").build())
+                            .overrides(
+                                LaunchTemplateOverrides::builder()
+                                    .instance_type("c7g.large")
+                                    .build(),
+                            )
+                            .overrides(
+                                LaunchTemplateOverrides::builder()
+                                    .instance_type("m7g.large")
+                                    .build(),
+                            )
                             .build(),
                     )
                     .build(),
             )
             .build();
-        let mut output = DescribeAutoScalingGroupsOutput::builder().auto_scaling_groups(group).build();
+        let mut output = DescribeAutoScalingGroupsOutput::builder()
+            .auto_scaling_groups(group)
+            .build();
         Group::read(&mut output, "workers")
             .expect("fixture has a valid group")
             .launch_candidates
@@ -248,9 +274,20 @@ mod tests {
         let candidates = candidates();
         let reason = "InsufficientInstanceCapacity: capacity unavailable; exact reason.";
         let zone_a = || with_details(reason, r#"{"Availability Zone":"us-east-1a"}"#);
-        let zone_b = || with_details("UnfulfillableCapacity", r#"{"Availability Zone":"us-east-1b"}"#);
-        assert_eq!(blocked_reason(&[zone_a()], Some(&candidates), Some(4)), None);
-        assert_eq!(blocked_reason(&[zone_a(), zone_b()], Some(&candidates), Some(4)), Some(reason));
+        let zone_b = || {
+            with_details(
+                "UnfulfillableCapacity",
+                r#"{"Availability Zone":"us-east-1b"}"#,
+            )
+        };
+        assert_eq!(
+            blocked_reason(&[zone_a()], Some(&candidates), Some(4)),
+            None
+        );
+        assert_eq!(
+            blocked_reason(&[zone_a(), zone_b()], Some(&candidates), Some(4)),
+            Some(reason)
+        );
         assert_eq!(blocked_reason(&[zone_a(), zone_b()], None, Some(4)), None);
 
         let pair = |kind: &str, zone: &str| {
@@ -259,26 +296,63 @@ mod tests {
                 &format!(r#"{{"Availability Zone":"{zone}","Instance Type":"{kind}"}}"#),
             )
         };
-        assert_eq!(blocked_reason(&[pair("c7g.large", "us-east-1a")], Some(&candidates), Some(4)), None);
+        assert_eq!(
+            blocked_reason(
+                &[pair("c7g.large", "us-east-1a")],
+                Some(&candidates),
+                Some(4)
+            ),
+            None
+        );
         let all = [
             pair("c7g.large", "us-east-1a"),
             pair("m7g.large", "us-east-1a"),
             pair("c7g.large", "us-east-1b"),
             pair("m7g.large", "us-east-1b"),
         ];
-        assert_eq!(blocked_reason(&all, Some(&candidates), Some(4)), Some("InvalidFleetConfiguration: unsupported"));
-        let progress = activity(Some(ScalingActivityStatusCode::InProgress), Some(LAUNCH), None);
-        assert_eq!(blocked_reason(&[progress.clone(), zone_a(), zone_b()], Some(&candidates), Some(4)), None);
-        assert_eq!(blocked_reason(&[zone_a(), progress, zone_a(), zone_b()], Some(&candidates), Some(4)), None);
+        assert_eq!(
+            blocked_reason(&all, Some(&candidates), Some(4)),
+            Some("InvalidFleetConfiguration: unsupported")
+        );
+        let progress = activity(
+            Some(ScalingActivityStatusCode::InProgress),
+            Some(LAUNCH),
+            None,
+        );
+        assert_eq!(
+            blocked_reason(
+                &[progress.clone(), zone_a(), zone_b()],
+                Some(&candidates),
+                Some(4)
+            ),
+            None
+        );
+        assert_eq!(
+            blocked_reason(
+                &[zone_a(), progress, zone_a(), zone_b()],
+                Some(&candidates),
+                Some(4)
+            ),
+            None
+        );
     }
 
     #[test]
     fn unattributed_or_unknown_failures_do_not_cover_candidates() {
         let candidates = candidates();
-        let other_zone = with_details("InsufficientInstanceCapacity", r#"{"Availability Zone":"us-east-1z"}"#);
-        let other_type = with_details("InsufficientInstanceCapacity", r#"{"Availability Zone":"us-east-1a","Instance Type":"x9.large"}"#);
+        let other_zone = with_details(
+            "InsufficientInstanceCapacity",
+            r#"{"Availability Zone":"us-east-1z"}"#,
+        );
+        let other_type = with_details(
+            "InsufficientInstanceCapacity",
+            r#"{"Availability Zone":"us-east-1a","Instance Type":"x9.large"}"#,
+        );
         let no_zone = failed("InsufficientInstanceCapacity");
-        let zone_b = with_details("InsufficientInstanceCapacity", r#"{"Availability Zone":"us-east-1b"}"#);
+        let zone_b = with_details(
+            "InsufficientInstanceCapacity",
+            r#"{"Availability Zone":"us-east-1b"}"#,
+        );
         for failure in [
             other_zone,
             other_type,
@@ -287,22 +361,48 @@ mod tests {
             failed("InsufficientInstanceCapacity us-east-1a m8i.metal-24xl"),
             failed("InsufficientInstanceCapacity us-east-1a m8i.metal-48xl"),
         ] {
-            assert_eq!(blocked_reason(&[failure, zone_b.clone()], Some(&candidates), Some(4)), None);
+            assert_eq!(
+                blocked_reason(&[failure, zone_b.clone()], Some(&candidates), Some(4)),
+                None
+            );
         }
-        assert_eq!(blocked_reason(&[failed("InsufficientInstanceCapacity us-east-1a-extra"), zone_b], Some(&candidates), Some(4)), None);
+        assert_eq!(
+            blocked_reason(
+                &[
+                    failed("InsufficientInstanceCapacity us-east-1a-extra"),
+                    zone_b
+                ],
+                Some(&candidates),
+                Some(4)
+            ),
+            None
+        );
     }
 
     #[test]
     fn ignores_nonlaunch_activities_and_preserves_newest_reason() {
         let candidates = candidates();
-        let terminate = activity(Some(ScalingActivityStatusCode::Failed), Some("Terminating EC2 instance"), Some("AccessDenied"));
+        let terminate = activity(
+            Some(ScalingActivityStatusCode::Failed),
+            Some("Terminating EC2 instance"),
+            Some("AccessDenied"),
+        );
         let a = failed("InsufficientInstanceCapacity us-east-1a");
         let b = failed("UnfulfillableCapacity us-east-1b");
-        assert_eq!(blocked_reason(&[terminate, a, b], Some(&candidates), Some(4)), Some("InsufficientInstanceCapacity us-east-1a"));
-        assert_eq!(blocked_reason(&[failed("AccessDenied")], None, None), Some("AccessDenied"));
+        assert_eq!(
+            blocked_reason(&[terminate, a, b], Some(&candidates), Some(4)),
+            Some("InsufficientInstanceCapacity us-east-1a")
+        );
+        assert_eq!(
+            blocked_reason(&[failed("AccessDenied")], None, None),
+            Some("AccessDenied")
+        );
         assert_eq!(
             blocked_reason(
-                &[failed("InvalidFleetConfiguration c7g.large us-east-1a"), failed("VcpuLimitExceeded")],
+                &[
+                    failed("InvalidFleetConfiguration c7g.large us-east-1a"),
+                    failed("VcpuLimitExceeded")
+                ],
                 Some(&candidates),
                 Some(4),
             ),
@@ -319,16 +419,55 @@ mod tests {
             failed("InvalidFleetConfiguration c7g.large us-east-1b"),
             failed("InvalidFleetConfiguration m7g.large us-east-1b"),
         ];
-        assert_eq!(blocked_reason(&failures, Some(&candidates), Some(4)), failures[0].status_message());
+        assert_eq!(
+            blocked_reason(&failures, Some(&candidates), Some(4)),
+            failures[0].status_message()
+        );
         let ambiguous = failed("InvalidFleetConfiguration c7g.large us-east-1a us-east-1b");
-        assert_eq!(blocked_reason(&[ambiguous, failures[1].clone(), failures[2].clone(), failures[3].clone()], Some(&candidates), Some(4)), None);
+        assert_eq!(
+            blocked_reason(
+                &[
+                    ambiguous,
+                    failures[1].clone(),
+                    failures[2].clone(),
+                    failures[3].clone()
+                ],
+                Some(&candidates),
+                Some(4)
+            ),
+            None
+        );
         let preferred = with_details(
             "InvalidFleetConfiguration c7g.large us-east-1a us-east-1b",
             r#"{"Availability Zone":"us-east-1a","Instance Type":"c7g.large"}"#,
         );
-        assert_eq!(blocked_reason(&[preferred, failures[1].clone(), failures[2].clone(), failures[3].clone()], Some(&candidates), Some(4)), Some("InvalidFleetConfiguration c7g.large us-east-1a us-east-1b"));
+        assert_eq!(
+            blocked_reason(
+                &[
+                    preferred,
+                    failures[1].clone(),
+                    failures[2].clone(),
+                    failures[3].clone()
+                ],
+                Some(&candidates),
+                Some(4)
+            ),
+            Some("InvalidFleetConfiguration c7g.large us-east-1a us-east-1b")
+        );
         let wrong_type = failed("InvalidFleetConfiguration c7g.large-extra us-east-1a");
-        assert_eq!(blocked_reason(&[wrong_type, failures[1].clone(), failures[2].clone(), failures[3].clone()], Some(&candidates), Some(4)), None);
+        assert_eq!(
+            blocked_reason(
+                &[
+                    wrong_type,
+                    failures[1].clone(),
+                    failures[2].clone(),
+                    failures[3].clone()
+                ],
+                Some(&candidates),
+                Some(4)
+            ),
+            None
+        );
     }
 
     #[test]

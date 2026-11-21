@@ -983,9 +983,15 @@ mod tests {
         zoned_activity(&harness, 60, "us-east-1a", STOCKOUT);
         zoned_activity(&harness, 30, "us-east-1b", UNFULFILLABLE);
         let mut supply = FleetSupply::default();
-        harness.fleets.supply(fleet(FLEET)?.view(), &mut supply).await?;
+        harness
+            .fleets
+            .supply(fleet(FLEET)?.view(), &mut supply)
+            .await?;
         assert_eq!(
-            supply.launch_failure.as_ref().map(|failure| failure.reason.as_str()),
+            supply
+                .launch_failure
+                .as_ref()
+                .map(|failure| failure.reason.as_str()),
             Some(UNFULFILLABLE)
         );
 
@@ -1012,7 +1018,10 @@ mod tests {
         fallback.fleets.supply(fleet.view(), &mut supply).await?;
         assert_eq!(supply.abandoned, 2);
         gang_testkit::fence::with_held(async |held| {
-            fallback.fleets.set_desired_capacity(held, fleet.view(), 2).await
+            fallback
+                .fleets
+                .set_desired_capacity(held, fleet.view(), 2)
+                .await
         })
         .await?;
         assert_eq!(fallback.desired("gang-fleet-on-demand"), Some(2));
@@ -1052,7 +1061,10 @@ mod tests {
                     if observed == reason
             )));
             gang_testkit::fence::with_held(async |held| {
-                harness.fleets.set_desired_capacity(held, fleet.view(), 2).await
+                harness
+                    .fleets
+                    .set_desired_capacity(held, fleet.view(), 2)
+                    .await
             })
             .await?;
             assert_eq!(harness.desired("gang-fleet-on-demand"), Some(0));
@@ -1086,7 +1098,10 @@ mod tests {
         harness.fleets.supply(fleet.view(), &mut supply).await?;
         assert_eq!(supply.abandoned, 0);
         assert_eq!(
-            supply.launch_failure.as_ref().map(|failure| failure.reason.as_str()),
+            supply
+                .launch_failure
+                .as_ref()
+                .map(|failure| failure.reason.as_str()),
             Some(UNFULFILLABLE)
         );
         Ok(())
@@ -1100,10 +1115,19 @@ mod tests {
         for age in 1..=100 {
             zoned_activity(&harness, age, "us-east-1b", UNFULFILLABLE);
         }
-        let mut output = harness.fleets.describe_groups(std::iter::once(FLEET)).await?;
+        let mut output = harness
+            .fleets
+            .describe_groups(std::iter::once(FLEET))
+            .await?;
         let group = Group::read(&mut output, FLEET)?;
         let since = harness.clock.wall() - Duration::from_mins(5);
-        assert!(harness.fleets.launch_assessment(&group, since).await?.is_none());
+        assert!(
+            harness
+                .fleets
+                .launch_assessment(&group, since)
+                .await?
+                .is_none()
+        );
 
         let sdk = harness.fake.sdk_config().await;
         let config: crate::config::AwsConfig = serde_json::from_value(serde_json::json!({
@@ -1119,14 +1143,21 @@ mod tests {
         );
         let fleets = Fleets::new(&sdk, harness.clock.clone(), CooldownPolicy::Ignore, events);
         assert_eq!(
-            fleets.launch_assessment(&group, since).await?.map(|failure| failure.reason),
+            fleets
+                .launch_assessment(&group, since)
+                .await?
+                .map(|failure| failure.reason),
             Some(UNFULFILLABLE.to_owned())
         );
         let requests = harness.request_log();
         assert!(requests.iter().any(|(operation, parameters)| {
             operation == "DescribeScalingActivities"
-                && parameters.get("MaxRecords").is_some_and(|value| value == "1")
-                && parameters.get("NextToken").is_some_and(|value| value == "100")
+                && parameters
+                    .get("MaxRecords")
+                    .is_some_and(|value| value == "1")
+                && parameters
+                    .get("NextToken")
+                    .is_some_and(|value| value == "100")
         }));
         activity(&harness, "Successful", 0, LAUNCH, None);
         let before = harness.requests(DESCRIBE_SCALING_ACTIVITIES);

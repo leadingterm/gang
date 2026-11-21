@@ -375,8 +375,12 @@ async fn zonal_stockouts_require_all_zones_before_fallback() -> TestResult {
     assert_eq!(supply.desired, 0);
     assert_eq!(supply.abandoned, 4);
     gang_testkit::fence::with_held(async |held| {
-        harness.fleets.set_desired_capacity(held, fleet.view(), 4).await
-    }).await?;
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 4)
+            .await
+    })
+    .await?;
     assert_eq!(writes(&harness), vec![write(FLEET, "0"), write(TWIN, "4")]);
     Ok(())
 }
@@ -397,8 +401,12 @@ async fn newer_launch_progress_clears_zonal_stockouts() -> TestResult {
         assert_eq!(supply.abandoned, 0);
         assert!(supply.launch_failure.is_none());
         gang_testkit::fence::with_held(async |held| {
-            harness.fleets.set_desired_capacity(held, fleet.view(), 5).await
-        }).await?;
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet.view(), 5)
+                .await
+        })
+        .await?;
         assert_eq!(writes(&harness), vec![write(FLEET, "5")]);
         assert_eq!(harness.desired(TWIN), Some(0));
     }
@@ -478,7 +486,10 @@ async fn healthy_spot_raise_goes_to_spot_only() -> TestResult {
     let activities_before = harness.requests("DescribeScalingActivities");
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 10);
-    assert_eq!(harness.requests("DescribeScalingActivities") - activities_before, 4);
+    assert_eq!(
+        harness.requests("DescribeScalingActivities") - activities_before,
+        4
+    );
     Ok(())
 }
 
@@ -651,7 +662,10 @@ async fn first_failure_withdraws_spot_then_raises_on_demand() -> TestResult {
     let activities_before = harness.requests("DescribeScalingActivities");
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 10);
-    assert_eq!(harness.requests("DescribeScalingActivities") - activities_before, 3);
+    assert_eq!(
+        harness.requests("DescribeScalingActivities") - activities_before,
+        3
+    );
     Ok(())
 }
 
