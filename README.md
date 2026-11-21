@@ -30,13 +30,13 @@ In production a viewer signs in through `[dashboard.login]` and sees data only w
 
 ## Build
 
-The flake devShell is the supported build entry point: it supplies Bazel and the action shell and tools pinned by `flake.lock`.
-On macOS, actions additionally see `/usr/bin` for Apple's toolchain.
-Repository rules see the client's environment (`--incompatible_repo_env_ignores_action_env` in `.bazelrc`), so the actions' pinned `PATH` never hides the host toolchain that `cc_configure` needs on macOS.
+The flake devShell is the supported build entry point: it supplies Bazel and action tools pinned by `flake.lock`. Without `--config=local`, Bazel uses its normal defaults and workspace settings; remote actions need FHS-compatible shell and tool paths provided by the worker root filesystem.
+Use `--config=local` for local builds and tests to select the pinned Nix shell and tools and restrict execution to local strategies. On macOS, local actions additionally see `/usr/bin` for Apple's toolchain.
+Do not use `--config=local` on remote clients: its host-specific Nix store paths are not available on workers, and it prevents remote execution. Repository rules see the client's environment (`--incompatible_repo_env_ignores_action_env` in `.bazelrc`), so the local actions' pinned `PATH` never hides the host toolchain that `cc_configure` needs on macOS.
 
 ```sh
-nix develop -c bazel build //...
-nix develop -c bazel test //...
+nix develop -c bazel build --config=local //...
+nix develop -c bazel test --config=local //...
 ```
 
 CI is the merge gate: `ci.yml` runs on every pull request, including drafts and updates, `merge_group` `checks_requested` events, pushes to `main` and `master` and `v*` tags, and manual dispatch. Documentation-only pull requests and merge groups may skip heavy jobs; `docs/API.md` and `docs/PLAN.md` are live test inputs and do not qualify. Ordinary and fork PRs remain x86-only: portable lint, Nix VM checks, the complete partitioned Linux test suite, a parallel binary and harness bundle build, and parallel end-to-end gates. ARM and cross validation also run for trusted merge groups, default-branch pushes, version tags and same-repository `release/*` PRs, with `release-validation` aggregating the release scope. Release PRs test the head commit itself; merge groups check out the combined group SHA. macOS runs as a standalone advisory on public release pushes; it neither delays nor gates releases, and private RunsOn repositories skip it. Superseded PR and branch runs are cancelled. Public CI uses GitHub's free standard runners; private CI uses ephemeral RunsOn Linux runners with 4 CPUs and 16 GB RAM. CI uses read-only contents permission, no secrets, no OIDC and no Gang farm. See [specification §7.1](docs/SPECIFICATION.md#71-continuous-integration) for exact checks, skip policy, runners and cache budgets.
@@ -69,7 +69,7 @@ fetch.
 Local Mode runs the controller and on-demand workers on one machine from `configs/gang.local.toml` (specification section 1.4). Actions run under `bwrap` on Linux. On macOS, set the fleet's `sandbox = "noop"` in that file first, because bubblewrap is Linux-only. Install the binary first.
 
 ```sh
-nix develop -c bazel build -c opt //:gang && install bazel-bin/crates/gang-main/gang ~/.local/bin/gang
+nix develop -c bazel build --config=local -c opt //:gang && install bazel-bin/crates/gang-main/gang ~/.local/bin/gang
 gang local up --insecure          # from this checkout; loopback only, plaintext, no authentication; prints the endpoints and the next step
 cd <your Bazel workspace>
 gang setup --server http://127.0.0.1:50051
@@ -87,7 +87,7 @@ Setup writes Gang-owned files under `.gang/` and one `try-import` line in `.baze
 
 Generated rc files use `--remote_download_outputs=toplevel`: requested build artifacts and test outputs remain local, while unused intermediate outputs stay in the remote cache. `bazel run` still downloads what it needs to run locally. Pass Bazel's own `--remote_download_outputs=all` flag when you need every intermediate output.
 
-TLS Local Mode (`gang local up` without `--insecure`) accepts client tokens only from the providers in `[authentication.clients.token] providers`. Add an interactive provider (specification section 1.3) before you `gang login` to it. Run the end-to-end harness from this checkout with `nix develop -c bazel run //crates/gang-e2e:local -- --gate 1` (specification section 6.5). The `gang` binary and pinned Bazel come from the harness's runfiles; `--gang` and `--bazel` override them. `nix develop -c tools/gate.sh` mirrors the x86 PR coverage on one x86 Linux host: both local lint partitions, the full workspace, the binary and harness bundle, and every end-to-end gate scenario (specification section 7). It is an optional local diagnostic, not a mandatory duplicate of CI, and does not run Darwin Clippy. Every Rust target, tests included, uses the lint policy in `[workspace.lints]` of `Cargo.toml`.
+TLS Local Mode (`gang local up` without `--insecure`) accepts client tokens only from the providers in `[authentication.clients.token] providers`. Add an interactive provider (specification section 1.3) before you `gang login` to it. Run the end-to-end harness from this checkout with `nix develop -c bazel run --config=local //crates/gang-e2e:local -- --gate 1` (specification section 6.5). The `gang` binary and pinned Bazel come from the harness's runfiles; `--gang` and `--bazel` override them. `nix develop -c tools/gate.sh` mirrors the x86 PR coverage on one x86 Linux host: both local lint partitions, the full workspace, the binary and harness bundle, and every end-to-end gate scenario (specification section 7). It is an optional local diagnostic, not a mandatory duplicate of CI, and does not run Darwin Clippy. Every Rust target, tests included, uses the lint policy in `[workspace.lints]` of `Cargo.toml`.
 
 The harness settings `startup_timeout` and `command_timeout` default to `2m`; `build_timeout`
 defaults to `30m` for each Bazel invocation, including shutdown. `handshake_timeout` defaults to

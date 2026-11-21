@@ -201,11 +201,13 @@
       # macOS builds use Apple's toolchain through /usr/bin; Nix tools come first to keep bash and coreutils pinned.
       actionPath = lib.concatStringsSep ":" ([(lib.makeBinPath actionTools)] ++ lib.optional pkgs.stdenv.hostPlatform.isDarwin "/usr/bin");
       bazelrc = pkgs.writeText "gang.bazelrc" ''
-        # Actions run with bash and coreutils pinned by flake.lock, so a build is the same on NixOS, Linux and macOS.
-        build --shell_executable=${pkgs.bash}/bin/bash
-        build --action_env=PATH=${actionPath}
-        build --host_action_env=PATH=${actionPath}
-        test --test_env=PATH=${actionPath}
+        # Local actions use tools pinned by flake.lock and cannot run remotely.
+        build:local --shell_executable=${pkgs.bash}/bin/bash
+        build:local --action_env=PATH=${actionPath}
+        build:local --host_action_env=PATH=${actionPath}
+        test:local --test_env=PATH=${actionPath}
+        build:local --spawn_strategy=sandboxed,local
+        test:local --strategy=TestRunner=sandboxed,local
       '';
       bazelWrapper = name:
         pkgs.writeShellScriptBin name ''
@@ -229,6 +231,7 @@
       deployTools = [pkgs.awscli2 pkgs.coreutils pkgs.curl pkgs.gh pkgs.git pkgs.jq pkgs.openssl opentofu];
     in {
       default = pkgs.mkShell ({
+          GANG_BAZELRC = "${bazelrc}";
           # The e2e harness uses pinned action tools without the host toolchain.
           GANG_E2E_ACTION_SHELL = "${pkgs.bash}/bin/bash";
           GANG_E2E_ACTION_PATH = lib.makeBinPath actionTools;

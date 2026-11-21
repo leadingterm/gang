@@ -28,6 +28,7 @@
 
 ### Fixed
 
+- Keep remote action shells and paths FHS-compatible: the devShell's later-loaded Bazel rc previously replaced them with host-only Nix store paths. Use `--config=local` for pinned Nix tools and local-only execution.
 - Cache DNS locally on controller and worker images, including for static binaries.
 - Fix startup on nominal 64 GiB workers whose measured memory, less reserve, is smaller than the fleet estimate; workers advertise their actual available action-pool capacity.
 - Use the same current memory guarantees for learned reservations, queued work, OOM retries and scaling, while preserving explicit client minimums and per-action ceilings.

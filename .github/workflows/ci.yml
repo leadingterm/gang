@@ -191,6 +191,8 @@ jobs:
         with:
           cache-job: linux-x86_64
           restore-only: 'true'
+      - name: Check remote action shell environment
+        run: tools/check-action-shell.sh
       - name: Build gang and e2e harness
         timeout-minutes: 50
         # Cache hits materialize only top-level outputs; upload-gang needs //:gang outside the bundle.
@@ -333,6 +335,8 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
+      - name: Check remote action shell environment
+        run: tools/check-action-shell.sh
       - name: Build gang and e2e harness
         timeout-minutes: 50
         run: bazel build --build_event_json_file="$RUNNER_TEMP/bazel-build.bep.json" --profile="$RUNNER_TEMP/bazel-build.profile.gz" //:gang //crates/gang-e2e:bundle
