@@ -409,6 +409,48 @@ fn burst_queue_fits_one_http2_connection() -> gang_e2e::Result<()> {
 }
 
 #[test]
+fn leader_failover_preset_renders_only_the_service_prior() -> gang_e2e::Result<()> {
+    let baseline = varied_document(&Variant::baseline(Sandbox::Noop))?;
+    let leader = varied_document(&Variant {
+        control: ControlKnobs::LEADER_FAILOVER,
+        ..Variant::baseline(Sandbox::Noop)
+    })?;
+    assert_eq!(
+        ControlKnobs::LEADER_FAILOVER,
+        ControlKnobs {
+            unknown_action_duration: Some(std::time::Duration::from_mins(1)),
+            ..ControlKnobs::NONE
+        }
+    );
+    assert_eq!(
+        baseline.scaling.unknown_action_duration.get(),
+        std::time::Duration::from_secs(10)
+    );
+    assert_eq!(
+        leader.scaling.unknown_action_duration.get(),
+        std::time::Duration::from_mins(1)
+    );
+    let mut leader_scaling = leader.scaling;
+    leader_scaling.unknown_action_duration = baseline.scaling.unknown_action_duration;
+    assert_eq!(leader_scaling, baseline.scaling);
+    assert_eq!(leader.poll_interval, baseline.poll_interval);
+    assert_eq!(leader.client_action_timeout, baseline.client_action_timeout);
+    assert_eq!(leader.fleets.len(), baseline.fleets.len());
+    for (fleet, before) in leader.fleets.iter().zip(&baseline.fleets) {
+        assert_eq!(fleet.min_instances, before.min_instances);
+        assert_eq!(fleet.max_instances, before.max_instances);
+        assert_eq!(
+            fleet.target_actions_per_instance,
+            before.target_actions_per_instance
+        );
+        assert_eq!(fleet.idle_timeout, before.idle_timeout);
+        assert_eq!(fleet.boot_grace, before.boot_grace);
+        assert_eq!(fleet.max_drain_wait, before.max_drain_wait);
+    }
+    Ok(())
+}
+
+#[test]
 fn rate_scaling_presets_render_typed_knobs() -> gang_e2e::Result<()> {
     let backlog = varied_document(&Variant {
         control: ControlKnobs::BACKLOG_GROWS_FLEET,

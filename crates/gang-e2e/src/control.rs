@@ -260,6 +260,12 @@ impl ControlKnobs {
         ..Self::SUSTAINED_STREAM
     };
 
+    /// Held leader-failover probes must justify another worker while the leader is lost.
+    pub const LEADER_FAILOVER: Self = Self {
+        unknown_action_duration: Some(Duration::from_mins(1)),
+        ..Self::NONE
+    };
+
     /// Database outage/partition builds: cost-justified held demand makes the follower
     /// demonstrate a real purchase before the bounded partition heals.
     pub const DATABASE_OUTAGE: Self = Self {
@@ -276,7 +282,7 @@ impl ControlKnobs {
 
     /// Every preset a fleet or control scenario runs under; configuration parse tests draw from
     /// this list.
-    pub const PRESETS: [Self; 14] = [
+    pub const PRESETS: [Self; 15] = [
         Self::FLEETS,
         Self::ORPHAN,
         Self::DRAIN_CANCEL,
@@ -290,6 +296,7 @@ impl ControlKnobs {
         Self::SUSTAINED_STREAM,
         Self::TWO_SOURCES,
         Self::UTILIZATION_SCALE_IN,
+        Self::LEADER_FAILOVER,
         Self::DATABASE_OUTAGE,
     ];
 }

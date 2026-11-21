@@ -929,8 +929,11 @@ fn cluster_variant(scenario: Scenario, baseline: &Variant) -> Option<Variant> {
         | Scenario::RollingUpgrade
         | Scenario::ConfigRefetchRestart
         | Scenario::UpgradeNegativeControl
-        | Scenario::LeaderFailover
         | Scenario::FollowerBuilds => Variant::baseline(Sandbox::Noop),
+        Scenario::LeaderFailover => Variant {
+            control: ControlKnobs::LEADER_FAILOVER,
+            ..Variant::baseline(Sandbox::Noop)
+        },
         Scenario::CrossRevocation => Variant {
             identity: IdentityKnobs {
                 standing_worker: crate::access::StandingWorker::One,
@@ -1628,6 +1631,31 @@ mod tests {
             if let Some(subject) = variant.identity.sign_in.subject(variant.identity.sessions) {
                 assert!(!mutated.contains(&subject), "{scenario}: {subject}");
             }
+        }
+    }
+
+    #[test]
+    fn cluster_control_presets_are_scenario_specific() {
+        for scenario in [
+            Scenario::ControllerLoss,
+            Scenario::RollingDeploy,
+            Scenario::RollingUpgrade,
+            Scenario::ConfigRefetchRestart,
+            Scenario::UpgradeNegativeControl,
+            Scenario::FollowerBuilds,
+            Scenario::CrossRevocation,
+            Scenario::LeaderFailover,
+            Scenario::DatabaseOutage,
+            Scenario::LoginAcross,
+        ] {
+            let variant = cluster_variant(scenario, &Variant::baseline(Sandbox::Noop))
+                .expect("listed scenarios are cluster scenarios");
+            let expected = match scenario {
+                Scenario::LeaderFailover => ControlKnobs::LEADER_FAILOVER,
+                Scenario::DatabaseOutage => ControlKnobs::DATABASE_OUTAGE,
+                _ => ControlKnobs::NONE,
+            };
+            assert_eq!(variant.control, expected, "{scenario}");
         }
     }
 
