@@ -184,6 +184,18 @@ impl ControlKnobs {
         ..Self::NONE
     };
 
+    /// An untrained burst keeps the default scaling prior and a realistic payback horizon.
+    /// The 64 MiB request is raised to the 1 GiB disk minimum; on an 8 GiB fleet
+    /// with 16 slots it weighs two slots, so 160 unknown 10s actions contribute 3200
+    /// slot-seconds.
+    /// The default 90s readiness prior is clamped by the 60s boot grace; with a 10 minute
+    /// idle timeout, the default 50% payback gives a 330s horizon, so 3200/330 is less
+    /// than the first worker's 16 slots.
+    pub const COLD_BURST_FROM_ZERO: Self = Self {
+        idle_timeout: Some(Duration::from_mins(10)),
+        ..Self::BURST_FROM_ZERO
+    };
+
     /// Short running work can absorb an additional queued action.
     pub const QUEUED_BEHIND_SHORT_WORK: Self = Self {
         poll_interval: Some(Duration::from_secs(1)),
@@ -264,7 +276,7 @@ impl ControlKnobs {
 
     /// Every preset a fleet or control scenario runs under; configuration parse tests draw from
     /// this list.
-    pub const PRESETS: [Self; 13] = [
+    pub const PRESETS: [Self; 14] = [
         Self::FLEETS,
         Self::ORPHAN,
         Self::DRAIN_CANCEL,
@@ -272,6 +284,7 @@ impl ControlKnobs {
         Self::LAUNCH_FAILURE,
         Self::SCHEDULED_MINIMUM,
         Self::BURST_FROM_ZERO,
+        Self::COLD_BURST_FROM_ZERO,
         Self::QUEUED_BEHIND_SHORT_WORK,
         Self::BACKLOG_GROWS_FLEET,
         Self::SUSTAINED_STREAM,

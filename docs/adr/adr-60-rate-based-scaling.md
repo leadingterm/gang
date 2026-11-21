@@ -6,7 +6,7 @@ Accepted for v0.3.4. Supersedes ADR-56's candidate-count payback simulation, str
 
 ## Context
 
-On 2026-11-19, production x86-64 episodes A, C and D jumped to six instances for short work; B held distributed thin load for roughly two hours, while E justified sustained capacity. Queue age did not distinguish a static Bazel batch from refill, and idle-only release could not reclaim partly busy workers.
+On 2026-11-19, production x86-64 episodes A, C and D jumped to six instances for short work; B held distributed thin load for roughly two hours, while E sustained work through its window. Queue age did not distinguish a static Bazel batch from refill, and idle-only release could not reclaim partly busy workers.
 
 Corrected evidence is successful ASG launch StartTime through termination EndTime, clipped to whole-fleet UTC windows. It measures lifecycle exposure, not exact billing:
 
@@ -23,12 +23,12 @@ The earlier audit-cohort totals 181/1034/162/167/1837 are retracted: they missed
 ## Decision
 
 - Adopt the user's 2026-11-19 choices: default `payback_percent = 50`, source = authenticated principal (CI repository/event class via GitHub `sub`, humans per person), durable source activity profiles without principal strings, and draining partly busy workers.
-- Estimate offered resource load from event-time verified completions and sampled in-flight counts. Separate persistent refill from transient queued resource-work. Buy by componentwise payback, preserving four resource dimensions through summation, readiness credit, launch accounting, reachability and existing bounds; remove candidate trials and the 2B stream trigger.
+- Estimate offered resource load from event-time verified completions and sampled in-flight counts. Separate persistent refill from transient queued resource-work. Persistent queued reservations are a raw demand candidate, not a payback exemption: bound purchases componentwise by all duration-weighted queued work and qualified genuine future arrivals, crediting readiness, serving and booting capacity. Require recent refill in the current nonempty cohort; historical activity or running load alone is not a forecast. Preserve four resource dimensions through summation, reachability and existing bounds; remove candidate trials and the 2B stream trigger.
 - Apply the later ruling: keep load distributed, never pack. Cordon one whole physical instance only after N−1 fits the configured waterline continuously for the dwell; choose the instance that empties soonest. Resume owned capacity on returning load before buying. Idle timeout is an upper bound, not a minimum hold.
 
 ## Consequences
 
-Short bursts need not reach the ceiling; sustained or learned-heavy sources can justify capacity without waiting for a queue-age override. With `B = 45s` and idle timeout `10m`, default `H = 322.5s` and persistence threshold `B + H = 367.5s`; examples using `H = 645s` are non-default 100% payback. Live estimators and dwell restart per term; learned profiles survive compatible fenced flushes. `max_cordons = 0` permits a soak with idle drains intact. After the first `utilization` audit row, v0.3.3 readers reject its cause, so downgrade is unsupported; earlier rollback must also restore the old configuration.
+Short bursts need not reach the ceiling; sustained or learned-heavy sources can justify capacity without waiting for a queue-age override, but source history alone cannot make a cheap static batch pay for maximum capacity. With `B = 45s` and idle timeout `10m`, default `H = 322.5s` and persistence threshold `B + H = 367.5s`; examples using `H = 645s` are non-default 100% payback. Live estimators and dwell restart per term; learned profiles survive compatible fenced flushes. `max_cordons = 0` permits a soak with idle drains intact. After the first `utilization` audit row, v0.3.3 readers reject its cause, so downgrade is unsupported; earlier rollback must also restore the old configuration.
 
 ## Rejected alternatives
 

@@ -140,7 +140,7 @@ fn rounded_backlog(seconds: f64) -> Duration {
     Duration::try_from_secs_f64(seconds.round()).unwrap_or(Duration::from_secs(u64::MAX))
 }
 
-fn update_metrics(fleet: &mut FleetPass, rates: FleetRates, serving_capacity: SlotVector) {
+fn update_metrics(fleet: &mut FleetPass, rates: &FleetRates, serving_capacity: SlotVector) {
     fleet.outlook.load = Some(floor_to_u32(
         (rates.persistent_load.max_component() * 10.0).round(),
     ));
@@ -229,7 +229,7 @@ struct Purchase {
 }
 
 fn purchase(
-    rates: FleetRates,
+    rates: &FleetRates,
     cap: SlotVector,
     pre_ready: SlotVector,
     booting: u32,
@@ -240,19 +240,32 @@ fn purchase(
     if horizon.payback.is_zero() {
         return Purchase::default();
     }
-    let backlog = rates.transient_work.sub_floor(
-        pre_ready.sub_floor(
-            rates
-                .persistent_load
-                .scaled(horizon.readiness.as_secs_f64()),
-        ),
+    let pre_ready_credit = pre_ready.sub_floor(
+        rates
+            .persistent_load
+            .scaled(horizon.readiness.as_secs_f64()),
     );
-    let transient = backlog
-        .scaled(1.0 / horizon.payback.as_secs_f64())
+    let inverse_payback = 1.0 / horizon.payback.as_secs_f64();
+    let transient = rates
+        .transient_work
+        .sub_floor(pre_ready_credit)
+        .scaled(inverse_payback)
         .sub_floor(cap.sub_floor(rates.persistent_load).slot_gate(slots));
-    // In-flight instances net AFTER q_P is added, or a persistent partial remainder ratchets.
-    let extra =
-        (transient + rates.persistent_queue).sub_floor(nominal(slots).scaled(f64::from(booting)));
+    // Completion waves may exceed physical service without any net new input.
+    let future = rates.arrival_load.component_min(
+        rates.completion_load.component_min(cap)
+            + rates.arrival_load.sub_floor(rates.completion_load),
+    );
+    let excess = future.sub_floor(cap);
+    let projected =
+        (rates.queued_work + future.scaled(horizon.readiness.as_secs_f64())).sub_floor(pre_ready);
+    let booting_capacity = nominal(slots).scaled(f64::from(booting));
+    // In-flight instances net AFTER q_P and forecast excess, preventing ratchets.
+    let candidate = (transient + rates.persistent_queue + excess).sub_floor(booting_capacity);
+    let payable = (projected.scaled(inverse_payback) + excess)
+        .sub_floor(cap.sub_floor(future).slot_gate(slots))
+        .sub_floor(booting_capacity);
+    let extra = candidate.component_min(payable);
     let instances = floor_to_u32(extra.max_component() / f64::from(slots));
     Purchase {
         transient,
@@ -671,7 +684,7 @@ impl WorkPlanner {
             };
             let base = serving.saturating_add(booting);
             let floor = self.reachability_floor(index, None);
-            let rates = *self.rates.fleet(index);
+            let rates = self.rates.fleet(index);
             let horizon = self.horizons[index];
             let slots = fleet.policy.target_actions_per_instance.get();
             let purchase = if self.queued[index] {
@@ -780,7 +793,7 @@ impl WorkPlanner {
         if self.queued[fleet] && horizon.payback.is_zero() {
             return None;
         }
-        let rates = *self.rates.fleet(fleet);
+        let rates = self.rates.fleet(fleet);
         let cap = self.serving_capacities[fleet].sub_floor(victim.cap);
         let pre_ready = self.serving_pre_ready[fleet].sub_floor(victim.pre_ready);
         let demand = if horizon.payback.is_zero() {
@@ -891,13 +904,14 @@ mod tests {
         fleets: Vec<FleetPass>,
         hosted: HostedSnapshot,
         planner: WorkPlanner,
+        profiles: SourceProfiles,
         capacities: Vec<Capacity>,
     }
 
     impl Scene {
         fn new(policies: Vec<FleetPolicy>, scaling: ScalingConfig) -> Self {
             let profiles = SourceProfiles::new(&scaling, HistoryWindow::from_units(7));
-            let planner = WorkPlanner::new(&policies, Arc::new(scaling), profiles);
+            let planner = WorkPlanner::new(&policies, Arc::new(scaling), profiles.clone());
             Self {
                 clock: TestClock::new(Timestamp::from_unix_millis(1_000_000)),
                 capacities: policies
@@ -912,6 +926,7 @@ mod tests {
                     .collect(),
                 fleets: policies.into_iter().map(FleetPass::new).collect(),
                 hosted: HostedSnapshot::default(),
+                profiles,
                 planner,
             }
         }
@@ -988,6 +1003,136 @@ mod tests {
         }
     }
 
+    fn persistent_scene() -> (Scene, gang_types::SourceId) {
+        let mut scene = Scene::new(vec![policy("workers", 16)], ScalingConfig::default());
+        let source =
+            gang_types::SourceId::from_identity_str("test:payback").expect("valid identity");
+        let mut demand = queued(&[0], Some(Duration::from_secs(1)));
+        demand.source = Some(source);
+        scene.snapshot(
+            SchedulerSnapshot {
+                queued: vec![demand],
+                ..SchedulerSnapshot::default()
+            },
+            &[Some(0)],
+        );
+        scene.run(&[Some(Duration::from_secs(45))]);
+        let idle = Duration::from(scene.planner.scaling.source_idle);
+        let cadence = idle / 2;
+        let mut remaining = Duration::from_mins(30);
+        while !remaining.is_zero() {
+            let elapsed = cadence.min(remaining);
+            scene.clock.advance(elapsed);
+            scene.run(&[Some(Duration::from_secs(45))]);
+            remaining = remaining.saturating_sub(elapsed);
+        }
+        scene.snapshot(SchedulerSnapshot::default(), &[]);
+        scene.run(&[Some(Duration::from_secs(45))]);
+        scene.clock.advance(idle);
+        scene.run(&[Some(Duration::from_secs(45))]);
+        let mut records = Vec::new();
+        scene
+            .profiles
+            .snapshot(PassTime::read(&scene.clock), &mut records)
+            .expect("profile snapshot");
+        assert!(!records.is_empty());
+        scene
+            .profiles
+            .restore(PassTime::read(&scene.clock), &records);
+        scene.planner = WorkPlanner::new(
+            &[scene.fleets[0].policy.clone()],
+            Arc::clone(&scene.planner.scaling),
+            scene.profiles.clone(),
+        );
+        (scene, source)
+    }
+
+    #[test]
+    fn persistent_planner_queue_buys_only_payable_work() {
+        for expensive in [false, true] {
+            let (mut scene, source) = persistent_scene();
+            let horizon = Horizon::new(
+                Duration::from_secs(45),
+                scene.fleets[0].policy.idle_timeout,
+                scene.planner.scaling.payback_percent,
+            );
+            let duration = if expensive {
+                horizon.payback * 2
+            } else {
+                Duration::from_secs(1)
+            };
+            let mut demand = queued(&[0], Some(duration));
+            demand.source = Some(source);
+            demand.queued_since = PassTime::read(&scene.clock).wall;
+            scene.snapshot(
+                SchedulerSnapshot {
+                    queued: vec![demand; 160],
+                    ..SchedulerSnapshot::default()
+                },
+                &[Some(0); 160],
+            );
+            scene.run(&[Some(Duration::from_secs(45))]);
+            let summary = scene.planner.scale_decision(0);
+            assert_eq!(summary.persistent_streams, 1);
+            assert_float_eq(summary.persistent_queue.get(), 160.0);
+            assert_float_eq(summary.transient_backlog.get(), 0.0);
+            assert_eq!(scene.planner.work(0), if expensive { 10 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn persistent_cheap_planner_queue_does_not_ratchet_while_booting() {
+        let (mut scene, source) = persistent_scene();
+        let mut demand = queued(&[0], Some(Duration::from_secs(1)));
+        demand.source = Some(source);
+        demand.queued_since = PassTime::read(&scene.clock).wall;
+        scene.snapshot(
+            SchedulerSnapshot {
+                queued: vec![demand; 160],
+                ..SchedulerSnapshot::default()
+            },
+            &[Some(0); 160],
+        );
+        scene.run(&[Some(Duration::from_secs(45))]);
+        assert_eq!(scene.planner.work(0), 1);
+        scene.member(0, "booting", InstanceLifecycle::Pending, true);
+        scene.fleets[0].supply.instances[0].launched_at = PassTime::read(&scene.clock).wall;
+        for elapsed in [8, 8, 8] {
+            scene.clock.advance(Duration::from_secs(elapsed));
+            scene.run(&[Some(Duration::from_secs(45))]);
+            assert_eq!(scene.planner.scale_decision(0).persistent_streams, 1);
+            assert_eq!(scene.planner.work(0), 1);
+            assert_eq!(scene.planner.scale_decision(0).extra_instances, 0);
+            assert_float_eq(scene.planner.scale_decision(0).pre_ready.get(), 16.0);
+        }
+        assert_float_eq(
+            scene.planner.instance_view(0, 0).unwrap().pre_ready.actions,
+            16.0 * 24.0,
+        );
+        let allocation = allocation_counter::measure(|| {
+            scene.run(&[Some(Duration::from_secs(45))]);
+        });
+        assert_eq!(allocation.count_total, 0);
+        assert_eq!(scene.planner.work(0), 1);
+        scene.fleets[0].supply.instances[0].lifecycle = InstanceLifecycle::InService;
+        let mut snapshot = scene.hosted.snapshot().clone();
+        snapshot.queued.truncate(144);
+        snapshot.workers = vec![worker(&scene.fleets[0].policy, "booting", 16, 16)];
+        let mut running = executing(0, Some(Duration::from_secs(1)));
+        running.source = Some(source);
+        running.started = PassTime::read(&scene.clock).wall;
+        snapshot.executing = vec![running; 16];
+        scene.snapshot(snapshot, &[Some(0); 144]);
+        scene.run(&[Some(Duration::from_secs(45))]);
+        assert_float_eq(scene.planner.rates.fleet(0).persistent_load.actions, 16.0);
+        assert_eq!(
+            scene.planner.rates.fleet(0).arrival_load,
+            SlotVector::default()
+        );
+        assert_eq!(scene.planner.work(0), 1);
+        assert_eq!(scene.planner.scale_decision(0).extra_instances, 0);
+    }
+
     #[test]
     fn cold_queues_keep_one_at_zero_eight_and_nine_seconds() {
         let mut scene = Scene::new(vec![policy("workers", 16)], ScalingConfig::default());
@@ -1049,6 +1194,198 @@ mod tests {
     }
 
     #[test]
+    fn persistent_cheap_queue_cannot_bypass_payback() {
+        let queue = SlotVector {
+            actions: 160.0,
+            disk: 320.0,
+            ..SlotVector::default()
+        };
+        let buy = purchase(
+            &FleetRates {
+                persistent_queue: queue,
+                queued_work: queue,
+                ..FleetRates::default()
+            },
+            SlotVector::default(),
+            SlotVector::default(),
+            0,
+            Horizon {
+                readiness: Duration::from_secs(10),
+                payback: Duration::from_secs(8),
+            },
+            16,
+            20,
+        );
+        assert_float_eq(buy.extra.actions, 20.0);
+        assert_float_eq(buy.extra.disk, 40.0);
+        assert_eq!(buy.instances, 2);
+        let cheap = purchase(
+            &FleetRates {
+                persistent_queue: queue,
+                queued_work: queue.scaled(0.125),
+                ..FleetRates::default()
+            },
+            SlotVector::default(),
+            SlotVector::default(),
+            0,
+            Horizon {
+                readiness: Duration::from_secs(10),
+                payback: Duration::from_secs(8),
+            },
+            16,
+            20,
+        );
+        assert_float_eq(cheap.extra.actions, 2.5);
+        assert_float_eq(cheap.extra.disk, 5.0);
+        assert_eq!(cheap.instances, 0);
+    }
+
+    #[test]
+    fn persistent_expensive_queue_still_buys_with_headroom() {
+        let buy = purchase(
+            &FleetRates {
+                persistent_queue: nominal(64),
+                queued_work: nominal(64).scaled(300.0),
+                ..FleetRates::default()
+            },
+            SlotVector::default(),
+            SlotVector::default(),
+            0,
+            Horizon {
+                readiness: Duration::from_secs(45),
+                payback: Duration::from_mins(5),
+            },
+            16,
+            2,
+        );
+        assert_eq!(buy.extra, nominal(64));
+        assert_eq!(buy.instances, 2);
+    }
+
+    #[test]
+    fn payback_bounds_each_dimension_before_instance_flooring() {
+        let buy = purchase(
+            &FleetRates {
+                persistent_queue: SlotVector {
+                    cpu: 32.0,
+                    memory: 16.0,
+                    ..SlotVector::default()
+                },
+                queued_work: SlotVector {
+                    cpu: 8.0,
+                    memory: 64.0,
+                    ..SlotVector::default()
+                },
+                ..FleetRates::default()
+            },
+            SlotVector::default(),
+            SlotVector::default(),
+            0,
+            Horizon {
+                readiness: Duration::ZERO,
+                payback: Duration::from_secs(1),
+            },
+            16,
+            10,
+        );
+        assert_float_eq(buy.extra.cpu, 8.0);
+        assert_float_eq(buy.extra.memory, 16.0);
+        assert_eq!(buy.instances, 1);
+    }
+
+    #[test]
+    fn persistent_payback_credits_pre_ready_spare_and_booting_capacity() {
+        let buy = purchase(
+            &FleetRates {
+                persistent_load: nominal(8),
+                arrival_load: nominal(8),
+                completion_load: nominal(8),
+                persistent_queue: nominal(64),
+                queued_work: nominal(40).scaled(10.0),
+                ..FleetRates::default()
+            },
+            nominal(16),
+            nominal(16).scaled(10.0),
+            1,
+            Horizon {
+                readiness: Duration::from_secs(10),
+                payback: Duration::from_secs(10),
+            },
+            16,
+            10,
+        );
+        // ((400 + 8 * 10 - 160) / 10 - (16 - 8)) - 16 = 8.
+        assert_eq!(buy.extra, nominal(8));
+        assert_eq!(buy.instances, 0);
+    }
+
+    #[test]
+    fn forecast_purchase_uses_net_growth_and_credits_pending_capacity() {
+        for (arrival, service, work, booting, extra, instances) in [
+            (0, 0, 4, 0, 0, 0),
+            (32, 32, 4, 0, 1, 0),
+            (24, 16, 4, 0, 13, 0),
+            (24, 16, 16, 0, 16, 1),
+            (24, 16, 16, 1, 0, 0),
+        ] {
+            let buy = purchase(
+                &FleetRates {
+                    persistent_load: nominal(16),
+                    arrival_load: nominal(arrival),
+                    completion_load: nominal(service),
+                    persistent_queue: nominal(32),
+                    queued_work: nominal(work),
+                    ..FleetRates::default()
+                },
+                nominal(16),
+                nominal(16).scaled(2.0),
+                booting,
+                Horizon {
+                    readiness: Duration::from_secs(2),
+                    payback: Duration::from_secs(4),
+                },
+                16,
+                10,
+            );
+            assert_eq!(
+                buy.extra,
+                nominal(extra),
+                "arrival={arrival}, service={service}"
+            );
+            assert_eq!(buy.instances, instances, "work={work}, booting={booting}");
+        }
+    }
+
+    #[test]
+    fn nonpersistent_purchase_keeps_existing_payback_arithmetic() {
+        let work = nominal(320).scaled(60.0);
+        let horizon = Horizon {
+            readiness: Duration::from_secs(45),
+            payback: Duration::from_mins(5),
+        };
+        let buy = purchase(
+            &FleetRates {
+                transient_work: work,
+                queued_work: work,
+                ..FleetRates::default()
+            },
+            nominal(4),
+            nominal(16).scaled(30.0),
+            1,
+            horizon,
+            16,
+            10,
+        );
+        let transient = work
+            .sub_floor(nominal(16).scaled(30.0))
+            .scaled(1.0 / horizon.payback.as_secs_f64())
+            .sub_floor(nominal(4));
+        assert_eq!(buy.transient, transient);
+        assert_eq!(buy.extra, transient.sub_floor(nominal(16)));
+        assert_eq!(buy.instances, 2);
+    }
+
+    #[test]
     fn persistent_queue_nets_booting_after_adding_queue() {
         let horizon = Horizon {
             readiness: Duration::from_secs(45),
@@ -1059,14 +1396,26 @@ mod tests {
                 actions: 16.0,
                 ..SlotVector::default()
             },
+            arrival_load: SlotVector {
+                actions: 16.0,
+                ..SlotVector::default()
+            },
+            completion_load: SlotVector {
+                actions: 16.0,
+                ..SlotVector::default()
+            },
             persistent_queue: SlotVector {
                 actions: 40.0,
+                ..SlotVector::default()
+            },
+            queued_work: SlotVector {
+                actions: 40.0 * horizon.payback.as_secs_f64(),
                 ..SlotVector::default()
             },
             ..FleetRates::default()
         };
         let buy = purchase(
-            rates,
+            &rates,
             nominal(16),
             SlotVector::default(),
             2,
@@ -1077,9 +1426,13 @@ mod tests {
         assert_float_eq(buy.extra.actions, 8.0);
         assert_eq!(buy.instances, 0);
         let buy = purchase(
-            FleetRates {
+            &FleetRates {
                 persistent_queue: SlotVector {
                     actions: 32.0,
+                    ..SlotVector::default()
+                },
+                queued_work: SlotVector {
+                    actions: 32.0 * horizon.payback.as_secs_f64(),
                     ..SlotVector::default()
                 },
                 ..rates
@@ -1737,12 +2090,17 @@ mod tests {
     #[test]
     fn complementary_transient_and_persistent_queue_buy_one_not_two() {
         let buy = purchase(
-            FleetRates {
+            &FleetRates {
                 transient_work: SlotVector {
                     cpu: 16.0,
                     ..SlotVector::default()
                 },
                 persistent_queue: SlotVector {
+                    memory: 16.0,
+                    ..SlotVector::default()
+                },
+                queued_work: SlotVector {
+                    cpu: 16.0,
                     memory: 16.0,
                     ..SlotVector::default()
                 },
@@ -1840,7 +2198,7 @@ mod tests {
         let mut fleet = FleetPass::new(policy("workers", 16));
         update_metrics(
             &mut fleet,
-            FleetRates {
+            &FleetRates {
                 persistent_load: SlotVector {
                     actions: 1.26,
                     ..SlotVector::default()

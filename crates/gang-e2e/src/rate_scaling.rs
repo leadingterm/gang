@@ -160,9 +160,8 @@ fn boundary(stack: &Stack<'_>) -> Result<u64> {
         .map_or(Ok(0), crate::event_log::sequence)
 }
 
-/// Judges the two bounded purchases for eight outstanding lanes and four slots/worker.
-/// The concurrency ceiling is ceil(8/4)=2, including executing lanes; dispatch removes
-/// executing actions from the instantaneous queue without changing that ceiling.
+/// Judges the single purchase for eight closed-loop lanes sharing four slots.
+/// Refill replaces completions; it does not add offered work beyond serving capacity.
 #[must_use]
 pub fn stream_checks(events: &[Event], refilled: bool) -> Vec<Check> {
     let purchases: Vec<_> = events
@@ -182,8 +181,8 @@ pub fn stream_checks(events: &[Event], refilled: bool) -> Vec<Check> {
                 .iter()
                 .map(|(from, to, _)| (*from, *to))
                 .collect::<Vec<_>>()
-                == [(0, 1), (1, 2)],
-            || format!("expected bounded 0->1->2, ceiling ceil(8/4)=2; got {purchases:?}"),
+                == [(0, 1)],
+            || format!("expected only 0->1 for bounded refill; got {purchases:?}"),
         ),
         Check::expect(
             names::DECISION_DETAIL,
@@ -217,9 +216,9 @@ pub fn sustained_stream(stack: &Stack<'_>) -> Result<Vec<Check>> {
         let mut started = None;
         let mut completed = None;
         let mut ceiling = true;
-        let observation = wait(stack, "sustained stream reaches two workers", |state| {
+        let observation = wait(stack, "sustained stream holds one worker", |state| {
             refill(directory, state)?;
-            ceiling &= desired(state) <= 2;
+            ceiling &= desired(state) <= 1;
             if running(state) > 0 {
                 started.get_or_insert(state.update_time.as_unix_millis());
                 completed.get_or_insert(state.completed);
@@ -228,7 +227,7 @@ pub fn sustained_stream(stack: &Stack<'_>) -> Result<Vec<Check>> {
                 elapsed(state, start) > horizon(state)
                     && elapsed(state, start) >= Duration::from_secs(30)
             }) && completed.is_some_and(|count| state.completed >= count.saturating_add(16))
-                && desired(state) == 2)
+                && desired(state) == 1)
         });
         let observed = hold.settle(observation, || Ok(()));
         let outcome = joined(build);
@@ -236,9 +235,11 @@ pub fn sustained_stream(stack: &Stack<'_>) -> Result<Vec<Check>> {
         observed?;
         let outcome = outcome?;
         let mut checks = stream_checks(&after(stack, since)?, true);
-        checks.push(Check::expect(names::STREAM_CEILING, ceiling, || {
-            "desired capacity exceeded ceil(8/4)=2 while lanes refilled".to_owned()
-        }));
+        checks.push(Check::expect(
+            "stream stays within paid capacity",
+            ceiling,
+            || "desired capacity exceeded one while lanes refilled".to_owned(),
+        ));
         checks.push(Check::expect(
             names::STREAM_BUILD,
             outcome.succeeded(),
@@ -270,7 +271,18 @@ fn has_source_b_work(state: &State) -> bool {
     })
 }
 
-/// A mature three-slot source leaves one spare slot, but cannot age a new five-lane source.
+fn has_both_builds(state: &State, principal_a: &str, principal_b: &str) -> bool {
+    state
+        .builds
+        .iter()
+        .any(|build| build.principal == principal_a)
+        && state
+            .builds
+            .iter()
+            .any(|build| build.principal == principal_b)
+}
+
+/// Two authenticated closed-loop streams share one worker after each matures.
 ///
 /// # Errors
 /// Returns login, deployment, observation or build errors after releasing/cancelling and joining.
@@ -319,14 +331,7 @@ pub fn two_sources(system: &Secured<'_>) -> Result<Vec<Check>> {
         let mut authenticated_builds = false;
         let observation = wait(stack, "source B persistence", |state| {
             refill(directory, state)?;
-            authenticated_builds |= state
-                .builds
-                .iter()
-                .any(|build| build.principal == principal_a)
-                && state
-                    .builds
-                    .iter()
-                    .any(|build| build.principal == principal_b);
+            authenticated_builds |= has_both_builds(state, &principal_a, &principal_b);
             if let Some(actions) = &state.actions {
                 for action in &actions.running {
                     if action.target.contains(":rate_b_") {
@@ -338,17 +343,12 @@ pub fn two_sources(system: &Secured<'_>) -> Result<Vec<Check>> {
             if b_seen {
                 start_b.get_or_insert(state.update_time.as_unix_millis());
             }
-            if start_b.is_none_or(|start| elapsed(state, start) < Duration::from_secs(4)) {
-                // A is already persistent. If ages/rates are merged across principals,
-                // B's four queued lanes buy a second worker immediately. Isolated B has
-                // W_B/H well below A's one spare slot during these first four seconds.
-                isolated &= desired(state) <= 1;
-            }
-            Ok(
-                start_b.is_some_and(|start| elapsed(state, start) > horizon(state))
-                    && b_targets.len() >= 10
-                    && desired(state) == 2,
-            )
+            isolated &= desired(state) <= 1;
+            Ok(start_b.is_some_and(|start| {
+                elapsed(state, start) > horizon(state)
+                    && elapsed(state, start) >= Duration::from_secs(30)
+            }) && b_targets.len() >= 10
+                && desired(state) == 1)
         });
         let observed = hold.settle(observation, || Ok(()));
         let outcome_a = joined(a);
@@ -358,10 +358,20 @@ pub fn two_sources(system: &Secured<'_>) -> Result<Vec<Check>> {
         let a = outcome_a?;
         let b = outcome_b?;
         let mut checks = stream_checks(&after(stack, since)?, true);
-        checks.push(Check::expect(names::SOURCE_ISOLATION,
-            first.principal != second.principal && first.home != second.home
-                && first.token != second.token && a_at_floor && isolated && authenticated_builds,
-            || format!("principal isolation failed: A at floor={a_at_floor}, young B at floor={isolated}, distinct authenticated builds={authenticated_builds}")));
+        checks.push(Check::expect(
+            "distinct authenticated streams share one worker",
+            first.principal != second.principal
+                && first.home != second.home
+                && first.token != second.token
+                && a_at_floor
+                && isolated
+                && authenticated_builds,
+            || {
+                format!(
+                    "distinct streams: A at floor={a_at_floor}, both at floor={isolated}, authenticated builds={authenticated_builds}"
+                )
+            },
+        ));
         checks.push(Check::expect(
             names::SOURCES_BUILD,
             a.succeeded() && b.succeeded(),
@@ -561,10 +571,7 @@ mod tests {
                 Some(Cause::Demand),
             )
         };
-        let valid = [
-            scale(0, 1, Some("floor".to_owned())),
-            scale(1, 2, Some("persistent queue".to_owned())),
-        ];
+        let valid = [scale(0, 1, Some("floor".to_owned()))];
         assert!(
             stream_checks(&valid, true)
                 .iter()
@@ -576,6 +583,16 @@ mod tests {
                 .filter(|check| check.is_failure())
                 .count()
                 >= 2
+        );
+        assert!(
+            stream_checks(
+                &[
+                    scale(0, 1, Some("floor".to_owned())),
+                    scale(1, 2, Some("extra".to_owned())),
+                ],
+                true,
+            )[1]
+            .is_failure()
         );
         assert!(stream_checks(&valid, false)[0].is_failure());
     }

@@ -336,7 +336,7 @@ fn seventeen_action_static_build_does_not_ratchet() -> TestResult {
 
 #[test]
 fn persistent_queue_nets_booting_and_unborn_capacity_once() -> TestResult {
-    for (serving, queue, booting, needed) in [(1, 40, 2, 3), (0, 32, 1, 2)] {
+    for (serving, queue, booting, needed) in [(1, 40, 2, 3), (0, 32, 1, 1)] {
         let mut w = Workload::new(6, 16, 50)?;
         w.learn_profile(source(1)?, secs(1800))?;
         if serving == 1 {
@@ -359,18 +359,18 @@ fn persistent_queue_nets_booting_and_unborn_capacity_once() -> TestResult {
 }
 
 #[test]
-fn known_source_profile_trusts_immediately() -> TestResult {
+fn known_source_profile_admits_without_bypassing_payback() -> TestResult {
     let mut w = Workload::new(6, 16, 50)?;
     w.learn_profile(source(1)?, secs(1800))?;
     w.queue(Some(source(1)?), X86, 48, None)?;
     let steps = w.pass();
-    assert_eq!(purchases(&steps), vec![(X86, 0, 3, NeedCause::Demand)]);
+    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
     assert_eq!(summary(&steps)?.persistent_streams, 1);
     Ok(())
 }
 
 #[test]
-fn closed_loop_aged_source_buys_unmet_concurrency() -> TestResult {
+fn closed_loop_aged_source_does_not_buy_unpaid_backlog() -> TestResult {
     let mut w = Workload::new(6, 16, 50)?;
     w.serve(X86, "local-1")?;
     w.queue(Some(source(1)?), X86, 40, None)?;
@@ -399,11 +399,13 @@ fn closed_loop_aged_source_buys_unmet_concurrency() -> TestResult {
             Some(secs(30)),
         )?;
         let steps = w.pass();
-        if w.h.clock.monotonic().elapsed() < secs(368) {
-            assert!(purchases(&steps).is_empty());
-        } else {
-            assert_eq!(purchases(&steps), vec![(X86, 1, 3, NeedCause::Demand)]);
-        }
+        // Constant inflight count means arrivals equal completions: 16/30 actions/s,
+        // or 16 offered slots, exactly the worker's capacity. The 1200 slot-second
+        // backlog does not repay another worker's 16 * 322.5 = 5160 slot-seconds.
+        assert!(
+            purchases(&steps).is_empty(),
+            "unpaid backlog bought: {steps:?}"
+        );
     }
     Ok(())
 }
@@ -421,7 +423,19 @@ fn steady_ci_stream_scales_stepwise_and_bounded() -> TestResult {
         Some(secs(20)),
     )?;
     w.pass();
-    for queued in [4, 8, 12, 16, 32] {
+    let kappa = std::f64::consts::LN_2 / Duration::from(w.h.scaling.load_half_life).as_secs_f64();
+    let decay = (-kappa * 20.0).exp();
+    let readiness = Duration::from(w.h.scaling.readiness_prior).as_secs_f64();
+    let horizon = (readiness + w.h.passes[X86].policy.idle_timeout.as_secs_f64()) * 0.5;
+    let pre_ready = 16.0 * (readiness - 20.0);
+    let mut offered = 0.0;
+    let mut completed = 0.0;
+    let mut previous = 0;
+    let mut all_steps = Vec::new();
+    let mut pending_since = Vec::new();
+    for queued in [
+        4, 8, 12, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240,
+    ] {
         w.h.advance(secs(20));
         w.complete(
             Some(source(1)?),
@@ -430,20 +444,75 @@ fn steady_ci_stream_scales_stepwise_and_bounded() -> TestResult {
             Some(secs(20)),
             ActionResources::default(),
         );
+        w.running(
+            "local-1",
+            16,
+            Some(source(1)?),
+            Duration::ZERO,
+            Some(secs(20)),
+        )?;
         w.h.snapshot.queued.clear();
+        // Preserve the original cohorts, then sustain the last cohort's 16 net arrivals/window.
         w.queue(Some(source(1)?), X86, queued, Some(secs(20)))?;
+        // Independent event-kernel arithmetic: timed mean 20s, 16 completions and
+        // the observed increase in inflight count each 20-second window.
+        offered = offered * decay + 20.0 * kappa * (16 + queued - previous) as f64;
+        completed = completed * decay + 20.0 * kappa * 16.0;
+        // Service-wave spikes cannot fabricate excess arrival work above physical capacity.
+        let future = offered.min(completed.min(16.0) + (offered - completed).max(0.0));
+        previous = queued;
+        let pending_credit = pending_since
+            .iter()
+            .map(|launched| {
+                16.0 * w
+                    .h
+                    .clock
+                    .monotonic()
+                    .saturating_duration_since(*launched)
+                    .as_secs_f64()
+                    .min(readiness)
+            })
+            .sum::<f64>();
+        let payable = ((queued as f64 * 20.0 + future * readiness - pre_ready - pending_credit)
+            .max(0.0)
+            / horizon
+            + (future - 16.0).max(0.0)
+            - (16.0 - future).max(0.0))
+        .max(0.0);
+        let from = w.h.supply(X86)?.desired;
+        let extra = (payable - f64::from(from - 1) * 16.0).max(0.0);
+        assert!(extra < 32.0, "the trace buys at most one worker per pass");
+        let needed = from + u32::from(extra >= 16.0);
         let steps = w.run();
-        assert!(w.h.supply(X86)?.desired <= 3);
-        if queued < 16 {
-            assert!(purchases(&steps).is_empty());
+        assert_eq!(w.h.outlook(X86)?.needed, needed);
+        if needed > from {
+            assert_eq!(
+                purchases(&steps),
+                vec![(X86, from, needed, NeedCause::Demand)]
+            );
+            w.h.launch(
+                X86,
+                &format!("pending-{needed}"),
+                InstanceLifecycle::Pending,
+                Duration::ZERO,
+            )?;
+            pending_since.push(w.h.clock.monotonic());
+        } else {
+            assert!(
+                purchases(&steps).is_empty(),
+                "pending capacity counted twice"
+            );
         }
-        if queued == 16 {
-            assert_eq!(purchases(&steps), vec![(X86, 1, 2, NeedCause::Demand)]);
-        }
-        if queued == 32 {
-            assert_eq!(purchases(&steps), vec![(X86, 2, 3, NeedCause::Demand)]);
-        }
+        all_steps.extend(steps);
     }
+    assert_eq!(
+        purchases(&all_steps),
+        vec![
+            (X86, 1, 2, NeedCause::Demand),
+            (X86, 2, 3, NeedCause::Demand)
+        ]
+    );
+    assert_eq!(w.h.supply(X86)?.desired, 3);
     Ok(())
 }
 
@@ -503,7 +572,9 @@ fn two_sources_share_capacity_without_cross_attribution() -> TestResult {
         w.pass();
     }
     let aged = w.h.plan.steps.clone();
-    assert_eq!(purchases(&aged), vec![(X86, 1, 6, NeedCause::Demand)]);
+    // A offers 3/5 * 20 = 12 slots and B offers 4/30 * 30 = 4: no net excess.
+    // B's 200 * 30 = 6000 slot-seconds repay one extra worker, not five.
+    assert_eq!(purchases(&aged), vec![(X86, 1, 2, NeedCause::Demand)]);
     assert_eq!(summary(&aged)?.persistent_streams, 2);
     Ok(())
 }
@@ -704,7 +775,16 @@ fn open_loop_excess_accumulates_until_one_whole_instance_repays() -> TestResult 
         Some(secs(20)),
     )?;
     w.pass();
-    for queue in [4, 8, 12, 16] {
+    let kappa = std::f64::consts::LN_2 / Duration::from(w.h.scaling.load_half_life).as_secs_f64();
+    let decay = (-kappa * 20.0).exp();
+    let readiness = Duration::from(w.h.scaling.readiness_prior).as_secs_f64();
+    let horizon = (readiness + w.h.passes[X86].policy.idle_timeout.as_secs_f64()) * 0.5;
+    let pre_ready = 16.0 * (readiness - 20.0);
+    let mut offered = 0.0;
+    let mut completed = 0.0;
+    let mut all_steps = Vec::new();
+    for batch in 1..=44 {
+        let queue = batch * 4;
         w.h.advance(secs(20));
         w.complete(
             Some(source(1)?),
@@ -714,13 +794,42 @@ fn open_loop_excess_accumulates_until_one_whole_instance_repays() -> TestResult 
             ActionResources::default(),
         );
         w.h.snapshot.queued.clear();
+        // Arrival rate is (16 + 4)/20 = 1/s versus service 16/20 = 0.8/s:
+        // 20 offered slots exceed the serving worker's 16 slots by four.
+        w.running(
+            "local-1",
+            16,
+            Some(source(1)?),
+            Duration::ZERO,
+            Some(secs(20)),
+        )?;
         w.queue(Some(source(1)?), X86, queue, Some(secs(20)))?;
-        let steps = w.pass();
-        assert_eq!(purchases(&steps).len(), usize::from(queue == 16));
-        if queue == 16 {
+        // A_k = 20*kappa*20*(1-decay^k)/(1-decay); M_k uses 16 completions, not 20 arrivals.
+        offered = offered * decay + 20.0 * kappa * 20.0;
+        completed = completed * decay + 20.0 * kappa * 16.0;
+        let future = offered.min(completed.min(16.0) + (offered - completed).max(0.0));
+        let payable = ((queue as f64 * 20.0 + future * readiness - pre_ready).max(0.0) / horizon
+            + (future - 16.0).max(0.0)
+            - (16.0 - future).max(0.0))
+        .max(0.0);
+        assert!(payable < 32.0, "this trace funds only one extra worker");
+        let needed = if payable >= 16.0 { 2 } else { 1 };
+        let from = w.h.supply(X86)?.desired;
+        let steps = w.run();
+        assert_eq!(w.h.outlook(X86)?.needed, needed);
+        if needed > from {
             assert_eq!(purchases(&steps), vec![(X86, 1, 2, NeedCause::Demand)]);
+            w.h.launch(X86, "pending-2", InstanceLifecycle::Pending, Duration::ZERO)?;
+        } else {
+            assert!(
+                purchases(&steps).is_empty(),
+                "purchase before payback or pending ratchet"
+            );
         }
+        all_steps.extend(steps);
     }
+    assert_eq!(purchases(&all_steps), vec![(X86, 1, 2, NeedCause::Demand)]);
+    assert_eq!(w.h.supply(X86)?.desired, 2);
     Ok(())
 }
 

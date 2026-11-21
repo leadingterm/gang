@@ -123,6 +123,7 @@ struct Outcome {
     late_instances: u32,
     utilization_cordons: u32,
     completed: u64,
+    persistent_refill_completions: u64,
 }
 
 fn register_ready(h: &mut Harness, boots: &mut Vec<Boot>, now: u64, delay: u64) -> TestResult {
@@ -287,6 +288,7 @@ fn simulate(episode: &Episode) -> TestResult<Outcome> {
         late_instances: 0,
         utilization_cordons: 0,
         completed: 0,
+        persistent_refill_completions: 0,
     };
     // Fixed iteration count is a deterministic hard deadline; no wall clock or sleeps.
     for step in 0..=episode.observed.window_ms / STEP_MS {
@@ -314,6 +316,9 @@ fn simulate(episode: &Episode) -> TestResult<Outcome> {
         );
         publish_workload(&mut w, &jobs, queued, now, model, resources)?;
         let decisions = w.run();
+        if queued > 0 && w.h.outlook(X86)?.load.is_some_and(|load| load > 0) {
+            outcome.persistent_refill_completions += u64::try_from(completed)?;
+        }
         outcome.utilization_cordons += u32::try_from(
             decisions
                 .iter()
@@ -384,7 +389,23 @@ fn modeled_episode(name: &str) -> TestResult {
                 "modeled spread settles to waterline capacity"
             );
         }
-        "sustained" => assert_eq!(after.peak, 6, "sustained refill justifies full capacity"),
+        "sustained" => {
+            assert_eq!(episode.modeled.concurrency, 96);
+            assert_eq!(episode.modeled.duration_ms, 30_000);
+            // Even all 96 queued jobs supply only 2_880 slot-seconds. Once
+            // B=45s is measured, H=(45+600)*50%=322.5s: work/H < 9 slots,
+            // below the 16 needed to buy one extra instance. Persistent refill
+            // does not turn that short queued work into a raw-count purchase.
+            assert_eq!(after.peak, 1, "short queued work cannot repay another host");
+            assert_eq!(
+                after.late_instances, 1,
+                "sustained work keeps its serving host"
+            );
+            assert!(
+                after.persistent_refill_completions > u64::from(episode.modeled.concurrency),
+                "multiple closed-loop waves must finish with persistent load and work still queued"
+            );
+        }
         _ => return Err("unknown modeled workload".into()),
     }
     println!(
@@ -416,6 +437,6 @@ fn modeled_episode_d_short_burst_avoids_observed_jump() -> TestResult {
     modeled_episode("D")
 }
 #[test]
-fn modeled_episode_e_sustained_refill_justifies_capacity() -> TestResult {
+fn modeled_episode_e_sustained_refill_still_requires_queued_work_payback() -> TestResult {
     modeled_episode("E")
 }

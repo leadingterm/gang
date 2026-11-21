@@ -670,7 +670,7 @@ fn work_aware_dispatch(scenario: Scenario, ctx: &RunContext<'_>) -> Vec<Check> {
         Scenario::ColdBurstFromZero => work_aware_checks(
             scenario,
             ctx,
-            ControlKnobs::BURST_FROM_ZERO,
+            ControlKnobs::COLD_BURST_FROM_ZERO,
             |stack, exec| crate::cold_burst_from_zero(stack, exec),
         ),
         Scenario::SustainedStream => {

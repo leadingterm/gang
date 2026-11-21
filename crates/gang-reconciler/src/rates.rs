@@ -17,6 +17,8 @@ use crate::{FleetPass, HostedSnapshot, PassTime};
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FleetRates {
     pub persistent_load: SlotVector,
+    pub arrival_load: SlotVector,
+    pub completion_load: SlotVector,
     pub total_load: SlotVector,
     pub transient_work: SlotVector,
     pub persistent_queue: SlotVector,
@@ -68,6 +70,20 @@ impl Moments {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CompletionDelta {
+    moments: Moments,
+    window_start: Option<Tick>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RefillEvidence {
+    #[default]
+    None,
+    Pending,
+    Confirmed,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Cell {
     seeded: bool,
@@ -76,12 +92,17 @@ struct Cell {
     running_prev: ResourceVector,
     rbar: ResourceVector,
     moments: Moments,
+    cohort_start: Option<Tick>,
+    completion_credit: f64,
+    admission_high_water: f64,
+    refill: RefillEvidence,
     // Per-pass scratch, reset without disturbing either estimator's history.
     n: f64,
     running: ResourceVector,
     preferred_running: ResourceVector,
     inflight_work: ResourceVector,
     fresh: Moments,
+    completion_window_start: Option<Tick>,
     persistent: bool,
     refill_failed: Option<Tick>,
 }
@@ -93,6 +114,7 @@ impl Cell {
         self.preferred_running = ResourceVector::default();
         self.inflight_work = ResourceVector::default();
         self.fresh = Moments::default();
+        self.completion_window_start = None;
     }
 
     fn reset_history(&mut self) {
@@ -104,6 +126,47 @@ impl Cell {
         self.moments = Moments::default();
         self.persistent = false;
         self.refill_failed = None;
+        self.reset_cohort();
+    }
+
+    fn reset_cohort(&mut self) {
+        self.cohort_start = None;
+        self.completion_credit = 0.0;
+        self.admission_high_water = 0.0;
+        self.refill = RefillEvidence::None;
+    }
+
+    fn observe_cohort(&mut self, kappa: f64, now: Tick, frame_start: Option<Tick>) -> bool {
+        if self.n == 0.0 {
+            self.reset_cohort();
+            return false;
+        }
+        let Some(start) = self.cohort_start.filter(|_| self.n_prev > 0.0) else {
+            self.reset_cohort();
+            self.cohort_start = Some(now);
+            self.admission_high_water = self.n;
+            return false;
+        };
+        if frame_start.is_some_and(|at| at >= start) {
+            // Rate reads precede listings. Discard crossing windows and require
+            // evidence to survive another aligned frame: receipt/listing alias
+            // remains bounded by the adapter, not an atomic conservation proof.
+            if self.completion_window_start.is_some_and(|at| at >= start) {
+                self.completion_credit =
+                    (self.completion_credit + self.fresh.all / kappa).min(f64::MAX);
+            }
+            let admitted = (self.n + self.completion_credit.floor()).min(f64::MAX);
+            self.refill = match self.refill {
+                RefillEvidence::Confirmed => RefillEvidence::Confirmed,
+                RefillEvidence::Pending if admitted >= self.admission_high_water => {
+                    RefillEvidence::Confirmed
+                }
+                _ if admitted > self.admission_high_water => RefillEvidence::Pending,
+                _ => RefillEvidence::None,
+            };
+            self.admission_high_water = self.admission_high_water.max(admitted);
+        }
+        self.refill == RefillEvidence::Confirmed && self.n >= self.n_prev
     }
 
     fn estimate(
@@ -113,7 +176,7 @@ impl Cell {
         read_to_now: f64,
         kappa: f64,
         unknown_seconds: f64,
-    ) -> (f64, f64, ResourceVector) {
+    ) -> (f64, f64, ResourceVector, ResourceVector) {
         if self.seeded {
             self.nbar += (self.n_prev - self.nbar) * (1.0 - gauge_decay);
             self.rbar = self.rbar.scaled(gauge_decay) + self.running_prev.scaled(1.0 - gauge_decay);
@@ -142,7 +205,7 @@ impl Cell {
         };
         let completed = product(self.moments.all, read_to_now);
         let arrived = (kappa * (self.n - self.nbar) + completed).clamp(0.0, f64::MAX);
-        (arrived, completed, mean.scaled(arrived))
+        (arrived, completed, mean.scaled(arrived), mean)
     }
 
     fn classify(
@@ -218,6 +281,8 @@ impl Default for SourceState {
 #[derive(Clone, Copy, Debug, Default)]
 struct FleetScratch {
     preferred_persistent: ResourceVector,
+    arrival_load: ResourceVector,
+    completion_load: ResourceVector,
     preferred_total: ResourceVector,
     preferred_persistent_actual: ResourceVector,
     overflow_persistent: ResourceVector,
@@ -248,7 +313,7 @@ pub(crate) struct SourceRates {
     worker_fleets: Vec<Option<usize>>,
     worker_serving: Vec<bool>,
     previous_rows: Vec<CompletionRates>,
-    deltas: Vec<Moments>,
+    deltas: Vec<CompletionDelta>,
     previous_read: Option<Tick>,
     previous_pass: Option<Tick>,
 }
@@ -396,7 +461,7 @@ impl SourceRates {
             self.pin(row.source);
         }
         for (row, delta) in snapshot.source_rates.iter().zip(&self.deltas) {
-            if delta.all > 0.0
+            if delta.moments.all > 0.0
                 && let Some(slot) = self.lookup(row.source)
             {
                 self.sources[slot].selected = true;
@@ -409,7 +474,7 @@ impl SourceRates {
             self.select(row.source);
         }
         for i in 0..snapshot.source_rates.len() {
-            if self.deltas[i].all > 0.0 {
+            if self.deltas[i].moments.all > 0.0 {
                 self.select(snapshot.source_rates[i].source);
             }
         }
@@ -483,8 +548,10 @@ impl SourceRates {
             if row.preferred_fleet >= self.fleet_count {
                 continue;
             }
-            self.cells[slot * self.fleet_count + row.preferred_fleet].fresh = *fresh;
-            if fresh.all > 0.0 {
+            let cell = &mut self.cells[slot * self.fleet_count + row.preferred_fleet];
+            cell.fresh = fresh.moments;
+            cell.completion_window_start = fresh.window_start;
+            if fresh.moments.all > 0.0 {
                 let source = &mut self.sources[slot];
                 let receipt = row.at.min(now);
                 source.active_at = Some(source.active_at.map_or(receipt, |at| at.max(receipt)));
@@ -510,7 +577,12 @@ impl SourceRates {
                 if !cell.seeded && cell.n == 0.0 && cell.fresh.all == 0.0 {
                     continue;
                 }
-                let (arrived, completed, rho) = cell.estimate(
+                let forecast_ready = cell.observe_cohort(
+                    self.kappa,
+                    now,
+                    self.previous_read.filter(|&at| read_at > at),
+                );
+                let (arrived, completed, rho, mean) = cell.estimate(
                     gauge_decay,
                     moment_decay,
                     read_to_now,
@@ -536,6 +608,10 @@ impl SourceRates {
                     .component_max(cell.preferred_running);
                 self.rates[preferred].streams = self.rates[preferred].streams.saturating_add(1);
                 if cell.persistent {
+                    if forecast_ready {
+                        scratch.arrival_load += rho.sub_floor(overflow);
+                        scratch.completion_load += mean.scaled(completed).sub_floor(overflow);
+                    }
                     scratch.preferred_persistent += rho
                         .sub_floor(overflow)
                         .component_max(cell.preferred_running);
@@ -624,6 +700,8 @@ impl SourceRates {
             .component_max(persistent);
             let rate = &mut self.rates[fleet];
             rate.persistent_load = persistent;
+            rate.arrival_load = normalize(scratch.arrival_load);
+            rate.completion_load = normalize(scratch.completion_load);
             rate.total_load = total;
             rate.transient_work = normalize(scratch.transient);
             rate.persistent_queue = normalize(scratch.persistent_queue);
@@ -655,7 +733,15 @@ impl SourceRates {
                 (Some(at), _) if row.created_at >= at => current,
                 _ => Moments::default(),
             };
-            self.deltas.push(fresh);
+            self.deltas.push(CompletionDelta {
+                moments: fresh,
+                // Counter birth/reuse may supply estimator moments, never
+                // completion credit for the preceding listing cohort.
+                window_start: old
+                    .filter(|old| old.generation == row.generation)
+                    .and(self.previous_read)
+                    .filter(|&at| snapshot.source_rates_at >= at),
+            });
         }
     }
 
@@ -1067,6 +1153,147 @@ mod tests {
         assert_eq!(actual.to_bits(), expected.to_bits());
     }
 
+    fn sample_cohort(
+        cell: &mut Cell,
+        n: f64,
+        completions: f64,
+        frame_start: Option<u64>,
+        completion_start: Option<u64>,
+        now: u64,
+    ) -> bool {
+        cell.n = n;
+        cell.fresh = Moments {
+            all: completions,
+            ..Moments::default()
+        };
+        cell.completion_window_start = completion_start.map(tick);
+        let ready = cell.observe_cohort(1.0, tick(now), frame_start.map(tick));
+        cell.estimate(1.0, 1.0, 1.0, 1.0, 1.0);
+        ready
+    }
+
+    #[test]
+    fn finite_cohort_completions_never_prove_future_admissions() {
+        let mut cell = Cell::default();
+        assert!(!sample_cohort(&mut cell, 10.0, 0.0, None, None, 0));
+        for (now, n, completions) in [(1, 8.0, 1.9), (2, 5.0, 2.9), (3, 1.0, 3.9)] {
+            assert!(!sample_cohort(
+                &mut cell,
+                n,
+                completions,
+                Some(now - 1),
+                Some(now - 1),
+                now,
+            ));
+        }
+        assert_eq!(cell.refill, RefillEvidence::None);
+        exact(cell.admission_high_water, 10.0);
+    }
+
+    #[test]
+    fn repeated_admissions_accumulate_fractional_completion_credit() {
+        let mut cell = Cell::default();
+        assert!(!sample_cohort(&mut cell, 4.0, 0.0, None, None, 0));
+        assert!(!sample_cohort(&mut cell, 4.0, 0.9, Some(0), Some(0), 1));
+        assert!(!sample_cohort(&mut cell, 4.0, 0.9, Some(1), Some(1), 2));
+        assert!(!sample_cohort(&mut cell, 4.0, 0.0, None, None, 2));
+        assert!(sample_cohort(&mut cell, 4.0, 0.9, Some(2), Some(2), 3));
+        assert_eq!(cell.refill, RefillEvidence::Confirmed);
+        // Retained refill history must not extrapolate while the cohort drains.
+        assert!(!sample_cohort(&mut cell, 3.0, 0.0, Some(3), Some(3), 4));
+        assert_eq!(cell.refill, RefillEvidence::Confirmed);
+    }
+
+    #[test]
+    fn observed_empty_restarts_cohort_even_with_retained_persistence() {
+        let mut cell = Cell {
+            persistent: true,
+            ..Cell::default()
+        };
+        assert!(!sample_cohort(&mut cell, 4.0, 0.0, None, None, 0));
+        assert!(!sample_cohort(&mut cell, 5.0, 0.0, Some(0), None, 1));
+        assert!(sample_cohort(&mut cell, 5.0, 0.0, Some(1), None, 2));
+        assert!(!sample_cohort(&mut cell, 0.0, 0.0, Some(2), None, 3));
+        assert!(cell.persistent);
+        assert!(!sample_cohort(&mut cell, 100.0, 10.0, Some(3), Some(3), 4));
+        assert!(!sample_cohort(&mut cell, 100.0, 0.0, Some(4), Some(4), 5));
+        exact(cell.completion_credit, 0.0);
+        exact(cell.admission_high_water, 100.0);
+    }
+
+    #[test]
+    fn preseed_read_listing_skew_cannot_supply_completion_credit() {
+        let mut cell = Cell::default();
+        // Two of a finite ten finish between read 0 and the first listing at 2.
+        assert!(!sample_cohort(&mut cell, 8.0, 0.0, None, None, 2));
+        assert!(!sample_cohort(&mut cell, 8.0, 1.9, Some(0), Some(0), 4));
+        assert!(!sample_cohort(&mut cell, 8.0, 0.0, Some(3), Some(3), 5));
+        exact(cell.completion_credit, 0.0);
+        assert_eq!(cell.refill, RefillEvidence::None);
+    }
+
+    #[test]
+    fn counter_birth_generation_and_single_frame_alias_do_not_prove_refill() {
+        let mut cell = Cell::default();
+        assert!(!sample_cohort(&mut cell, 10.0, 0.0, None, None, 0));
+        // Birth/reuse has no same-generation completion window.
+        assert!(!sample_cohort(&mut cell, 10.0, 100.0, Some(0), None, 1));
+        assert!(!sample_cohort(&mut cell, 10.0, 100.0, Some(1), None, 2));
+        exact(cell.completion_credit, 0.0);
+        // A late listing can overlap one frame's completions; wait for confirmation.
+        assert!(!sample_cohort(&mut cell, 10.0, 1.9, Some(2), Some(2), 3));
+        assert!(!sample_cohort(&mut cell, 8.0, 0.0, Some(3), Some(3), 4));
+        assert_eq!(cell.refill, RefillEvidence::None);
+        cell.reset_history();
+        assert!(cell.cohort_start.is_none());
+        exact(cell.completion_credit, 0.0);
+    }
+
+    #[test]
+    fn qualified_arrival_and_completion_work_remain_unclipped() {
+        let mut world = World::new(1, 2);
+        world.capacities[0].actions = 1.0;
+        world.queue(16, Some(20));
+        world.observe(0);
+        world.complete(source(1), 0, 20, 16, Some(20), ActionResources::default());
+        world.queue(20, Some(20));
+        world.observe(20);
+        assert_eq!(world.rates.fleet(0).arrival_load, SlotVector::default());
+        world.complete(source(1), 0, 40, 16, Some(20), ActionResources::default());
+        world.queue(24, Some(20));
+        world.observe(40);
+        let weight = world.rates.kappa * (1.0 + decay(world.rates.kappa, tick(40), tick(20)));
+        let rates = world.rates.fleet(0);
+        near(rates.arrival_load.actions, 20.0 * weight * 20.0, 1e-12);
+        near(rates.completion_load.actions, 16.0 * weight * 20.0, 1e-12);
+        exact(rates.persistent_load.actions, 1.0);
+        assert!(rates.arrival_load.actions > rates.persistent_load.actions);
+        world.queue(23, Some(20));
+        world.observe(41);
+        assert_eq!(world.rates.fleet(0).arrival_load, SlotVector::default());
+        assert_eq!(world.rates.fleet(0).completion_load, SlotVector::default());
+    }
+
+    #[test]
+    fn counter_birth_and_reuse_never_credit_cohort_completions() {
+        let mut world = World::new(1, 2);
+        world.queue(10, Some(1));
+        world.observe(0);
+        world.complete(source(1), 0, 1, 2, Some(1), ActionResources::default());
+        world.queue(8, Some(1));
+        world.observe(1);
+        exact(world.cell(source(1), 0).completion_credit, 0.0);
+        world.snapshot.source_rates[0].generation += 1;
+        world.snapshot.source_rates[0].created_at = tick(2);
+        world.snapshot.source_rates[0].at = tick(2);
+        world.snapshot.source_rates[0].completions = finite(100.0 * world.rates.kappa);
+        world.observe(2);
+        exact(world.cell(source(1), 0).completion_credit, 0.0);
+        world.observe(3);
+        exact(world.cell(source(1), 0).completion_credit, 0.0);
+        assert_eq!(world.rates.fleet(0).arrival_load, SlotVector::default());
+    }
+
     #[test]
     fn static_dump_first_completion_does_not_reset_known_gauge() {
         for expected in [Some(30), None] {
@@ -1341,7 +1568,7 @@ mod tests {
             },
             ..Cell::default()
         };
-        let (arrived, completed, rho) = cell.estimate(0.0, 0.0, 0.0, 0.1, 10.0);
+        let (arrived, completed, rho, _) = cell.estimate(0.0, 0.0, 0.0, 0.1, 10.0);
         exact(completed, 0.0);
         exact(arrived, 1.0);
         exact(rho.actions, 2.0);

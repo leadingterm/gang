@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use gang_clock::Clock;
 use gang_config::SourceLimit;
+use gang_reconciler::{NeedCause, PassTime, PlanStep};
 use gang_testkit::TestResult;
-use gang_types::ActionResources;
+use gang_types::{ActionResources, InstanceLifecycle, SourceId};
 
-use super::work_aware::{Workload, purchases, secs, source};
+use super::work_aware::{Workload, purchases, secs, source, summary};
 use crate::support::{Harness, X86};
 
 fn aged() -> TestResult<Workload> {
@@ -506,7 +507,7 @@ fn snapshot_alias_error_stays_within_documented_step_bound() -> TestResult {
 }
 
 #[test]
-fn first_build_checkpoint_survives_model_replacement() -> TestResult {
+fn first_build_checkpoint_retains_source_admission_after_model_replacement() -> TestResult {
     let mut w = Workload::new(6, 16, 50)?;
     w.queue(Some(source(1)?), X86, 40, None)?;
     w.pass();
@@ -519,7 +520,8 @@ fn first_build_checkpoint_survives_model_replacement() -> TestResult {
         .restore(gang_reconciler::PassTime::read(&w.h.clock), &records);
     w.h.restart();
     let steps = w.pass();
-    assert_eq!(purchases(&steps).first().map(|step| step.2), Some(2));
+    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
+    assert_eq!(summary(&steps)?.persistent_streams, 1);
     Ok(())
 }
 
@@ -550,6 +552,149 @@ fn source_period_flush_settles_unobserved_checkpoint_once() -> TestResult {
     );
     w.h.restart();
     w.queue(Some(source(1)?), X86, 40, None)?;
-    assert_eq!(purchases(&w.pass()).first().map(|step| step.2), Some(2));
+    let steps = w.pass();
+    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
+    assert_eq!(summary(&steps)?.persistent_streams, 1);
     Ok(())
+}
+
+fn train_long_source(src: SourceId) -> TestResult<Workload> {
+    let mut w = Workload::new(6, 16, 50)?;
+    w.serve(X86, "trained-worker")?;
+    w.running(
+        "trained-worker",
+        1,
+        Some(src),
+        Duration::ZERO,
+        Some(secs(600)),
+    )?;
+    w.pass();
+    for period in 1..=3 {
+        w.observe_for(secs(600));
+        w.complete(
+            Some(src),
+            X86,
+            1,
+            Some(secs(600)),
+            ActionResources::default(),
+        );
+        w.running(
+            "trained-worker",
+            u32::from(period != 3),
+            Some(src),
+            Duration::ZERO,
+            Some(secs(600)),
+        )?;
+        w.pass();
+    }
+    let frame = w.h.snapshot.source_rates[0];
+    assert_eq!(frame.source, Some(src));
+    assert!(frame.timed_completions.get() > 0.0);
+    assert!(
+        (frame.work.actions.get() / frame.timed_completions.get() - 600.0).abs() < 1e-9,
+        "real completion frames retain the long source's 600-second mean"
+    );
+    w.h.advance(secs(1));
+    w.pass();
+    w.h.advance(Duration::from(w.h.scaling.source_idle));
+    w.pass();
+    let mut records = Vec::new();
+    w.h.profiles
+        .snapshot(PassTime::read(&w.h.clock), &mut records)?;
+    assert_eq!(records.len(), 1, "the 1800-second source period is durable");
+    w.h.profiles.restore(PassTime::read(&w.h.clock), &records);
+    w.h.disconnect("trained-worker")?;
+    w.h.set_lifecycle(
+        X86,
+        "trained-worker",
+        InstanceLifecycle::Terminating,
+        Duration::ZERO,
+    )?;
+    w.h.set_desired_capacity(X86, 0);
+    w.h.restart();
+    Ok(w)
+}
+
+#[test]
+fn retained_long_source_short_static_batch_buys_only_reachability_without_ratchet() -> TestResult {
+    let src = source(1)?;
+    let mut w = train_long_source(src)?;
+    let frame = w.h.snapshot.source_rates[0];
+
+    // Keep the authenticated principal and long mean; only this batch's known duration changes.
+    w.queue(Some(src), X86, 160, Some(secs(1)))?;
+    let mut steps = w.run();
+    let decision = summary(&steps)?;
+    assert_eq!(
+        decision.persistent_streams, 1,
+        "restored history must admit the short batch as persistent, not transient"
+    );
+    assert_eq!(decision.readiness, secs(45));
+    assert_eq!(decision.horizon, Duration::from_millis(322_500));
+    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
+    w.h.launch(
+        X86,
+        "new-worker",
+        InstanceLifecycle::Pending,
+        Duration::ZERO,
+    )?;
+    for delay in [8, 1, 30, 60] {
+        w.h.advance(secs(delay));
+        steps.extend(w.run());
+        assert_eq!(w.h.snapshot.queued.len(), 160, "the batch never refills");
+        let current = w.h.snapshot.source_rates[0];
+        assert_eq!(current.at, frame.at, "no new completion frame");
+        assert_eq!(current.timed_completions, frame.timed_completions);
+        assert_eq!(current.work, frame.work, "the long source mean is retained");
+        assert_eq!(w.h.outlook(X86)?.load, Some(0), "static is not sustained");
+        assert_eq!(
+            w.h.outlook(X86)?.needed,
+            1,
+            "pending capacity cannot ratchet"
+        );
+    }
+    steps.extend(serve_finite_cohort(&mut w, src)?);
+    assert_eq!(purchases(&steps), vec![(X86, 0, 1, NeedCause::Demand)]);
+    assert_eq!(w.h.supply(X86)?.desired, 1);
+    Ok(())
+}
+
+fn serve_finite_cohort(w: &mut Workload, src: SourceId) -> TestResult<Vec<PlanStep>> {
+    let mut steps = Vec::new();
+    w.h.set_lifecycle(
+        X86,
+        "new-worker",
+        InstanceLifecycle::InService,
+        Duration::ZERO,
+    )?;
+    w.h.connect(X86, "new-worker")?;
+    w.h.snapshot.queued.truncate(144);
+    w.running("new-worker", 16, Some(src), Duration::ZERO, Some(secs(1)))?;
+    steps.extend(w.run());
+    assert_eq!(
+        w.h.outlook(X86)?.load,
+        Some(160),
+        "actual load fills the worker"
+    );
+    assert_eq!(w.h.outlook(X86)?.needed, 1);
+    for remaining in [128, 112, 96] {
+        w.h.advance(secs(1));
+        w.complete(
+            Some(src),
+            X86,
+            16,
+            Some(secs(1)),
+            ActionResources::default(),
+        );
+        w.h.snapshot.queued.truncate(remaining);
+        w.running("new-worker", 16, Some(src), Duration::ZERO, Some(secs(1)))?;
+        steps.extend(w.run());
+        assert_eq!(w.h.outlook(X86)?.load, Some(160));
+        assert_eq!(
+            w.h.outlook(X86)?.needed,
+            1,
+            "serving a finite cohort cannot justify imaginary future arrivals"
+        );
+    }
+    Ok(steps)
 }

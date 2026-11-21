@@ -396,6 +396,7 @@ fn burst_queue_fits_one_http2_connection() -> gang_e2e::Result<()> {
         (ControlKnobs::NONE, 100),
         (ControlKnobs::QUEUED_BEHIND_SHORT_WORK, 100),
         (ControlKnobs::BURST_FROM_ZERO, 160),
+        (ControlKnobs::COLD_BURST_FROM_ZERO, 160),
     ] {
         let variant = Variant {
             control,
@@ -417,11 +418,23 @@ fn rate_scaling_presets_render_typed_knobs() -> gang_e2e::Result<()> {
         backlog.scaling.unknown_action_duration.get(),
         std::time::Duration::from_mins(10),
     );
-    let burst = varied_document(&Variant {
-        control: ControlKnobs::BURST_FROM_ZERO,
-        ..Variant::baseline(Sandbox::Noop)
-    })?;
-    assert_eq!(burst.scaling, gang_config::ScalingConfig::default());
+    for (control, idle) in [
+        (
+            ControlKnobs::BURST_FROM_ZERO,
+            std::time::Duration::from_secs(5),
+        ),
+        (
+            ControlKnobs::COLD_BURST_FROM_ZERO,
+            std::time::Duration::from_mins(10),
+        ),
+    ] {
+        let burst = varied_document(&Variant {
+            control,
+            ..Variant::baseline(Sandbox::Noop)
+        })?;
+        assert_eq!(burst.scaling, gang_config::ScalingConfig::default());
+        assert_eq!(burst.fleets[0].idle_timeout, idle);
+    }
     for control in [
         ControlKnobs::SUSTAINED_STREAM,
         ControlKnobs::TWO_SOURCES,
