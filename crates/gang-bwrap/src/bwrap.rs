@@ -649,9 +649,8 @@ pub(super) mod tests {
             memory_cgroup: None,
             launcher: &[],
         };
-        let error = match sandbox.start(&spec).await {
-            Ok(_) => return Err("granted action without cgroup unexpectedly started".into()),
-            Err(error) => error,
+        let Err(error) = sandbox.start(&spec).await else {
+            return Err("granted action without cgroup unexpectedly started".into());
         };
         assert!(error.to_string().contains("public egress"));
         Ok(())

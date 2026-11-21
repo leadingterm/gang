@@ -34,7 +34,7 @@ fn base_config() -> gang_e2e::Result<String> {
 
 fn base_with_egress() -> gang_e2e::Result<String> {
     Ok(format!(
-        "{}\n[execution.egress]\nprotected_networks = [\"10.0.0.0/8\"]\ndns_servers = [\"1.1.1.1\"]\n",
+        "{}\n[execution.egress]\nprotected_networks = [\"10.0.0.0/8\"]\ndns_servers = [\"1.1.1.1\"]\n[sandbox.bwrap.egress]\n",
         base_config()?
     ))
 }
