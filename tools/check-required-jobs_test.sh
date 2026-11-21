@@ -78,7 +78,7 @@ for job in linux-arm64-bundle linux-arm64-checks linux-arm64 cross release-valid
   expect failure "$job cannot accept ordinary same-repository PRs" "$guard" "$fixture"
 done
 cp "$workflow" "$fixture"
-yq -i 'del(.jobs.linux-x86_64-bundle.steps[] | select((.uses // "") | startswith("actions/checkout@")) | .with.ref)' "$fixture"
+yq -i 'del(.jobs.linux-x86_64-bundle.steps[0].with.ref)' "$fixture"
 expect failure 'release binary checkout must use the PR head' "$guard" "$fixture"
 cp "$workflow" "$fixture"
 yq -i '(.jobs.changes.steps[] | select(.id == "filter") | .env.HEAD) = "${{ github.sha }}"' "$fixture"
