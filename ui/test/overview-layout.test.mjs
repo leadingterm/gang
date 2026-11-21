@@ -160,6 +160,48 @@ const probe = async (scenario) => {
     return { name, tile: bounds, label: labelRect, value: rect(value), meter: meterSlotRect, actualMeter: meterRect, caption: captionRect, chart: chartRect, svgs: svgRects };
   });
   if (scenario === "isolated" && isolatedMarkers < 4) add(`isolated: expected at least four Queue/Executing markers, got ${isolatedMarkers}`);
+  if (scenario === "instances") {
+    const executing = elements.find((element) => element.querySelector(".label")?.textContent.trim() === "Executing")?.querySelector(".readout__big")?.textContent.trim() ?? "";
+    if (!/^120$/.test(executing)) add(`Executing: expected 120 without a denominator, got "${executing}"`);
+    if (/\/\s*0(?:\D|$)/.test(document.body.innerText)) add("Overview contains a /0 denominator");
+    const fleets = [...document.querySelectorAll(".fleet")];
+    const histories = [...document.querySelectorAll(".fleet__history")];
+    if (fleets.length < 2 || histories.length !== fleets.length) add(`expected one history per fleet, got ${histories.length} histories for ${fleets.length} fleets`);
+    const ids = [...document.querySelectorAll("svg pattern[id]")].map((pattern) => pattern.id);
+    if (new Set(ids).size !== ids.length) add("duplicate SVG hatch IDs");
+    for (const [index, fleet] of fleets.entries()) {
+      const history = fleet.querySelector(".fleet__history");
+      const svg = history?.querySelector("svg");
+      const legend = history?.querySelector('[aria-label="Instance history legend"]');
+      const historyBox = rect(history), svgBox = rect(svg), legendBox = rect(legend);
+      if (!historyBox || !svgBox || !legendBox || svgBox.width <= EPS || svgBox.height <= EPS || legendBox.width <= EPS || legendBox.height <= EPS) {
+        add(`fleet ${index}: chart or legend is missing or invisible`);
+        continue;
+      }
+      const labels = [...legend.children].map((item) => item.textContent.trim());
+      for (const label of ["Pending", "In service", "Terminating", "Warm", "Desired", "Max"]) {
+        if (!labels.includes(label)) add(`fleet ${index}: missing ${label} legend item`);
+      }
+      for (const [name, node] of [["chart", svg], ["legend", legend], ...[...legend.children].map((item) => ["legend item", item])]) {
+        const box = rect(node);
+        const style = getComputedStyle(node);
+        if (!box || box.width <= EPS || box.height <= EPS || style.display === "none" || style.visibility === "hidden" ||
+            box.left < historyBox.left - EPS || box.right > historyBox.right + EPS ||
+            box.top < historyBox.top - EPS || box.bottom > historyBox.bottom + EPS) add(`fleet ${index}: ${name} is invisible or overflows history`);
+      }
+      for (const name of ["pending", "inService", "terminating", "warm", "desired", "max"]) {
+        const paths = svg.querySelectorAll(`path[data-series="${name}"]`);
+        if (paths.length !== 1) add(`fleet ${index}: expected one ${name} path, got ${paths.length}`);
+        else {
+          const reference = paths[0].classList.contains("spark__run--reference");
+          if (reference !== ["desired", "max"].includes(name)) add(`fleet ${index}: incorrect reference class for ${name}`);
+          if (!(paths[0].getAttribute("d") ?? "").trim()) add(`fleet ${index}: ${name} path is empty`);
+          if (index === 0 && name === "pending" && (paths[0].getAttribute("d")?.match(/M/g) ?? []).length !== 2) add("fleet 0: missing-entry gap or scheduler-independent sample not preserved");
+        }
+      }
+      if (svg.querySelectorAll("path[data-series]").length !== 6) add(`fleet ${index}: expected exactly six series paths`);
+    }
+  }
   const reference = tiles.find((tile) => tile.label)?.label;
   const referenceTile = tiles.find((tile) => tile.label)?.tile;
   if (reference && referenceTile) {
@@ -268,7 +310,7 @@ test("overview tile geometry", { timeout: 120000 }, async () => {
     const fixtureNow = load("live").at(-1).at;
     await page.send("Page.addScriptToEvaluateOnNewDocument", { source: `{ const offset = ${fixtureNow} - Date.now(); const now = Date.now.bind(Date); Date.now = () => now() + offset; }` });
     const violations = [];
-    for (const scenario of ["live", "empty", "isolated"]) {
+    for (const scenario of ["live", "empty", "isolated", "instances"]) {
       const frameCount = load(scenario).length;
       for (const width of [...FULL_WIDTHS, ...FOCUSED_WIDTHS]) {
         await page.send("Network.clearBrowserCookies");
@@ -298,6 +340,11 @@ test("overview tile geometry", { timeout: 120000 }, async () => {
           writeFileSync(join(process.env.TEST_UNDECLARED_OUTPUTS_DIR, `overview-${scenario}-${width}.png`), Buffer.from(screenshot.data, "base64"));
           const shot = await page.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, clip: { x: clip.left, y: clip.top, width: clip.width, height: clip.height, scale: 1 } });
           writeFileSync(join(process.env.TEST_UNDECLARED_OUTPUTS_DIR, `overview-${scenario}-${width}-tiles.png`), Buffer.from(shot.data, "base64"));
+          if (scenario === "instances" && [390, 1516].includes(width)) {
+            const full = await page.send("Runtime.evaluate", { expression: `({ x: 0, y: 0, width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight, scale: 1 })`, returnByValue: true });
+            const pageShot = await page.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, clip: full.result.value });
+            writeFileSync(join(process.env.TEST_UNDECLARED_OUTPUTS_DIR, `overview-instances-${width}-full.png`), Buffer.from(pageShot.data, "base64"));
+          }
         }
       }
     }

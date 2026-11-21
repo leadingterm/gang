@@ -372,6 +372,16 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .spark__point { fill: var(--color-accent); }
 .spark__point--secondary { fill: var(--color-accent-deep); }
 .spark__unrecorded { opacity: 0.35; }
+.spark__unknown { opacity: 0.35; }
+.spark__series--pending { color: var(--color-amber); }
+.spark__series--inService { color: var(--color-accent); }
+.spark__series--terminating { color: var(--color-bark); }
+.spark__series--warm { color: var(--color-accent-deep); }
+.spark__series--desired { color: var(--color-ink-2); }
+.spark__series--max { color: var(--color-muted); }
+.spark__series .spark__run { stroke: currentColor; }
+.spark__series .spark__point { fill: currentColor; }
+.spark__series--reference .spark__run { stroke-dasharray: 4 3; }
 
 .cache-table .meter { width: var(--size-cache-meter); }
 .cache-table td.a-span { white-space: normal; }
@@ -401,7 +411,7 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .fleet {
   display: grid;
   grid-template-columns: minmax(var(--size-fleet-id), 1fr) minmax(0, 1.6fr) auto;
-  grid-template-areas: "id gauge nums";
+  grid-template-areas: "id gauge nums" "history history history";
   align-items: center;
   gap: var(--space-sm) var(--space-xl);
   padding-block: var(--space-md);
@@ -450,6 +460,9 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .fleet__nums > div { display: flex; flex-direction: column-reverse; align-items: flex-end; min-width: var(--fleet-count-width); }
 .fleet__nums dt { color: var(--color-muted); font-size: var(--text-xs); }
 .fleet__nums dd { font-family: var(--font-mono); font-size: var(--text-2xl); line-height: 1.1; }
+.fleet__history { grid-area: history; min-width: 0; }
+.fleet__history-swatch { width: var(--chart-swatch-width); border-block-start: 2px solid currentColor; }
+.spark__series--reference .fleet__history-swatch { border-block-start-style: dashed; }
 
 .tag {
   display: inline-block;
@@ -830,11 +843,6 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .phase--draining .phase__name { color: var(--color-bark); }
 .paused { color: var(--color-bark); font-size: var(--text-xs); font-family: var(--font-mono); }
 
-.slots { display: flex; align-items: center; }
-.slots__pips { display: grid; grid-template-columns: repeat(8, var(--size-pip)); grid-auto-rows: var(--size-pip); gap: var(--size-fine); }
-.slots__pips i { border-radius: var(--size-pixel); background: var(--color-paper-3); }
-.slots__pips i.on { background: var(--color-accent); }
-.slots__pips.is-draining i.on { background: var(--color-bark); }
 
 .lane {
   position: relative;
@@ -1049,7 +1057,7 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .ann__long { display: none; }
   .ann__short { display: inline; }
   .ann__short:empty { display: none; }
-  .fleet { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "id nums" "gauge gauge"; }
+  .fleet { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "id nums" "gauge gauge" "history history"; }
   .wgrid { grid-template-columns: minmax(var(--size-worker-id-compact), 1fr) max-content var(--size-worker-slots) minmax(0, 1.4fr); }
   .builds-table thead { display: block; position: absolute; width: var(--size-pixel); height: var(--size-pixel); overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .table.builds-table { display: block; }
@@ -1088,7 +1096,7 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .main { padding-block: var(--space-lg) var(--space-2xl); }
   .readout__big { font-size: var(--text-2xl); }
   .readout__of { font-size: var(--text-sm); }
-  .fleet { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "id id" "gauge nums"; }
+  .fleet { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "id id" "gauge nums" "history history"; }
   .fleet { gap: var(--space-xs) var(--space-md); }
   .fleet__nums { gap: var(--space-md); }
   .fleet__nums > div { min-width: var(--size-fleet-mobile-value); }

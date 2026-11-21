@@ -582,6 +582,24 @@ workers: WorkerCounts,
  */
 demand: Demand, };
 
+export type FleetInstanceSample = { 
+/**
+ * Fleet resource name, `fleets/{fleet}`.
+ */
+name: string, 
+/**
+ * Observed instances by lifecycle.
+ */
+instances: InstanceCounts, 
+/**
+ * Desired instances at observation time.
+ */
+desired: number, 
+/**
+ * Maximum instances at observation time.
+ */
+max: number, };
+
 export type Frame = { "event": "snapshot", "data": State } | { "event": "delta", "data": Delta } | { "event": "tick", "data": Tick } | { "event": "closed", "data": Closed };
 
 export type InfrastructurePhase = "REPLACING" | "REPLACEMENT";
@@ -1015,6 +1033,12 @@ skipped: number,
  * step is false until its first complete observation. Absent only on legacy samples.
  */
 schedulerKnown?: boolean, 
+/**
+ * Latest independent supply observation for each successfully read fleet in this step.
+ * A missing fleet is unknown, including in legacy or unobserved steps; a present all-zero
+ * entry is a measurement. Later failed reads remove the fleet from this step.
+ */
+fleets?: Array<FleetInstanceSample>, 
 /**
  * `GetActionResult` calls answered during the step.
  */
