@@ -326,7 +326,7 @@ mod tests {
 
     use super::*;
     use crate::config::{AwsFleetOptions, Capacity, RetrySpotAfter, SpotFallback};
-    use crate::fake_aws::{FakeAws, FakeFailure, FakeGroup};
+    use crate::fake_aws::{FakeAws, FakeFailure, FakeGroup, FakeTemplateKind};
     use crate::fleet_harness::{Harness, NOW_MILLIS, fleet, fleet_with, rfc3339_ago};
     use crate::test_support::context;
     use gang_clock::{Sleep, TestClock, Tick, Timestamp};
@@ -519,10 +519,16 @@ mod tests {
     async fn abandoned_requests_follow_the_provisioner_contract() -> TestResult {
         let harness = Harness::start().await?;
         harness.add_group_with(FakeGroup {
+            availability_zones: vec!["us-east-1a".to_owned()],
+            instance_types: vec!["c7g.large".to_owned()],
+            template_kind: FakeTemplateKind::Mixed,
             new_instances_protected: true,
             ..FakeGroup::new(GROUP, 4, &[])
         });
         harness.add_group_with(FakeGroup {
+            availability_zones: vec!["us-east-1a".to_owned()],
+            instance_types: vec!["c7g.large".to_owned()],
+            template_kind: FakeTemplateKind::Mixed,
             new_instances_protected: true,
             ..FakeGroup::new("gang-worker-x86-64-on-demand", 0, &[])
         });

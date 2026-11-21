@@ -425,7 +425,9 @@ async fn zonal_stockouts_require_all_zones_before_fallback() -> TestResult {
             .await
     })
     .await?;
-    assert_eq!(writes(&harness), vec![write(FLEET, "0"), write(TWIN, "4")]);
+    assert_eq!(writes(&harness), vec![write(TWIN, "4")]);
+    assert_eq!(harness.desired(FLEET), Some(4));
+    assert_eq!(harness.desired(TWIN), Some(4));
     Ok(())
 }
 
