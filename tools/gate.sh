@@ -34,7 +34,7 @@ fi
 tools/lint.sh
 bazel=${BAZEL:-bazel}
 # Disable inherited remote services without disabling the local disk cache.
-flags=(--compilation_mode=opt --remote_cache= --remote_executor=)
+flags=(--config=local --compilation_mode=opt --remote_cache= --remote_executor=)
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 BAZEL="$bazel" tools/ci-targets.sh --query | tools/ci-targets.sh 1 1 >"$scratch/targets"

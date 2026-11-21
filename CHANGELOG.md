@@ -6,6 +6,10 @@
 
 - Show worker FastSlowStore cache reads, evictions and capacity in live state and the dashboard, with fleet reporting coverage.
 
+### Fixed
+
+- Keep remote action shells and paths FHS-compatible: the devShell's later-loaded Bazel rc previously replaced them with host-only Nix store paths. Use `--config=local` for pinned Nix tools and local-only execution.
+
 ## 0.3.5 — 2026-11-21
 
 ### Added
