@@ -53,20 +53,20 @@ fn plain_options() -> AwsFleetOptions {
     }
 }
 
-/// A group with scale-in protection on new instances, as an opted-in fleet requires.
+/// A protected group with one explicit launch candidate, as fallback scenarios require.
 fn protected(name: &str, desired: i32, instances: &[(&str, &str)]) -> FakeGroup {
     FakeGroup {
         new_instances_protected: true,
+        template_kind: FakeTemplateKind::Mixed,
+        instance_types: vec!["c7g.large".to_owned()],
+        availability_zones: vec!["us-east-1a".to_owned()],
         ..FakeGroup::new(name, desired, instances)
     }
 }
 
 /// An explicit single launch candidate, allowing its failure to prove the group is blocked.
 fn single_candidate(name: &str, desired: i32) -> FakeGroup {
-    let mut group = protected(name, desired, &[]);
-    group.template_kind = FakeTemplateKind::Mixed;
-    group.instance_types = vec!["c7g.large".to_owned()];
-    group
+    protected(name, desired, &[])
 }
 
 /// Records an activity while preserving its original status message.
@@ -87,6 +87,22 @@ fn activity(harness: &Harness, group: &str, status: &str, age: u64, message: Opt
             "Launching a new EC2 instance".to_owned(),
         ),
     );
+}
+
+/// Records a launch activity scoped to an availability zone, without narrowing the instance type.
+fn zonal_activity(harness: &Harness, status: &str, age: u64, zone: &str, message: Option<&str>) {
+    activity(harness, FLEET, status, age, message);
+    let mut state = harness.fake.state();
+    let index = state.activities.len() - 1;
+    state.activity_zones.insert(index, zone.to_owned());
+}
+
+/// Two types across two zones, as in a real multi-candidate Spot group.
+fn two_zone_spot() -> FakeGroup {
+    let mut group = protected(FLEET, 4, &[]);
+    group.instance_types = vec!["c7g.large".to_owned(), "m7g.large".to_owned()];
+    group.availability_zones = vec!["us-east-1a".to_owned(), "us-east-1b".to_owned()];
+    group
 }
 
 /// The on-demand twin with a warm pool that reuses instances on scale-in. Its members are
@@ -336,6 +352,59 @@ async fn partial_candidate_failure_warns_without_abandoning_spot_or_raising_twin
     Ok(())
 }
 
+#[tokio::test]
+async fn zonal_stockouts_require_all_zones_before_fallback() -> TestResult {
+    const REASON: &str = "InsufficientInstanceCapacity: no Spot capacity available";
+    let harness = harness_with(vec![two_zone_spot(), protected(TWIN, 0, &[])]).await?;
+    let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+    let mut supply = FleetSupply::default();
+    zonal_activity(&harness, "Failed", 90, "us-east-1a", Some(REASON));
+
+    harness.fleets.supply(fleet.view(), &mut supply).await?;
+    assert_eq!(supply.desired, 4);
+    assert_eq!(supply.abandoned, 0);
+    assert!(supply.launch_failure.is_none());
+    assert!(supply.events.iter().any(|event| matches!(
+        &event.kind,
+        InfrastructureEventKind::CapacityUnavailable { reason } if reason == REASON
+    )));
+    assert!(writes(&harness).is_empty());
+
+    zonal_activity(&harness, "Failed", 60, "us-east-1b", Some(REASON));
+    harness.fleets.supply(fleet.view(), &mut supply).await?;
+    assert_eq!(supply.desired, 0);
+    assert_eq!(supply.abandoned, 4);
+    gang_testkit::fence::with_held(async |held| {
+        harness.fleets.set_desired_capacity(held, fleet.view(), 4).await
+    }).await?;
+    assert_eq!(writes(&harness), vec![write(FLEET, "0"), write(TWIN, "4")]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn newer_launch_progress_clears_zonal_stockouts() -> TestResult {
+    const REASON: &str = "InsufficientInstanceCapacity: no Spot capacity available";
+    for status in ["Successful", "InProgress"] {
+        let harness = harness_with(vec![two_zone_spot(), protected(TWIN, 0, &[])]).await?;
+        zonal_activity(&harness, "Failed", 90, "us-east-1a", Some(REASON));
+        zonal_activity(&harness, "Failed", 60, "us-east-1b", Some(REASON));
+        zonal_activity(&harness, status, 30, "us-east-1a", None);
+        let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+        let mut supply = FleetSupply::default();
+
+        harness.fleets.supply(fleet.view(), &mut supply).await?;
+        assert_eq!(supply.desired, 4);
+        assert_eq!(supply.abandoned, 0);
+        assert!(supply.launch_failure.is_none());
+        gang_testkit::fence::with_held(async |held| {
+            harness.fleets.set_desired_capacity(held, fleet.view(), 5).await
+        }).await?;
+        assert_eq!(writes(&harness), vec![write(FLEET, "5")]);
+        assert_eq!(harness.desired(TWIN), Some(0));
+    }
+    Ok(())
+}
+
 /// A met plain spot fleet needs no capacity probe and never touches the on-demand twin.
 #[tokio::test]
 async fn met_plain_spot_fleet_skips_capacity_probes_and_twin() -> TestResult {
@@ -364,7 +433,7 @@ async fn met_plain_spot_fleet_skips_capacity_probes_and_twin() -> TestResult {
     })
     .await?;
 
-    assert_eq!(harness.activity_probes(), 0);
+    assert_eq!(harness.requests("DescribeScalingActivities"), 1);
     assert!(harness.request_log().iter().all(|(_, parameters)| {
         parameters
             .values()
@@ -406,10 +475,10 @@ async fn healthy_spot_raise_goes_to_spot_only() -> TestResult {
     assert_eq!(writes(&harness), vec![write(FLEET, "10")]);
     assert_eq!(harness.desired(TWIN), Some(0));
 
-    let activities_before = harness.activity_probes();
+    let activities_before = harness.requests("DescribeScalingActivities");
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 10);
-    assert_eq!(harness.activity_probes() - activities_before, 2);
+    assert_eq!(harness.requests("DescribeScalingActivities") - activities_before, 4);
     Ok(())
 }
 
@@ -579,10 +648,10 @@ async fn first_failure_withdraws_spot_then_raises_on_demand() -> TestResult {
     .await?;
     assert_eq!(writes(&harness), vec![write(FLEET, "6"), write(TWIN, "4")]);
 
-    let activities_before = harness.activity_probes();
+    let activities_before = harness.requests("DescribeScalingActivities");
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 10);
-    assert_eq!(harness.activity_probes() - activities_before, 1);
+    assert_eq!(harness.requests("DescribeScalingActivities") - activities_before, 3);
     Ok(())
 }
 

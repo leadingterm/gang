@@ -290,6 +290,8 @@ pub(crate) struct FakeState {
     pub(crate) messages: Vec<FakeMessage>,
     /// Additional activity identity and description, indexed by activity position.
     pub(crate) activity_details: HashMap<usize, (String, String, String)>,
+    /// Availability zone in activity details, indexed by activity position.
+    pub(crate) activity_zones: HashMap<usize, String>,
 }
 
 impl Default for FakeState {
@@ -319,6 +321,7 @@ impl Default for FakeState {
             group_page_failure: None,
             messages: Vec::new(),
             activity_details: HashMap::new(),
+            activity_zones: HashMap::new(),
         }
     }
 }
@@ -1114,8 +1117,13 @@ fn describe_activities(state: &FakeState, params: &Parameters) -> Result<String,
             let fallback_id = format!("{ACTIVITY_ID_PREFIX}{index:012}");
             let (id, cause, description) = state.activity_details.get(&index)
                 .map_or((fallback_id.as_str(), message, message), |details| (details.0.as_str(), details.1.as_str(), details.2.as_str()));
+            let details = state.activity_zones.get(&index).map(|zone| {
+                let json = serde_json::json!({ "Availability Zone": zone }).to_string();
+                let escaped = json.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                format!("<Details>{escaped}</Details>")
+            }).unwrap_or_default();
             format!(
-                "<member><ActivityId>{id}</ActivityId><AutoScalingGroupName>{group}</AutoScalingGroupName><Cause>{cause}</Cause><Description>{description}</Description><StartTime>{start}</StartTime><StatusCode>{status}</StatusCode>{status_message}<Progress>0</Progress></member>",
+                "<member><ActivityId>{id}</ActivityId><AutoScalingGroupName>{group}</AutoScalingGroupName><Cause>{cause}</Cause><Description>{description}</Description><StartTime>{start}</StartTime><StatusCode>{status}</StatusCode>{status_message}{details}<Progress>0</Progress></member>",
                 group = activity.group,
                 start = activity.start_time,
                 status = activity.status_code,

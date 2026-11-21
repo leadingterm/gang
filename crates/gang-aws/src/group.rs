@@ -3,7 +3,8 @@
 
 use aws_sdk_autoscaling::operation::describe_auto_scaling_groups::DescribeAutoScalingGroupsOutput;
 use aws_sdk_autoscaling::types::{
-    AutoScalingGroup, Instance as AutoScalingInstance, InstanceReusePolicy, LifecycleState,
+    AutoScalingGroup, Instance as AutoScalingInstance, InstanceReusePolicy, LaunchTemplateOverrides,
+    LifecycleState,
 };
 use gang_types::{FleetName, InstanceId, InstanceLifecycle};
 
@@ -26,6 +27,30 @@ pub(crate) struct Member {
     pub current_generation: bool,
 }
 
+/// Original explicit overrides and zones for a completely known set of launch candidates.
+///
+/// Both lists are nonempty, every zone and instance type is nonempty, and no override has
+/// instance requirements. Duplicates are retained; callers must not count pairs as distinct.
+#[derive(Debug)]
+pub(crate) struct LaunchCandidates {
+    overrides: Vec<LaunchTemplateOverrides>,
+    zones: Vec<String>,
+}
+
+impl LaunchCandidates {
+    /// Iterates over the configured instance-type and availability-zone Cartesian product.
+    pub(crate) fn pairs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.overrides
+            .iter()
+            .filter_map(|item| item.instance_type())
+            .flat_map(move |instance_type| {
+                self.zones
+                    .iter()
+                    .map(move |zone| (instance_type, zone.as_str()))
+            })
+    }
+}
+
 /// An auto scaling group as read from AWS, with the warm-pool rules that govern its release.
 #[derive(Debug)]
 pub(crate) struct Group {
@@ -46,6 +71,8 @@ pub(crate) struct Group {
     /// Distinct explicit instance-type and availability-zone pairs, if fully known.
     /// Unknown candidates cannot establish that failures exhaust the fleet's launch options.
     pub(crate) candidate_count: Option<usize>,
+    /// Complete configured candidate metadata, or `None` when it is not fully known.
+    pub(crate) launch_candidates: Option<LaunchCandidates>,
 }
 
 impl Group {
@@ -54,18 +81,22 @@ impl Group {
     /// A group that reuses warm instances on scale-in must also protect new instances from
     /// scale-in, or a scale-in could terminate an instance the warm pool expects to keep.
     ///
+    /// Complete candidate vectors are moved out of the selected response group.
+    ///
     /// # Errors
     ///
     /// Returns [`AwsError::MissingGroup`] when the response lacks the group,
     /// [`AwsError::MalformedResponse`] when the group or an instance lacks a field the adapter
     /// needs, and [`AwsError::Config`] when warm-pool reuse is configured without protection.
     pub(crate) fn read(
-        output: &DescribeAutoScalingGroupsOutput,
+        output: &mut DescribeAutoScalingGroupsOutput,
         name: &str,
     ) -> Result<Self, AwsError> {
         let group = output
-            .auto_scaling_groups()
-            .iter()
+            .auto_scaling_groups
+            .as_mut()
+            .into_iter()
+            .flatten()
             .find(|group| group.auto_scaling_group_name() == Some(name))
             .ok_or_else(|| missing(name))?;
         let reuse_on_scale_in = group
@@ -101,6 +132,19 @@ impl Group {
             .iter()
             .map(|instance| member(instance, template))
             .collect::<Result<Vec<_>, _>>()?;
+        let warm = group.warm_pool_size().map_or(0, capacity_of);
+        let candidate_count = candidate_count(group);
+        let launch_candidates = candidate_count.and_then(|_| {
+            let overrides = group
+                .mixed_instances_policy
+                .as_mut()?
+                .launch_template
+                .as_mut()?
+                .overrides
+                .take()?;
+            let zones = group.availability_zones.take()?;
+            Some(LaunchCandidates { overrides, zones })
+        });
         Ok(Self {
             name: name.to_owned(),
             desired: capacity_of(desired),
@@ -108,8 +152,9 @@ impl Group {
             members,
             reuse_on_scale_in,
             protects_new_instances,
-            candidate_count: candidate_count(group),
-            warm: group.warm_pool_size().map_or(0, capacity_of),
+            candidate_count,
+            launch_candidates,
+            warm,
         })
     }
 
@@ -353,10 +398,10 @@ mod tests {
     }
 
     fn read(group: AutoScalingGroup) -> Result<Group, AwsError> {
-        let output = DescribeAutoScalingGroupsOutput::builder()
+        let mut output = DescribeAutoScalingGroupsOutput::builder()
             .auto_scaling_groups(group)
             .build();
-        Group::read(&output, GROUP)
+        Group::read(&mut output, GROUP)
     }
 
     fn candidates(zones: &[&str], overrides: Vec<LaunchTemplateOverrides>) -> AutoScalingGroup {
@@ -400,6 +445,91 @@ mod tests {
             .candidate_count,
             Some(4)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn moves_original_candidate_vectors_and_iterates_all_pairs() -> TestResult {
+        let raw = candidates(
+            &["us-east-1a", "us-east-1b", "us-east-1a"],
+            vec![explicit("c7g.large"), explicit("m7g.large")],
+        );
+        let zones_ptr = raw.availability_zones.as_ref().ok_or("missing zones")?.as_ptr();
+        let overrides_ptr = raw
+            .mixed_instances_policy
+            .as_ref()
+            .and_then(|policy| policy.launch_template.as_ref())
+            .and_then(|launch| launch.overrides.as_ref())
+            .ok_or("missing overrides")?
+            .as_ptr();
+        let mut output = DescribeAutoScalingGroupsOutput::builder()
+            .auto_scaling_groups(raw)
+            .build();
+        let group = Group::read(&mut output, GROUP)?;
+        assert_eq!(group.candidate_count, Some(4));
+        let launch = group.launch_candidates.ok_or("missing candidates")?;
+        assert_eq!(launch.zones.as_ptr(), zones_ptr);
+        assert_eq!(launch.overrides.as_ptr(), overrides_ptr);
+        assert_eq!(
+            launch.pairs().collect::<Vec<_>>(),
+            vec![
+                ("c7g.large", "us-east-1a"),
+                ("c7g.large", "us-east-1b"),
+                ("c7g.large", "us-east-1a"),
+                ("m7g.large", "us-east-1a"),
+                ("m7g.large", "us-east-1b"),
+                ("m7g.large", "us-east-1a"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn taking_candidates_preserves_template_and_current_generation() -> TestResult {
+        let template = LaunchTemplateSpecification::builder()
+            .launch_template_id("lt-123")
+            .version("2")
+            .build();
+        let instance = Instance::builder()
+            .instance_id("i-a")
+            .lifecycle_state(LifecycleState::InService)
+            .launch_template(template.clone())
+            .build();
+        let raw = AutoScalingGroup::builder()
+            .auto_scaling_group_name(GROUP)
+            .desired_capacity(1)
+            .availability_zones("us-east-1a")
+            .instances(instance)
+            .mixed_instances_policy(
+                MixedInstancesPolicy::builder()
+                    .launch_template(
+                        LaunchTemplate::builder()
+                            .launch_template_specification(template)
+                            .overrides(explicit("c7g.large"))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build();
+        let mut output = DescribeAutoScalingGroupsOutput::builder()
+            .auto_scaling_groups(raw)
+            .build();
+        let group = Group::read(&mut output, GROUP)?;
+        assert!(group.members[0].current_generation);
+        assert!(group.launch_candidates.is_some());
+        let raw = &output.auto_scaling_groups()[0];
+        let launch = raw
+            .mixed_instances_policy()
+            .and_then(|policy| policy.launch_template())
+            .ok_or("missing launch template")?;
+        assert_eq!(
+            launch
+                .launch_template_specification()
+                .and_then(|template| template.version()),
+            Some("2")
+        );
+        assert!(raw.availability_zones.is_none());
+        assert!(launch.overrides.is_none());
         Ok(())
     }
 
@@ -448,7 +578,9 @@ mod tests {
             ),
         ];
         for group in cases {
-            assert_eq!(read(group)?.candidate_count, None);
+            let group = read(group)?;
+            assert_eq!(group.candidate_count, None);
+            assert!(group.launch_candidates.is_none());
         }
         Ok(())
     }
@@ -669,9 +801,9 @@ mod tests {
 
     #[test]
     fn a_missing_group_is_a_missing_group_error() {
-        let output = DescribeAutoScalingGroupsOutput::builder().build();
+        let mut output = DescribeAutoScalingGroupsOutput::builder().build();
         assert!(matches!(
-            Group::read(&output, GROUP),
+            Group::read(&mut output, GROUP),
             Err(AwsError::MissingGroup(_))
         ));
     }

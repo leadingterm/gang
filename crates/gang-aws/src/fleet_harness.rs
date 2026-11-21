@@ -110,7 +110,7 @@ impl Harness {
             status_code: status.to_owned(),
             start_time: start_time.to_owned(),
             message: Some(if status == "Failed" {
-                "MaxSpotInstanceCountExceeded: no Spot capacity available".to_owned()
+                "InsufficientInstanceCapacity: no Spot capacity available".to_owned()
             } else {
                 String::new()
             }),
@@ -120,9 +120,10 @@ impl Harness {
             (
                 format!("00000000-0000-0000-0002-{index:012}"),
                 String::new(),
-                "Launching a new EC2 instance".to_owned(),
+                "Launching a new EC2 instance: c7g.large".to_owned(),
             ),
         );
+        state.activity_zones.insert(index, "us-east-1a".to_owned());
     }
 
     /// Answers every call to `operation` with `failure` until it is cleared.
