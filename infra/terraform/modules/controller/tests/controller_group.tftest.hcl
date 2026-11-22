@@ -130,8 +130,33 @@ run "group_resources_and_permissions" {
   }
 
   assert {
-    condition     = length([for hook in aws_autoscaling_group.controller[0].initial_lifecycle_hook : hook if hook.lifecycle_transition == "autoscaling:EC2_INSTANCE_LAUNCHING" && hook.default_result == "ABANDON" && hook.heartbeat_timeout == local.hook.heartbeat_timeout_seconds]) == 1 && length([for hook in aws_autoscaling_group.controller[0].initial_lifecycle_hook : hook if hook.lifecycle_transition == "autoscaling:EC2_INSTANCE_TERMINATING" && hook.default_result == "CONTINUE" && hook.heartbeat_timeout == 3600]) == 1
-    error_message = "Launch and termination hooks must use the canonical heartbeat and safe defaults."
+    condition     = length([for hook in aws_autoscaling_group.controller[0].initial_lifecycle_hook : hook if hook.name == "launch" && hook.lifecycle_transition == "autoscaling:EC2_INSTANCE_LAUNCHING" && hook.default_result == "ABANDON" && hook.heartbeat_timeout == 3600]) == 1 && length([for hook in aws_autoscaling_group.controller[0].initial_lifecycle_hook : hook if hook.name == "terminate" && hook.lifecycle_transition == "autoscaling:EC2_INSTANCE_TERMINATING" && hook.default_result == "CONTINUE" && hook.heartbeat_timeout == 3600]) == 1
+    error_message = "Bootstrap hooks must protect the first instances with the canonical heartbeat and safe defaults."
+  }
+
+  # Mock contracts check wiring, not provider replacement or same-name upsert behavior.
+  assert {
+    condition = (
+      length(aws_autoscaling_lifecycle_hook.controller_launch) == 1 &&
+      aws_autoscaling_lifecycle_hook.controller_launch[0].name == "launch" &&
+      aws_autoscaling_lifecycle_hook.controller_launch[0].autoscaling_group_name == aws_autoscaling_group.controller[0].name &&
+      aws_autoscaling_lifecycle_hook.controller_launch[0].lifecycle_transition == "autoscaling:EC2_INSTANCE_LAUNCHING" &&
+      aws_autoscaling_lifecycle_hook.controller_launch[0].heartbeat_timeout == 3600 &&
+      aws_autoscaling_lifecycle_hook.controller_launch[0].default_result == "ABANDON"
+    )
+    error_message = "The mutable launch hook must own the same group hook with a 3600-second heartbeat and ABANDON default."
+  }
+
+  assert {
+    condition = (
+      length(aws_autoscaling_lifecycle_hook.controller_terminate) == 1 &&
+      aws_autoscaling_lifecycle_hook.controller_terminate[0].name == "terminate" &&
+      aws_autoscaling_lifecycle_hook.controller_terminate[0].autoscaling_group_name == aws_autoscaling_group.controller[0].name &&
+      aws_autoscaling_lifecycle_hook.controller_terminate[0].lifecycle_transition == "autoscaling:EC2_INSTANCE_TERMINATING" &&
+      aws_autoscaling_lifecycle_hook.controller_terminate[0].heartbeat_timeout == 3600 &&
+      aws_autoscaling_lifecycle_hook.controller_terminate[0].default_result == "CONTINUE"
+    )
+    error_message = "The mutable termination hook must own the same group hook with a 3600-second heartbeat and CONTINUE default."
   }
 
   assert {

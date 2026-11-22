@@ -15,8 +15,8 @@
 //!     {"address": "aws_eip.gateway", "type": "aws_eip", "change": {"actions": ["delete"]}}
 //! ]}"#
 //!     .parse()?;
-//! assert!(plan.is_blocked());
-//! assert_eq!(plan.protected_changes()[0].to_string(), "aws_eip.gateway\taws_eip\tdelete");
+//! assert!(plan.is_blocked(&[]));
+//! assert_eq!(plan.protected_changes(&[])[0].to_string(), "aws_eip.gateway\taws_eip\tdelete");
 //! # Ok::<(), DeployError>(())
 //! ```
 

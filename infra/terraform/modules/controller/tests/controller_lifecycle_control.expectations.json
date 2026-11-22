@@ -1,0 +1,14 @@
+{
+  "plans": {
+    "adopt_live_hooks": {
+      "aws_autoscaling_group.controller[0]": ["delete", "create"],
+      "aws_autoscaling_lifecycle_hook.controller_launch[0]": ["create"],
+      "aws_autoscaling_lifecycle_hook.controller_terminate[0]": ["create"]
+    },
+    "update_live_hooks": {
+      "aws_autoscaling_group.controller[0]": ["delete", "create"],
+      "aws_autoscaling_lifecycle_hook.controller_launch[0]": ["update"],
+      "aws_autoscaling_lifecycle_hook.controller_terminate[0]": ["update"]
+    }
+  }
+}

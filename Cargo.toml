@@ -44,7 +44,7 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-version = "0.3.6"
+version = "0.3.7"
 
 [workspace.lints.rust]
 missing_docs = "deny"

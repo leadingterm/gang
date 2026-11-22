@@ -26,7 +26,7 @@ const BLOCKED_EXIT_CODE: u8 = 3;
 /// Runs one `gang deploy` command.
 pub(crate) fn run(command: DeployCommand, input: impl Read, out: &Output) -> Result<ExitCode> {
     match command {
-        DeployCommand::Policy => policy(input, out),
+        DeployCommand::Policy(args) => policy(&args.allow_asg_destroy, input, out),
         DeployCommand::Configuration => configuration(input, std::io::stdout().lock()),
         DeployCommand::StoreRequest(args) => store_request(args, input, out),
         DeployCommand::Manifest(args) => manifest(args, input, out),
@@ -64,9 +64,9 @@ fn read_manifest(path: &Path) -> Result<Manifest> {
 
 /// Prints `has_changes=` and `blocked=` in `GITHUB_OUTPUT` form. A blocked plan lists the
 /// protected changes on stderr and exits with [`BLOCKED_EXIT_CODE`].
-fn policy(input: impl Read, out: &Output) -> Result<ExitCode> {
+fn policy(allow_asg_destroy: &[String], input: impl Read, out: &Output) -> Result<ExitCode> {
     let plan: Plan = stdin_document(input)?;
-    let protected = plan.protected_changes();
+    let protected = plan.protected_changes(allow_asg_destroy);
     let blocked = !protected.is_empty();
     out.data(format!("has_changes={}", plan.has_changes()))?;
     out.data(format!("blocked={blocked}"))?;
@@ -131,14 +131,14 @@ fn comment(args: &CommentArgs, input: impl Read, out: &Output) -> Result<ExitCod
         Some(text.parse()?)
     };
     let manifest;
-    let source = match args {
-        CommentArgs::Tree(tree) => CommentSource::Tree(tree),
-        CommentArgs::Manifest(path) => {
+    let (source, allow_asg_destroy) = match args {
+        CommentArgs::Tree(tree, addresses) => (CommentSource::Tree(tree), addresses),
+        CommentArgs::Manifest(path, addresses) => {
             manifest = read_manifest(path)?;
-            CommentSource::Manifest(&manifest)
+            (CommentSource::Manifest(&manifest), addresses)
         }
     };
-    let body = PlanComment::new(source, plan.as_ref()).to_string();
+    let body = PlanComment::new(source, plan.as_ref(), allow_asg_destroy).to_string();
     out.data(serde_json::json!({ "body": body }).to_string())?;
     Ok(ExitCode::SUCCESS)
 }
@@ -295,6 +295,67 @@ mod tests {
     const WORKFLOW: &str = "example-org/gang/.github/workflows/infra.yml@refs/heads/main";
     const EMPTY_PLAN: &str = "{}";
     const BLOCKED_PLAN: &str = r#"{"resource_changes":[{"address":"aws_kms_key.state","type":"aws_kms_key","change":{"actions":["delete"]}}]}"#;
+
+    #[test]
+    fn asg_policy_exit_status_and_comment_share_exact_exceptions() {
+        let first = "module.gang.aws_autoscaling_group.worker[\"arm spot\"]";
+        let second = "module.other.aws_autoscaling_group.controller[0]";
+        let plan = json!({"resource_changes": [
+            {"address": first, "type": "aws_autoscaling_group",
+                "change": {"actions": ["create", "delete"]}},
+            {"address": second, "type": "aws_autoscaling_group",
+                "change": {"actions": ["delete", "create"]}}
+        ]})
+        .to_string();
+        let fixtures = Fixtures::new();
+        for allowed in [
+            vec![],
+            vec![first],
+            vec![first, second],
+            vec!["module.gang"],
+        ] {
+            let blocked = allowed.len() != 2;
+            let mut args = vec!["policy"];
+            for address in &allowed {
+                args.extend(["--allow-asg-destroy", address]);
+            }
+            let (code, stdout, stderr) = gang_deploy(&args, &plan);
+            assert_eq!(
+                code,
+                if blocked {
+                    ExitCode::from(3)
+                } else {
+                    ExitCode::SUCCESS
+                }
+            );
+            assert_eq!(stdout, format!("has_changes=true\nblocked={blocked}\n"));
+            assert_eq!(!stderr.is_empty(), blocked);
+            for source in [
+                vec!["comment", "--tree", TREE],
+                vec!["comment", "--manifest", &fixtures.manifest_file],
+            ] {
+                let mut args = source;
+                for address in &allowed {
+                    args.extend(["--allow-asg-destroy", address]);
+                }
+                let (code, stdout, stderr) = gang_deploy(&args, &plan);
+                assert_eq!(code, ExitCode::SUCCESS);
+                assert!(stderr.is_empty());
+                let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+                let body = payload["body"].as_str().unwrap();
+                assert_eq!(body.contains("**Blocked:"), blocked);
+                assert_eq!(
+                    body.contains("Explicitly allowed Auto Scaling group destructions:"),
+                    allowed.contains(&first)
+                );
+            }
+        }
+        let (code, _, _) = gang_deploy(
+            &["policy", "--allow-asg-destroy", "aws_kms_key.state"],
+            BLOCKED_PLAN,
+        );
+        assert_eq!(code, ExitCode::from(3));
+    }
 
     struct Case<'a> {
         args: Vec<&'a str>,

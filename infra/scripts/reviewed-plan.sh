@@ -10,6 +10,12 @@ ROOT="${ROOT:-.}"
 # The gang executable, as the login action's `gang` input names it.
 GANG="${GANG:-gang}"
 
+# Newline-separated exact Terraform addresses; never split an address on spaces or quotes.
+declare -a asg_destroy_args=()
+while IFS= read -r address; do
+  [[ -z "$address" ]] || asg_destroy_args+=(--allow-asg-destroy "$address")
+done <<<"${ALLOW_ASG_DESTROY:-}"
+
 die() {
   printf 'reviewed-plan: %s\n' "$*" >&2
   exit 1
@@ -74,7 +80,7 @@ cmd_plan() {
   esac
 
   tofu -chdir="$ROOT" show -json "$plan_file" >"$json_file"
-  policy_output="$("$GANG" deploy policy <"$json_file")" || policy_rc=$?
+  policy_output="$("$GANG" deploy policy "${asg_destroy_args[@]}" <"$json_file")" || policy_rc=$?
   case "$policy_rc" in
     0) ;;
     3)
@@ -146,7 +152,7 @@ cmd_publish() {
     tree="$(git rev-parse 'HEAD^{tree}')"
     tree_source=(--tree "$tree")
   fi
-  "$GANG" deploy comment "${tree_source[@]}" <"$plan_input" >"$payload"
+  "$GANG" deploy comment "${tree_source[@]}" "${asg_destroy_args[@]}" <"$plan_input" >"$payload"
 
   gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" | jq -s 'add // []' >"$comments"
   comment_id="$("$GANG" deploy comment-id <"$comments")"
@@ -227,7 +233,7 @@ cmd_verify() {
   local outputs
 
   tofu -chdir="$ROOT" show -json "$RUNNER_TEMP/infra.tfplan" >"$json_file"
-  outputs="$("$GANG" deploy policy <"$json_file")" || die "reviewed plan is blocked by policy"
+  outputs="$("$GANG" deploy policy "${asg_destroy_args[@]}" <"$json_file")" || die "reviewed plan is blocked by policy"
   printf '%s\n' "$outputs" >>"$GITHUB_OUTPUT"
 }
 

@@ -84,6 +84,10 @@ on:
         description: "How long apply and the convergence plan wait for another run to release the state lock, as an OpenTofu duration (-lock-timeout)."
         type: string
         default: 4m
+      allow_asg_destroy:
+        description: "Exact Auto Scaling group resource addresses allowed to be deleted or replaced, one per line; empty grants no exceptions."
+        type: string
+        default: ''
       runner:
         description: "Runner label of every job."
         type: string
@@ -118,6 +122,7 @@ env:
   INFRA_PLAN_PREFIX: ${{ inputs.plan_prefix }}
   INFRA_PLAN_MAX_AGE: ${{ inputs.plan_max_age }}
   INFRA_LOCK_TIMEOUT: ${{ inputs.lock_timeout }}
+  ALLOW_ASG_DESTROY: ${{ inputs.allow_asg_destroy }}
   GANG_SHA256: ${{ inputs.gang_sha256 }}
 
 jobs:
