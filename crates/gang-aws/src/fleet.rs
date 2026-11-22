@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aws_config::SdkConfig;
 use aws_sdk_autoscaling::operation::describe_auto_scaling_groups::DescribeAutoScalingGroupsOutput;
@@ -15,11 +16,14 @@ use aws_sdk_autoscaling::types::ScalingActivityStatusCode;
 use aws_sdk_ec2::types::Filter;
 use aws_sdk_ec2::types::builders::FilterBuilder;
 use gang_aws_sdk::call_error;
-use gang_clock::{Clock, Timestamp};
+use gang_clock::{Clock, Tick, Timestamp};
 use gang_spi::{FleetInstance, FleetSupply, Held, LaunchFailure, TerminationMode};
 use gang_types::{Fleet, InstanceId, InstanceLifecycle};
+use tokio::sync::Mutex;
 
-use crate::config::{AwsFleetOptions, CooldownPolicy, ON_DEMAND_SUFFIX, SpotFallback};
+use crate::config::{
+    AwsFleetOptions, CooldownPolicy, DEFAULT_SUPPLY_POLL_INTERVAL, ON_DEMAND_SUFFIX, SpotFallback,
+};
 use crate::errors::AwsError;
 use crate::events::Events;
 use crate::fallback::{self, Counts, Tier};
@@ -43,6 +47,13 @@ const FAILED_STATUS: &str = "Failed";
 /// One record answers whether any failed activity exists.
 const ACTIVITY_PROBE_LIMIT: i32 = 1;
 
+/// A complete batch, shared without copying its AWS group payload between supply calls.
+struct Observation {
+    output: Arc<DescribeAutoScalingGroupsOutput>,
+    observed: Tick,
+    revision: u64,
+}
+
 /// The auto scaling groups and EC2 instances behind the fleets of one AWS account and region.
 ///
 /// Each fleet is one group named `Fleet::name`, plus the on-demand twin for an opted-in fleet.
@@ -53,6 +64,8 @@ pub(crate) struct Fleets {
     /// Applied to every desired-capacity write: raises, spot withdrawals and release lowerings.
     cooldown: CooldownPolicy,
     events: Events,
+    observation_interval: Duration,
+    observation: Mutex<Option<Observation>>,
 }
 
 impl Fleets {
@@ -64,14 +77,22 @@ impl Fleets {
         clock: Arc<dyn Clock>,
         cooldown: CooldownPolicy,
         events: Events,
+        autoscaling: aws_sdk_autoscaling::Client,
     ) -> Self {
         Self {
-            autoscaling: aws_sdk_autoscaling::Client::new(sdk),
+            autoscaling,
             ec2: aws_sdk_ec2::Client::new(sdk),
             clock,
             cooldown,
             events,
+            observation_interval: DEFAULT_SUPPLY_POLL_INTERVAL.get(),
+            observation: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn with_observation_interval(mut self, interval: Duration) -> Self {
+        self.observation_interval = interval;
+        self
     }
 
     pub(crate) fn events(&self) -> &Events {
@@ -86,7 +107,7 @@ impl Fleets {
         into: &mut FleetSupply,
     ) -> Result<(), AwsError> {
         let names = GroupNames::of(fleet);
-        let output = self.describe_groups(names.iter()).await?;
+        let output = self.observe_groups(&names).await?;
         let groups = FleetGroups::read(&output, &names)?;
         let (desired, spot_down, abandoned) = match &groups {
             FleetGroups::Plain(group) => (group.reported(), false, 0),
@@ -174,6 +195,9 @@ impl Fleets {
         fleet: Fleet<'_, AwsFleetOptions>,
         desired: u32,
     ) -> Result<(), AwsError> {
+        // Serialize fresh mutation reads and writes with observation fills.
+        let mut observation = self.observation.lock().await;
+        *observation = None;
         let names = GroupNames::of(fleet);
         let output = self.describe_groups(names.iter()).await?;
         match FleetGroups::read(&output, &names)? {
@@ -224,6 +248,8 @@ impl Fleets {
         instance: &InstanceId,
         mode: TerminationMode,
     ) -> Result<(), AwsError> {
+        let mut observation = self.observation.lock().await;
+        *observation = None;
         let names = GroupNames::of(fleet);
         let output = self.describe_groups(names.iter()).await?;
         let groups = FleetGroups::read(&output, &names)?;
@@ -400,19 +426,68 @@ impl Fleets {
         }))
     }
 
-    /// Reads the named groups in one call.
+    /// Coalesces supply reads into one complete snapshot of all managed groups.
+    async fn observe_groups(
+        &self,
+        requested: &GroupNames<'_>,
+    ) -> Result<Arc<DescribeAutoScalingGroupsOutput>, AwsError> {
+        let mut cached = self.observation.lock().await;
+        let managed = self.events.managed();
+        let revision = managed.revision();
+        let now = self.clock.monotonic();
+        if let Some(observation) = cached.as_ref()
+            && observation.revision == revision
+            && now.saturating_duration_since(observation.observed) < self.observation_interval
+            && requested.iter().all(|name| {
+                observation
+                    .output
+                    .auto_scaling_groups()
+                    .iter()
+                    .any(|group| group.auto_scaling_group_name() == Some(name))
+            })
+        {
+            return Ok(Arc::clone(&observation.output));
+        }
+        let mut names = managed.group_names();
+        for name in requested.iter() {
+            if !names.iter().any(|candidate| candidate == name) {
+                names.push(name.to_owned());
+            }
+        }
+        let output = Arc::new(
+            self.describe_groups(names.iter().map(String::as_str))
+                .await?,
+        );
+        self.events.observe_groups(&output).await;
+        *cached = Some(Observation {
+            output: Arc::clone(&output),
+            observed: self.clock.monotonic(),
+            revision,
+        });
+        Ok(output)
+    }
+
+    /// Reads every page of the named groups in API-sized batches.
     async fn describe_groups<'n>(
         &self,
         names: impl Iterator<Item = &'n str>,
     ) -> Result<DescribeAutoScalingGroupsOutput, AwsError> {
-        let mut request = self.autoscaling.describe_auto_scaling_groups();
-        for name in names {
-            request = request.auto_scaling_group_names(name);
+        let names: Vec<_> = names.collect();
+        let mut groups = Vec::new();
+        for chunk in names.chunks(50) {
+            let mut request = self.autoscaling.describe_auto_scaling_groups();
+            for name in chunk {
+                request = request.auto_scaling_group_names(*name);
+            }
+            let mut pages = request.into_paginator().send();
+            while let Some(page) = pages.next().await {
+                let page = page.map_err(|e| call_error(DESCRIBE_GROUPS, e))?;
+                groups.extend(page.auto_scaling_groups.unwrap_or_default());
+            }
         }
-        request
-            .send()
-            .await
-            .map_err(|e| call_error(DESCRIBE_GROUPS, e).into())
+        Ok(DescribeAutoScalingGroupsOutput::builder()
+            .set_auto_scaling_groups(Some(groups))
+            .build())
     }
 
     /// Maps each EC2 instance of the named groups to its launch time.
@@ -579,6 +654,8 @@ mod tests {
     use crate::fake_aws::{FakeFailure, FakeGroup};
     use crate::fleet_harness::{FLEET, Harness, NOW_MILLIS, fleet, fleet_with};
     use std::error::Error;
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
     use std::time::Duration;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -586,6 +663,245 @@ mod tests {
     /// `2026-01-01T00:00:00Z` in Unix milliseconds.
     const LAUNCHED_MILLIS: u64 = 1_767_225_600_000;
     const LAUNCHED_RFC3339: &str = "2026-01-01T00:00:00.000Z";
+
+    #[tokio::test]
+    async fn supply_batches_concurrent_fleets_and_expires_at_interval() -> TestResult {
+        let harness = Harness::start().await?;
+        let first = fleet(FLEET)?;
+        let second = fleet("second")?;
+        harness.add_group(FLEET, 0, &[]);
+        harness.add_group("second", 0, &[]);
+        harness.fleets.events().managed().add(first.view());
+        harness.fleets.events().managed().add(second.view());
+        let mut control = FleetSupply::default();
+        let mut observer = FleetSupply::default();
+        let (a, b) = tokio::join!(
+            harness.fleets.supply(first.view(), &mut control),
+            harness.fleets.supply(second.view(), &mut observer),
+        );
+        a?;
+        b?;
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 1);
+        harness.clock.advance(Duration::from_millis(999));
+        harness.fleets.supply(first.view(), &mut control).await?;
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 1);
+        harness.clock.advance(Duration::from_millis(1));
+        harness.fleets.supply(second.view(), &mut observer).await?;
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn slow_batch_is_fresh_when_completed() -> TestResult {
+        let harness = Harness::start().await?;
+        let first = fleet(FLEET)?;
+        let second = fleet("second")?;
+        harness.add_group(FLEET, 0, &[]);
+        harness.add_group("second", 0, &[]);
+        harness.fleets.events().managed().add(first.view());
+        harness.fleets.events().managed().add(second.view());
+
+        let mut supply = FleetSupply::default();
+        {
+            let fetch = harness.fleets.supply(first.view(), &mut supply);
+            tokio::pin!(fetch);
+            poll_fn(|cx| match fetch.as_mut().poll(cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("the fake AWS request must yield before completing"),
+            })
+            .await;
+            harness.clock.advance(Duration::from_secs(1));
+            fetch.await?;
+        }
+
+        harness.fleets.supply(second.view(), &mut supply).await?;
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_revision_and_unregistered_names_refresh_snapshot() -> TestResult {
+        let harness = Harness::start().await?;
+        let first = fleet(FLEET)?;
+        let second = fleet("second")?;
+        let third = fleet("third")?;
+        for name in [FLEET, "second", "third"] {
+            harness.add_group(name, 0, &[]);
+        }
+        harness.fleets.events().managed().add(first.view());
+        let mut supply = FleetSupply::default();
+        harness.fleets.supply(first.view(), &mut supply).await?;
+        harness.fleets.events().managed().add(second.view());
+        harness.fleets.supply(first.view(), &mut supply).await?;
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 2);
+        harness.fleets.supply(second.view(), &mut supply).await?;
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 2);
+        harness.fleets.supply(third.view(), &mut supply).await?;
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supply_batches_and_paginates_more_than_fifty_groups() -> TestResult {
+        let harness = Harness::start().await?;
+        harness.fake.state().group_page_size = Some(10);
+        for index in 0..51 {
+            let name = format!("fleet-{index:02}");
+            harness.add_group(&name, 0, &[]);
+            harness.fleets.events().managed().add(fleet(&name)?.view());
+        }
+        let mut supply = FleetSupply::default();
+        harness
+            .fleets
+            .supply(fleet("fleet-50")?.view(), &mut supply)
+            .await?;
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 6);
+        harness
+            .fleets
+            .supply(fleet("fleet-00")?.view(), &mut supply)
+            .await?;
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 6);
+        let requests = harness.request_log();
+        let group_requests: Vec<_> = requests
+            .iter()
+            .filter(|(operation, _)| operation == DESCRIBE_GROUPS)
+            .collect();
+        assert!(
+            group_requests
+                .iter()
+                .any(|(_, params)| params.contains_key("NextToken"))
+        );
+        assert!(group_requests.iter().all(|(_, params)| {
+            params
+                .keys()
+                .filter(|key| key.starts_with("AutoScalingGroupNames.member."))
+                .count()
+                <= 50
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutation_reads_fresh_and_invalidates_observation() -> TestResult {
+        let harness = Harness::start().await?;
+        let test_fleet = fleet(FLEET)?;
+        harness.add_group(FLEET, 1, &[]);
+        let mut supply = FleetSupply::default();
+        harness
+            .fleets
+            .supply(test_fleet.view(), &mut supply)
+            .await?;
+        harness.fake.state().groups[0].desired = 3;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, test_fleet.view(), 2)
+                .await
+        })
+        .await?;
+        assert_eq!(harness.desired(FLEET), Some(2));
+        harness
+            .fleets
+            .supply(test_fleet.view(), &mut supply)
+            .await?;
+        assert_eq!(supply.desired, 2);
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminate_reads_fresh_and_invalidates_observation() -> TestResult {
+        let harness = Harness::start().await?;
+        let test_fleet = fleet(FLEET)?;
+        harness.add_group(FLEET, 1, &[]);
+        let mut supply = FleetSupply::default();
+        harness
+            .fleets
+            .supply(test_fleet.view(), &mut supply)
+            .await?;
+        harness.fake.state().groups[0] = FakeGroup::new(FLEET, 1, &[("i-new", "Pending")]);
+        let instance = InstanceId::try_new("i-new")?;
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .terminate(held, test_fleet.view(), &instance, TerminationMode::ScaleIn)
+                .await
+        })
+        .await?;
+        assert_eq!(harness.requests(TERMINATE_INSTANCE), 1);
+        harness
+            .fleets
+            .supply(test_fleet.view(), &mut supply)
+            .await?;
+        assert_eq!(supply.desired, 0);
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_observation_is_not_used_when_refresh_is_throttled() -> TestResult {
+        let harness = Harness::start().await?;
+        let test_fleet = fleet(FLEET)?;
+        harness.add_group(FLEET, 1, &[]);
+        let mut supply = FleetSupply::default();
+        harness
+            .fleets
+            .supply(test_fleet.view(), &mut supply)
+            .await?;
+        harness.clock.advance(Duration::from_secs(1));
+        harness.fail(
+            DESCRIBE_GROUPS,
+            FakeFailure {
+                status: 400,
+                code: "Throttling",
+                message: "rate exceeded",
+            },
+        );
+        let result = harness.fleets.supply(test_fleet.view(), &mut supply).await;
+        assert!(matches!(
+            result,
+            Err(AwsError::Call(gang_aws_sdk::CallError::Transient { .. }))
+        ));
+        assert_eq!(harness.requests(SET_DESIRED_CAPACITY), 0);
+        assert_eq!(harness.requests(TERMINATE_INSTANCE), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_later_page_never_publishes_partial_snapshot() -> TestResult {
+        let harness = Harness::start().await?;
+        let first = fleet(FLEET)?;
+        let second = fleet("second")?;
+        harness.add_group(FLEET, 0, &[]);
+        harness.add_group("second", 0, &[]);
+        harness.fleets.events().managed().add(first.view());
+        harness.fleets.events().managed().add(second.view());
+        harness.fake.state().group_page_size = Some(1);
+        let mut supply = FleetSupply::default();
+        harness.fleets.supply(first.view(), &mut supply).await?;
+        harness.clock.advance(Duration::from_secs(1));
+        harness.fake.state().group_page_failure = Some((
+            "1".to_owned(),
+            FakeFailure {
+                status: 400,
+                code: "Throttling",
+                message: "rate exceeded",
+            },
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                harness.fleets.supply(first.view(), &mut supply).await,
+                Err(AwsError::Call(gang_aws_sdk::CallError::Transient { .. }))
+            ));
+        }
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 6);
+        harness.fake.state().group_page_failure = None;
+        harness.fleets.supply(second.view(), &mut supply).await?;
+        assert_eq!(harness.requests(DESCRIBE_GROUPS), 8);
+        assert_eq!(harness.requests(SET_DESIRED_CAPACITY), 0);
+        assert_eq!(harness.requests(TERMINATE_INSTANCE), 0);
+        Ok(())
+    }
 
     #[test]
     fn launch_times_before_the_epoch_clamp_to_the_epoch() {

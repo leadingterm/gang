@@ -217,6 +217,44 @@ fn fleet_launch_failure_json_round_trips_and_is_omitted_when_absent() -> Result<
 }
 
 #[test]
+fn pass_diagnostics_round_trip_in_state_and_delta() -> Result<(), Box<dyn Error>> {
+    let mut state = gang_wire::State::default();
+    let old = serde_json::to_value(&state)?;
+    assert!(old["pass"].get("error").is_none());
+    assert_eq!(serde_json::from_value::<gang_wire::State>(old)?, state);
+
+    state.pass.error = Some("fleets/spot: ThrottlingException: Rate exceeded".to_owned());
+    let with_error = serde_json::to_value(&state)?;
+    assert_eq!(
+        with_error["pass"]["error"],
+        "fleets/spot: ThrottlingException: Rate exceeded"
+    );
+    assert_eq!(
+        serde_json::from_value::<gang_wire::State>(with_error.clone())?,
+        state
+    );
+
+    let mut delta = serde_json::json!({
+        "seq": 2, "base": 1, "updateTime": "1970-01-01T00:00:00.000Z",
+        "pass": with_error["pass"]
+    });
+    let parsed: gang_wire::Delta = serde_json::from_value(delta.clone())?;
+    assert_eq!(
+        parsed.pass.as_ref().and_then(|pass| pass.error.as_deref()),
+        state.pass.error.as_deref()
+    );
+    assert_eq!(serde_json::to_value(parsed)?, delta);
+
+    state.pass = gang_wire::Pass::ok(std::time::Duration::from_secs(1), 0, 0);
+    delta["pass"] = serde_json::to_value(&state.pass)?;
+    assert!(delta["pass"].get("error").is_none());
+    let recovered: gang_wire::Delta = serde_json::from_value(delta.clone())?;
+    assert_eq!(recovered.pass.as_ref(), Some(&state.pass));
+    assert_eq!(serde_json::to_value(recovered)?, delta);
+    Ok(())
+}
+
+#[test]
 fn queued_refusal_json_round_trips_and_is_omitted_when_absent() -> Result<(), Box<dyn Error>> {
     let mut action = gang_wire::QueuedAction::default();
     let absent = serde_json::to_value(&action)?;

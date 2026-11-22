@@ -42,7 +42,7 @@ pub enum CallError {
     Transient {
         /// The AWS operation that failed, for example `DescribeAutoScalingGroups`.
         operation: &'static str,
-        /// The underlying SDK failure.
+        /// The failure; SDK errors remain available through its source chain.
         source: BoxedError,
     },
     /// AWS refused an AWS call or the response could not be built; retrying will not help.
@@ -50,7 +50,7 @@ pub enum CallError {
     Refused {
         /// The AWS operation that failed, for example `Sign`.
         operation: &'static str,
-        /// The underlying SDK failure.
+        /// The failure; SDK errors remain available through its source chain.
         source: BoxedError,
     },
 }
@@ -90,7 +90,33 @@ pub fn classify(code: Option<&str>, status: Option<u16>) -> Retryability {
     }
 }
 
-/// Converts a failed SDK call into a `CallError`, keeping the SDK error as the source.
+#[derive(Debug)]
+struct DisplaySdkError<E>(SdkError<E, HttpResponse>);
+
+impl<E: ProvideErrorMetadata> std::fmt::Display for DisplaySdkError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let SdkError::ServiceError(service) = &self.0 {
+            match (service.err().code(), service.err().message()) {
+                (Some(code), Some(message)) => return write!(f, "{code}: {message}"),
+                (Some(code), None) => return f.write_str(code),
+                (None, Some(message)) => return f.write_str(message),
+                (None, None) => {}
+            }
+        }
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl<E> std::error::Error for DisplaySdkError<E>
+where
+    E: ProvideErrorMetadata + std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Converts a failed SDK call into a `CallError`, retaining the SDK error in the source chain.
 #[must_use]
 pub fn call_error<E>(operation: &'static str, error: SdkError<E, HttpResponse>) -> CallError
 where
@@ -107,7 +133,7 @@ where
         ),
         _ => Retryability::Permanent,
     };
-    CallError::failed(operation, retryability, Box::new(error))
+    CallError::failed(operation, retryability, Box::new(DisplaySdkError(error)))
 }
 
 #[cfg(test)]
@@ -125,6 +151,74 @@ mod tests {
         fn meta(&self) -> &ErrorMetadata {
             &self.0
         }
+    }
+
+    fn service_error(
+        code: Option<&str>,
+        message: Option<&str>,
+    ) -> SdkError<TestError, HttpResponse> {
+        let mut metadata = ErrorMetadata::builder();
+        if let Some(code) = code {
+            metadata = metadata.code(code);
+        }
+        if let Some(message) = message {
+            metadata = metadata.message(message);
+        }
+        SdkError::service_error(
+            TestError(metadata.build()),
+            HttpResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(400)
+                    .expect("400 is a valid HTTP status"),
+                aws_smithy_types::body::SdkBody::empty(),
+            ),
+        )
+    }
+
+    #[test]
+    fn service_metadata_is_displayed_and_sdk_error_is_preserved() {
+        for (code, message, expected, transient) in [
+            (
+                Some("ThrottlingException"),
+                Some("Rate exceeded"),
+                "Describe did not complete: ThrottlingException: Rate exceeded",
+                true,
+            ),
+            (
+                Some("AccessDenied"),
+                Some("Not allowed"),
+                "Describe was refused: AccessDenied: Not allowed",
+                false,
+            ),
+            (
+                Some("AccessDenied"),
+                None,
+                "Describe was refused: AccessDenied",
+                false,
+            ),
+            (
+                None,
+                Some("Not allowed"),
+                "Describe was refused: Not allowed",
+                false,
+            ),
+            (None, None, "Describe was refused: service error", false),
+        ] {
+            let converted = call_error("Describe", service_error(code, message));
+            assert_eq!(converted.to_string(), expected);
+            assert_eq!(matches!(converted, CallError::Transient { .. }), transient);
+            let original = converted.source().and_then(|source| source.source());
+            assert!(original.is_some_and(
+                <dyn std::error::Error + 'static>::is::<SdkError<TestError, HttpResponse>>
+            ));
+        }
+    }
+
+    #[test]
+    fn non_service_display_is_unchanged() {
+        let error: SdkError<TestError, HttpResponse> =
+            SdkError::timeout_error(std::io::Error::other("slow"));
+        let expected = format!("Describe did not complete: {error}");
+        assert_eq!(call_error("Describe", error).to_string(), expected);
     }
 
     #[test]

@@ -110,7 +110,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use gang_clock::{TestClock, Timestamp};
+    use gang_clock::{Clock, Sleep, TestClock, Tick, Timestamp};
     use gang_spi::CandidatePriority;
     use gang_testkit::TestResult;
     use gang_types::InstanceId;
@@ -123,6 +123,28 @@ mod tests {
 
     const GROUP: &str = "controllers";
     const INSTANCE: &str = "i-controller";
+
+    // Runtime HTTP pacing advances independently; host polling retains its manually driven clock.
+    struct AutoAdvanceClock {
+        wall: Arc<TestClock>,
+        monotonic: TestClock,
+    }
+
+    impl Clock for AutoAdvanceClock {
+        fn wall(&self) -> Timestamp {
+            self.wall.wall()
+        }
+
+        fn monotonic(&self) -> Tick {
+            self.monotonic.monotonic()
+        }
+
+        fn sleep_until(&self, deadline: Tick) -> Sleep {
+            self.monotonic
+                .advance(deadline.saturating_duration_since(self.monotonic.monotonic()));
+            self.monotonic.sleep_until(deadline)
+        }
+    }
 
     async fn setup() -> Result<(FakeAws, Aws, Arc<TestClock>), Box<dyn std::error::Error>> {
         let fake = FakeAws::start().await?;
@@ -142,7 +164,10 @@ mod tests {
             &fake.sdk_config().await,
             fake.imds_client()?,
             &config,
-            clock.clone(),
+            Arc::new(AutoAdvanceClock {
+                wall: clock.clone(),
+                monotonic: TestClock::default(),
+            }),
             &Arc::new(crate::events::Managed::default()),
         );
         let mut aws = Aws::with_runtime(config, runtime);

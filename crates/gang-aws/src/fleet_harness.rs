@@ -48,8 +48,15 @@ impl Harness {
         let config: AwsConfig = serde_json::from_value(serde_json::json!({
             "region": "us-east-1", "scratch_mount_point": "/mnt/scratch"
         }))?;
-        let events = Events::new(&sdk, &config, clock.clone(), Arc::new(Managed::default()));
-        let fleets = Fleets::new(&sdk, clock.clone(), cooldown, events);
+        let autoscaling = aws_sdk_autoscaling::Client::new(&sdk);
+        let events = Events::new(
+            &sdk,
+            &config,
+            clock.clone(),
+            Arc::new(Managed::default()),
+            autoscaling.clone(),
+        );
+        let fleets = Fleets::new(&sdk, clock.clone(), cooldown, events, autoscaling);
         Ok(Self {
             fake,
             fleets,
@@ -64,13 +71,15 @@ impl Harness {
     /// restart does: nothing it held in memory survives.
     pub(crate) fn restart(&mut self) {
         let clock: Arc<dyn Clock> = self.clock.clone();
+        let autoscaling = aws_sdk_autoscaling::Client::new(&self.sdk);
         let events = Events::new(
             &self.sdk,
             &self.config,
             Arc::clone(&clock),
             Arc::new(Managed::default()),
+            autoscaling.clone(),
         );
-        self.fleets = Fleets::new(&self.sdk, clock, self.cooldown, events);
+        self.fleets = Fleets::new(&self.sdk, clock, self.cooldown, events, autoscaling);
     }
 
     /// Adds an unprotected group with the given members and no warm pool; the fake applies no

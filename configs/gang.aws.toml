@@ -1,4 +1,4 @@
-poll_interval = "1s"
+poll_interval = "2s"
 client_action_timeout = "2m"
 default_isa = "x86-64"
 listen = "0.0.0.0:443"
@@ -43,6 +43,9 @@ boot_grace = "10m"
 [fleets.options]
 capacity = "spot"
 
+
+[actions]
+cpu_oversubscription = 2
 
 [execution]
 input_links = "break"

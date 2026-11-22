@@ -34,9 +34,16 @@ pub enum PassStatus<'a> {
         applied: u32,
         /// The number of fleet changes that failed.
         failed: u32,
+        /// The first diagnostic from this pass, if any.
+        error: Option<&'a str>,
     },
     /// The pass was skipped for the given reason.
-    Skipped(SkipReason),
+    Skipped {
+        /// Why the pass was skipped.
+        reason: SkipReason,
+        /// The first diagnostic from this pass, if any.
+        error: Option<&'a str>,
+    },
     /// An independent observation, without a completed or skipped control pass.
     Observed {
         /// Fresh scheduler snapshot, or `None` when unavailable.

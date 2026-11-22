@@ -117,6 +117,7 @@ fn state(seq: u64, in_service: u32, workers: Vec<Worker>, completed: u64) -> Sta
             interval: Duration::from_millis(500),
             applied: 0,
             failed: 0,
+            error: None,
             skip_reason: None,
             last_ok_time: None,
             skipped: None,

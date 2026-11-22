@@ -182,8 +182,15 @@ fn fill_into(
         prev
     };
     let pass = match outcome {
-        Outcome::Ok { applied, failed } => PassStatus::Ok { applied, failed },
-        Outcome::Skipped(reason) => PassStatus::Skipped(reason),
+        Outcome::Ok { applied, failed } => PassStatus::Ok {
+            applied,
+            failed,
+            error: None,
+        },
+        Outcome::Skipped(reason) => PassStatus::Skipped {
+            reason,
+            error: None,
+        },
         Outcome::Observed {
             known,
             ref supplies,
@@ -2028,7 +2035,10 @@ fn events_keep_only_the_newest_configured_window() -> TestResult {
     let mut prev = blank();
     let initial = Inputs {
         wall: ts(0),
-        pass: PassStatus::Skipped(SkipReason::SchedulerUnavailable),
+        pass: PassStatus::Skipped {
+            reason: SkipReason::SchedulerUnavailable,
+            error: None,
+        },
         fleets: &[],
         catalog: &catalog,
         actions: None,
@@ -2043,7 +2053,10 @@ fn events_keep_only_the_newest_configured_window() -> TestResult {
     let mut cur = blank();
     let inputs = Inputs {
         wall: ts(10),
-        pass: PassStatus::Skipped(SkipReason::SchedulerUnavailable),
+        pass: PassStatus::Skipped {
+            reason: SkipReason::SchedulerUnavailable,
+            error: None,
+        },
         fleets: &[],
         catalog: &catalog,
         actions: None,
@@ -2111,6 +2124,7 @@ fn history_control(
         pass: PassStatus::Ok {
             applied: 0,
             failed: 0,
+            error: None,
         },
         fleets: &passes,
         catalog: &catalog,
@@ -2771,6 +2785,7 @@ fn delayed_control_snapshot_does_not_replace_newer_observations() -> TestResult 
         pass: PassStatus::Ok {
             applied: 0,
             failed: 0,
+            error: None,
         },
         fleets: &passes,
         catalog: &catalog,

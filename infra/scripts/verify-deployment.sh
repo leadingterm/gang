@@ -13,25 +13,78 @@ region=$(jq -er '.region | select(type == "string" and length > 0)' <<<"$gang")
 asg=$(jq -er 'if has("controller_autoscaling_group_name") then .controller_autoscaling_group_name // "" else error("missing controller ASG") end' <<<"$gang")
 targets=$(jq -er '.controller_target_group_arns | select(type == "array" and all(.[]; type == "string" and length > 0)) | join("\n")' <<<"$gang")
 workers=$(jq -er '.asg_names | select(type == "array" and all(.[]; type == "string" and length > 0)) | join("\n")' <<<"$gang")
-deadline=$((SECONDS + 2400))
+deadline=$(($(date +%s) + 2400))
+dir=$(mktemp -d)
+trap 'rm -rf "$dir"' EXIT
+
+# Retry only AWS throttling errors, without extending the caller's deadline.
+aws_read() {
+  local end=$1 remaining delay=1 status now
+  shift
+  while :; do
+    now=$(date +%s)
+    remaining=$((end - now))
+    if (( remaining <= 0 )); then
+      echo '::error::AWS read deadline expired' >&2
+      return 1
+    fi
+    if AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=3 timeout --signal=KILL "$remaining" aws --cli-connect-timeout "$remaining" --cli-read-timeout "$remaining" "$@" >"$dir/aws-output" 2>"$dir/aws-error"; then
+      cat "$dir/aws-error" >&2
+      now=$(date +%s)
+      if (( now >= end )); then
+        echo '::error::AWS read deadline expired' >&2
+        return 1
+      fi
+      cat "$dir/aws-output"
+      return 0
+    else
+      status=$?
+    fi
+    cat "$dir/aws-error" >&2
+    if (( status == 124 || status == 137 )); then
+      echo '::error::AWS read deadline expired' >&2
+      return "$status"
+    fi
+    if ! grep -Eq 'An error occurred \((Throttling|ThrottlingException|RequestLimitExceeded|TooManyRequestsException|RequestThrottled)\) when calling' "$dir/aws-error"; then
+      return "$status"
+    fi
+    now=$(date +%s)
+    remaining=$((end - now))
+    if (( remaining <= delay )); then
+      return "$status"
+    fi
+    sleep "$delay"
+    if (( delay < 30 )); then
+      delay=$((delay * 2))
+      if (( delay > 30 )); then delay=30; fi
+    fi
+  done
+}
+
+# Sleep only while there is time for another readiness read.
+readiness_sleep() {
+  local end=$1 remaining
+  remaining=$((end - $(date +%s)))
+  if (( remaining > 0 )); then sleep "$((remaining < 5 ? remaining : 5))"; fi
+  (( $(date +%s) < end ))
+}
 
 if [[ -n $asg ]]; then
   while :; do
-    if ! refresh=$(aws --region "$region" autoscaling describe-instance-refreshes --auto-scaling-group-name "$asg" --max-records 1 --no-paginate --output json); then
+    if ! refresh=$(aws_read "$deadline" --region "$region" autoscaling describe-instance-refreshes --auto-scaling-group-name "$asg" --max-records 1 --no-paginate --output json); then
       echo '::error::failed to describe controller instance refreshes' >&2; exit 1
     fi
     status=$(jq -er 'if (.InstanceRefreshes | type) != "array" then error("missing refreshes") elif .InstanceRefreshes | length == 0 then "None" else .InstanceRefreshes[0].Status | select(type == "string" and length > 0) end' <<<"$refresh")
     case $status in
       None|Successful) break ;;
       Pending|InProgress|Baking|Cancelling|RollbackInProgress)
-        if (( SECONDS >= deadline )); then echo "::error::controller instance refresh timed out: $status" >&2; exit 1; fi
-        sleep 5 ;;
+        if ! readiness_sleep "$deadline"; then echo "::error::controller instance refresh timed out: $status" >&2; exit 1; fi ;;
       *) reason=$(jq -r '.InstanceRefreshes[0].StatusReason // ""' <<<"$refresh")
         echo "::error::controller instance refresh $status: $reason" >&2; exit 1 ;;
     esac
   done
   while :; do
-    if ! groups=$(aws --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$asg" --output json); then
+    if ! groups=$(aws_read "$deadline" --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$asg" --output json); then
       echo "::error::failed to describe controller Auto Scaling group $asg" >&2; exit 1
     fi
     if controller_ids=$(jq -ec --arg name "$asg" '
@@ -42,11 +95,10 @@ if [[ -n $asg ]]; then
     | select(all(.Instances[]; .HealthStatus == "Healthy" and .LifecycleState == "InService" and .LaunchTemplate.LaunchTemplateId == $template.LaunchTemplateId and (.LaunchTemplate.Version | tostring) == $template.Version and (.InstanceId | type == "string" and length > 0)))
     | [.Instances[].InstanceId] | sort | select(length == (unique | length))
     ' <<<"$groups"); then break; fi
-    if (( SECONDS >= deadline )); then
+    if ! readiness_sleep "$deadline"; then
       jq -c '[.AutoScalingGroups[]? | {AutoScalingGroupName, DesiredCapacity, LaunchTemplate, Instances: [.Instances[]? | {InstanceId, HealthStatus, LifecycleState, LaunchTemplate}]}]' <<<"$groups" >&2
       echo "::error::controller Auto Scaling group $asg is not healthy on its current launch template" >&2; exit 1
     fi
-    sleep 5
   done
 elif [[ -n $targets ]]; then
   controller_ids=$(jq -ec '[.controller_instance_id | select(type == "string" and length > 0)] | select(length == 1)' <<<"$gang")
@@ -55,7 +107,7 @@ fi
 if [[ -n $targets ]]; then
   while IFS= read -r arn; do
     while :; do
-      if ! health=$(aws --region "$region" elbv2 describe-target-health --target-group-arn "$arn" --output json); then
+      if ! health=$(aws_read "$deadline" --region "$region" elbv2 describe-target-health --target-group-arn "$arn" --output json); then
         echo "::error::failed to describe target health in $arn" >&2; exit 1
       fi
       if jq -e --argjson ids "$controller_ids" '
@@ -64,11 +116,10 @@ if [[ -n $targets ]]; then
           and ([.[] | select(.TargetHealth.State == "healthy")] | length == 1)
           and all(.[]; .TargetHealth.State == "healthy" or (.TargetHealth.State == "unhealthy" and .TargetHealth.Reason == "Target.FailedHealthChecks"))
       ' <<<"$health" >/dev/null; then break; fi
-      if (( SECONDS >= deadline )); then
+      if ! readiness_sleep "$deadline"; then
         printf '%s\n' "$health" >&2
         echo "::error::controller targets did not reach leader/passive readiness in $arn" >&2; exit 1
       fi
-      sleep 5
     done
   done <<<"$targets"
 fi
@@ -85,7 +136,7 @@ case "$pid" in *[1-9]*) ;; *) exit 1 ;; esac
 kill -0 "$pid" || exit 1
 exec "/proc/$pid/exe" -V' '{commands: [$command]}')
     while :; do
-      if ! groups=$(aws --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$worker" --output json); then
+      if ! groups=$(aws_read "$deadline" --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$worker" --output json); then
         echo "::error::failed to describe worker Auto Scaling group $worker" >&2; exit 1
       fi
       state=$(jq -r --arg name "$worker" '
@@ -98,30 +149,33 @@ exec "/proc/$pid/exe" -V' '{commands: [$command]}')
               else "pending" end
           end
         end' <<<"$groups")
+      ids=$(jq -c '[.AutoScalingGroups[0].Instances[]? | select((.LifecycleState // "") | startswith("Terminating") | not) | .InstanceId] | sort' <<<"$groups")
+      if [[ $ids != "$membership" ]]; then
+        membership=$ids
+        attested='[]'
+        command_id=''
+        command_instance=''
+      fi
       case $state in
         ready)
-          if (( SECONDS >= deadline )); then
+          if (( $(date +%s) >= deadline )); then
             echo "::error::worker Auto Scaling group $worker did not attest the expected running version $expected" >&2; exit 1
-          fi
-          ids=$(jq -c '[.AutoScalingGroups[0].Instances[] | select(.LifecycleState == "InService") | .InstanceId] | sort' <<<"$groups")
-          if [[ $ids != "$membership" ]]; then
-            membership=$ids
-            attested='[]'
-            command_id=''
           fi
           instance=$(jq -r --argjson 'done' "$attested" '[.[] | select(. as $id | $done | index($id) | not)] | .[0] // ""' <<<"$ids")
           if [[ -z $instance ]]; then break; fi
           if [[ -z $command_id ]]; then
             command_instance=$instance
-            if result=$(aws --region "$region" ssm send-command --instance-ids "$instance" --document-name AWS-RunShellScript --parameters "$commands" --output json) &&
+            if result=$(aws_read "$deadline" --region "$region" ssm send-command --instance-ids "$instance" --document-name AWS-RunShellScript --parameters "$commands" --output json) &&
               command_id=$(jq -er '.Command.CommandId | select(type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))' <<<"$result"); then
               :
-            else
+            elif grep -Fq 'An error occurred (InvalidInstanceId) when calling' "$dir/aws-error"; then
               command_id=''
+            else
+              echo "::error::worker Auto Scaling group $worker did not attest the expected running version $expected: failed to send SSM command" >&2; exit 1
             fi
           fi
           if [[ -n $command_id ]]; then
-            if invocation=$(aws --region "$region" ssm get-command-invocation --command-id "$command_id" --instance-id "$command_instance" --output json); then
+            if invocation=$(aws_read "$deadline" --region "$region" ssm get-command-invocation --command-id "$command_id" --instance-id "$command_instance" --output json); then
               status=$(jq -r '.Status // ""' <<<"$invocation" 2>/dev/null) || status=''
               case $status in
                 Pending|InProgress|Delayed) ;;
@@ -132,19 +186,20 @@ exec "/proc/$pid/exe" -V' '{commands: [$command]}')
                   command_id='' ;;
                 *) command_id='' ;;
               esac
+            elif ! grep -Fq 'An error occurred (InvocationDoesNotExist) when calling' "$dir/aws-error"; then
+              echo "::error::worker Auto Scaling group $worker did not attest the expected running version $expected: failed to read SSM invocation" >&2; exit 1
             fi
           fi
-          if (( SECONDS >= deadline )); then
+          if ! readiness_sleep "$deadline"; then
             echo "::error::worker Auto Scaling group $worker did not attest the expected running version $expected" >&2; exit 1
           fi
-          sleep 5 ;;
+          ;;
         missing|unhealthy) echo "::error::worker Auto Scaling group $worker is $state" >&2; exit 1 ;;
         *)
-          if (( SECONDS >= deadline )); then
+          if ! readiness_sleep "$deadline"; then
             jq -c '.AutoScalingGroups[] | {AutoScalingGroupName, DesiredCapacity, Instances: [.Instances[] | {InstanceId, HealthStatus, LifecycleState}]}' <<<"$groups" >&2
             echo "::error::worker Auto Scaling group $worker did not reach desired healthy capacity" >&2; exit 1
-          fi
-          sleep 5 ;;
+          fi ;;
       esac
     done
   done <<<"$workers"
@@ -152,8 +207,6 @@ fi
 
 curl_trust=()
 if [[ -z $targets ]]; then
-  dir=$(mktemp -d)
-  trap 'rm -rf "$dir"' EXIT
   jq -er '.gang_toml | select(type == "string" and length > 0)' <<<"$gang" >"$dir/gang.toml"
   if ! pin=$("${GANG:-gang}" ca-pin --config "$dir/gang.toml"); then
     echo '::error::failed to derive controller CA pin' >&2; exit 1

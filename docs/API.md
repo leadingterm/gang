@@ -319,6 +319,8 @@ The singleton `state`: the latest independently observed fleet, workers, instanc
 
 `State.schedulerKnown` is an optional current point status: it is absent before the first scheduler observation, true after a successful observation and false after an unavailable observation. It is independent of historical sample completeness, so point readouts recover immediately on success even if the current sample remains incomplete. Older responses omit it; clients may fall back to the latest sample's availability. Global queue totals and oldest time reflect the latest scheduler observation; each fleet's `demand.queued` is attributed by the latest completed control pass and can therefore be older.
 
+`pass.error` is an additive optional string containing the first authoritative pass or step failure in execution order from the latest control pass; only if there is no such failure does it contain the first best-effort observation warning. It can accompany a skipped pass, a pass with failed steps, or a successful pass with a nonfatal provider diagnostic; it does not mean that a launch failed. AWS diagnostics include the provider error code and message when available, for example `ThrottlingException: Rate exceeded`. The field is absent when that pass has no diagnostic, including after recovery. Older responses can omit it. A `pass` delta replaces the whole pass, so a replacement without `error` clears the previous diagnostic.
+
 ### Methods
 
 | Method | Path | Permission |

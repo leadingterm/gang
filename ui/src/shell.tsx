@@ -154,7 +154,7 @@ const Banner = () => {
       <BannerView
         level="warning"
         role="alert"
-        title={<>Pass skipped · {skipText(pass.skipReason)}</>}
+        title={<>Pass skipped · {skipText(pass.skipReason)}{pass.error !== undefined && <> · {pass.error}</>}</>}
         meta={
           pass.lastOkTime === undefined ? undefined : (
             <>
@@ -164,6 +164,9 @@ const Banner = () => {
         }
       />
     );
+  }
+  if (pass?.error !== undefined) {
+    return <BannerView level="warning" role="alert" title={<>Provider diagnostic · {pass.error}</>} />;
   }
   const connections = client.state.value?.connections;
   if (connections && connections.limit > 0 && connections.active >= connections.limit) {

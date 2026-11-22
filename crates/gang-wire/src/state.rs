@@ -612,6 +612,10 @@ pub struct Pass {
     pub applied: u32,
     /// Steps the pass failed to apply; 0 when skipped.
     pub failed: u32,
+    /// First fleet-attributed provider diagnostic of this pass, if any. An authoritative pass or
+    /// step failure takes priority over a best-effort observation warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Why the pass was skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<SkipReason>,
@@ -637,6 +641,7 @@ impl Pass {
             interval,
             applied,
             failed,
+            error: None,
             skip_reason: None,
             last_ok_time: None,
             skipped: None,
@@ -657,6 +662,7 @@ impl Pass {
             interval,
             applied: 0,
             failed: 0,
+            error: None,
             skip_reason: Some(reason),
             last_ok_time,
             skipped: Some(skipped),
@@ -1506,6 +1512,7 @@ mod tests {
         let pass: Pass = round_trip(&value);
         assert_eq!(pass.state, PassState::Ok);
         assert_eq!(pass.interval, Duration::from_secs(2));
+        assert_eq!(pass.error, None);
         assert_eq!(pass.skip_reason, None);
         assert_eq!(pass.last_ok_time, None);
         assert_eq!(pass.skipped, None);
@@ -1525,6 +1532,7 @@ mod tests {
         let pass: Pass = round_trip(&value);
         assert_eq!(pass.skip_reason, Some(SkipReason::ProvisionerUnavailable));
         assert_eq!(pass.skipped, Some(3));
+        assert_eq!(pass.error, None);
     }
 
     #[test]
