@@ -13,6 +13,7 @@ use std::process::Command;
 
 use base64::Engine as _;
 use serde::Serialize;
+use serde::ser::SerializeMap;
 use serde_json::Value;
 
 const TEST: &str = "tests/upgrade.tftest.hcl";
@@ -35,7 +36,6 @@ struct Frontend {
     preserve_client_ip: Option<bool>,
     health: Health,
 }
-#[derive(Serialize)]
 struct Controller {
     instances: u32,
     health_check_type: String,
@@ -43,6 +43,42 @@ struct Controller {
     max_healthy_percentage: u32,
     warmup_seconds: u64,
     deregistration_delay_seconds: u64,
+    mode: Option<&'static str>,
+    image: Option<String>,
+    stop_timeout_seconds: Option<u64>,
+    network_mode: Option<String>,
+    circuit_breaker_enable: Option<bool>,
+    circuit_breaker_rollback: Option<bool>,
+    target_type: Option<String>,
+}
+
+impl Serialize for Controller {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("instances", &self.instances)?;
+        map.serialize_entry("min_healthy_percentage", &self.min_healthy_percentage)?;
+        map.serialize_entry("max_healthy_percentage", &self.max_healthy_percentage)?;
+        map.serialize_entry(
+            "deregistration_delay_seconds",
+            &self.deregistration_delay_seconds,
+        )?;
+        if let Some(mode) = self.mode {
+            map.serialize_entry("mode", mode)?;
+            map.serialize_entry("image", &self.image)?;
+            map.serialize_entry("stop_timeout_seconds", &self.stop_timeout_seconds)?;
+            map.serialize_entry("network_mode", &self.network_mode)?;
+            map.serialize_entry("circuit_breaker_enable", &self.circuit_breaker_enable)?;
+            map.serialize_entry("circuit_breaker_rollback", &self.circuit_breaker_rollback)?;
+            map.serialize_entry("target_type", &self.target_type)?;
+        } else {
+            map.serialize_entry("health_check_type", &self.health_check_type)?;
+            map.serialize_entry("warmup_seconds", &self.warmup_seconds)?;
+        }
+        map.end()
+    }
 }
 #[derive(Serialize)]
 struct Fixture {
@@ -101,8 +137,7 @@ pub fn upgrade_fixture(
     let work = tempfile::tempdir()?;
     crate::contract::stage(&source, work.path())?;
     let root = work.path().join("infra/terraform/modules/deployment");
-    fs::create_dir_all(root.join("tests"))?;
-    fs::copy(test, root.join(TEST))?;
+    stage_upgrade_test(&root, &test)?;
     let local = fs::read_to_string(work.path().join("configs/gang.local.toml"))?;
     let _: toml::Value = toml::from_str(&local)?;
     let command = || {
@@ -150,6 +185,87 @@ pub fn upgrade_fixture(
     }
     let fixture = extract(&result.stdout, local)?;
     fs::write(output, serde_json::to_vec(&fixture)?)?;
+    Ok(())
+}
+
+fn stage_upgrade_test(root: &Path, test: &Path) -> Result<()> {
+    fs::create_dir_all(root.join("tests"))?;
+    let mut test_content = fs::read_to_string(test)?;
+    let variables = fs::read_to_string(root.join("variables.tf"))?;
+    if variables.contains("variable \"controller_image_digest\"") {
+        test_content = test_content.replace(
+            "# CONTROLLER_INSTANCE_TYPE",
+            "controller_instance_type = \"t4g.large\"",
+        );
+        test_content = test_content.replace(
+            "# CONTROLLER_ECS_INPUTS",
+            "controller_image_digest = \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n  controller_stop_timeout_seconds = 2460",
+        );
+        test_content = test_content.replace(
+            "# CONTROLLER_ECS_OVERRIDES",
+            r#"override_data {
+  target = module.controller.data.aws_ec2_instance_type.this
+  values = { supported_architectures = ["arm64"], burstable_performance_supported = true, memory_size = 8192, default_vcpus = 2, boot_modes = ["uefi"] }
+}
+override_resource {
+  target = module.controller.aws_ecr_repository.controller[0]
+  values = { repository_url = "000000000000.dkr.ecr.eu-north-1.amazonaws.com/gang-controller", arn = "arn:aws:ecr:eu-north-1:000000000000:repository/gang-controller" }
+}
+override_resource {
+  target = module.controller.aws_autoscaling_group.capacity[0]
+  values = { arn = "arn:aws:autoscaling:eu-north-1:000000000000:autoScalingGroup:00000000-0000-0000-0000-000000000000:autoScalingGroupName/gang-capacity" }
+}
+override_resource {
+  target = module.controller.aws_iam_role.execution[0]
+  values = { arn = "arn:aws:iam::000000000000:role/gang-ecs-execution" }
+}
+override_resource {
+  target = module.controller.aws_ecs_cluster.controller[0]
+  values = { arn = "arn:aws:ecs:eu-north-1:000000000000:cluster/gang-controller" }
+}
+override_resource {
+  target = module.controller.aws_ecs_task_definition.controller[0]
+  values = { arn = "arn:aws:ecs:eu-north-1:000000000000:task-definition/gang-controller:1" }
+}
+override_resource {
+  target = module.controller.aws_security_group.capacity[0]
+  values = { id = "sg-0123456789abcdef0" }
+}
+override_resource {
+  target = module.load_balancer[0].aws_lb_target_group.service[0]
+  values = { arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/public/0000000000000001" }
+}
+override_resource {
+  target = module.load_balancer[0].aws_lb_target_group.service_internal["serve"]
+  values = { arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/serve/0000000000000002" }
+}
+override_resource {
+  target = module.load_balancer[0].aws_lb_target_group.service_internal["workers"]
+  values = { arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/workers/0000000000000003" }
+}"#,
+        );
+    } else {
+        test_content = test_content.replace(
+            "# CONTROLLER_INSTANCE_TYPE",
+            "controller_instance_type = \"c7i.large\"",
+        );
+        test_content = test_content.replace(
+            "# CONTROLLER_ECS_OVERRIDES",
+            r#"override_resource {
+  target = module.load_balancer[0].aws_lb_target_group.this
+  values = { arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/public/0000000000000001" }
+}
+override_resource {
+  target = module.load_balancer[0].aws_lb_target_group.internal["serve"]
+  values = { arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/serve/0000000000000002" }
+}
+override_resource {
+  target = module.load_balancer[0].aws_lb_target_group.internal["workers"]
+  values = { arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/workers/0000000000000003" }
+}"#,
+        );
+    }
+    fs::write(root.join(TEST), test_content)?;
     Ok(())
 }
 
@@ -398,8 +514,11 @@ fn extract(stdout: &[u8], local_config: String) -> Result<Fixture> {
             .ok_or("missing planned root module")?,
         &mut resources,
     )?;
-    let (public, public_delay) = frontend(plan, &resources, public_port, "TLS")?;
-    let (workers, workers_delay) = frontend(plan, &resources, worker_port, "TCP")?;
+    let ecs = resources
+        .iter()
+        .any(|r| r["address"] == "module.controller.aws_ecs_service.controller[0]");
+    let (public, public_delay) = frontend(plan, &resources, public_port, "TLS", ecs)?;
+    let (workers, workers_delay) = frontend(plan, &resources, worker_port, "TCP", ecs)?;
     let deregistration_delay_seconds = public_delay.max(workers_delay);
     let configuration = configuration(&evidence, &config)?;
     let seed_gang = state_output(&evidence.seed, "gang_toml")?;
@@ -417,7 +536,7 @@ fn extract(stdout: &[u8], local_config: String) -> Result<Fixture> {
         local_config,
         public,
         workers,
-        controller: controller(plan, &resources, deregistration_delay_seconds)?,
+        controller: controller(plan, &resources, deregistration_delay_seconds, &config)?,
         configuration,
         seed,
     })
@@ -506,13 +625,20 @@ fn state_configuration(
         .ok_or("invalid generation name")?;
     let namespace = format!("{arn_prefix}:parameter{name_prefix}/generations/*");
     validate_reference(active, &resources, state_output(state, "gang_toml")?)?;
-    let controller = role_access(
-        &resources,
-        "module.controller",
-        "controller",
-        active,
-        &namespace,
-    )?;
+    let controller = if resources
+        .iter()
+        .any(|r| r["address"] == "module.controller.aws_ecs_task_definition.controller[0]")
+    {
+        ecs_access(&resources, active, &namespace, arn_prefix)?
+    } else {
+        role_access(
+            &resources,
+            "module.controller",
+            "controller",
+            active,
+            &namespace,
+        )?
+    };
     let workers = worker_access(&resources, config, active, &namespace)?;
     Ok(Configuration {
         controller,
@@ -656,6 +782,87 @@ fn role_access(
     let mut access = instance_access(instance, resources, module, role, active)?;
     validate_namespace(&mut access, namespace)?;
     Ok(access)
+}
+
+fn ecs_container(resources: &[&Value]) -> Result<Value> {
+    let task = &resource(
+        resources,
+        "module.controller.aws_ecs_task_definition.controller[0]",
+    )?["values"];
+    let containers: Value = serde_json::from_str(string(task, "container_definitions")?)?;
+    let mut matching = containers
+        .as_array()
+        .ok_or("missing containers")?
+        .iter()
+        .filter(|container| container["name"] == "controller");
+    let container = matching.next().ok_or("missing controller container")?;
+    if matching.next().is_some() {
+        return Err("ambiguous controller container".into());
+    }
+    Ok(container.clone())
+}
+
+fn ecs_access(
+    resources: &[&Value],
+    active: &str,
+    namespace: &str,
+    arn_prefix: &str,
+) -> Result<Access> {
+    let task = &resource(
+        resources,
+        "module.controller.aws_ecs_task_definition.controller[0]",
+    )?["values"];
+    let execution = &resource(resources, "module.controller.aws_iam_role.execution[0]")?["values"];
+    let attached = &resource(
+        resources,
+        "module.controller.aws_iam_role_policy.execution_secrets[0]",
+    )?["values"];
+    let policy = &resource(
+        resources,
+        "module.controller.data.aws_iam_policy_document.execution_secrets",
+    )?["values"];
+    if string(task, "execution_role_arn")? != string(execution, "arn")?
+        || string(attached, "role")? != string(execution, "id")?
+        || string(attached, "policy")? != string(policy, "json")?
+    {
+        return Err("controller task execution policy binding mismatch".into());
+    }
+    let container = ecs_container(resources)?;
+    let mut selectors = container["secrets"]
+        .as_array()
+        .ok_or("missing ECS secrets")?
+        .iter()
+        .filter(|secret| secret["name"] == "GANG_CONFIG");
+    let selector = selectors
+        .next()
+        .ok_or("missing ECS configuration selector")?;
+    if selectors.next().is_some()
+        || string(selector, "valueFrom")? != format!("{arn_prefix}:parameter{active}")
+    {
+        return Err("ECS configuration selector does not use active generation".into());
+    }
+    let statements = policy["statement"]
+        .as_array()
+        .ok_or("missing execution IAM statements")?;
+    let mut readable_resources = policy_resources(
+        statements,
+        "ReadParameters",
+        "Allow",
+        "resources",
+        &["ssm:GetParameters"],
+    )?;
+    if !readable_resources
+        .iter()
+        .any(|resource| resource == namespace)
+    {
+        return Err("execution role cannot read generation namespace".into());
+    }
+    readable_resources.retain(|resource| resource == namespace);
+    Ok(Access {
+        reference: active.into(),
+        readable_resources,
+        excluded_from_deny: Vec::new(),
+    })
 }
 
 fn instance_access(
@@ -814,7 +1021,14 @@ fn controller(
     plan: &Value,
     resources: &[&Value],
     deregistration_delay_seconds: u64,
+    config: &toml::Value,
 ) -> Result<Controller> {
+    if resources
+        .iter()
+        .any(|r| r["address"] == "module.controller.aws_ecs_service.controller[0]")
+    {
+        return ecs_controller(resources, deregistration_delay_seconds, config);
+    }
     let asgs: Vec<_> = resources
         .iter()
         .filter(|r| {
@@ -847,11 +1061,105 @@ fn controller(
         max_healthy_percentage: number(prefs, "max_healthy_percentage")?.try_into()?,
         warmup_seconds: warmup_seconds(plan, asgs[0], prefs)?,
         deregistration_delay_seconds,
+        mode: None,
+        image: None,
+        stop_timeout_seconds: None,
+        network_mode: None,
+        circuit_breaker_enable: None,
+        circuit_breaker_rollback: None,
+        target_type: None,
     };
     if controller.min_healthy_percentage != 100 || controller.max_healthy_percentage != 200 {
         return Err("unexpected controller refresh percentages".into());
     }
     Ok(controller)
+}
+
+fn ecs_controller(
+    resources: &[&Value],
+    deregistration_delay_seconds: u64,
+    config: &toml::Value,
+) -> Result<Controller> {
+    let service =
+        &resource(resources, "module.controller.aws_ecs_service.controller[0]")?["values"];
+    let task = &resource(
+        resources,
+        "module.controller.aws_ecs_task_definition.controller[0]",
+    )?["values"];
+    let capacity = &resource(
+        resources,
+        "module.controller.aws_launch_template.capacity[0]",
+    )?["values"];
+    let breaker = single(&service["deployment_circuit_breaker"])?;
+    let instances = number(service, "desired_count")?;
+    let min = number(service, "deployment_minimum_healthy_percent")?;
+    let max = number(service, "deployment_maximum_percent")?;
+    let network = string(task, "network_mode")?;
+    if instances != 1
+        || min != 100
+        || max != 200
+        || network != "awsvpc"
+        || breaker["enable"] != true
+        || breaker["rollback"] != true
+    {
+        return Err("invalid ECS deployment policy".into());
+    }
+    let container = ecs_container(resources)?;
+    let image = string(&container, "image")?;
+    let (repository, digest) = image
+        .rsplit_once("@sha256:")
+        .ok_or("image is not digest pinned")?;
+    if repository.is_empty()
+        || repository.chars().any(|c| c == '@' || c.is_whitespace())
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("malformed ECS image digest".into());
+    }
+    let user_data = decode_base64(string(capacity, "user_data")?)?;
+    let mut budgets = user_data.lines().filter_map(|line| {
+        line.split_once("ECS_CONTAINER_STOP_TIMEOUT=")
+            .map(|(_, rest)| rest)
+    });
+    let raw = budgets.next().ok_or("missing ECS host stop budget")?;
+    if budgets.next().is_some() {
+        return Err("ambiguous ECS host stop budget".into());
+    }
+    let digits: String = raw.chars().take_while(char::is_ascii_digit).collect();
+    let suffix = &raw[digits.len()..];
+    let host_timeout_seconds: u64 = digits.parse()?;
+    let stop_timeout_seconds = number(&container, "stopTimeout")?;
+    if stop_timeout_seconds == 0
+        || host_timeout_seconds != stop_timeout_seconds
+        || !suffix.starts_with("s'")
+    {
+        return Err("ECS task and host stop budgets are invalid or differ".into());
+    }
+    if config
+        .get("server")
+        .and_then(|server| server.get("stop_timeout"))
+        .and_then(toml::Value::as_str)
+        != Some(format!("{stop_timeout_seconds}s").as_str())
+    {
+        return Err("ECS host stop budget differs from controller shutdown timeout".into());
+    }
+    Ok(Controller {
+        instances: instances.try_into()?,
+        health_check_type: String::new(),
+        min_healthy_percentage: min.try_into()?,
+        max_healthy_percentage: max.try_into()?,
+        warmup_seconds: 0,
+        deregistration_delay_seconds,
+        mode: Some("ecs"),
+        image: Some(image.into()),
+        stop_timeout_seconds: Some(stop_timeout_seconds),
+        network_mode: Some(network.into()),
+        circuit_breaker_enable: Some(true),
+        circuit_breaker_rollback: Some(true),
+        target_type: Some("ip".into()),
+    })
 }
 
 fn warmup_seconds(plan: &Value, resource: &Value, preferences: &Value) -> Result<u64> {
@@ -1080,6 +1388,7 @@ fn frontend(
     resources: &[&Value],
     port: u16,
     protocol: &str,
+    ecs: bool,
 ) -> Result<(Frontend, u64)> {
     let listeners: Vec<_> = resources
         .iter()
@@ -1094,20 +1403,23 @@ fn frontend(
     }
     let listener = listeners[0];
     let address = string(listener, "address")?;
-    let target_address = address.replace(".aws_lb_listener.", ".aws_lb_target_group.");
+    let action = single(&listener["values"]["default_action"])?;
+    if string(action, "type")? != "forward" {
+        return Err("listener does not forward to a target group".into());
+    }
+    let target_arn = string(action, "target_group_arn")?;
     let targets: Vec<_> = resources
         .iter()
-        .filter(|r| r["type"] == "aws_lb_target_group" && r["address"] == target_address)
+        .filter(|r| {
+            r["type"] == "aws_lb_target_group" && r["values"]["arn"].as_str() == Some(target_arn)
+        })
         .collect();
     if targets.len() != 1 {
         return Err(format!("missing or ambiguous target group for {address}").into());
     }
     let target = &targets[0]["values"];
-    let action = single(&listener["values"]["default_action"])?;
-    if string(action, "type")? != "forward"
-        || string(action, "target_group_arn")? != string(target, "arn")?
-    {
-        return Err("listener target group mismatch".into());
+    if ecs && string(target, "target_type")? != "ip" {
+        return Err("ECS target group must use IP targets".into());
     }
     let health = single(&target["health_check"])?;
     if string(health, "protocol")? != "HTTP" {
@@ -1340,6 +1652,231 @@ mod tests {
             .iter_mut()
             .find(|r| r["address"] == address)
             .expect("applied resource")
+    }
+
+    fn ecs_events() -> Vec<Value> {
+        let mut candidate = plan(GANG);
+        candidate["output_changes"]["gang_toml"]["after"] = json!(format!(
+            "{}\n[server]\nstop_timeout = \"2460s\"\n",
+            candidate["output_changes"]["gang_toml"]["after"]
+                .as_str()
+                .expect("gang")
+        ));
+        let entries = resources(&mut candidate);
+        entries.retain(|r| r["type"] != "aws_autoscaling_group");
+        for index in [1, 5] {
+            entries[index]["values"]["target_type"] = json!("ip");
+        }
+        entries[1]["address"] = json!("module.load_balancer[0].aws_lb_target_group.service[0]");
+        entries[4]["address"] =
+            json!("module.load_balancer[0].aws_lb_listener.internal[\"workers\"]");
+        entries[5]["address"] =
+            json!("module.load_balancer[0].aws_lb_target_group.service_internal[\"workers\"]");
+        entries.push(json!({"address":"module.controller.aws_ecs_service.controller[0]","type":"aws_ecs_service",
+            "values":{"desired_count":1,"deployment_minimum_healthy_percent":100,"deployment_maximum_percent":200,
+                "deployment_circuit_breaker":[{"enable":true,"rollback":true}]}}));
+        entries.push(json!({"address":"module.controller.aws_ecs_task_definition.controller[0]","type":"aws_ecs_task_definition",
+            "values":{"network_mode":"awsvpc","container_definitions":json!([{"name":"controller",
+                "stopTimeout":2460,
+                "image":format!("000000000000.dkr.ecr.eu-north-1.amazonaws.com/gang-controller@sha256:{}", "a".repeat(64))}]).to_string()}}));
+        entries.push(json!({"address":"module.controller.aws_launch_template.capacity[0]","type":"aws_launch_template",
+            "values":{"user_data":base64::engine::general_purpose::STANDARD.encode("echo 'ECS_CONTAINER_STOP_TIMEOUT=2460s' >> /etc/ecs/ecs.config")}}));
+        let mut events = synthetic_events(&candidate, false);
+        for run in ["seed", "promote"] {
+            let state = event_payload(&mut events, run, "test_state");
+            let active = state["values"]["outputs"]["config_parameter_reference"]["value"]
+                .as_str()
+                .expect("selector")
+                .to_owned();
+            let entries = state["values"]["root_module"]["resources"]
+                .as_array_mut()
+                .expect("resources");
+            entries
+                .retain(|r| r["address"] != "module.controller.aws_launch_template.controller[0]");
+            let container = json!([{"name":"controller", "secrets":[{"name":"GANG_CONFIG",
+                "valueFrom":format!("arn:aws:ssm:eu-north-1:000000000000:parameter{active}")}]}]);
+            entries.push(json!({"address":"module.controller.aws_ecs_task_definition.controller[0]","type":"aws_ecs_task_definition",
+                "values":{"execution_role_arn":"execution-arn","container_definitions":container.to_string()}}));
+            entries.push(json!({"address":"module.controller.aws_iam_role.execution[0]","type":"aws_iam_role",
+                "values":{"arn":"execution-arn","id":"execution"}}));
+            entries.push(json!({"address":"module.controller.aws_iam_role_policy.execution_secrets[0]","type":"aws_iam_role_policy",
+                "values":{"role":"execution","policy":"{}"}}));
+            entries.push(json!({"address":"module.controller.data.aws_iam_policy_document.execution_secrets","type":"aws_iam_policy_document",
+                "values":{"json":"{}","statement":[{"sid":"ReadParameters","effect":"Allow","actions":["ssm:GetParameters"],
+                    "resources":["arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml/generations/*"]}]}}));
+        }
+        events
+    }
+
+    #[test]
+    fn extracts_ecs_service_and_execution_role_evidence() {
+        let fixture = extract(&encode_events(&ecs_events()), "local".into()).expect("ECS fixture");
+        let controller = serde_json::to_value(&fixture.controller).expect("controller JSON");
+        assert_eq!(controller["mode"], "ecs");
+        assert_eq!(
+            controller["image"],
+            format!(
+                "000000000000.dkr.ecr.eu-north-1.amazonaws.com/gang-controller@sha256:{}",
+                "a".repeat(64)
+            )
+        );
+        assert_eq!(controller["network_mode"], "awsvpc");
+        assert_eq!(controller["target_type"], "ip");
+        assert_eq!(controller["stop_timeout_seconds"], 2460);
+        assert_eq!(controller["circuit_breaker_enable"], true);
+        assert_eq!(controller["circuit_breaker_rollback"], true);
+        assert!(controller.get("warmup_seconds").is_none());
+        assert!(controller.get("health_check_type").is_none());
+        assert!(
+            fixture
+                .configuration
+                .controller
+                .excluded_from_deny
+                .is_empty()
+        );
+        assert_eq!(fixture.configuration.controller.readable_resources.len(), 1);
+        assert_eq!(
+            fixture.configuration.controller.reference,
+            fixture.configuration.workers[0].reference
+        );
+        let old = extract(&stream(GANG), "local".into()).expect("historical fixture");
+        let old = serde_json::to_value(old.controller).expect("historical JSON");
+        assert!(old.get("mode").is_none());
+        assert_eq!(old["health_check_type"], "EC2");
+        assert_eq!(old["warmup_seconds"], 300);
+    }
+
+    #[test]
+    fn rejects_unresolved_or_ambiguous_listener_targets() {
+        for duplicate in [false, true] {
+            let mut events = ecs_events();
+            let plan = event_payload(&mut events, "upgrade", "test_plan");
+            let entries = resources(plan);
+            if duplicate {
+                entries[3]["values"]["arn"] = entries[1]["values"]["arn"].clone();
+            } else {
+                entries[0]["values"]["default_action"][0]["target_group_arn"] = json!("missing");
+            }
+            assert!(extract(&encode_events(&events), "local".into()).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_missing_invalid_or_mismatched_task_stop_timeout() {
+        for value in [Value::Null, json!(0), json!(2459), json!("2460")] {
+            let mut events = ecs_events();
+            let plan = event_payload(&mut events, "upgrade", "test_plan");
+            let task = resources(plan)
+                .iter_mut()
+                .find(|r| r["address"] == "module.controller.aws_ecs_task_definition.controller[0]")
+                .expect("task");
+            let mut containers: Value = serde_json::from_str(
+                task["values"]["container_definitions"]
+                    .as_str()
+                    .expect("definitions"),
+            )
+            .expect("container JSON");
+            containers[0]["stopTimeout"] = value;
+            task["values"]["container_definitions"] = json!(containers.to_string());
+            assert!(extract(&encode_events(&events), "local".into()).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_ecs_service_evidence() {
+        for (address, field, invalid) in [
+            (
+                "module.controller.aws_ecs_service.controller[0]",
+                "deployment_circuit_breaker",
+                json!([{"enable":true}]),
+            ),
+            (
+                "module.controller.aws_ecs_service.controller[0]",
+                "deployment_circuit_breaker",
+                json!([{"enable":true,"rollback":false}]),
+            ),
+            (
+                "module.controller.aws_ecs_task_definition.controller[0]",
+                "network_mode",
+                json!("bridge"),
+            ),
+            (
+                "module.controller.aws_ecs_task_definition.controller[0]",
+                "container_definitions",
+                json!("[{\"name\":\"controller\"}]"),
+            ),
+            (
+                "module.controller.aws_ecs_task_definition.controller[0]",
+                "container_definitions",
+                json!("[{\"name\":\"controller\",\"image\":\"example:latest\"}]"),
+            ),
+            (
+                "module.controller.aws_ecs_task_definition.controller[0]",
+                "container_definitions",
+                json!("[{\"name\":\"controller\",\"image\":\"example@sha256:abc\"}]"),
+            ),
+            (
+                "module.controller.aws_launch_template.capacity[0]",
+                "user_data",
+                json!(
+                    base64::engine::general_purpose::STANDARD
+                        .encode("echo 'ECS_CONTAINER_STOP_TIMEOUT=1s'")
+                ),
+            ),
+            (
+                "module.load_balancer[0].aws_lb_target_group.service[0]",
+                "target_type",
+                json!("instance"),
+            ),
+            (
+                "module.load_balancer[0].aws_lb_target_group.service_internal[\"workers\"]",
+                "target_type",
+                json!("instance"),
+            ),
+        ] {
+            let mut events = ecs_events();
+            let plan = event_payload(&mut events, "upgrade", "test_plan");
+            resources(plan)
+                .iter_mut()
+                .find(|r| r["address"] == address)
+                .expect("resource")["values"][field] = invalid;
+            assert!(
+                extract(&encode_events(&events), "local".into()).is_err(),
+                "{address} {field}"
+            );
+        }
+        for (address, field, invalid) in [
+            (
+                "module.controller.data.aws_iam_policy_document.execution_secrets",
+                "statement",
+                json!([{"sid":"ReadParameters","effect":"Allow","actions":["ssm:GetParameter"],"resources":["*"]}]),
+            ),
+            (
+                "module.controller.aws_ecs_task_definition.controller[0]",
+                "container_definitions",
+                json!(
+                    "[{\"name\":\"controller\",\"secrets\":[{\"name\":\"GANG_CONFIG\",\"valueFrom\":\"wrong\"}]}]"
+                ),
+            ),
+            (
+                "module.controller.aws_iam_role_policy.execution_secrets[0]",
+                "role",
+                json!("wrong"),
+            ),
+        ] {
+            let mut events = ecs_events();
+            let state = event_payload(&mut events, "promote", "test_state");
+            state["values"]["root_module"]["resources"]
+                .as_array_mut()
+                .expect("resources")
+                .iter_mut()
+                .find(|r| r["address"] == address)
+                .expect("resource")["values"][field] = invalid;
+            assert!(
+                extract(&encode_events(&events), "local".into()).is_err(),
+                "{address} {field}"
+            );
+        }
     }
 
     #[test]

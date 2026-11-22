@@ -60,9 +60,57 @@ pub(crate) struct HealthPlan {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ControllerPlan {
     pub(crate) instances: u32,
-    pub(crate) health_check_type: String,
+    #[serde(default)]
+    pub(crate) health_check_type: Option<String>,
     pub(crate) min_healthy_percentage: u32,
     pub(crate) max_healthy_percentage: u32,
+    #[serde(default)]
+    pub(crate) mode: Option<String>,
+    #[serde(default)]
+    pub(crate) stop_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub(crate) image: Option<String>,
+    #[serde(default)]
+    pub(crate) network_mode: Option<String>,
+    #[serde(default)]
+    pub(crate) circuit_breaker_enable: Option<bool>,
+    #[serde(default)]
+    pub(crate) circuit_breaker_rollback: Option<bool>,
+    #[serde(default)]
+    pub(crate) target_type: Option<String>,
+}
+
+impl ControllerPlan {
+    pub(crate) fn ecs_stop_timeout(&self) -> Result<std::time::Duration> {
+        let image_valid = self
+            .image
+            .as_deref()
+            .and_then(|image| image.rsplit_once("@sha256:"))
+            .is_some_and(|(repository, digest)| {
+                !repository.is_empty()
+                    && digest.len() == 64
+                    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+        let seconds = self.stop_timeout_seconds.filter(|seconds| *seconds > 0);
+        if self.mode.as_deref() != Some("ecs")
+            || self.instances != 1
+            || self.min_healthy_percentage != 100
+            || self.max_healthy_percentage != 200
+            || self.network_mode.as_deref() != Some("awsvpc")
+            || self.target_type.as_deref() != Some("ip")
+            || self.circuit_breaker_enable != Some(true)
+            || self.circuit_breaker_rollback != Some(true)
+            || !image_valid
+            || seconds.is_none()
+        {
+            return Err(E2eError::system(
+                "invalid ECS controller deployment fixture",
+            ));
+        }
+        Ok(std::time::Duration::from_secs(seconds.ok_or_else(
+            || E2eError::system("missing ECS controller stop timeout"),
+        )?))
+    }
 }
 
 impl ReleaseFixture {
@@ -152,6 +200,43 @@ mod tests {
         assert_eq!(fixture.public.preserve_client_ip, Some(false));
         assert!(!fixture.workers.proxy_protocol_v2);
         assert_eq!(fixture.workers.preserve_client_ip, None);
+    }
+
+    #[test]
+    fn candidate_requires_ecs_deployment_contract() {
+        let mut value = fixture();
+        value["controller"]["mode"] = json!("ecs");
+        value["controller"]["stop_timeout_seconds"] = json!(2460);
+        value["controller"]["image"] = json!(format!("example.com/gang@sha256:{}", "a".repeat(64)));
+        value["controller"]["network_mode"] = json!("awsvpc");
+        value["controller"]["target_type"] = json!("ip");
+        value["controller"]["circuit_breaker_enable"] = json!(true);
+        value["controller"]["circuit_breaker_rollback"] = json!(true);
+        let parsed: ReleaseFixture = serde_json::from_value(value.clone()).expect("ECS fixture");
+        assert_eq!(
+            parsed
+                .controller
+                .ecs_stop_timeout()
+                .expect("stop budget")
+                .as_secs(),
+            2460
+        );
+        for (field, invalid) in [
+            ("mode", json!("asg")),
+            ("stop_timeout_seconds", json!(0)),
+            ("image", json!("example.com/gang:latest")),
+            ("network_mode", json!("bridge")),
+            ("target_type", json!("instance")),
+            ("circuit_breaker_enable", json!(false)),
+            ("circuit_breaker_rollback", json!(false)),
+        ] {
+            let mut invalid_fixture = value.clone();
+            invalid_fixture["controller"][field] = invalid;
+            let parsed: ReleaseFixture = serde_json::from_value(invalid_fixture).expect("fixture");
+            assert!(parsed.controller.ecs_stop_timeout().is_err(), "{field}");
+        }
+        let historical: ReleaseFixture = serde_json::from_value(fixture()).expect("historical");
+        assert!(historical.controller.ecs_stop_timeout().is_err());
     }
 
     #[test]

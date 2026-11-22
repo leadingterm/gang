@@ -2435,6 +2435,7 @@ fn worker_server_settings(
         proxy_protocol: None,
         leadership: gang_config::LeadershipConfig::default(),
         attempt_budget,
+        stop_timeout: NonZeroDuration::from_secs(2460),
         revocation_refresh_interval: NonZeroDuration::from_secs(1),
         poll_interval: NonZeroDuration::from_secs(1),
         client_action_timeout: NonZeroDuration::from_mins(1),

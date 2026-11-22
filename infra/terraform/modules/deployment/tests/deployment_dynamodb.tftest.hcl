@@ -1,4 +1,34 @@
+override_data {
+  target = module.controller.data.aws_ec2_instance_type.this
+  values = { supported_architectures = ["arm64"], boot_modes = ["uefi"], burstable_performance_supported = true }
+}
+
 mock_provider "aws" {
+  mock_data "aws_ami" {
+    defaults = { root_device_name = "/dev/xvda" }
+  }
+  mock_data "aws_ssm_parameter" {
+    defaults = { value = "ami-0123456789abcdef0" }
+  }
+  mock_data "aws_security_group" {
+    defaults = { vpc_id = "vpc-0123456789abcdef0" }
+  }
+  mock_resource "aws_iam_role" {
+    defaults = { arn = "arn:aws:iam::000000000000:role/gang-ecs-execution" }
+  }
+  mock_resource "aws_autoscaling_group" {
+    defaults = { arn = "arn:aws:autoscaling:eu-north-1:000000000000:autoScalingGroup:00000000-0000-0000-0000-000000000000:autoScalingGroupName/gang-ecs-capacity" }
+  }
+  mock_resource "aws_ecs_cluster" {
+    defaults = { arn = "arn:aws:ecs:eu-north-1:000000000000:cluster/gang-controller" }
+  }
+  mock_resource "aws_ecs_task_definition" {
+    defaults = { arn = "arn:aws:ecs:eu-north-1:000000000000:task-definition/gang-controller:1" }
+  }
+  mock_resource "aws_ecr_repository" {
+    defaults = { arn = "arn:aws:ecr:eu-north-1:000000000000:repository/gang-controller", repository_url = "000000000000.dkr.ecr.eu-north-1.amazonaws.com/gang-controller" }
+  }
+
   mock_data "aws_caller_identity" {
     defaults = { account_id = "000000000000" }
   }
@@ -158,13 +188,13 @@ override_data {
 }
 
 variables {
-  client_token_providers   = ["google", "github-actions"]
-  region                   = "eu-north-1"
-  cidr_block               = "10.20.0.0/16"
-  cache_bucket_name        = "example-gang-cache"
-  controller_instance_type = "c7i.large"
-  default_isa              = "x86-64"
-  trust_domain             = "example.com"
+  client_token_providers  = ["google", "github-actions"]
+  region                  = "eu-north-1"
+  cidr_block              = "10.20.0.0/16"
+  cache_bucket_name       = "example-gang-cache"
+  controller_image_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  default_isa             = "x86-64"
+  trust_domain            = "example.com"
   fleets = [
     {
       name               = "gang-worker-x86-64"
@@ -191,16 +221,47 @@ run "dynamodb_group_shape" {
   command = apply
 
   variables {
-    database         = { engine = "dynamodb" }
-    controller_count = 2
-    hostname         = "gang.example.com"
-    load_balancer    = {}
-    nat_mode         = "per_az"
+    database                     = { engine = "dynamodb" }
+    controller_count             = 1
+    hostname                     = "gang.example.com"
+    load_balancer                = {}
+    nat_mode                     = "per_az"
+    controller_secret_parameters = { token = "/gang/secrets/token" }
   }
 
   assert {
-    condition     = output.controller_shape == "group" && strcontains(output.gang_toml, "[database.dynamodb]") && !strcontains(output.gang_toml, "[database.sqlite]") && strcontains(output.gang_toml, "[cache.s3]")
+    condition     = output.controller_shape == "service" && strcontains(output.gang_toml, "[database.dynamodb]") && !strcontains(output.gang_toml, "[database.sqlite]") && strcontains(output.gang_toml, "[cache.s3]")
     error_message = "The group must render DynamoDB and the shared S3 cache."
+  }
+
+  assert {
+    condition     = output.controller_count == 1 && output.controller_instance_id == null && output.controller_service_name != null && output.controller_cluster_name != null && output.controller_task_definition_arn != null && output.controller_capacity_asg_name != null
+    error_message = "A shared database must expose its ECS service, cluster, task definition, and capacity ASG."
+  }
+
+  assert {
+    condition     = var.controller_instance_type == "t4g.large" && var.default_isa == "x86-64"
+    error_message = "The ARM controller capacity default must be independent of the worker ISA."
+  }
+
+  assert {
+    condition     = output.controller_repository_url == module.controller.repository_url && output.controller_repository_url != null && output.controller_image_digest == var.controller_image_digest
+    error_message = "The deployment must expose the private controller repository and configured immutable image digest."
+  }
+
+  assert {
+    condition     = length(module.load_balancer[0].target_groups) == 3 && module.load_balancer[0].target_groups["serve"].port == module.network.public_port && module.load_balancer[0].target_groups["internal_serve"].port == module.network.public_port && module.load_balancer[0].target_groups["workers"].port == module.network.worker_port && length(output.controller_target_group_arns) == 3
+    error_message = "All three load balancer targets must reach the correct ECS container ports."
+  }
+
+  assert {
+    condition     = strcontains(output.gang_toml, "stop_timeout = \"2460s\"") && !contains(keys(output.images), "controller") && alltrue([for fleet in var.fleets : contains(keys(output.images), fleet.name)])
+    error_message = "The service must use its drain timeout without resolving a controller Gang AMI, while retaining worker AMIs."
+  }
+
+  assert {
+    condition     = module.controller.secret_parameter_arns == ["arn:aws:ssm:eu-north-1:000000000000:parameter/gang/secrets/token"] && output.config_parameter_reference == "${output.config_parameter_name}:1" && output.controller_config_digest == sha256(output.gang_toml)
+    error_message = "The ECS controller must receive only secret parameter references and a version-pinned configuration with its digest."
   }
 
   assert {
@@ -295,15 +356,51 @@ run "rejects_fractional_controller_count" {
   expect_failures = [var.controller_count]
 }
 
-run "rejects_multiple_controllers_in_one_zone" {
+run "rejects_multiple_controllers" {
   command = plan
   variables {
     database         = { engine = "dynamodb" }
     hostname         = "gang.example.com"
     load_balancer    = {}
     controller_count = 2
-    network          = { availability_zone_count = 1 }
+    network          = { availability_zone_count = 2 }
     nat_mode         = "per_az"
   }
   expect_failures = [var.controller_count]
+}
+
+run "rejects_missing_controller_image" {
+  command = plan
+  variables {
+    database                = { engine = "dynamodb" }
+    hostname                = "gang.example.com"
+    load_balancer           = {}
+    controller_image_digest = null
+  }
+  expect_failures = [var.controller_image_digest]
+}
+
+run "rejects_mutable_controller_image" {
+  command = plan
+  variables {
+    database                = { engine = "dynamodb" }
+    hostname                = "gang.example.com"
+    load_balancer           = {}
+    controller_image_digest = "latest"
+  }
+  expect_failures = [var.controller_image_digest]
+}
+
+run "renders_configured_controller_drain_timeout" {
+  command = plan
+  variables {
+    database                        = { engine = "dynamodb" }
+    hostname                        = "gang.example.com"
+    load_balancer                   = {}
+    controller_stop_timeout_seconds = 1800
+  }
+  assert {
+    condition     = strcontains(output.gang_toml, "stop_timeout = \"1800s\"")
+    error_message = "The configured stop timeout must reach the controller configuration."
+  }
 }

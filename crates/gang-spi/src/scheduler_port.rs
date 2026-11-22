@@ -121,9 +121,9 @@ pub trait SchedulerPort: Send + Sync {
     ///
     /// [`SchedulerPort::hand_off`] freezes new dispatch and worker admission while the original
     /// engine retains admitted work and listeners continue to refuse new public requests. The
-    /// caller waits for the handoff to complete and then for [`crate::HostMilestone::Unrouted`]
-    /// before ending the supplied streams and shutting down the final transport. Dropping the
-    /// returned future closes its remaining connections at once.
+    /// caller drains admitted work within the SIGTERM stop budget before ending the supplied
+    /// streams and shutting down the final transport. Dropping the returned future closes its
+    /// remaining connections at once.
     ///
     /// # Errors
     ///

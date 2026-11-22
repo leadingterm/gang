@@ -118,6 +118,8 @@ fn initial_leader(observations: &[Option<LeadershipHealth>]) -> Option<usize> {
 #[derive(Default)]
 struct LinkState {
     cut: bool,
+    stalled: bool,
+    stalled_connections: usize,
     flows: Vec<AbortHandle>,
 }
 
@@ -212,6 +214,15 @@ impl DatabaseLink {
                         if state.cut {
                             continue;
                         }
+                        if state.stalled {
+                            state.stalled_connections += 1;
+                            let flow = flows.spawn(async move {
+                                std::future::pending::<()>().await;
+                                drop(incoming);
+                            });
+                            state.flows.push(flow);
+                            continue;
+                        }
                         state.flows.retain(|flow| !flow.is_finished());
                         let target = target.clone();
                         let flow = flows.spawn(async move {
@@ -289,7 +300,7 @@ struct Controller {
 
 pub(crate) struct Retiring {
     index: usize,
-    child: ControllerHost,
+    started: Instant,
 }
 
 /// Controllers with shared database, S3, local provisioner state and signing key.
@@ -434,7 +445,7 @@ impl<'a> Cluster<'a> {
             )
         };
         self.release_evidence.lock().push(format!(
-            "public={}; workers={}; controllers={}, health={}, min={}%, max={}%",
+            "public={}; workers={}; controllers={}, health={:?}, min={}%, max={}%",
             plan(&fixture.public),
             plan(&fixture.workers),
             fixture.controller.instances,
@@ -627,6 +638,43 @@ impl<'a> Cluster<'a> {
         }
     }
 
+    pub(crate) fn observe_restarted_standby(
+        &self,
+        old: usize,
+        successor: usize,
+        original_pid: u32,
+    ) -> Result<()> {
+        let (pid, _) = {
+            let controllers = self.controllers.lock();
+            let child = controllers
+                .get(old)
+                .and_then(|controller| controller.child.as_ref())
+                .ok_or_else(|| E2eError::system("original controller host is not running"))?;
+            child.wait_restarted(self.stack.settings().startup_timeout)?
+        };
+        if pid == original_pid {
+            return Err(E2eError::system("original controller did not restart"));
+        }
+        self.wait_for_serving(&[successor])?;
+        let start = Instant::now();
+        let window = gang_types::health::health_check().healthy_window();
+        loop {
+            if self.controller_pid(old)? != pid
+                || !self.controller_is_leader(successor)?
+                || self.controller_is_leader(old)?
+                || !self.only_healthy_controller(successor)?
+            {
+                return Err(E2eError::system(
+                    "restarted older controller displaced the successor",
+                ));
+            }
+            if start.elapsed() >= window {
+                return Ok(());
+            }
+            std::thread::sleep(LEASE_POLL_INTERVAL.min(window.saturating_sub(start.elapsed())));
+        }
+    }
+
     fn frontend_url(&self, frontend: Frontend, scheme: &str) -> Result<Url> {
         Url::parse(&format!("{scheme}://{}", self.balancer.address(frontend)))
             .map_err(E2eError::system_from("forming balancer endpoint"))
@@ -696,20 +744,31 @@ impl<'a> Cluster<'a> {
                     index,
                     controller.health,
                     Arc::clone(&controller.health_policy),
+                    controller.child.as_ref().map(ControllerHost::identity),
                 )
             })
             .collect();
         drop(controllers);
+        let lease = self.observe_leader_lease().ok().flatten();
+        let now = unix_millis().ok();
         self.runtime.block_on(async {
             let mut checks = JoinSet::new();
-            for (index, address, policy) in probes {
-                checks.spawn(
-                    async move { (index, probe_leadership(address, &policy, timeout).await) },
-                );
+            for (index, address, policy, identity) in probes {
+                checks.spawn(async move {
+                    (
+                        index,
+                        identity,
+                        probe_leadership(address, &policy, timeout).await,
+                    )
+                });
             }
             while let Some(result) = checks.join_next().await {
-                if let Ok((index, health)) = result {
-                    observations[index] = health;
+                if let Ok((index, identity, Some(_))) = result {
+                    let leading =
+                        lease.as_ref().zip(identity.as_ref()).zip(now).is_some_and(
+                            |((lease, identity), now)| lease.is_held_by(identity, now),
+                        );
+                    observations[index] = Some(LeadershipHealth { leading });
                 }
             }
         });
@@ -820,6 +879,61 @@ impl<'a> Cluster<'a> {
             None,
             self.stack.settings().startup_timeout,
         )
+    }
+
+    /// Launches a real candidate with its database link stalled, and collects it without promotion.
+    pub(crate) fn observe_unprepared_candidate(
+        &self,
+        leader: usize,
+        mut work_is_held: impl FnMut() -> Result<bool>,
+    ) -> Result<()> {
+        let index = self.controllers.lock().len();
+        let addr =
+            || -> Result<SocketAddr> { Ok(SocketAddr::from(([127, 0, 0, 1], ports::reserve()?))) };
+        let (public, worker, health) = (addr()?, addr()?, addr()?);
+        let database_link = self.start_database_link()?;
+        database_link.state.lock().stalled = true;
+        let config = self
+            .stack
+            .placement()
+            .root()
+            .join("controller-unprepared.toml");
+        self.write_controller_config(&config, public, worker, health, &database_link)?;
+        for (frontend, traffic) in [(Frontend::Serve, public), (Frontend::Workers, worker)] {
+            self.balancer.register(frontend, Target { traffic, health });
+        }
+        let result = (|| {
+            let (mut child, _) = self.spawn_controller(index, self.stack.binary(), &config)?;
+            let start = Instant::now();
+            let window = gang_types::health::health_check().healthy_window();
+            loop {
+                if child.has_exited()?
+                    || !work_is_held()?
+                    || !self.controller_is_leader(leader)?
+                    || !self.controller_is_healthy(leader)?
+                    || self.balancer.healthy(Frontend::Serve).contains(&public)
+                    || self.balancer.healthy(Frontend::Workers).contains(&worker)
+                {
+                    return Err(E2eError::system(
+                        "unprepared candidate or original held leader violated the handover contract",
+                    ));
+                }
+                if start.elapsed() >= window {
+                    break;
+                }
+                std::thread::sleep(LEASE_POLL_INTERVAL.min(window.saturating_sub(start.elapsed())));
+            }
+            if database_link.state.lock().stalled_connections == 0 {
+                return Err(E2eError::system(
+                    "candidate did not reach the stalled database",
+                ));
+            }
+            child.kill()?;
+            Ok(())
+        })();
+        self.balancer.deregister(Frontend::Serve, public);
+        self.balancer.deregister(Frontend::Workers, worker);
+        result
     }
 
     pub(crate) fn start_controller_release(
@@ -1255,18 +1369,35 @@ impl<'a> Cluster<'a> {
 
     /// Requests graceful handoff without waiting for the controller to exit.
     pub(crate) fn begin_retire(&self, index: usize) -> Result<Retiring> {
-        let mut child = self.take_controller(index)?;
-        child
-            .request_exit()
-            .map_err(|error| self.timeout_evidence(error))?;
-        Ok(Retiring { index, child })
+        let started = Instant::now();
+        {
+            let mut controllers = self.controllers.lock();
+            let child = controllers
+                .get_mut(index)
+                .and_then(|controller| controller.child.as_mut())
+                .ok_or_else(|| E2eError::system("controller is not running"))?;
+            child.request_exit()?;
+        }
+        Ok(Retiring { index, started })
     }
 
     /// Waits for a controller whose graceful handoff has been requested.
-    pub(crate) fn finish_retire(&self, mut retiring: Retiring) -> Result<ExitStatus> {
-        let status = retiring
-            .child
-            .wait_stopped(self.stack.settings().startup_timeout)
+    pub(crate) fn finish_retire(&self, retiring: &Retiring) -> Result<ExitStatus> {
+        self.finish_retire_within(retiring, self.stack.settings().startup_timeout)
+    }
+
+    pub(crate) fn finish_retire_within(
+        &self,
+        retiring: &Retiring,
+        budget: Duration,
+    ) -> Result<ExitStatus> {
+        let remaining = budget.saturating_sub(retiring.started.elapsed());
+        if remaining.is_zero() {
+            return Err(E2eError::timeout("controller graceful stop", budget));
+        }
+        let mut child = self.take_controller(retiring.index)?;
+        let status = child
+            .wait_stopped(remaining)
             .map_err(|error| self.timeout_evidence(error))?;
         self.remember_exit(retiring.index, status);
         Ok(status)
@@ -1277,7 +1408,7 @@ impl<'a> Cluster<'a> {
     /// # Errors
     /// Returns an error for an unknown controller, a signal failure, or an expired deadline.
     pub fn retire(&self, index: usize) -> Result<ExitStatus> {
-        self.finish_retire(self.begin_retire(index)?)
+        self.finish_retire(&self.begin_retire(index)?)
     }
     /// Waits for the original controller child to exit, without stopping its host supervisor.
     ///
@@ -1299,34 +1430,6 @@ impl<'a> Cluster<'a> {
             .as_mut()
             .ok_or_else(|| E2eError::system("controller is not running"))?;
         child.wait_within(timeout, &format!("original controller {index} to exit"))
-    }
-
-    /// Proves a natural drain caused a fresh passive child on the same local host.
-    pub(crate) fn wait_for_host_restart(
-        &self,
-        index: usize,
-        original_pid: u32,
-        original_holder: &str,
-    ) -> Result<u32> {
-        let (pid, identity) = {
-            let controllers = self.controllers.lock();
-            let child = controllers
-                .get(index)
-                .and_then(|controller| controller.child.as_ref())
-                .ok_or_else(|| E2eError::system("controller host is not running"))?;
-            child.wait_restarted(self.stack.settings().startup_timeout)?
-        };
-        if pid == original_pid || identity.as_ref() == original_holder {
-            return Err(E2eError::system(
-                "host restart retained original PID or holder",
-            ));
-        }
-        if self.controller_is_leader(index)? {
-            return Err(E2eError::system(
-                "older restarted host reacquired leadership",
-            ));
-        }
-        Ok(pid)
     }
 
     /// Reads the captured standard output and standard error of a controller.

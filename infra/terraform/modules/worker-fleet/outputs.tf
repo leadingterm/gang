@@ -1,6 +1,6 @@
 output "asg_names" {
   description = "Names of the worker Auto Scaling groups in fleet order: each fleet's group, then its on-demand twin when it has one."
-  value       = [for name in local.group_names : aws_autoscaling_group.this[name].name]
+  value       = local.group_names
 }
 
 output "permissions_boundary_arn" {

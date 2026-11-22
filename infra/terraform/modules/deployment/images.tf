@@ -5,7 +5,7 @@ locals {
   isa_architectures       = { "x86-64" = "x86_64", aarch64 = "aarch64" }
   controller_architecture = contains(data.aws_ec2_instance_type.controller.supported_architectures, "arm64") ? "aarch64" : "x86_64"
   # Ownership: Only architectures without an override come from this module's release.
-  release_architectures = setsubtract(toset(concat([local.controller_architecture], [for fleet in var.fleets : local.isa_architectures[fleet.isa] if fleet.image == null])), keys(var.images))
+  release_architectures = setsubtract(toset(concat(local.group ? [] : [local.controller_architecture], [for fleet in var.fleets : local.isa_architectures[fleet.isa] if fleet.image == null])), keys(var.images))
   release_images = { for architecture in local.release_architectures : architecture => {
     owner  = var.image_publisher
     sha256 = regex("(?m)^([0-9a-f]{64})  gang-image-${architecture}\\.raw\\.zst$", data.http.sha256sums[0].response_body)[0]
@@ -13,7 +13,7 @@ locals {
   architecture_images = merge(local.release_images, var.images)
   # Correctness: A fleet override does not require an architecture-level image.
   node_images = merge(
-    { controller = merge(local.architecture_images[local.controller_architecture], { architecture = local.controller_architecture }) },
+    local.group ? {} : { controller = merge(local.architecture_images[local.controller_architecture], { architecture = local.controller_architecture }) },
     { for fleet in var.fleets : fleet.name => merge(fleet.image == null ? local.architecture_images[local.isa_architectures[fleet.isa]] : fleet.image, { architecture = local.isa_architectures[fleet.isa] }) },
   )
   # Correctness: Group nodes sharing an image into one lookup.

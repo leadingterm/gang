@@ -14,7 +14,7 @@ output "config_parameter_name" {
 }
 
 output "config_parameter_reference" {
-  description = "Version-pinned active configuration reference used by instances."
+  description = "Version-pinned active configuration reference used by controllers."
   value       = "${aws_ssm_parameter.config_generation.name}:1"
 }
 
@@ -29,7 +29,7 @@ output "worker_endpoint" {
 }
 
 output "controller_public_ip" {
-  description = "Public IP of the controller Elastic IP, or null for a controller group."
+  description = "Public IP of the controller Elastic IP, or null for a controller service."
   value       = module.network.controller_public_ip
 }
 
@@ -53,7 +53,7 @@ output "certificate_validation_records" {
 }
 
 output "controller_public_dns" {
-  description = "EC2 public DNS name of the controller Elastic IP, or null for a controller group."
+  description = "EC2 public DNS name of the controller Elastic IP, or null for a controller service."
   value       = module.network.controller_public_dns
 }
 
@@ -78,18 +78,48 @@ output "events_dead_letter_queue_url" {
 }
 
 output "controller_instance_id" {
-  description = "Instance ID of the SQLite controller, or null for a controller group."
+  description = "Instance ID of the SQLite controller, or null for a controller service."
   value       = module.controller.instance_id
 }
 
 output "controller_shape" {
-  description = "Controller resource shape: instance for SQLite or group for PostgreSQL or DynamoDB."
+  description = "Controller resource shape: instance for SQLite or service for PostgreSQL or DynamoDB."
   value       = local.controller_shape
 }
 
-output "controller_autoscaling_group_name" {
-  description = "Controller Auto Scaling group name, or null for the instance shape."
-  value       = module.controller.autoscaling_group_name
+output "controller_count" {
+  description = "Desired number of controller tasks or standalone instances."
+  value       = var.controller_count
+}
+
+output "controller_service_name" {
+  description = "ECS controller service name, or null for the instance shape."
+  value       = module.controller.service_name
+}
+
+output "controller_cluster_name" {
+  description = "ECS controller cluster name, or null for the instance shape."
+  value       = module.controller.cluster_name
+}
+
+output "controller_task_definition_arn" {
+  description = "ECS controller task definition ARN, or null for the instance shape."
+  value       = module.controller.task_definition_arn
+}
+
+output "controller_capacity_asg_name" {
+  description = "Controller ECS capacity Auto Scaling group name, or null for the instance shape."
+  value       = module.controller.capacity_asg_name
+}
+
+output "controller_repository_url" {
+  description = "Private ECR repository URL for the controller image."
+  value       = module.controller.repository_url
+}
+
+output "controller_image_digest" {
+  description = "Configured immutable controller image digest."
+  value       = var.controller_image_digest
 }
 
 output "cache_bucket_name" {
@@ -98,6 +128,6 @@ output "cache_bucket_name" {
 }
 
 output "images" {
-  description = "AMI id of each node: controller and each fleet by name."
+  description = "AMI id of each worker fleet and, for SQLite only, the controller."
   value       = local.node_ami_ids
 }

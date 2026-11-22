@@ -123,6 +123,45 @@ jobs:
           name: images-${{ matrix.arch }}
           path: images-${{ matrix.arch }}.sha256
 
+  controller_image:
+    needs: locate
+    if: ${{ !(github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-nix
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gang-aarch64-unknown-linux-musl
+          path: staged
+          run-id: ${{ needs.locate.outputs.run-id }}
+          github-token: ${{ github.token }}
+      - name: Build controller image
+        shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
+        run: |
+          install -D -m 0755 staged/gang-aarch64-unknown-linux-musl gang-binaries/aarch64-linux/gang
+          nix build -L --override-input gang-binaries "path:$PWD/gang-binaries" .#packages.x86_64-linux.controller-oci --out-link controller-image
+          nix build -L --rebuild --override-input gang-binaries "path:$PWD/gang-binaries" .#packages.x86_64-linux.controller-oci --no-link
+          cp -L controller-image gang-controller.oci.tar
+          digest="$(tar -xOf gang-controller.oci.tar index.json | jq -er '.manifests | select(length == 1) | .[0].digest | strings | select(test("^sha256:[0-9a-f]{64}$"))')"
+          [[ "$(tar -xOf gang-controller.oci.tar "blobs/sha256/${digest#sha256:}" | sha256sum | cut -d' ' -f1)" == "${digest#sha256:}" ]]
+          jq -n --arg digest "$digest" --arg asset gang-controller.oci.tar '{controller_image_digest: $digest, controller_image_asset: $asset}' > gang-controller.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: env.PUBLISH == 'true'
+        with:
+          name: gang-controller
+          path: |
+            gang-controller.oci.tar
+            gang-controller.json
+          retention-days: 1
+          compression-level: 0
+
   amis:
     needs: [locate, images]
     if: ${{ !cancelled() && ((github.event_name == 'push' && needs.locate.result == 'success' && needs.images.result == 'success') || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v'))) }}
@@ -250,8 +289,8 @@ jobs:
         run: infra/scripts/publish-amis.sh
 
   publish:
-    needs: [locate, images, amis]
-    if: ${{ github.event_name == 'push' && !cancelled() && needs.locate.result == 'success' && needs.images.result == 'success' && needs.amis.result == 'success' }}
+    needs: [locate, images, amis, controller_image]
+    if: ${{ github.event_name == 'push' && !cancelled() && needs.locate.result == 'success' && needs.images.result == 'success' && needs.amis.result == 'success' && needs.controller_image.result == 'success' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     permissions:
@@ -301,6 +340,10 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: gang-amis
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gang-controller
           path: dist
       - name: Render changelog
         env:

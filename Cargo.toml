@@ -83,10 +83,6 @@ aws-sdk-ec2 = { default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",
 ], version = "1.275" }
-aws-sdk-elasticloadbalancingv2 = { default-features = false, features = [
-    "behavior-version-latest",
-    "rt-tokio",
-], version = "1.138" }
 aws-sdk-kms = { default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",

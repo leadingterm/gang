@@ -1,7 +1,9 @@
 //! Rolling controller replacement while a build has executing and queued actions.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::process::ExitStatus;
+use std::time::Duration;
 
 use crate::build_output::BuildOutcome;
 use crate::check::Check;
@@ -102,18 +104,90 @@ fn held_attempts(journal: &Journal, run: &Run, attempts: &mut Attempts) -> Resul
         .count())
 }
 
-fn retire_original_hosts(
+fn server_stop_timeout(config: &str) -> Result<Duration> {
+    let document: toml::Value = toml::from_str(config).map_err(crate::template::template_error)?;
+    let server: gang_config::ServerConfig = document
+        .get("server")
+        .cloned()
+        .ok_or_else(|| E2eError::system("missing controller server configuration"))?
+        .try_into()
+        .map_err(crate::template::template_error)?;
+    Ok(server.stop_timeout.get())
+}
+
+fn observe_stable_host_priority(cluster: &Cluster<'_>) -> Result<()> {
+    let old = cluster.wait_for_leader()?;
+    let original_pid = cluster.controller_pid(old)?;
+    let successor = cluster.start_controller()?;
+    cluster
+        .wait_for_controller_leader_within(successor, cluster.stack().settings().startup_timeout)?;
+    cluster.wait_for_controller_health(successor)?;
+    cluster.observe_restarted_standby(old, successor, original_pid)?;
+    cluster.deregister_controller(old)?;
+    cluster.retire(old)?;
+    Ok(())
+}
+
+fn replace_controllers(
     cluster: &Cluster<'_>,
-    leader: usize,
-    natural: ExitStatus,
-) -> Result<Vec<ExitStatus>> {
-    let mut statuses = Vec::with_capacity(2);
-    for index in [0, 1] {
-        cluster.deregister_controller(index)?;
-        let stopped = cluster.retire(index)?;
-        statuses.push(if index == leader { natural } else { stopped });
+    attempts: &Attempts,
+    work_is_held: impl Fn() -> Result<bool>,
+    release: impl FnOnce() -> Result<()>,
+) -> Result<(bool, Vec<ExitStatus>)> {
+    let initial_leader = cluster.wait_for_leader()?;
+    let config = fs::read_to_string(cluster.release_config_path(initial_leader)?)
+        .map_err(E2eError::io("reading original controller configuration"))?;
+    let stop_timeout = server_stop_timeout(&config)?;
+    let original_holder = cluster.controller_identity(initial_leader)?;
+    let original_attempts: BTreeMap<_, _> = attempts
+        .iter()
+        .map(|(key, attempt)| (key.clone(), (attempt.worker, attempt.start)))
+        .collect();
+    cluster.observe_unprepared_candidate(initial_leader, &work_is_held)?;
+    if !cluster.controller_is_leader(initial_leader)?
+        || !cluster.controller_is_healthy(initial_leader)?
+    {
+        return Err(E2eError::system(
+            "original controller lost leadership after unprepared candidate collection",
+        ));
     }
-    Ok(statuses)
+    let retired_leader = cluster.controller_is_leader(initial_leader)?;
+    let next = cluster.start_controller()?;
+    let mut retiring = None;
+    release_after_promotion(
+        || {
+            cluster
+                .wait_for_leader_matching(cluster.stack().settings().startup_timeout, |leader| {
+                    leader == next
+                })?;
+            cluster.wait_for_controller_health(next)
+        },
+        || {
+            if !work_is_held()?
+                || cluster.controller_identity(initial_leader)? != original_holder
+                || original_attempts.iter().any(|(key, &(worker, start))| {
+                    !attempts.get(key).is_some_and(|attempt| {
+                        attempt.worker == worker && attempt.start == start && attempt.end.is_none()
+                    })
+                })
+            {
+                return Err(E2eError::system(
+                    "original controller/worker/timestamp changed while work was held",
+                ));
+            }
+            Ok(())
+        },
+        || {
+            retiring = Some(cluster.begin_retire(initial_leader)?);
+            release()
+        },
+    )?;
+    let retiring = retiring.ok_or_else(|| E2eError::system("missing retirement signal"))?;
+    let natural = cluster.finish_retire_within(&retiring, stop_timeout)?;
+    let other = usize::from(initial_leader == 0);
+    cluster.deregister_controller(initial_leader)?;
+    cluster.deregister_controller(other)?;
+    Ok((retired_leader, vec![natural, cluster.retire(other)?]))
 }
 
 /// Replaces the initial controllers while the build is held, then judges its journal.
@@ -121,6 +195,7 @@ fn retire_original_hosts(
 /// # Errors
 /// Returns an error if the cluster, journal, or build cannot be observed.
 pub fn rolling_deploy(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
+    observe_stable_host_priority(cluster)?;
     let signal = cluster.stack().signal_path();
     let journal = Journal::create(
         &signal.with_file_name("journal"),
@@ -150,46 +225,12 @@ pub fn rolling_deploy(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
                 .wait_live_state(cluster.stack().settings().history_timeout, |state| {
                     state.queue.total > 0
                 })?;
-            let initial_leader = cluster.wait_for_leader()?;
-            let original_pid = cluster.controller_pid(initial_leader)?;
-            let original_holder = cluster.controller_identity(initial_leader)?;
-            let original_attempts: BTreeMap<_, _> = attempts
-                .iter()
-                .map(|(key, attempt)| (key.clone(), (attempt.worker, attempt.start)))
-                .collect();
-            let next = cluster.start_controller()?;
-            let retired_leader = initial_leader == 0 || initial_leader == 1;
-            release_after_promotion(
-                || {
-                    cluster.wait_for_leader_matching(
-                        cluster.stack().settings().startup_timeout,
-                        |leader| leader == next,
-                    )?;
-                    cluster.wait_for_controller_health(next)
-                },
-                || {
-                    if build.is_finished()
-                        || !pending.is_held()?
-                        || cluster.controller_pid(initial_leader)? != original_pid
-                        || original_attempts.iter().any(|(key, &(worker, start))| {
-                            !attempts.get(key).is_some_and(|attempt| {
-                                attempt.worker == worker
-                                    && attempt.start == start
-                                    && attempt.end.is_none()
-                            })
-                        })
-                    {
-                        return Err(E2eError::system(
-                            "original controller/worker/timestamp changed while work was held",
-                        ));
-                    }
-                    Ok(())
-                },
+            let (retired_leader, statuses) = replace_controllers(
+                cluster,
+                &attempts,
+                || Ok(!build.is_finished() && pending.is_held()?),
                 || pending.release(),
             )?;
-            let natural = cluster.wait_exit(initial_leader)?;
-            cluster.wait_for_host_restart(initial_leader, original_pid, &original_holder)?;
-            let statuses = retire_original_hosts(cluster, initial_leader, natural)?;
             Ok((held, retired_leader, statuses))
         })();
         let settled = pending.settle(observation, || {
@@ -222,6 +263,21 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
+
+    #[test]
+    fn stop_budget_comes_from_rendered_server_configuration() {
+        let default = server_stop_timeout("[server]\ntransport = 'plaintext'\n")
+            .expect("default server configuration");
+        let configured =
+            server_stop_timeout("[server]\ntransport = 'plaintext'\nstop_timeout = '43m'\n")
+                .expect("configured stop timeout");
+        assert_eq!(configured, Duration::from_mins(43));
+        assert_ne!(default, configured);
+        assert!(
+            server_stop_timeout("[server]\ntransport = 'plaintext'\nstop_timeout = '0s'\n")
+                .is_err()
+        );
+    }
 
     #[test]
     fn successor_health_and_original_identity_precede_release() {

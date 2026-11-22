@@ -129,6 +129,7 @@ root = "/etc/gang/action-rootfs"
 trust_domain = ${jsonencode(trust_domain)}
 # Workers trust this deployment's signer as their CA.
 ca_pin = "signer"
+stop_timeout = ${jsonencode("${controller_stop_timeout_seconds}s")}
 %{ if endpoint_trust != null ~}
 # A load balancer presents a publicly trusted certificate for endpoint, so clients use their system roots.
 endpoint_trust = ${jsonencode(endpoint_trust)}

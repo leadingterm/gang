@@ -4,6 +4,13 @@ variable "name" {
   nullable    = false
 }
 
+variable "assume_role_services" {
+  description = "AWS service principals allowed to assume the role."
+  type        = list(string)
+  default     = ["ec2.amazonaws.com"]
+  nullable    = false
+}
+
 variable "iam_name_prefix" {
   description = "Prefix of the name of the IAM role and instance profile, including any separator (for example `example-`). Empty keeps the module's own names. Use it where IAM names must sit under a prefix."
   type        = string

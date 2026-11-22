@@ -2,7 +2,7 @@
 //! the node is parked.
 //!
 //! Reads go to the instance metadata service through `IMDSv2` session tokens, which the SDK client
-//! fetches and refreshes itself. Worker and controller identities are memoized independently.
+//! fetches and refreshes itself. Worker identities are memoized.
 
 use aws_config::imds::Client;
 use aws_config::imds::client::error::{ImdsError, TokenError};
@@ -28,10 +28,6 @@ const PREEMPTION_PATH: &str = "/latest/meta-data/spot/instance-action";
 const TARGET_LIFECYCLE_PATH: &str = "/latest/meta-data/autoscaling/target-lifecycle-state";
 /// Prefix of the target lifecycle state of an instance that its group keeps in the warm pool.
 const WARMED_PREFIX: &str = "Warmed:";
-/// Target state signaling that Auto Scaling is retiring the instance.
-const TERMINATED_STATE: &str = "Terminated";
-/// Auto Scaling's instance tag naming the group.
-const GROUP_TAG_PATH: &str = "/latest/meta-data/tags/instance/aws:autoscaling:groupName";
 
 /// Prefix of the metadata path of an instance tag; the tag key follows it. The Auto Scaling
 /// group propagates the fleet tag to its instances; requires instance metadata tags to be
@@ -112,7 +108,7 @@ impl Metadata {
             .cloned()
     }
 
-    /// This controller's immutable launch identity, independent of the worker fleet tag.
+    /// The controller's immutable launch identity, independent of the worker fleet tag.
     pub(crate) async fn incarnation(&self) -> Result<ControllerHostIdentity, AwsError> {
         self.controller_identity
             .get_or_try_init(|| async {
@@ -155,35 +151,13 @@ impl Metadata {
         }
     }
 
-    /// The Auto Scaling target state, absent outside a group; unknown values fail closed.
-    pub(crate) async fn retiring(&self) -> Result<Option<bool>, AwsError> {
-        match self.imds.get(TARGET_LIFECYCLE_PATH).await {
-            Ok(body) if body.as_ref() == TERMINATED_STATE => Ok(Some(true)),
-            Ok(body) if body.as_ref() == "InService" => Ok(Some(false)),
-            Ok(_) => Err(AwsError::malformed(
-                IMDS_OPERATION,
-                "target lifecycle state",
-            )),
-            Err(error) if is_not_found(&error) => Ok(None),
-            Err(error) => Err(imds_error(error)),
-        }
-    }
-
-    /// The Auto Scaling group name, if the instance belongs to a group.
-    pub(crate) async fn group_name(&self) -> Result<Option<String>, AwsError> {
-        match self.imds.get(GROUP_TAG_PATH).await {
-            Ok(body) => Ok(Some(body.as_ref().to_owned())),
-            Err(error) if is_not_found(&error) => Ok(None),
-            Err(error) => Err(imds_error(error)),
-        }
-    }
-
+    #[cfg(test)]
     /// The instance id without requiring a worker fleet tag.
     pub(crate) async fn instance_id(&self) -> Result<InstanceId, AwsError> {
         Ok(self.identity_document().await?.0)
     }
 
-    /// Fetches and validates the identity document shared by controller and worker reads.
+    /// Fetches and validates the worker identity document.
     async fn identity_document(&self) -> Result<(InstanceId, String), AwsError> {
         let body = self.imds.get(IDENTITY_PATH).await.map_err(imds_error)?;
         let document: IdentityDocument = serde_json::from_str(body.as_ref())
@@ -240,7 +214,7 @@ struct IdentityDocument {
     architecture: String,
 }
 
-/// Controller launch fields are required only for controller reads, never for worker identity.
+/// Fields used to identify a controller on a standalone EC2 instance.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ControllerIdentityDocument {
@@ -363,6 +337,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn controller_identity_uses_immutable_launch_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeAws::start().await?;
+        fake.state().identity_document = Some(
+            serde_json::json!({
+                "instanceId": INSTANCE_ID,
+                "pendingTime": "2026-11-19T12:00:00Z"
+            })
+            .to_string(),
+        );
+        let metadata = metadata(&fake)?;
+        let expected = ControllerHostIdentity::Launched {
+            at: Timestamp::from_rfc3339("2026-11-19T12:00:00Z")?,
+            instance: InstanceId::try_new(INSTANCE_ID)?,
+        };
+        assert_eq!(metadata.incarnation().await?, expected);
+        assert_eq!(metadata.incarnation().await?, expected);
+        assert_eq!(document_requests(&fake), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn worker_identity_does_not_require_or_validate_controller_launch_time()
     -> Result<(), Box<dyn std::error::Error>> {
         let fake = FakeAws::start().await?;
@@ -381,10 +377,6 @@ mod tests {
             }
             fake.state().identity_document = Some(document.to_string());
             let meta = metadata(&fake)?;
-            assert!(matches!(
-                meta.incarnation().await,
-                Err(AwsError::MalformedResponse { .. })
-            ));
             let worker = meta.identity().await?;
             assert_eq!(worker.instance, InstanceId::try_new(INSTANCE_ID)?);
             assert_eq!(worker.fleet, FleetName::try_new(FLEET)?);
@@ -720,7 +712,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            metadata(&fake)?.retiring().await,
+            metadata(&fake)?.parked().await,
             Err(AwsError::Call(CallError::Transient { .. }))
         ));
         Ok(())
@@ -738,7 +730,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            metadata(&fake)?.retiring().await,
+            metadata(&fake)?.parked().await,
             Err(AwsError::Call(CallError::Refused { .. }))
         ));
         Ok(())

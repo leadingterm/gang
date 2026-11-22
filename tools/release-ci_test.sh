@@ -16,7 +16,16 @@ yq -er '.jobs.publish.steps[] | select(.name == "Select available CI binaries") 
 workflow="$script_dir/../.github/workflows/release.yml"
 yq -o=json '.jobs' "$workflow" | jq -e '
   . as $jobs
-  | ($jobs.publish.needs == ["locate", "images", "amis"])
+  | ($jobs.publish.needs == ["locate", "images", "amis", "controller_image"])
+    and ($jobs.controller_image.needs == "locate")
+    and ($jobs.controller_image["runs-on"] == "ubuntu-24.04")
+    and ([$jobs.controller_image.steps[] | select((.uses // "") | startswith("actions/download-artifact@")) | [.with.name, .with["run-id"]]] == [["gang-aarch64-unknown-linux-musl", "${{ needs.locate.outputs.run-id }}"]])
+    and ($jobs.controller_image.permissions == {"contents":"read", "actions":"read"})
+    and ([$jobs.controller_image.steps[] | select((.uses // "") | startswith("aws-actions/"))] == [])
+    and ([$jobs.controller_image.steps[] | select(.name == "Build controller image") | .run | (contains("gang-controller.oci.tar") and contains("gang-controller.json") and contains("gang-binaries/aarch64-linux/gang") and contains("nix build -L --rebuild --override-input gang-binaries"))] == [true])
+    and ([$jobs.controller_image.steps[] | select((.uses // "") | startswith("actions/upload-artifact@")) | [.["if"], .with.name, (.with.path | contains("gang-controller.oci.tar"))]] == [["env.PUBLISH == '\''true'\''", "gang-controller", true]])
+    and ([$jobs.publish.steps[] | select(.name == "Write SHA256SUMS") | .run | contains("sha256sum gang-*")] == [true])
+    and ([$jobs.publish.steps[] | select(.with.name == "gang-controller") | .with.path] == ["dist"])
     and ($jobs.amiscopies.needs == ["locate", "amis"])
     and ($jobs.amiscopies["if"] == "${{ github.event_name == '\''push'\'' }}")
     and ($jobs.amiscopies["runs-on"] == "ubuntu-24.04-arm")
@@ -159,6 +168,95 @@ for scenario in direct:1,2,3 no_darwin:1,2 expired_darwin:1,2 missing_artifact:f
   elif (( status != 0 )) || [[ $(<"$GITHUB_OUTPUT") != "artifact-ids=$expected" ]]; then
     printf '%s did not select artifacts %s\n' "$CASE" "$expected" >&2
     cat "$scratch/case.log" >&2
+    exit 1
+  fi
+  ((cases += 1))
+done
+# Exercise the real bootstrap with isolated filesystem paths and fake privileged commands.
+mkdir -p "$scratch/bin" "$scratch/etc/gang"
+entrypoint=$(<"$script_dir/../infra/container/entrypoint.sh")
+gang_dir=/etc/gang
+resolv_conf=/etc/resolv.conf
+entrypoint=${entrypoint//"$gang_dir"/"$scratch/etc/gang"}
+entrypoint=${entrypoint//"$resolv_conf"/"$scratch/etc/resolv.conf"}
+printf '%s\n' "$entrypoint" >"$scratch/entrypoint.sh"
+cat >"$scratch/bin/chown" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat >"$scratch/bin/dnsmasq" <<'EOF'
+#!/bin/sh
+[ -z "${GANG_CONFIG+x}${GANG_SECRET_0+x}${GANG_SECRET_1+x}${GANG_SECRET_FILES+x}" ] || exit 1
+printf '%s\n' "$@" > "$TRACE_DNS"
+EOF
+cat >"$scratch/bin/su-exec" <<'EOF'
+#!/bin/sh
+[ -z "${GANG_CONFIG+x}${GANG_SECRET_0+x}${GANG_SECRET_1+x}${GANG_SECRET_FILES+x}" ] || exit 1
+printf '%s\n' "$@" > "$TRACE_EXEC"
+printf '%s' "${GANG_CONTROLLER_IDENTITY-}" > "$TRACE_IDENTITY"
+printf '%s' "${GANG_CONTROLLER_LAUNCHED_AT-}" > "$TRACE_LAUNCHED"
+EOF
+cat >"$scratch/bin/wget" <<'EOF'
+#!/bin/sh
+[ "$*" = '-q -T 10 -O - http://169.254.170.2/v4/task' ] || exit 1
+printf '%s' "$METADATA_RESPONSE"
+EOF
+chmod +x "$scratch/bin/"*
+export PATH="$scratch/bin:$PATH" TRACE_DNS="$scratch/dns" TRACE_EXEC="$scratch/exec" TRACE_IDENTITY="$scratch/identity" TRACE_LAUNCHED="$scratch/launched"
+unset ECS_CONTAINER_METADATA_URI_V4 GANG_CONTROLLER_IDENTITY GANG_CONTROLLER_LAUNCHED_AT
+printf 'nameserver 10.0.0.2\nsearch internal\n' >"$scratch/etc/resolv.conf"
+export GANG_CONFIG=$'config contents\n' GANG_SECRET_FILES=$'0=database-password\n1=token' GANG_SECRET_0=$'password\n\n' GANG_SECRET_1='token value'
+sh "$scratch/entrypoint.sh"
+printf 'config contents\n' >"$scratch/expected-config"
+printf 'password\n\n' >"$scratch/expected-secret"
+cmp "$scratch/expected-config" "$scratch/etc/gang/gang.toml"
+cmp "$scratch/expected-secret" "$scratch/etc/gang/secrets/database-password"
+[[ $(<"$scratch/etc/gang/secrets/token") == 'token value' ]]
+[[ $(stat -c %a "$scratch/etc/gang/gang.toml") == 600 ]]
+[[ $(stat -c %a "$scratch/etc/gang/secrets/token") == 600 ]]
+[[ $(stat -c %a "$scratch/etc/gang") == 755 ]]
+[[ $(stat -c %a "$scratch/etc/gang/secrets") == 700 ]]
+[[ $(stat -c %a "$scratch/etc/gang/upstream-resolv.conf") == 644 ]]
+[[ $(<"$scratch/etc/gang/upstream-resolv.conf") == $'nameserver 10.0.0.2\nsearch internal' ]]
+[[ $(<"$scratch/etc/resolv.conf") == $'nameserver 127.0.0.1\nsearch internal' ]]
+[[ $(<"$TRACE_EXEC") == $'65532:65532\n/usr/local/bin/gang\nserver\n--config\n'"$scratch/etc/gang/gang.toml" ]]
+grep -Fx -- "--resolv-file=$scratch/etc/gang/upstream-resolv.conf" "$TRACE_DNS" >/dev/null
+grep -Fx -- '--pid-file=' "$TRACE_DNS" >/dev/null
+((cases += 1))
+for bad in '../escape' '.' 'bad/name' 'bad name'; do
+  export GANG_SECRET_FILES="0=$bad"
+  if sh "$scratch/entrypoint.sh" >"$scratch/case.log" 2>&1; then
+    printf 'unsafe secret filename accepted: %s\n' "$bad" >&2
+    exit 1
+  fi
+  ((cases += 1))
+done
+export ECS_CONTAINER_METADATA_URI_V4=http://169.254.170.2/v4
+export GANG_SECRET_FILES=$'0=database-password\n1=token'
+export METADATA_RESPONSE='{"TaskARN":"arn:aws:ecs:example:123:task/cluster/stable","Containers":[{"Name":"controller","CreatedAt":"2026-11-22T12:34:56.123Z"}]}'
+expected_identity=$(printf '%s' 'arn:aws:ecs:example:123:task/cluster/stable' | sha256sum)
+expected_identity=${expected_identity%% *}
+sh "$scratch/entrypoint.sh"
+[[ $(<"$TRACE_IDENTITY") == "$expected_identity" ]]
+[[ $(<"$TRACE_LAUNCHED") == '2026-11-22T12:34:56.123Z' ]]
+sh "$scratch/entrypoint.sh"
+[[ $(<"$TRACE_IDENTITY") == "$expected_identity" ]]
+[[ $(<"$TRACE_LAUNCHED") == '2026-11-22T12:34:56.123Z' ]]
+((cases += 1))
+responses=(
+  '{}'
+  '{"TaskARN":"invalid"}'
+  'not-json'
+  '{"TaskARN":"arn:task","Containers":[]}'
+  '{"TaskARN":"arn:task","Containers":[{"Name":"controller","CreatedAt":"invalid"}]}'
+  '{"TaskARN":"arn:task","Containers":[{"Name":"controller"}]}'
+  '{"TaskARN":"arn:task","Containers":[{"Name":"controller","CreatedAt":"2026-11-22T12:34:56Z"},{"Name":"controller","CreatedAt":"2026-11-22T12:34:56Z"}]}'
+)
+for response in "${responses[@]}"; do
+  export METADATA_RESPONSE="$response"
+  rm -f "$TRACE_EXEC"
+  if sh "$scratch/entrypoint.sh" >"$scratch/case.log" 2>&1 || [[ -e $TRACE_EXEC ]]; then
+    printf 'invalid task metadata reached controller\n' >&2
     exit 1
   fi
   ((cases += 1))

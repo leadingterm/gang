@@ -252,6 +252,13 @@ jobs:
       - name: Verify reviewed plan
         id: verify
         run: .gang/infra/scripts/reviewed-plan.sh verify
+      - name: Import reviewed controller image
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GANG_REPOSITORY: ${{ job.workflow_repository }}
+          GANG_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: .gang/infra/scripts/publish-controller-image.sh
       - name: Apply reviewed plan
         env:
           HAS_CHANGES: ${{ steps.verify.outputs.has_changes }}

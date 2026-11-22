@@ -160,10 +160,6 @@ variable "database" {
     error_message = "database.postgres.external requires non-empty host, database, user and password_parameter, and a whole-number port from 1 to 65535."
   }
 
-  validation {
-    condition     = var.database.engine != "sqlite" || var.controller_count == 1
-    error_message = "sqlite requires controller_count to be 1."
-  }
 
   validation {
     condition     = var.database.engine == "sqlite" || var.load_balancer != null
@@ -178,18 +174,13 @@ variable "database" {
 
 variable "controller_count" {
   type        = number
-  description = "Number of controllers; more than one requires at least two availability zones."
+  description = "Number of controllers. Must be one because ECS health checks route only to the leader."
   default     = 1
   nullable    = false
 
   validation {
-    condition     = var.controller_count >= 1 && floor(var.controller_count) == var.controller_count
-    error_message = "controller_count must be a positive whole number."
-  }
-
-  validation {
-    condition     = var.controller_count <= 1 || coalesce(var.network.availability_zone_count, 3) >= 2
-    error_message = "controller_count greater than one requires at least two availability zones."
+    condition     = var.controller_count == 1
+    error_message = "controller_count must be 1."
   }
 }
 
@@ -265,7 +256,31 @@ variable "images" {
 
 variable "controller_instance_type" {
   type        = string
-  description = "EC2 instance type of the controller."
+  description = "EC2 instance type of the SQLite controller or ECS capacity host."
+  default     = "t4g.large"
+}
+
+variable "controller_image_digest" {
+  type        = string
+  description = "SHA-256 digest of the controller image in the deployment's private ECR repository, required for a shared database."
+  default     = null
+
+  validation {
+    condition     = !contains(["postgres", "dynamodb"], var.database.engine) || can(regex("^sha256:[0-9a-f]{64}$", var.controller_image_digest))
+    error_message = "controller_image_digest must be a sha256 digest for a shared database."
+  }
+}
+
+variable "controller_stop_timeout_seconds" {
+  type        = number
+  description = "Graceful controller drain timeout in seconds; also configures the ECS host stop timeout for a service."
+  default     = 2460
+  nullable    = false
+
+  validation {
+    condition     = var.controller_stop_timeout_seconds > 0 && floor(var.controller_stop_timeout_seconds) == var.controller_stop_timeout_seconds
+    error_message = "controller_stop_timeout_seconds must be a positive whole number."
+  }
 }
 
 variable "controller_root_volume_gib" {

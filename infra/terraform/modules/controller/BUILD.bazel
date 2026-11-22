@@ -1,10 +1,5 @@
 load("//bazel/opentofu:defs.bzl", "opentofu_contract_test")
 
-exports_files(
-    ["lifecycle-hook.json"],
-    visibility = ["//crates/gang-aws:__pkg__"],
-)
-
 opentofu_contract_test(
     name = "controller_contract",
     deps = [
@@ -14,37 +9,8 @@ opentofu_contract_test(
 )
 
 opentofu_contract_test(
-    name = "controller_group_contract",
-    test_file = "tests/controller_group.tftest.hcl",
-    deps = [
-        "//infra/terraform/modules/instance-role:sources",
-        "//infra/terraform/modules/load-balancer:sources",
-    ],
-)
-
-opentofu_contract_test(
-    name = "controller_lifecycle_transition_contract",
-    root_overlays = [
-        "tests/fixtures/lifecycle_transition_test.tf",
-        "tests/fixtures/lifecycle_transition_override.tf",
-    ],
-    test_expectations = "tests/controller_lifecycle_transition.expectations.json",
-    test_file = "tests/controller_lifecycle_transition.tftest.hcl",
-    deps = [
-        "//infra/terraform/modules/instance-role:sources",
-        "//infra/terraform/modules/load-balancer:sources",
-    ],
-)
-
-opentofu_contract_test(
-    name = "controller_lifecycle_replacement_control",
-    root_overlays = [
-        "tests/fixtures/lifecycle_transition_test.tf",
-        "tests/fixtures/lifecycle_transition_override.tf",
-        "tests/fixtures/zz_lifecycle_control_override.tf",
-    ],
-    test_expectations = "tests/controller_lifecycle_control.expectations.json",
-    test_file = "tests/controller_lifecycle_transition.tftest.hcl",
+    name = "controller_service_contract",
+    test_file = "tests/controller_service.tftest.hcl",
     deps = [
         "//infra/terraform/modules/instance-role:sources",
         "//infra/terraform/modules/load-balancer:sources",

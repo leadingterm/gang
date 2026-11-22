@@ -226,8 +226,8 @@ async fn a_new_term_excludes_existing_evictions() -> TestResult {
     Ok(())
 }
 
-// A successor's observational baseline is passive preparation: the original controller
-// must keep renewing and serving until the successor is prepared to request takeover.
+// A successor's observational baseline is passive preparation: the original keeps serving
+// until the successor is prepared to request takeover.
 #[tokio::test]
 async fn the_lease_is_renewed_while_the_term_baseline_is_taken() -> TestResult {
     let (mut parts, mut handles, mut settings) = fixture();
@@ -290,10 +290,12 @@ async fn the_lease_is_renewed_while_the_term_baseline_is_taken() -> TestResult {
         .send(())
         .map_err(|()| "the baseline snapshot was not being taken")?;
     assert!(futures::poll!(run.as_mut()).is_pending());
+    assert_eq!(
+        follower_status(&controller).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
     handles.clock.advance(renew_interval);
-    if let std::task::Poll::Ready(result) = futures::poll!(old.as_mut()) {
-        result?;
-    }
+    old.await?;
     assert!(futures::poll!(run.as_mut()).is_pending());
     assert_eq!(
         follower_status(&controller).await,

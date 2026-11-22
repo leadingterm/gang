@@ -21,6 +21,7 @@ portable() {
   tools/release-notes_test.sh
   tools/release-ci_test.sh
   tools/verify-deployment_test.sh
+  tools/publish-controller-image_test.sh
   tools/verify-remote-build_test.sh
   alejandra --check .
   shellcheck infra/scripts/*.sh tools/*.sh

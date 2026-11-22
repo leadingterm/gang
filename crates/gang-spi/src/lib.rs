@@ -74,9 +74,7 @@ pub use expiring_port::{
 pub use fence::{Deadline, Fence, Held, Keeper, LeaseLapsed, RunError, Work};
 pub use fleet_options::{FleetOptions, OptionSpec};
 pub use gang_macros::{FleetOptions, PortFailure, compose, port};
-pub use host_port::{
-    ControllerHostIdentity, ControllerHostPort, ControllerHostState, HostMilestone,
-};
+pub use host_port::{ControllerHostIdentity, ControllerIdentityPort};
 pub use identity_port::{
     LoginChallenge, LoginClient, LoginGrant, LoginPort, LoginRequest, LoginSupport,
     ProofVerifierPort,

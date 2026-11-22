@@ -6,9 +6,9 @@ use std::sync::Arc;
 use gang_clock::Clock;
 use gang_config::{Fleets, PluginSet};
 use gang_spi::{
-    AuthenticationPort, CacheStorePort, CertificateSignerPort, ControllerHostPort, ControllerId,
-    CredentialLifecyclePort, ExpiringRecordPort, LeaderLeasePort, LoginPort, ProofVerifierPort,
-    ProvisionerPort, SchedulerPort, StateRepositoryPort,
+    AuthenticationPort, CacheStorePort, CertificateSignerPort, ControllerId,
+    ControllerIdentityPort, CredentialLifecyclePort, ExpiringRecordPort, LeaderLeasePort,
+    LoginPort, ProofVerifierPort, ProvisionerPort, SchedulerPort, StateRepositoryPort,
 };
 use gang_tls::Listener;
 
@@ -32,9 +32,8 @@ pub trait Stack: 'static {
 
 /// A [`Stack`] plus the adapters only the composed server needs.
 pub trait Deployment: Stack {
-    /// The provisioner that creates and removes worker instances and manages this controller's
-    /// host.
-    type Provisioner: ProvisionerPort + ControllerHostPort + 'static;
+    /// The provisioner that creates and removes worker instances.
+    type Provisioner: ProvisionerPort + ControllerIdentityPort + 'static;
     /// The cache stores that clients and workers read and write.
     type Cache: CacheStorePort;
     /// The scheduler that dispatches actions to workers.

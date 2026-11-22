@@ -1,3 +1,13 @@
+override_data {
+  target = module.gang.data.aws_ec2_instance_type.controller
+  values = { supported_architectures = ["arm64"], boot_modes = ["uefi"] }
+}
+
+override_data {
+  target = module.gang.module.controller.data.aws_ec2_instance_type.this
+  values = { supported_architectures = ["arm64"], boot_modes = ["uefi"], burstable_performance_supported = true }
+}
+
 mock_provider "aws" {
   mock_data "aws_partition" {
     defaults = {
@@ -148,6 +158,11 @@ run "plans_the_example_deployment" {
   assert {
     condition     = output.gang.load_balancer_dns_name != null
     error_message = "The example must expose a load balancer DNS name."
+  }
+
+  assert {
+    condition     = can(regex("controller_image_digest[[:space:]]*=[[:space:]]*\"sha256:[0-9a-f]{64}\"", file("${path.module}/main.tf")))
+    error_message = "The example caller must pin its controller image by digest."
   }
 
   assert {

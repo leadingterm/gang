@@ -114,6 +114,8 @@ pub struct ServerSettings {
     pub leadership: LeadershipConfig,
     /// Whole-attempt budget derived from the actual worker transfer and action settings.
     pub attempt_budget: Duration,
+    /// Maximum time allowed for graceful shutdown.
+    pub stop_timeout: NonZeroDuration,
     /// How often to refresh revocations written by other controllers.
     pub revocation_refresh_interval: NonZeroDuration,
     /// How often the control loop runs a reconcile pass.

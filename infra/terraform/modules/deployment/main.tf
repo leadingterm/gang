@@ -33,12 +33,6 @@ resource "terraform_data" "input_checks" {
   }
 }
 
-check "multi_controller_nat" {
-  assert {
-    condition     = var.controller_count <= 1 || var.nat_mode != "single"
-    error_message = "Multiple controllers with a single NAT gateway share an availability-zone failure point."
-  }
-}
 
 module "network" {
   source = "../network"
@@ -81,7 +75,7 @@ module "storage" {
 locals {
   config_parameter_name = coalesce(var.config_parameter_name, "/${var.name}/gang.toml")
   group                 = var.database.engine != "sqlite"
-  controller_shape      = local.group ? "group" : "instance"
+  controller_shape      = local.group ? "service" : "instance"
   public_port           = module.network.public_port
   worker_port           = module.network.worker_port
   network_granted       = anytrue([for fleet in var.fleets : contains(fleet.actions.grants, "network")])
@@ -149,6 +143,7 @@ locals {
     database_table_name               = module.storage.dynamodb_table_name
     database_postgres                 = local.database_postgres
     leadership_renew_interval_seconds = local.group ? local.health.renew_interval_seconds : null
+    controller_stop_timeout_seconds   = var.controller_stop_timeout_seconds
     leadership_call_timeout_seconds   = local.group ? local.health.call_timeout_seconds : null
     scratch_mount_point               = var.scratch_mount_point
     workload_token_audience           = var.workload_token_audience
@@ -162,7 +157,7 @@ locals {
     extra_config_toml                 = var.extra_config_toml
   })
 
-  # Controllers read the password file only at boot, so rotation must refresh the group.
+  # Controllers read the password file only at boot, so rotation must replace the task.
   controller_config_digest = sha256(join("\n", compact([
     local.gang_toml,
     try("password_version=${var.database.postgres.rds.password_version}", null),
@@ -196,18 +191,16 @@ locals {
 module "controller" {
   source = "../controller"
 
-  name             = "${var.name}-controller"
-  shape            = local.controller_shape
-  controller_count = var.controller_count
-  subnet_ids       = values(module.network.private_subnet_ids)
-  target_group_arns = local.group && var.load_balancer != null ? [
-    module.load_balancer[0].serve_target_group_arn,
-    module.load_balancer[0].internal_serve_target_group_arn,
-    module.load_balancer[0].workers_target_group_arn,
-  ] : []
+  name                          = "${var.name}-controller"
+  shape                         = local.controller_shape
+  controller_count              = var.controller_count
+  subnet_ids                    = values(module.network.private_subnet_ids)
+  target_groups                 = local.group && var.load_balancer != null ? module.load_balancer[0].target_groups : {}
   config_digest                 = local.group ? local.controller_config_digest : null
   dynamodb_table_arn            = module.storage.dynamodb_table_arn
-  ami_id                        = local.node_ami_ids["controller"]
+  ami_id                        = local.group ? null : local.node_ami_ids["controller"]
+  controller_image_digest       = var.controller_image_digest
+  stop_timeout_seconds          = var.controller_stop_timeout_seconds
   instance_type                 = var.controller_instance_type
   root_volume_gib               = var.controller_root_volume_gib
   state_volume_gib              = var.controller_state_volume_gib
@@ -229,7 +222,7 @@ module "controller" {
 }
 
 output "controller_config_digest" {
-  description = "Controller group configuration digest used to trigger instance refreshes, or null for a single instance."
+  description = "Controller service configuration digest used to create a task revision, or null for a single instance."
   value       = module.controller.config_digest
 }
 

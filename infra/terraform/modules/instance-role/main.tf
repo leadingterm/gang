@@ -10,7 +10,7 @@ data "aws_iam_policy_document" "assume_role" {
 
     principals {
       type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
+      identifiers = var.assume_role_services
     }
   }
 }

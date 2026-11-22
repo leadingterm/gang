@@ -13,7 +13,6 @@ aws-config = { workspace = true }
 aws-sdk-autoscaling = { workspace = true }
 aws-sdk-cloudwatch = { workspace = true }
 aws-sdk-ec2 = { workspace = true }
-aws-sdk-elasticloadbalancingv2 = { workspace = true }
 aws-sdk-kms = { workspace = true }
 aws-sdk-sqs = { workspace = true }
 aws-sdk-sts = { workspace = true }

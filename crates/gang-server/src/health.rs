@@ -138,7 +138,7 @@ pub(crate) async fn serve_health<L: Listener, C: Clock>(
                     let readiness = readiness.clone();
                     let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                         let status = readiness.status(request.uri().path());
-                        let leading = status == StatusCode::OK;
+                        let leading = readiness.is_leading();
                         async move {
                             let mut response = Response::new(Empty::<Bytes>::new());
                             *response.status_mut() = status;
@@ -327,10 +327,13 @@ mod tests {
         readiness.serve();
         readiness.lead();
         assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!readiness.is_leading());
         keeper.extend_to(clock.monotonic() + std::time::Duration::from_secs(2));
+        assert!(readiness.is_leading());
         assert_statuses(&readiness, StatusCode::OK);
         clock.advance(std::time::Duration::from_secs(3));
         assert_statuses(&readiness, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!readiness.is_leading());
         keeper.extend_to(clock.monotonic() + std::time::Duration::from_secs(2));
         assert_statuses(&readiness, StatusCode::OK);
     }
