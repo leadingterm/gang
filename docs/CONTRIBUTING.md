@@ -65,6 +65,11 @@ branches. It adds `needs-rebase` and a comment with escaped conflicting
 paths when needed, and clears the report when clean. It never checks out or
 executes PR code and is not a waiver of the queue gates.
 
+A PR-only push does not rerun this diagnostic. After fixing a conflict, its
+label or comment can remain until the next `main` push refreshes the report.
+Use current GitHub mergeability and queue results rather than treating a stale
+report as a reason to bypass checks or update an otherwise clean branch.
+
 If a queue check fails, inspect the failing merge-group run, for example:
 
 ```sh
