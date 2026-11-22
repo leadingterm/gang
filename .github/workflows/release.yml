@@ -146,8 +146,8 @@ jobs:
         shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
         run: |
           install -D -m 0755 staged/gang-aarch64-unknown-linux-musl gang-binaries/aarch64-linux/gang
-          nix build -L --override-input gang-binaries "path:$PWD/gang-binaries" .#packages.x86_64-linux.controller-oci --out-link controller-image
-          nix build -L --rebuild --override-input gang-binaries "path:$PWD/gang-binaries" .#packages.x86_64-linux.controller-oci --no-link
+          nix build -L --no-write-lock-file --override-input gang-binaries "path:$PWD/gang-binaries" .#packages.x86_64-linux.controller-oci --out-link controller-image
+          nix build -L --rebuild --no-write-lock-file --override-input gang-binaries "path:$PWD/gang-binaries" .#packages.x86_64-linux.controller-oci --no-link
           cp -L controller-image gang-controller.oci.tar
           digest="$(tar -xOf gang-controller.oci.tar index.json | jq -er '.manifests | select(length == 1) | .[0].digest | strings | select(test("^sha256:[0-9a-f]{64}$"))')"
           [[ "$(tar -xOf gang-controller.oci.tar "blobs/sha256/${digest#sha256:}" | sha256sum | cut -d' ' -f1)" == "${digest#sha256:}" ]]

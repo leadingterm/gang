@@ -1,5 +1,5 @@
 {
-  "checksum": "736443a00829223d500709036d962ace50c27e07c8113eb7e689e7409d5d2f89",
+  "checksum": "cb4515a8fab81e1bfaa6f1820036f45665a9ff835c96b99f0df2ee1dc0153388",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -2433,129 +2433,6 @@
         },
         "edition": "2021",
         "version": "1.275.0"
-      },
-      "license": "Apache-2.0",
-      "license_ids": [
-        "Apache-2.0"
-      ],
-      "license_file": "LICENSE"
-    },
-    "aws-sdk-elasticloadbalancingv2 1.138.0": {
-      "name": "aws-sdk-elasticloadbalancingv2",
-      "version": "1.138.0",
-      "package_url": "https://github.com/awslabs/aws-sdk-rust",
-      "repository": {
-        "Http": {
-          "url": "https://static.crates.io/crates/aws-sdk-elasticloadbalancingv2/1.138.0/download",
-          "sha256": "dd292df47c40229072ba7991f57d7f0a7a19224baa0cc62d5964343b9bb6e0ec"
-        }
-      },
-      "targets": [
-        {
-          "Library": {
-            "crate_name": "aws_sdk_elasticloadbalancingv2",
-            "crate_root": "src/lib.rs",
-            "srcs": {
-              "allow_empty": true,
-              "include": [
-                "**/*.rs"
-              ]
-            }
-          }
-        }
-      ],
-      "library_target_name": "aws_sdk_elasticloadbalancingv2",
-      "common_attrs": {
-        "compile_data_glob": [
-          "**"
-        ],
-        "crate_features": {
-          "common": [
-            "behavior-version-latest",
-            "rt-tokio"
-          ],
-          "selects": {}
-        },
-        "deps": {
-          "common": [
-            {
-              "id": "arc-swap 1.9.3",
-              "target": "arc_swap"
-            },
-            {
-              "id": "aws-credential-types 1.3.1",
-              "target": "aws_credential_types"
-            },
-            {
-              "id": "aws-runtime 1.10.4",
-              "target": "aws_runtime"
-            },
-            {
-              "id": "aws-smithy-async 1.3.1",
-              "target": "aws_smithy_async"
-            },
-            {
-              "id": "aws-smithy-http 0.64.3",
-              "target": "aws_smithy_http"
-            },
-            {
-              "id": "aws-smithy-json 0.65.1",
-              "target": "aws_smithy_json"
-            },
-            {
-              "id": "aws-smithy-observability 0.3.1",
-              "target": "aws_smithy_observability"
-            },
-            {
-              "id": "aws-smithy-query 0.64.0",
-              "target": "aws_smithy_query"
-            },
-            {
-              "id": "aws-smithy-runtime 1.16.4",
-              "target": "aws_smithy_runtime"
-            },
-            {
-              "id": "aws-smithy-runtime-api 1.22.0",
-              "target": "aws_smithy_runtime_api"
-            },
-            {
-              "id": "aws-smithy-schema 1.2.0",
-              "target": "aws_smithy_schema"
-            },
-            {
-              "id": "aws-smithy-types 1.9.4",
-              "target": "aws_smithy_types"
-            },
-            {
-              "id": "aws-smithy-xml 0.64.1",
-              "target": "aws_smithy_xml"
-            },
-            {
-              "id": "aws-types 1.7.0",
-              "target": "aws_types"
-            },
-            {
-              "id": "fastrand 2.5.0",
-              "target": "fastrand"
-            },
-            {
-              "id": "http 1.5.0",
-              "target": "http",
-              "alias": "http_1x"
-            },
-            {
-              "id": "regex-lite 0.1.9",
-              "target": "regex_lite"
-            },
-            {
-              "id": "tracing 0.1.44",
-              "target": "tracing"
-            }
-          ],
-          "selects": {}
-        },
-        "edition": "2021",
-        "version": "1.138.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13727,10 +13604,6 @@
             {
               "id": "aws-sdk-ec2 1.275.0",
               "target": "aws_sdk_ec2"
-            },
-            {
-              "id": "aws-sdk-elasticloadbalancingv2 1.138.0",
-              "target": "aws_sdk_elasticloadbalancingv2"
             },
             {
               "id": "aws-sdk-kms 1.129.0",
@@ -47538,7 +47411,6 @@
     "aws-sdk-cloudwatch 1.144.0",
     "aws-sdk-dynamodb 1.137.0",
     "aws-sdk-ec2 1.275.0",
-    "aws-sdk-elasticloadbalancingv2 1.138.0",
     "aws-sdk-kms 1.129.0",
     "aws-sdk-sqs 1.122.0",
     "aws-sdk-sts 1.124.0",

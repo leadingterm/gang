@@ -282,7 +282,7 @@ async fn run_leader<D: Deployment>(
             context.provisioner,
             &*context.core.host.clock,
             context.sidecar_retry_interval.get(),
-            context.leadership.host_call_timeout(),
+            context.leadership.incarnation_timeout(),
         ) => result.map_err(ServerError::HostIdentity)?,
     };
     let candidate = tokio::select! {
@@ -461,25 +461,6 @@ async fn freeze_and_release<D: Deployment>(
     Ok(())
 }
 
-async fn controller_identity<H: ControllerIdentityPort, C: Clock>(
-    host: &H,
-    clock: &C,
-    interval: Duration,
-) -> Result<ControllerHostIdentity, PortError> {
-    loop {
-        let started = clock.monotonic();
-        match clock.timeout(interval, host.incarnation()).await {
-            Ok(Ok(identity)) => return Ok(identity),
-            Ok(Err(error @ PortError::Unavailable(_))) => {
-                tracing::warn!(%error, "cannot identify controller incarnation");
-            }
-            Ok(Err(error)) => return Err(error),
-            Err(error) => tracing::warn!(%error, "timed out identifying controller incarnation"),
-        }
-        clock.sleep_until(started + interval).await;
-    }
-}
-
 /// Completes read-only import before reporting readiness or acquiring leadership.
 async fn prepare_history<D: Deployment>(
     context: &LeadContext<'_, D>,
@@ -610,11 +591,11 @@ async fn controller_identity<H: ControllerIdentityPort, C: Clock>(
     host: &H,
     clock: &C,
     interval: Duration,
-    host_call_timeout: Duration,
+    incarnation_timeout: Duration,
 ) -> Result<ControllerHostIdentity, PortError> {
     loop {
         let started = clock.monotonic();
-        match clock.timeout(host_call_timeout, host.incarnation()).await {
+        match clock.timeout(incarnation_timeout, host.incarnation()).await {
             Ok(Ok(identity)) => return Ok(identity),
             Ok(Err(error @ PortError::Unavailable(_))) => {
                 tracing::warn!(%error, "cannot identify controller incarnation");
@@ -1568,7 +1549,9 @@ mod tests {
         let clock = gang_clock::TestClock::default();
         let interval = std::time::Duration::from_secs(1);
         let host = RetryingIdentity(std::sync::atomic::AtomicUsize::new(0));
-        let mut identity = Box::pin(super::controller_identity(&host, &clock, interval, interval));
+        let mut identity = Box::pin(super::controller_identity(
+            &host, &clock, interval, interval,
+        ));
         assert!(futures::poll!(identity.as_mut()).is_pending());
         clock.advance(interval);
         assert!(matches!(

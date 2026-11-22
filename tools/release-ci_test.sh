@@ -22,7 +22,7 @@ yq -o=json '.jobs' "$workflow" | jq -e '
     and ([$jobs.controller_image.steps[] | select((.uses // "") | startswith("actions/download-artifact@")) | [.with.name, .with["run-id"]]] == [["gang-aarch64-unknown-linux-musl", "${{ needs.locate.outputs.run-id }}"]])
     and ($jobs.controller_image.permissions == {"contents":"read", "actions":"read"})
     and ([$jobs.controller_image.steps[] | select((.uses // "") | startswith("aws-actions/"))] == [])
-    and ([$jobs.controller_image.steps[] | select(.name == "Build controller image") | .run | (contains("gang-controller.oci.tar") and contains("gang-controller.json") and contains("gang-binaries/aarch64-linux/gang") and contains("nix build -L --rebuild --override-input gang-binaries"))] == [true])
+    and ([$jobs.controller_image.steps[] | select(.name == "Build controller image") | .run | (contains("gang-controller.oci.tar") and contains("gang-controller.json") and contains("gang-binaries/aarch64-linux/gang") and contains("nix build -L --no-write-lock-file --override-input gang-binaries") and contains("nix build -L --rebuild --no-write-lock-file --override-input gang-binaries"))] == [true])
     and ([$jobs.controller_image.steps[] | select((.uses // "") | startswith("actions/upload-artifact@")) | [.["if"], .with.name, (.with.path | contains("gang-controller.oci.tar"))]] == [["env.PUBLISH == '\''true'\''", "gang-controller", true]])
     and ([$jobs.publish.steps[] | select(.name == "Write SHA256SUMS") | .run | contains("sha256sum gang-*")] == [true])
     and ([$jobs.publish.steps[] | select(.with.name == "gang-controller") | .with.path] == ["dist"])

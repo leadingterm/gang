@@ -110,7 +110,7 @@ const DEFAULT_LEADERSHIP_TTL: NonZeroDuration = NonZeroDuration::from_secs(10);
 /// Default allowance for clock skew between controllers.
 const DEFAULT_LEADERSHIP_CLOCK_SKEW: Duration = Duration::from_secs(2);
 /// Default time allowed for a controller incarnation lookup.
-const DEFAULT_LEADERSHIP_HOST_CALL_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(10);
+const DEFAULT_LEADERSHIP_INCARNATION_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(10);
 /// Default interval between revocation refreshes.
 const DEFAULT_REVOCATION_REFRESH_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(5);
 /// Default maximum graceful shutdown duration.
@@ -130,7 +130,7 @@ pub struct LeadershipConfig {
     /// Minimum validity required before a provisioner mutation. Defaults to one second.
     pub call_timeout: NonZeroDuration,
     /// Timeout for incarnation lookup, independent of lease timing. Defaults to ten seconds.
-    pub host_call_timeout: NonZeroDuration,
+    pub incarnation_timeout: NonZeroDuration,
     /// Allowance for clock skew. Defaults to two seconds.
     #[serde(with = "gang_types::duration")]
     pub clock_skew: Duration,
@@ -146,7 +146,7 @@ impl Default for LeadershipConfig {
             call_timeout: NonZeroDuration::from_secs(
                 gang_types::handover::DEFAULT_CALL_TIMEOUT.as_secs(),
             ),
-            host_call_timeout: DEFAULT_LEADERSHIP_HOST_CALL_TIMEOUT,
+            incarnation_timeout: DEFAULT_LEADERSHIP_INCARNATION_TIMEOUT,
             clock_skew: DEFAULT_LEADERSHIP_CLOCK_SKEW,
         }
     }
@@ -433,17 +433,17 @@ mod tests {
     }
 
     #[test]
-    fn leadership_host_timeout_defaults_and_round_trips() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn leadership_incarnation_timeout_defaults_and_round_trips()
+    -> Result<(), Box<dyn std::error::Error>> {
         let default: ServerConfig = toml::from_str("transport = 'plaintext'")?;
         assert_eq!(
-            default.leadership.host_call_timeout.get(),
+            default.leadership.incarnation_timeout.get(),
             std::time::Duration::from_secs(10)
         );
         let config: ServerConfig =
-            toml::from_str("transport = 'plaintext'\n[leadership]\nhost_call_timeout = '25s'")?;
+            toml::from_str("transport = 'plaintext'\n[leadership]\nincarnation_timeout = '25s'")?;
         assert_eq!(
-            config.leadership.host_call_timeout.get(),
+            config.leadership.incarnation_timeout.get(),
             std::time::Duration::from_secs(25)
         );
         assert_eq!(
@@ -452,7 +452,7 @@ mod tests {
         );
         assert!(
             toml::from_str::<ServerConfig>(
-                "transport = 'plaintext'\n[leadership]\nhost_call_timeout = '0s'"
+                "transport = 'plaintext'\n[leadership]\nincarnation_timeout = '0s'"
             )
             .is_err()
         );

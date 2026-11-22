@@ -105,8 +105,8 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
         self.config.call_timeout.get()
     }
 
-    pub(crate) fn host_call_timeout(&self) -> Duration {
-        self.config.host_call_timeout.get()
+    pub(crate) fn incarnation_timeout(&self) -> Duration {
+        self.config.incarnation_timeout.get()
     }
 
     pub(crate) fn protection_ttl(&self) -> Duration {
