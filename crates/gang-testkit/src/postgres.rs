@@ -506,8 +506,8 @@ impl PostgresServer {
     }
 }
 
-/// A scanned Linux proc entry, possibly unrelated to PostgreSQL, can be reaped
-/// after its stat file is opened, causing the subsequent read to return ESRCH.
+/// A Linux `/proc` entry can disappear between opening and reading `stat`.
+/// The process may be unrelated to `PostgreSQL`; a reaped entry returns `ESRCH`.
 #[cfg(target_os = "linux")]
 fn process_vanished(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound
