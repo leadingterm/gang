@@ -23,24 +23,40 @@ alias(
 )
 
 alias(
-    name = "previous_gang",
+    name = "v035_gang",
     actual = select({
-        "//bazel/platforms:linux_x86_64": "@gang_v036_linux_x86_64//file:gang",
-        "//bazel/platforms:linux_arm64": "@gang_v036_linux_arm64//file:gang",
+        "//bazel/platforms:linux_x86_64": "@gang_v035_linux_x86_64//file:gang",
+        "//bazel/platforms:linux_arm64": "@gang_v035_linux_arm64//file:gang",
     }),
     target_compatible_with = ["@platforms//os:linux"],
 )
 
 upgrade_fixture(
-    name = "v036_fixture",
-    srcs = ["@gang_v036_source//:sources"],
-    source_root = "@gang_v036_source//:Cargo.toml",
+    name = "v035_fixture",
+    srcs = ["@gang_v035_source//:sources"],
+    source_root = "@gang_v035_source//:Cargo.toml",
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+alias(
+    name = "previous_gang",
+    actual = select({
+        "//bazel/platforms:linux_x86_64": "@gang_v037_linux_x86_64//file:gang",
+        "//bazel/platforms:linux_arm64": "@gang_v037_linux_arm64//file:gang",
+    }),
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+upgrade_fixture(
+    name = "v037_fixture",
+    srcs = ["@gang_v037_source//:sources"],
+    source_root = "@gang_v037_source//:Cargo.toml",
     target_compatible_with = ["@platforms//os:linux"],
 )
 
 alias(
     name = "previous_fixture",
-    actual = ":v036_fixture",
+    actual = ":v037_fixture",
     target_compatible_with = ["@platforms//os:linux"],
 )
 
@@ -166,6 +182,8 @@ e2e_bundle(
     previous_fixture = ":previous_fixture",
     previous_gang = ":previous_gang",
     target_compatible_with = ["@platforms//os:linux"],
+    v035_fixture = ":v035_fixture",
+    v035_gang = ":v035_gang",
 )
 
 workspace_rust_binary(

@@ -24,6 +24,12 @@ tofu() {
 }
 timeout() {
   [[ $1 == --signal=KILL && $2 -gt 0 && $3 == aws && $4 == --cli-connect-timeout && $5 == "$2" && $6 == --cli-read-timeout && $7 == "$2" ]] || return 1
+  if [[ $CASE == hung_refresh && $* == *describe-instance-refreshes* ]]; then
+    [[ $2 == 600 ]] || return 1
+    echo 600 >"$CLOCK"
+    echo 'fixture refresh read timed out' >&2
+    return 124
+  fi
   if [[ $CASE == cli_timeout || ( $CASE == timeout_ssm_send && $* == *'ssm send-command'* ) || ( $CASE == timeout_ssm_invocation && $* == *'ssm get-command-invocation'* ) ]]; then
     echo 'fixture CLI timed out' >&2
     return 124
@@ -32,7 +38,9 @@ timeout() {
   "$@"
 }
 aws() {
-  [[ $AWS_RETRY_MODE == standard && $AWS_MAX_ATTEMPTS == 3 ]] || return 1
+  [[ $AWS_RETRY_MODE == standard ]] || return 1
+  if [[ $* == *cancel-instance-refresh* ]]; then [[ $AWS_MAX_ATTEMPTS == 1 ]] || return 1
+  else [[ $AWS_MAX_ATTEMPTS == 3 ]] || return 1; fi
   [[ $1 == --cli-connect-timeout && $3 == --cli-read-timeout && $2 == "$4" && $2 -gt 0 ]] || return 1
   printf '%s\n' "$2" >>"$TIMEOUTS"
   shift 4
@@ -45,7 +53,7 @@ aws() {
     *'ssm send-command --instance-ids i-worker-one '*) site=ssm_send ;;
     *'ssm get-command-invocation '*' --instance-id i-worker-one '*) site=ssm_invocation ;;
   esac
-  if [[ ( $CASE == global_worker || $CASE == global_ssm_send || $CASE == global_ssm_invocation ) && $* == *describe-target-health*arn:two* ]]; then echo 2397 >"$CLOCK"; fi
+  if [[ $CASE == "global_$site" && ( $site == worker || $site == ssm_send || $site == ssm_invocation ) && $(<"$CLOCK") -lt 2397 ]]; then echo 2397 >"$CLOCK"; fi
   if [[ $CASE == boundary_refresh && $site == refresh || $CASE == boundary_controller && $site == controller || $CASE == boundary_target && $site == target ]]; then
     echo 2397 >"$CLOCK"
   elif [[ $CASE == boundary_worker && $site == worker ]]; then
@@ -75,12 +83,42 @@ aws() {
   case "$*" in
     '--region region-1 autoscaling describe-instance-refreshes --auto-scaling-group-name controller --max-records 1 --no-paginate --output json')
       if [[ $CASE == aws_failure ]]; then return 1; fi
-      if [[ $CASE == refresh_failed ]]; then echo '{"InstanceRefreshes":[{"Status":"Failed","StatusReason":"fixture failure"}]}'; elif [[ $CASE == boundary_refresh ]]; then echo '{"InstanceRefreshes":[{"Status":"InProgress"}]}'; else echo '{"InstanceRefreshes":[{"Status":"Successful"}]}'; fi ;;
+      if [[ $CASE == refresh_failed ]]; then
+        echo '{"InstanceRefreshes":[{"Status":"Failed","StatusReason":"fixture failure"}]}'
+      elif [[ $CASE == none_unhealthy ]]; then
+        : >"$PENDING_MARKER-inactive"
+        echo '{"InstanceRefreshes":[]}'
+      elif [[ $CASE == already_cancelling ]]; then
+        echo '{"InstanceRefreshes":[{"Status":"Cancelling"}]}'
+      elif [[ $CASE == rollback_success || $CASE == rollback_failure ]]; then
+        if [[ ! -e $PENDING_MARKER-rollback-progress ]]; then
+          : >"$PENDING_MARKER-rollback-progress"
+          echo '{"InstanceRefreshes":[{"Status":"RollbackInProgress","StatusReason":"rollback underway"}]}'
+        elif [[ $CASE == rollback_failure ]]; then
+          echo '{"InstanceRefreshes":[{"Status":"RollbackFailed","StatusReason":"fixture rollback failed"}]}'
+        else
+          echo '{"InstanceRefreshes":[{"Status":"RollbackSuccessful","StatusReason":"fixture rollback complete"}]}'
+        fi
+      elif [[ $CASE == cancel_success || $CASE == cancel_failure || $CASE == long_drain || $CASE == pending_proceed || $CASE == active_second_unhealthy || $CASE == boundary_refresh ]]; then
+        if [[ ( $CASE == long_drain || $CASE == pending_proceed ) && $(<"$CLOCK") -ge 605 ]]; then
+          : >"$PENDING_MARKER-inactive"
+          echo '{"InstanceRefreshes":[{"Status":"Successful"}]}'
+        else
+          printf '{"InstanceRefreshes":[{"Status":"InProgress","InstanceRefreshId":"refresh-1","PercentageComplete":%s}]}\n' "$(( $(<"$CLOCK") > 0 ? 50 : 0 ))"
+        fi
+      else : >"$PENDING_MARKER-inactive"; echo '{"InstanceRefreshes":[{"Status":"Successful"}]}'; fi ;;
+    '--region region-1 autoscaling cancel-instance-refresh --auto-scaling-group-name controller --output json')
+      if [[ -e $PENDING_MARKER-inactive ]]; then echo 'An error occurred (ActiveInstanceRefreshNotFound) when calling CancelInstanceRefresh' >&2; return 254; fi
+      if [[ $CASE == cancel_failure ]]; then echo 'fixture cancellation denied' >&2; return 253; fi
+      : >"$PENDING_MARKER-cancel"
+      echo '{"InstanceRefreshId":"refresh-1"}' ;;
     '--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names controller --output json')
-      local version=7 lifecycle=InService
+      local version=7 old_version=7 lifecycle=InService
       if [[ $CASE == old_template || $CASE == boundary_controller ]]; then version=6; fi
+      if [[ $CASE == cancel_success || $CASE == cancel_failure || ( ( $CASE == long_drain || $CASE == pending_proceed ) && $(<"$CLOCK") -lt 605 ) ]]; then old_version=6; fi
+      if [[ $CASE == pending_proceed && $(<"$CLOCK") -lt 605 ]]; then lifecycle=Pending:Proceed; fi
       if [[ $CASE == controller_terminating && ! -e $PENDING_MARKER-controller ]]; then lifecycle=Terminating; : >"$PENDING_MARKER-controller"; fi
-      printf '{"AutoScalingGroups":[{"AutoScalingGroupName":"controller","DesiredCapacity":2,"LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"7"},"Instances":[{"InstanceId":"i-one","HealthStatus":"Healthy","LifecycleState":"InService","LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"7"}},{"InstanceId":"i-two","HealthStatus":"Healthy","LifecycleState":"%s","LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"%s"}}]}]}\n' "$lifecycle" "$version" ;;
+      printf '{"AutoScalingGroups":[{"AutoScalingGroupName":"controller","DesiredCapacity":2,"LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"7"},"Instances":[{"InstanceId":"i-one","HealthStatus":"Healthy","LifecycleState":"InService","LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"%s"}},{"InstanceId":"i-two","HealthStatus":"Healthy","LifecycleState":"%s","LaunchTemplate":{"LaunchTemplateId":"lt-one","Version":"%s"}}]}]}\n' "$old_version" "$lifecycle" "$version" ;;
     '--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-one --output json'|'--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-two --output json')
       if [[ $CASE == worker_missing ]]; then echo '{"AutoScalingGroups":[]}'; return; fi
       local name=${6} state=Healthy desired=1 lifecycle=InService instance="i-${6}"
@@ -144,7 +182,9 @@ aws() {
       printf '%s\n' '{"Status":"Success","ResponseCode":0,"StandardOutputContent":"gang 1.2.3\n"}' ;;
     '--region region-1 elbv2 describe-target-health --target-group-arn arn:one --output json'|'--region region-1 elbv2 describe-target-health --target-group-arn arn:two --output json')
       local leader=healthy
-      if [[ $CASE == unhealthy || $CASE == boundary_target ]]; then leader=unhealthy; fi
+      if [[ $CASE == unhealthy || $CASE == none_unhealthy || $CASE == boundary_target ]]; then leader=unhealthy; fi
+      if [[ ( $CASE == second_target_unhealthy || $CASE == active_second_unhealthy ) && $* == *arn:two* ]]; then leader=unhealthy; fi
+      if [[ ( $CASE == long_drain || $CASE == pending_proceed ) && $(<"$CLOCK") -lt 605 ]]; then echo '{"TargetHealthDescriptions":[{"Target":{"Id":"i-one"},"TargetHealth":{"State":"unhealthy"}},{"Target":{"Id":"i-two"},"TargetHealth":{"State":"healthy"}}]}'; return; fi
       if [[ $CASE == sqlite_lb ]]; then echo '{"TargetHealthDescriptions":[{"Target":{"Id":"i-one"},"TargetHealth":{"State":"healthy"}}]}'; return; fi
       printf '{"TargetHealthDescriptions":[{"Target":{"Id":"i-one"},"TargetHealth":{"State":"%s"}},{"Target":{"Id":"i-two"},"TargetHealth":{"State":"unhealthy","Reason":"Target.FailedHealthChecks","Description":"Health checks failed"}}]}\n' "$leader" ;;
     *) return 1 ;;
@@ -189,7 +229,10 @@ sleep() {
   local now
   now=$(<"$CLOCK")
   case $CASE in
-    unhealthy|old_template|worker_short|worker_missing_pid|worker_missing_output|worker_ssm_failure) now=$((now + 2401)) ;;
+    unhealthy|none_unhealthy|old_template|second_target_unhealthy|active_second_unhealthy|already_cancelling) now=600 ;;
+    worker_short|worker_missing_pid|worker_missing_output|worker_ssm_failure) now=$((now + 2401)) ;;
+    cancel_success|cancel_failure|long_drain|pending_proceed)
+      if [[ $(<"$CLOCK") == 0 ]]; then now=300; elif [[ $(<"$CLOCK") == 300 ]]; then now=600; else now=$((now + $1)); fi ;;
     worker_mixed) if [[ -e $PENDING_MARKER-old ]]; then now=$((now + 2401)); else now=$((now + $1)); fi ;;
     worker_delayed_rollover)
       if [[ -e $PENDING_MARKER-rollover && ! -e $PENDING_MARKER-elapsed ]]; then
@@ -202,7 +245,7 @@ sleep() {
   echo "$now" >"$CLOCK"
 }
 export -f tofu aws gang openssl curl sleep date timeout
-for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unhealthy old_template controller_terminating missing aws_failure refresh_failed worker_missing worker_unhealthy worker_short worker_pending worker_pending_long worker_terminating worker_zero worker_mixed worker_missing_pid worker_missing_output worker_replacement worker_delayed_rollover worker_pending_replacement worker_appearing worker_terminating_mixed worker_ssm_pending worker_invocation_missing worker_registration_pending worker_ssm_failure worker_send_failure worker_invocation_failure boundary_refresh boundary_controller boundary_target boundary_worker throttle_refresh throttle_controller throttle_target throttle_worker throttle_ssm_send throttle_ssm_invocation global_exhaust worker_exhaust global_worker global_ssm_send global_ssm_invocation expired worker_expired permanent permanent_ssm_send permanent_ssm_invocation late late_ssm_send late_ssm_invocation cli_timeout timeout_ssm_send timeout_ssm_invocation; do
+for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unhealthy none_unhealthy old_template second_target_unhealthy active_second_unhealthy already_cancelling controller_terminating missing aws_failure refresh_failed rollback_success rollback_failure cancel_success cancel_failure hung_refresh long_drain pending_proceed worker_missing worker_unhealthy worker_short worker_pending worker_pending_long worker_terminating worker_zero worker_mixed worker_missing_pid worker_missing_output worker_replacement worker_delayed_rollover worker_pending_replacement worker_appearing worker_terminating_mixed worker_ssm_pending worker_invocation_missing worker_registration_pending worker_ssm_failure worker_send_failure worker_invocation_failure boundary_refresh boundary_controller boundary_target boundary_worker throttle_refresh throttle_controller throttle_target throttle_worker throttle_ssm_send throttle_ssm_invocation global_exhaust worker_exhaust global_worker global_ssm_send global_ssm_invocation expired worker_expired permanent permanent_ssm_send permanent_ssm_invocation late late_ssm_send late_ssm_invocation cli_timeout timeout_ssm_send timeout_ssm_invocation; do
   : >"$CALLS"
   : >"$CURL_CALLS"
   echo 0 >"$CLOCK"
@@ -212,20 +255,53 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
   rm -f "$PENDING_MARKER"-*
   status=0
   (cd "$scratch" && bash --noprofile --norc -euo pipefail "$scratch/step") >"$scratch/out" 2>&1 || status=$?
-  case $CASE in healthy|sqlite|sqlite_lb|controller_terminating|worker_pending|worker_pending_long|worker_terminating|worker_zero|worker_replacement|worker_delayed_rollover|worker_pending_replacement|worker_appearing|worker_terminating_mixed|worker_ssm_pending|worker_invocation_missing|worker_registration_pending|throttle_*) [[ $status == 0 ]] ;; *) [[ $status != 0 ]] ;; esac
+  case $CASE in healthy|sqlite|sqlite_lb|long_drain|pending_proceed|controller_terminating|worker_pending|worker_pending_long|worker_terminating|worker_zero|worker_replacement|worker_delayed_rollover|worker_pending_replacement|worker_appearing|worker_terminating_mixed|worker_ssm_pending|worker_invocation_missing|worker_registration_pending|throttle_*) [[ $status == 0 ]] ;; *) [[ $status != 0 ]] ;; esac
   case $CASE in
     healthy) [[ $(grep -c -- '--region region-1 ssm send-command' "$CALLS") -eq 2 ]] && grep -Fx -- '--region region-1 elbv2 describe-target-health --target-group-arn arn:one --output json' "$CALLS" >/dev/null && grep -Fx -- '--region region-1 elbv2 describe-target-health --target-group-arn arn:two --output json' "$CALLS" >/dev/null && grep -Fx -- '--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-two --output json' "$CALLS" >/dev/null ;;
     sqlite) [[ ! -s $CALLS ]] ;;
-    unhealthy|boundary_target)
-      grep -F '::error::controller targets did not reach leader/passive readiness in arn:one' "$scratch/out" >/dev/null
-      grep -F '"State":"unhealthy"' "$scratch/out" >/dev/null ;;
-    old_template|boundary_controller)
-      grep -F '::error::controller Auto Scaling group controller is not healthy on its current launch template' "$scratch/out" >/dev/null
-      grep -F '"Version":"6"' "$scratch/out" >/dev/null ;;
+    boundary_refresh|hung_refresh)
+      [[ $(grep -c -- 'autoscaling cancel-instance-refresh' "$CALLS") -eq 1 ]]
+      grep -F 'no serving incoming controller after 600 seconds' "$scratch/out" >/dev/null
+      grep -F 'instance refresh cancellation requested (not rolled back)' "$scratch/out" >/dev/null ;;
+    unhealthy|none_unhealthy|old_template|boundary_controller|boundary_target|second_target_unhealthy)
+      ! grep -F 'autoscaling cancel-instance-refresh' "$CALLS" >/dev/null
+      grep -F 'no serving incoming controller after 600 seconds' "$scratch/out" >/dev/null
+      grep -F 'no active instance refresh to cancel' "$scratch/out" >/dev/null ;;
+    already_cancelling)
+      ! grep -F 'autoscaling cancel-instance-refresh' "$CALLS" >/dev/null
+      grep -F 'instance refresh is already cancelling' "$scratch/out" >/dev/null ;;
+    active_second_unhealthy)
+      [[ $(grep -c -- 'autoscaling cancel-instance-refresh' "$CALLS") -eq 1 && $(<"$CLOCK") == 600 ]]
+      grep -F -- 'describe-target-health --target-group-arn arn:one' "$CALLS" >/dev/null
+      grep -F -- 'describe-target-health --target-group-arn arn:two' "$CALLS" >/dev/null
+      grep -F 'no serving incoming controller after 600 seconds' "$scratch/out" >/dev/null ;;
     wrong_pin) grep -F 'controller CA pin mismatch' "$scratch/out" >/dev/null && [[ $(wc -l <"$CURL_CALLS") -eq 1 ]] ;;
     aws_failure) grep -F '::error::failed to describe controller instance refreshes' "$scratch/out" >/dev/null ;;
     refresh_failed) grep -F 'controller instance refresh Failed: fixture failure' "$scratch/out" >/dev/null ;;
-    boundary_refresh) grep -F '::error::controller instance refresh timed out: InProgress' "$scratch/out" >/dev/null ;;
+    rollback_success|rollback_failure)
+      [[ -e $PENDING_MARKER-rollback-progress ]]
+      grep -F 'controller instance refresh RollbackInProgress' "$scratch/out" >/dev/null
+      if [[ $CASE == rollback_success ]]; then
+        grep -F 'RollbackSuccessful (deployment rolled back)' "$scratch/out" >/dev/null
+        grep -F 'fixture rollback complete' "$scratch/out" >/dev/null
+      else
+        grep -F 'RollbackFailed (rollback failure)' "$scratch/out" >/dev/null
+        grep -F 'fixture rollback failed' "$scratch/out" >/dev/null
+      fi
+      ! grep -E 'complete-lifecycle-action|cancel-instance-refresh|rollback-instance-refresh|terminate-instance-in-auto-scaling-group' "$CALLS" >/dev/null ;;
+    cancel_success|cancel_failure)
+      [[ $(grep -c -- 'autoscaling cancel-instance-refresh' "$CALLS") -eq 1 && $(<"$CLOCK") -eq 600 ]]
+      grep -F 'no serving incoming controller after 600 seconds' "$scratch/out" >/dev/null
+      if [[ $CASE == cancel_success ]]; then
+        [[ -e $PENDING_MARKER-cancel ]]
+        grep -F 'instance refresh cancellation requested (not rolled back)' "$scratch/out" >/dev/null
+      else
+        grep -F 'failed to request instance refresh cancellation' "$scratch/out" >/dev/null
+      fi
+      ! grep -E 'complete-lifecycle-action|rollback-instance-refresh|terminate-instance-in-auto-scaling-group' "$CALLS" >/dev/null ;;
+    long_drain|pending_proceed)
+      [[ $(<"$CLOCK") -ge 605 ]]
+      ! grep -F 'autoscaling cancel-instance-refresh' "$CALLS" >/dev/null ;;
     wrong) grep -F 'server version mismatch: expected 1.2.3, observed 0.0.0' "$scratch/out" >/dev/null ;;
     no_version) grep -F 'server response has no version' "$scratch/out" >/dev/null ;;
     http_failure) grep -F 'failed to query server version' "$scratch/out" >/dev/null ;;
@@ -242,7 +318,11 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
       else
         [[ $(<"$ATTEMPTS") == 8 ]]
       fi
-      [[ $(<"$TIMEOUTS") == *$'2400\n2399\n2397\n2393\n2385\n2369\n2339\n2309'* ]]
+      if [[ $CASE == throttle_refresh || $CASE == throttle_controller || $CASE == throttle_target ]]; then
+        [[ $(<"$TIMEOUTS") == *$'600\n599\n597\n593\n585\n569\n539\n509'* ]]
+      else
+        [[ $(<"$TIMEOUTS") == *$'2400\n2399\n2397\n2393\n2385\n2369\n2339\n2309'* ]]
+      fi
       [[ $(<"$SLEEPS") == $'1\n2\n4\n8\n16\n30\n30\n5\n5' ]]
       grep -F 'fixture throttle' "$scratch/out" >/dev/null
       ! grep -F 'partial output from failed AWS request' "$scratch/out" >/dev/null ;;
@@ -254,7 +334,7 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
       ! grep -F 'partial output from failed AWS request' "$scratch/out" >/dev/null ;;
     global_worker|global_ssm_send|global_ssm_invocation)
       [[ $(<"$ATTEMPTS") == 2 && $(<"$SLEEPS") == 1 && $(<"$CLOCK") == 2398 ]]
-      [[ $(<"$TIMEOUTS") == *$'\n3\n2' ]]
+      [[ $(<"$TIMEOUTS") == *$'\n2400\n2' ]]
       ! grep -F 'partial output from failed AWS request' "$scratch/out" >/dev/null ;;
     expired|worker_expired)
       [[ $(<"$ATTEMPTS") == 1 && ! -s $SLEEPS ]]
@@ -287,13 +367,11 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
     worker_registration_pending)
       [[ -e $PENDING_MARKER-registration && $(<"$CLOCK") == 2395 && $(<"$SLEEPS") == $'5\n5\n5' ]]
       [[ $(grep -c -- 'ssm send-command --instance-ids i-worker-one ' "$CALLS") -eq 2 && $(grep -c -- 'ssm get-command-invocation .* --instance-id i-worker-one ' "$CALLS") -eq 1 ]]
-      [[ $(<"$TIMEOUTS") == $'2400\n2400\n2400\n2400\n2400\n2400\n15\n15\n15\n10\n10\n10\n10\n5' ]]
+      [[ $(<"$TIMEOUTS") == $'600\n600\n600\n600\n2400\n2400\n15\n15\n15\n10\n10\n10\n10\n5' ]]
       grep -F 'An error occurred (InvalidInstanceId) when calling the SendCommand operation' "$scratch/out" >/dev/null ;;
   esac
   case $CASE in
-    boundary_refresh) expected_calls=1 ;;
-    boundary_controller) expected_calls=2 ;;
-    boundary_target) expected_calls=3 ;;
+    boundary_refresh|boundary_controller|boundary_target) continue ;;
     boundary_worker) expected_calls=5 ;;
     *) continue ;;
   esac

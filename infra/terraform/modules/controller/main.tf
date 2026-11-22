@@ -221,8 +221,9 @@ resource "aws_autoscaling_group" "controller" {
   instance_refresh {
     strategy = "Rolling"
     preferences {
-      min_healthy_percentage = 100
-      max_healthy_percentage = 200
+      min_healthy_percentage       = 100
+      max_healthy_percentage       = 200
+      scale_in_protected_instances = "Refresh"
       # Launch lifecycle completion follows promotion; do not add platform warmup.
       instance_warmup = 0
     }

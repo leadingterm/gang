@@ -7,8 +7,9 @@ use futures::{pin_mut, poll};
 use gang_clock::{Clock, TestClock, Timestamp};
 use gang_config::LeadershipConfig;
 use gang_spi::{
-    Acquisition, ControllerHostIdentity, ControllerId, FleetSupply, Held, LeaderLeasePort, Lease,
-    LeaseCandidate, PortError, ProvisionerPort, RunError, Takeover, TerminationMode,
+    Acquisition, ControllerHostIdentity, ControllerHostPort, ControllerHostState, ControllerId,
+    FleetSupply, Held, HostMilestone, LeaderLeasePort, Lease, LeaseCandidate, PortError,
+    ProvisionerPort, RunError, Takeover, TerminationMode,
 };
 use gang_testkit::{FakeProvisioner, FakeRepository, Opaque, TestResult};
 use gang_types::{Fleet, FleetName, InstanceId, Isa, Resources};
@@ -106,6 +107,198 @@ async fn acquire<L: LeaderLeasePort>(
         .await
         .expect("active test host")
         .expect("active test host acquires")
+}
+
+#[derive(Clone, Copy)]
+enum FirstHostRead {
+    Unavailable,
+    Stalled,
+    ActiveThenStalled,
+}
+
+struct RecoveringHost {
+    inner: FakeProvisioner,
+    first: FirstHostRead,
+    calls: AtomicUsize,
+}
+
+impl ControllerHostPort for RecoveringHost {
+    async fn state(&self) -> Result<ControllerHostState, PortError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            match self.first {
+                FirstHostRead::Unavailable => {
+                    return Err(PortError::unavailable("host unavailable"));
+                }
+                FirstHostRead::Stalled => return std::future::pending().await,
+                FirstHostRead::ActiveThenStalled => return Ok(ControllerHostState::Active),
+            }
+        }
+        if matches!(self.first, FirstHostRead::ActiveThenStalled) {
+            return std::future::pending().await;
+        }
+        self.inner.state().await
+    }
+
+    async fn drain_limit(&self) -> Result<Option<Duration>, PortError> {
+        self.inner.drain_limit().await
+    }
+
+    async fn heartbeat(&self) -> Result<(), PortError> {
+        self.inner.heartbeat().await
+    }
+
+    async fn incarnation(&self) -> Result<ControllerHostIdentity, PortError> {
+        self.inner.incarnation().await
+    }
+
+    async fn retiring(&self) -> Result<(), PortError> {
+        self.inner.retiring().await
+    }
+
+    async fn reached(&self, milestone: HostMilestone) -> Result<(), PortError> {
+        self.inner.reached(milestone).await
+    }
+}
+
+#[derive(Default)]
+struct CountingLease {
+    repository: FakeRepository,
+    calls: AtomicUsize,
+}
+
+impl LeaderLeasePort for CountingLease {
+    async fn register_candidate(
+        &self,
+        holder: &ControllerId,
+        host: &ControllerHostIdentity,
+    ) -> Result<LeaseCandidate, PortError> {
+        self.repository.register_candidate(holder, host).await
+    }
+
+    async fn acquire(
+        &self,
+        candidate: &LeaseCandidate,
+        now: Timestamp,
+        stale_before: Timestamp,
+        expires_at: Timestamp,
+        takeover: Takeover,
+    ) -> Result<Acquisition, PortError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.repository
+            .acquire(candidate, now, stale_before, expires_at, takeover)
+            .await
+    }
+
+    async fn renew(
+        &self,
+        lease: &Lease,
+        now: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<gang_spi::Renewal, PortError> {
+        self.repository.renew(lease, now, expires_at).await
+    }
+
+    async fn release(&self, lease: &Lease) -> Result<(), PortError> {
+        self.repository.release(lease).await
+    }
+}
+
+#[tokio::test]
+async fn unavailable_host_read_retries_without_requesting_takeover() {
+    let lease = CountingLease::default();
+    let clock = clock();
+    let id = ControllerId::new("first");
+    let leader = Leadership::new(&lease, &clock, &id, timing());
+    let host = RecoveringHost {
+        inner: FakeProvisioner::default(),
+        first: FirstHostRead::Unavailable,
+        calls: AtomicUsize::new(0),
+    };
+    let candidate = candidate(&id);
+    let acquire = leader.acquire(&candidate, &host);
+    pin_mut!(acquire);
+
+    assert!(poll!(acquire.as_mut()).is_pending());
+    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(lease.calls.load(Ordering::SeqCst), 0);
+    clock.advance(RENEW);
+    assert!(matches!(poll!(acquire.as_mut()), Poll::Ready(Ok(Some(_)))));
+    assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(lease.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn timed_out_host_read_retries_without_requesting_takeover() -> TestResult {
+    let lease = CountingLease::default();
+    let clock = clock();
+    let id = ControllerId::new("first");
+    let config = timing();
+    let host_timeout = config.host_call_timeout.get();
+    let leader = Leadership::new(&lease, &clock, &id, config);
+    let host = RecoveringHost {
+        inner: FakeProvisioner::default(),
+        first: FirstHostRead::Stalled,
+        calls: AtomicUsize::new(0),
+    };
+    let candidate = candidate(&id);
+    let acquire = leader.acquire(&candidate, &host);
+    pin_mut!(acquire);
+
+    assert!(poll!(acquire.as_mut()).is_pending());
+    clock.advance(RENEW);
+    assert!(poll!(acquire.as_mut()).is_pending());
+    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(lease.calls.load(Ordering::SeqCst), 0);
+    clock.advance(
+        host_timeout
+            .checked_sub(RENEW)
+            .ok_or("host timeout shorter than renew interval")?,
+    );
+    assert!(poll!(acquire.as_mut()).is_pending());
+    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(lease.calls.load(Ordering::SeqCst), 0);
+    clock.advance(RENEW);
+    assert!(matches!(poll!(acquire.as_mut()), Poll::Ready(Ok(Some(_)))));
+    assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(lease.calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn contender_acquires_released_lease_without_another_host_read() -> TestResult {
+    let lease = CountingLease::default();
+    let clock = clock();
+    let old_id = ControllerId::new("old");
+    let new_id = ControllerId::new("new");
+    let old = Leadership::new(&lease, &clock, &old_id, timing());
+    let new = Leadership::new(&lease, &clock, &new_id, timing());
+    let old_candidate = old.register_candidate(&host("old")?).await?;
+    let new_candidate = new.register_candidate(&host("new")?).await?;
+    let old_host = FakeProvisioner::default();
+    let old_lease = old
+        .acquire(&old_candidate, &old_host)
+        .await?
+        .ok_or("old retired")?;
+    let new_host = RecoveringHost {
+        inner: FakeProvisioner::default(),
+        first: FirstHostRead::ActiveThenStalled,
+        calls: AtomicUsize::new(0),
+    };
+    let attempt = new.acquire(&new_candidate, &new_host);
+    pin_mut!(attempt);
+    assert!(poll!(attempt.as_mut()).is_pending());
+    assert_eq!(lease.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(new_host.calls.load(Ordering::SeqCst), 1);
+
+    old.release(&old_lease).await;
+    clock.advance(RENEW);
+    let Poll::Ready(Ok(Some(acquired))) = poll!(attempt.as_mut()) else {
+        panic!("contender must acquire at the next database attempt");
+    };
+    assert_eq!(acquired.holder, new_id);
+    assert_eq!(lease.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(new_host.calls.load(Ordering::SeqCst), 1);
+    Ok(())
 }
 
 struct StalledLease {

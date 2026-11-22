@@ -120,8 +120,8 @@ run "group_resources_and_permissions" {
   }
 
   assert {
-    condition     = aws_autoscaling_group.controller[0].instance_refresh[0].strategy == "Rolling" && aws_autoscaling_group.controller[0].instance_refresh[0].preferences[0].min_healthy_percentage == 100 && aws_autoscaling_group.controller[0].instance_refresh[0].preferences[0].max_healthy_percentage == 200
-    error_message = "Group refresh must roll with 100 to 200 percent healthy capacity."
+    condition     = aws_autoscaling_group.controller[0].instance_refresh[0].strategy == "Rolling" && aws_autoscaling_group.controller[0].instance_refresh[0].preferences[0].min_healthy_percentage == 100 && aws_autoscaling_group.controller[0].instance_refresh[0].preferences[0].max_healthy_percentage == 200 && aws_autoscaling_group.controller[0].instance_refresh[0].preferences[0].scale_in_protected_instances == "Refresh"
+    error_message = "Group refresh must retain 100 to 200 percent healthy capacity and automatically refresh scale-in-protected controllers."
   }
 
   assert {

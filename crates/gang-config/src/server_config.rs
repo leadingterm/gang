@@ -109,6 +109,8 @@ const DEFAULT_HEALTH_MAX_HEADER_SIZE: Bytes = Bytes::kib(8);
 const DEFAULT_LEADERSHIP_TTL: NonZeroDuration = NonZeroDuration::from_secs(10);
 /// Default allowance for clock skew between controllers.
 const DEFAULT_LEADERSHIP_CLOCK_SKEW: Duration = Duration::from_secs(2);
+/// Default time allowed for a controller host operation.
+const DEFAULT_LEADERSHIP_HOST_CALL_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(10);
 /// Default interval between revocation refreshes.
 const DEFAULT_REVOCATION_REFRESH_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(5);
 
@@ -125,6 +127,8 @@ pub struct LeadershipConfig {
     pub renew_interval: NonZeroDuration,
     /// Minimum validity required before a provisioner mutation. Defaults to one second.
     pub call_timeout: NonZeroDuration,
+    /// Timeout for host operations, independent of lease timing. Defaults to ten seconds.
+    pub host_call_timeout: NonZeroDuration,
     /// Allowance for clock skew. Defaults to two seconds.
     #[serde(with = "gang_types::duration")]
     pub clock_skew: Duration,
@@ -140,6 +144,7 @@ impl Default for LeadershipConfig {
             call_timeout: NonZeroDuration::from_secs(
                 gang_types::handover::DEFAULT_CALL_TIMEOUT.as_secs(),
             ),
+            host_call_timeout: DEFAULT_LEADERSHIP_HOST_CALL_TIMEOUT,
             clock_skew: DEFAULT_LEADERSHIP_CLOCK_SKEW,
         }
     }
@@ -392,6 +397,33 @@ mod tests {
         assert_eq!(
             toml::from_str::<ServerConfig>(&toml::to_string(&config)?)?,
             config
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn leadership_host_timeout_defaults_and_round_trips() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let default: ServerConfig = toml::from_str("transport = 'plaintext'")?;
+        assert_eq!(
+            default.leadership.host_call_timeout.get(),
+            std::time::Duration::from_secs(10)
+        );
+        let config: ServerConfig =
+            toml::from_str("transport = 'plaintext'\n[leadership]\nhost_call_timeout = '25s'")?;
+        assert_eq!(
+            config.leadership.host_call_timeout.get(),
+            std::time::Duration::from_secs(25)
+        );
+        assert_eq!(
+            toml::from_str::<ServerConfig>(&toml::to_string(&config)?)?,
+            config
+        );
+        assert!(
+            toml::from_str::<ServerConfig>(
+                "transport = 'plaintext'\n[leadership]\nhost_call_timeout = '0s'"
+            )
+            .is_err()
         );
         Ok(())
     }

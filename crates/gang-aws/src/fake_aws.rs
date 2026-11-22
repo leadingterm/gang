@@ -4,11 +4,12 @@
 //! the `IMDSv2` paths. Tests seed [`FakeState`], run the real SDK clients against
 //! [`FakeAws::sdk_config`], then inspect what the fake recorded.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aws_config::SdkConfig;
 use aws_credential_types::Credentials;
@@ -20,7 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use gang_clock::{TestClock, Timestamp};
+use gang_clock::{Clock, TestClock, Tick, Timestamp};
 use gang_types::NonZeroDuration;
 use p256::ecdsa::signature::{Signer as _, hazmat::PrehashSigner as _};
 use p256::ecdsa::{Signature, SigningKey};
@@ -243,6 +244,43 @@ pub(crate) enum TokenFailure {
     Timeout,
 }
 
+/// One account-wide Auto Scaling request-start window, shared by every client.
+#[derive(Debug, Clone)]
+pub(crate) struct AccountQuota {
+    clock: Arc<TestClock>,
+    capacity: usize,
+    window: Duration,
+    starts: Arc<Mutex<VecDeque<Tick>>>,
+}
+
+impl AccountQuota {
+    pub(crate) fn new(clock: Arc<TestClock>, capacity: usize, window: Duration) -> Self {
+        assert!(capacity > 0 && !window.is_zero());
+        Self {
+            clock,
+            capacity,
+            window,
+            starts: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    fn admit(&self) -> bool {
+        let now = self.clock.monotonic();
+        let mut starts = self.starts.lock();
+        while starts
+            .front()
+            .is_some_and(|start| now.saturating_duration_since(*start) >= self.window)
+        {
+            starts.pop_front();
+        }
+        if starts.len() == self.capacity {
+            return false;
+        }
+        starts.push_back(now);
+        true
+    }
+}
+
 /// Everything the fake answers from. Tests seed it and inspect `requests`.
 #[derive(Debug, Clone)]
 pub(crate) struct FakeState {
@@ -284,6 +322,15 @@ pub(crate) struct FakeState {
     pub(crate) token_started: Arc<tokio::sync::Notify>,
     /// Every request received, in order.
     pub(crate) requests: Vec<FakeRequest>,
+    /// Optional account-wide Auto Scaling quota and its rejected requests.
+    pub(crate) account_quota: Option<AccountQuota>,
+    pub(crate) throttled: Vec<FakeRequest>,
+    /// Signals every recorded request, including throttled attempts.
+    pub(crate) request_started: Arc<tokio::sync::Notify>,
+    /// Withhold one matching response after its effects are applied.
+    pub(crate) hold_response: Option<&'static str>,
+    pub(crate) response_held: Arc<tokio::sync::Notify>,
+    pub(crate) release_response: Arc<tokio::sync::Notify>,
     /// Clock to advance after the next protection write is answered.
     pub(crate) advance_after_protection: Option<Arc<TestClock>>,
     /// Scaling activities answered by `DescribeScalingActivities`, in the order they were recorded.
@@ -328,6 +375,12 @@ impl Default for FakeState {
             token_failure: None,
             token_started: Arc::new(tokio::sync::Notify::new()),
             requests: Vec::new(),
+            account_quota: None,
+            throttled: Vec::new(),
+            request_started: Arc::new(tokio::sync::Notify::new()),
+            hold_response: None,
+            response_held: Arc::new(tokio::sync::Notify::new()),
+            release_response: Arc::new(tokio::sync::Notify::new()),
             advance_after_protection: None,
             activities: Vec::new(),
             target_lifecycle_state: None,
@@ -566,6 +619,7 @@ fn dispatch(
         operation: operation.to_owned(),
         parameters: parameters.clone(),
     });
+    state.request_started.notify_one();
     if let Some(refusal) = denied.filter(|_| !GRANTED_ACTIONS.contains(&operation)) {
         return Err(refusal);
     }
@@ -601,7 +655,7 @@ async fn post_root(State(state): State<Shared>, headers: HeaderMap, body: Bytes)
             sqs(&state, target.to_str().unwrap_or_default(), &body)
         }
         Some(target) => kms(&state, target, &body),
-        None => query(&state, &body),
+        None => query(&state, &body).await,
     }
 }
 
@@ -653,9 +707,33 @@ fn sqs(state: &Shared, target: &str, body: &[u8]) -> Response {
             .into_response(),
     }
 }
-fn query(state: &Shared, body: &[u8]) -> Response {
+async fn query(state: &Shared, body: &[u8]) -> Response {
     let parameters = parse_form(body);
     let action = parameters.get("Action").cloned().unwrap_or_default();
+    let service = QueryService::of(&action);
+    {
+        let mut fake = state.lock();
+        if matches!(service, QueryService::AutoScaling)
+            && fake
+                .account_quota
+                .as_ref()
+                .is_some_and(|quota| !quota.admit())
+        {
+            let request = FakeRequest {
+                operation: action.clone(),
+                parameters: parameters.clone(),
+            };
+            fake.requests.push(request.clone());
+            fake.throttled.push(request);
+            fake.request_started.notify_one();
+            let failure = FakeFailure {
+                status: 400,
+                code: "Throttling",
+                message: "Rate exceeded",
+            };
+            return xml_response(status_of(failure.status), query_error(service, &failure));
+        }
+    }
     let outcome = dispatch(
         state,
         &action,
@@ -682,7 +760,19 @@ fn query(state: &Shared, body: &[u8]) -> Response {
             Ok(response)
         },
     );
-    let service = QueryService::of(&action);
+    let hold = {
+        let mut fake = state.lock();
+        if fake.hold_response == Some(action.as_str()) {
+            fake.hold_response = None;
+            fake.response_held.notify_one();
+            Some(Arc::clone(&fake.release_response))
+        } else {
+            None
+        }
+    };
+    if let Some(release) = hold {
+        release.notified().await;
+    }
     match outcome {
         Ok(xml) => xml_response(StatusCode::OK, xml),
         Err(failure) => xml_response(status_of(failure.status), query_error(service, &failure)),
@@ -1734,6 +1824,27 @@ fn lifecycle_completion_rejects_nonmatching_actions_and_invalid_results() {
     assert!(state.lifecycle_completions.is_empty());
     assert!(query_operation(&mut state, "CompleteLifecycleAction", &params).is_ok());
     assert_eq!(state.lifecycle_completions.len(), 1);
+}
+
+#[tokio::test]
+async fn account_quota_is_shared_across_endpoints_and_operations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let first = FakeAws::start().await?;
+    let second = FakeAws::start().await?;
+    let clock = Arc::new(TestClock::default());
+    let quota = AccountQuota::new(clock.clone(), 1, Duration::from_secs(1));
+    first.state().account_quota = Some(quota.clone());
+    second.state().account_quota = Some(quota);
+    let a = aws_sdk_autoscaling::Client::new(&first.sdk_config().await);
+    let b = aws_sdk_autoscaling::Client::new(&second.sdk_config().await);
+    a.describe_auto_scaling_groups().send().await?;
+    assert!(b.describe_scaling_activities().send().await.is_err());
+    assert_eq!(second.state().throttled.len(), 1);
+    clock.advance(Duration::from_secs(1));
+    b.describe_scaling_activities().send().await?;
+    assert!(a.describe_auto_scaling_groups().send().await.is_err());
+    assert_eq!(first.state().throttled.len(), 1);
+    Ok(())
 }
 
 // Real time, not paused: the 1 ms backoffs are real but tiny, and the verdict never depends on elapsed time.

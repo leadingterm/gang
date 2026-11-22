@@ -69,22 +69,115 @@ readiness_sleep() {
   (( $(date +%s) < end ))
 }
 
+cancel_unready_refresh() {
+  local failure_reason remaining
+  failure_reason="controller instance refresh${refresh_id:+ $refresh_id} has no serving incoming controller after 600 seconds"
+  if [[ $refresh_state == inactive ]]; then
+    echo "::error::$failure_reason; no active instance refresh to cancel" >&2; exit 1
+  fi
+  if [[ $refresh_state == cancelling ]]; then
+    echo "::error::$failure_reason; instance refresh is already cancelling" >&2; exit 1
+  fi
+  echo "::error::$failure_reason; requesting cancellation" >&2
+  remaining=$((deadline - $(date +%s)))
+  if (( remaining <= 0 )); then
+    echo '::error::controller instance refresh timed out before cancellation could be requested' >&2; exit 1
+  fi
+  if ! AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=1 timeout --signal=KILL "$remaining" aws --cli-connect-timeout "$remaining" --cli-read-timeout "$remaining" --region "$region" autoscaling cancel-instance-refresh --auto-scaling-group-name "$asg" --output json; then
+    echo "::error::$failure_reason; failed to request instance refresh cancellation" >&2; exit 1
+  fi
+  echo "::error::$failure_reason; instance refresh cancellation requested (not rolled back)" >&2
+  exit 1
+}
+
+controller_read() {
+  local end=$deadline
+  if [[ -z $serving ]] && (( startup_deadline < end )); then end=$startup_deadline; fi
+  if ! aws_read "$end" "$@"; then
+    if [[ -z $serving ]] && (( $(date +%s) >= startup_deadline )); then cancel_unready_refresh; fi
+    return 1
+  fi
+}
+
+controller_sleep() {
+  local end=$deadline
+  if [[ -z $serving ]] && (( startup_deadline < end )); then end=$startup_deadline; fi
+  if ! readiness_sleep "$end"; then
+    if [[ -z $serving ]] && (( $(date +%s) >= startup_deadline )); then cancel_unready_refresh; fi
+    return 1
+  fi
+}
+
 if [[ -n $asg ]]; then
+  refresh_id='' rollback_observed='' serving='' refresh_state=unknown
+  startup_deadline=$(($(date +%s) + 600))
   while :; do
-    if ! refresh=$(aws_read "$deadline" --region "$region" autoscaling describe-instance-refreshes --auto-scaling-group-name "$asg" --max-records 1 --no-paginate --output json); then
+    if ! refresh=$(controller_read --region "$region" autoscaling describe-instance-refreshes --auto-scaling-group-name "$asg" --max-records 1 --no-paginate --output json); then
       echo '::error::failed to describe controller instance refreshes' >&2; exit 1
     fi
     status=$(jq -er 'if (.InstanceRefreshes | type) != "array" then error("missing refreshes") elif .InstanceRefreshes | length == 0 then "None" else .InstanceRefreshes[0].Status | select(type == "string" and length > 0) end' <<<"$refresh")
     case $status in
+      None|Successful) refresh_state=inactive ;;
+      Cancelling|RollbackInProgress) refresh_state=cancelling ;;
+      Pending|InProgress|Baking) refresh_state=active ;;
+    esac
+    case $status in
       None|Successful) break ;;
-      Pending|InProgress|Baking|Cancelling|RollbackInProgress)
+      InProgress)
+        current_id=$(jq -er '.InstanceRefreshes[0].InstanceRefreshId | select(type == "string" and length > 0)' <<<"$refresh")
+        if [[ $current_id != "$refresh_id" ]]; then
+          refresh_id=$current_id
+        fi
+        if [[ -z $serving ]]; then
+          if ! groups=$(controller_read --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$asg" --output json); then
+            echo "::error::failed to describe controller Auto Scaling group $asg" >&2; exit 1
+          fi
+          if ! candidates=$(jq -ec --arg name "$asg" '
+            .AutoScalingGroups | select(type == "array" and length == 1 and .[0].AutoScalingGroupName == $name) | .[0]
+            | .LaunchTemplate as $template
+            | select(($template.LaunchTemplateId | type == "string" and length > 0) and ($template.Version | type == "string" and test("^[0-9]+$")) and (.Instances | type == "array"))
+            | [.Instances[] | select(.LaunchTemplate.LaunchTemplateId == $template.LaunchTemplateId and (.LaunchTemplate.Version | tostring) == $template.Version and (.LifecycleState == "Pending:Wait" or .LifecycleState == "Pending:Proceed" or .LifecycleState == "InService") and (.InstanceId | type == "string" and length > 0)) | .InstanceId]
+          ' <<<"$groups"); then
+            echo '::error::controller Auto Scaling group is missing its numeric launch template or instances' >&2; exit 1
+          fi
+          if [[ -z $targets ]]; then
+            echo '::error::controller target groups are missing during instance refresh' >&2; exit 1
+          fi
+          while IFS= read -r arn; do
+            if ! health=$(controller_read --region "$region" elbv2 describe-target-health --target-group-arn "$arn" --output json); then
+              echo "::error::failed to describe target health in $arn" >&2; exit 1
+            fi
+            if ! candidates=$(jq -ec --argjson ids "$candidates" '
+              .TargetHealthDescriptions | select(type == "array")
+              | [.[] | select(.TargetHealth.State == "healthy" and (.Target.Id as $id | $ids | index($id))) | .Target.Id]
+            ' <<<"$health"); then
+              echo "::error::invalid target health in $arn" >&2; exit 1
+            fi
+          done <<<"$targets"
+          if [[ $candidates != '[]' ]]; then serving=1; fi
+        fi
+        if ! controller_sleep; then echo "::error::controller instance refresh timed out: $status" >&2; exit 1; fi ;;
+      RollbackInProgress)
+        serving=1
+        if [[ -z $rollback_observed ]]; then
+          echo 'controller instance refresh RollbackInProgress' >&2
+          rollback_observed=1
+        fi
         if ! readiness_sleep "$deadline"; then echo "::error::controller instance refresh timed out: $status" >&2; exit 1; fi ;;
+      Pending|Baking|Cancelling)
+        if ! controller_sleep; then echo "::error::controller instance refresh timed out: $status" >&2; exit 1; fi ;;
+      RollbackSuccessful)
+        reason=$(jq -r '.InstanceRefreshes[0].StatusReason // ""' <<<"$refresh")
+        echo "::error::controller instance refresh RollbackSuccessful (deployment rolled back): $reason" >&2; exit 1 ;;
+      RollbackFailed)
+        reason=$(jq -r '.InstanceRefreshes[0].StatusReason // ""' <<<"$refresh")
+        echo "::error::controller instance refresh RollbackFailed (rollback failure): $reason" >&2; exit 1 ;;
       *) reason=$(jq -r '.InstanceRefreshes[0].StatusReason // ""' <<<"$refresh")
         echo "::error::controller instance refresh $status: $reason" >&2; exit 1 ;;
     esac
   done
   while :; do
-    if ! groups=$(aws_read "$deadline" --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$asg" --output json); then
+    if ! groups=$(controller_read --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$asg" --output json); then
       echo "::error::failed to describe controller Auto Scaling group $asg" >&2; exit 1
     fi
     if controller_ids=$(jq -ec --arg name "$asg" '
@@ -95,7 +188,7 @@ if [[ -n $asg ]]; then
     | select(all(.Instances[]; .HealthStatus == "Healthy" and .LifecycleState == "InService" and .LaunchTemplate.LaunchTemplateId == $template.LaunchTemplateId and (.LaunchTemplate.Version | tostring) == $template.Version and (.InstanceId | type == "string" and length > 0)))
     | [.Instances[].InstanceId] | sort | select(length == (unique | length))
     ' <<<"$groups"); then break; fi
-    if ! readiness_sleep "$deadline"; then
+    if ! controller_sleep; then
       jq -c '[.AutoScalingGroups[]? | {AutoScalingGroupName, DesiredCapacity, LaunchTemplate, Instances: [.Instances[]? | {InstanceId, HealthStatus, LifecycleState, LaunchTemplate}]}]' <<<"$groups" >&2
       echo "::error::controller Auto Scaling group $asg is not healthy on its current launch template" >&2; exit 1
     fi
@@ -107,7 +200,9 @@ fi
 if [[ -n $targets ]]; then
   while IFS= read -r arn; do
     while :; do
-      if ! health=$(aws_read "$deadline" --region "$region" elbv2 describe-target-health --target-group-arn "$arn" --output json); then
+      if [[ -n $asg ]]; then
+        health=$(controller_read --region "$region" elbv2 describe-target-health --target-group-arn "$arn" --output json) || { echo "::error::failed to describe target health in $arn" >&2; exit 1; }
+      elif ! health=$(aws_read "$deadline" --region "$region" elbv2 describe-target-health --target-group-arn "$arn" --output json); then
         echo "::error::failed to describe target health in $arn" >&2; exit 1
       fi
       if jq -e --argjson ids "$controller_ids" '
@@ -115,13 +210,19 @@ if [[ -n $targets ]]; then
         | ([.[].Target.Id] | sort) == $ids
           and ([.[] | select(.TargetHealth.State == "healthy")] | length == 1)
           and all(.[]; .TargetHealth.State == "healthy" or (.TargetHealth.State == "unhealthy" and .TargetHealth.Reason == "Target.FailedHealthChecks"))
-      ' <<<"$health" >/dev/null; then break; fi
-      if ! readiness_sleep "$deadline"; then
-        printf '%s\n' "$health" >&2
-        echo "::error::controller targets did not reach leader/passive readiness in $arn" >&2; exit 1
+      ' <<<"$health" >/dev/null; then
+        break
       fi
+      if [[ -n $asg ]]; then
+        controller_sleep && continue
+      elif readiness_sleep "$deadline"; then
+        continue
+      fi
+      printf '%s\n' "$health" >&2
+      echo "::error::controller targets did not reach leader/passive readiness in $arn" >&2; exit 1
     done
   done <<<"$targets"
+  if [[ -n $asg ]]; then serving=1; fi
 fi
 
 if [[ -n $workers ]]; then
