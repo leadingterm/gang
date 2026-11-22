@@ -47,6 +47,10 @@ run "rolling_service_and_network" {
     error_message = "Rolling deployment must preserve serving capacity and roll back failures."
   }
   assert {
+    condition     = aws_ecs_service.controller[0].health_check_grace_period_seconds == 300 && aws_ecs_service.controller[0].health_check_grace_period_seconds > jsondecode(file("${path.module}/../load-balancer/health-check.json")).interval_seconds * jsondecode(file("${path.module}/../load-balancer/health-check.json")).threshold
+    error_message = "ECS needs a five-minute startup grace longer than the NLB health window so a preparing candidate is not evicted before it can become leader."
+  }
+  assert {
     condition     = aws_launch_template.capacity[0].instance_type == "t4g.large" && aws_launch_template.capacity[0].credit_specification[0].cpu_credits == "unlimited" && aws_ecs_task_definition.controller[0].runtime_platform[0].cpu_architecture == "ARM64" && aws_ecs_task_definition.controller[0].runtime_platform[0].operating_system_family == "LINUX"
     error_message = "Service capacity defaults to ARM64 t4g.large with unlimited CPU credits."
   }

@@ -275,6 +275,7 @@ resource "aws_ecs_service" "controller" {
   cluster                            = aws_ecs_cluster.controller[0].arn
   task_definition                    = aws_ecs_task_definition.controller[0].arn
   desired_count                      = var.controller_count
+  health_check_grace_period_seconds  = 300
   deployment_minimum_healthy_percent = 100
   deployment_maximum_percent         = 200
   wait_for_steady_state              = true
