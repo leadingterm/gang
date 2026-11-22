@@ -13,9 +13,8 @@ use crate::errors::{MainError, Result};
 use crate::output::{Output, Record};
 use crate::{
     bazel_command, ca_pin_command, client_command, database_command, deploy_command,
-    doctor_command, exec_command, guard_command, help, host_egress_command, join_command,
-    local_down, local_up, options_command, release_command, reset_command, server_command,
-    setup_command, worker_command,
+    doctor_command, exec_command, guard_command, help, join_command, local_down, local_up,
+    options_command, release_command, reset_command, server_command, setup_command, worker_command,
 };
 
 /// What a process runs, decided from its argv0 and arguments.
@@ -176,7 +175,8 @@ fn execute(command: Command, entrypoint: &Path, out: &Output) -> Result<ExitCode
         }
         Command::Database(DatabaseCommand::Copy(args)) => database_command::run(args, out),
         Command::Worker(args) => worker_command::run(args, out),
-        Command::PrepareActionEgress(args) => host_egress_command::run(&args),
+        #[cfg(target_os = "linux")]
+        Command::PrepareActionEgress(args) => crate::host_egress_command::run(&args),
         Command::LocalWorker(args) => {
             let (program, arguments) = args
                 .command

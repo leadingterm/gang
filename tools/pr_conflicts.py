@@ -152,7 +152,10 @@ def reconcile(api: GitHubApi, base: str, pr: PullRequest, paths: list[str]) -> N
     def write(method: str, route: str, payload: object = None) -> bool:
         if not fresh(api, base, pr):
             return False
-        api.request(method, route, payload)
+        try:
+            api.request(method, route, payload)
+        except GitHubApiError as error:
+            raise ConflictError(f"{method} {route}: {error}") from error
         return True
 
     if paths:
