@@ -20,8 +20,9 @@
     min_instances = 0
     max_instances = 1
     vcpus_per_instance = 1
-    memory_per_instance = "1GiB"
-    disk_per_instance = "1GiB"
+    # Match the local sample's capacities so default action budgets fit.
+    memory_per_instance = "8GiB"
+    disk_per_instance = "20GiB"
     idle_timeout = "15s"
     max_drain_wait = "1m"
     boot_grace = "1m"
@@ -76,6 +77,8 @@ in
       };
       client = {
         boot.binfmt.emulatedSystems = ["aarch64-linux"];
+        # Pin a static emulator before Podman enters the ARM container's root.
+        boot.binfmt.preferStaticEmulators = true;
         virtualisation.podman.enable = true;
         networking.useDHCP = false;
         networking.firewall.enable = false;
@@ -99,10 +102,18 @@ in
       image = client.succeed("podman images -q | sort -u").strip()
       assert image
       client.succeed(f"podman run -d --name controller -p 127.0.0.1:8080:8080 --dns 192.168.77.1 --env \"GANG_CONFIG=$(cat ${config})\" --env GANG_SECRET_FILES=0=test-secret --env GANG_SECRET_0=secret-value {image}")
-      client.wait_until_succeeds("curl -fsS http://127.0.0.1:8080/ready", timeout=timedelta(seconds=60))
+      try:
+          client.wait_until_succeeds("curl -fsS http://127.0.0.1:8080/ready", timeout=timedelta(seconds=60))
+      except Exception:
+          print(client.execute("podman logs --tail 100 controller"))
+          print(client.execute("podman inspect --format '{{json .State}}' controller"))
+          raise
       client.succeed("podman exec controller grep -Eq '^Uid:[[:space:]]+65532[[:space:]]+65532' /proc/1/status")
       client.succeed("podman exec controller sh -c 'test $(stat -c %u:%g:%a /etc/gang/gang.toml) = 65532:65532:600 && test $(stat -c %u:%g:%a /etc/gang/secrets/test-secret) = 65532:65532:600'")
-      environment = client.succeed("podman exec controller cat /proc/1/environ | tr '\\000' '\\n'")
+      # Host root can inspect the dropped-UID process without adding container capabilities.
+      controller_pid = int(client.succeed("podman inspect --format '{{.State.Pid}}' controller"))
+      assert controller_pid > 0
+      environment = client.succeed(f"cat /proc/{controller_pid}/environ | tr '\\000' '\\n'")
       assert "GANG_CONFIG=" not in environment and "GANG_SECRET" not in environment
       client.succeed("podman exec controller nslookup -type=A cached.cache.test 127.0.0.1 | grep -q 192.0.2.80")
       upstream.succeed("systemctl stop dns-fixture.service")

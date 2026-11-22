@@ -61,6 +61,7 @@ in {
     import hashlib
     import io
     import json
+    import posixpath
     import sys
     import tarfile
 
@@ -89,12 +90,25 @@ in {
                 for item in contents:
                     name = item.name.removeprefix("./").lstrip("/")
                     members[name] = (item, contents.extractfile(item).read() if item.isfile() else None)
-        entry = members["usr/local/bin/gang-entrypoint"][1]
+        def image_file(path):
+            seen = set()
+            while True:
+                assert path not in seen, f"image symlink cycle at {path}"
+                seen.add(path)
+                item, content = members[path]
+                if item.isfile():
+                    return content
+                assert item.issym(), f"image path is not a file or symlink: {path}"
+                target = item.linkname
+                path = posixpath.normpath(
+                    target if target.startswith("/") else posixpath.join(posixpath.dirname(path), target)
+                ).lstrip("/")
+        entry = image_file("usr/local/bin/gang-entrypoint")
         with open(sys.argv[3], "rb") as expected:
             assert entry == expected.read()
         binary_link = members["usr/local/bin/gang"][0]
         assert binary_link.issym()
-        binary = members[binary_link.linkname.lstrip("/")][1]
+        binary = image_file("usr/local/bin/gang")
         assert binary[:4] == b"\x7fELF" and binary[18:20] == b"\xb7\x00"
         with open(sys.argv[2], "rb") as expected:
             assert binary == expected.read()

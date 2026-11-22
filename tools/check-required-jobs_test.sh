@@ -115,11 +115,17 @@ expect failure 'release gate cannot be a green stub' "$guard" "$fixture" "$pr_fi
 reset_fixtures
 yq -i '.jobs.release-validation.needs += ["macos"]' "$fixture"
 expect failure 'advisory macOS cannot join release gate' "$guard" "$fixture" "$pr_fixture"
-for job in linux-arm64-checks e2e-gate-1-shards e2e-gate-2-shards e2e-v035-upgrade; do
+for job in nix-vm linux-arm64-checks e2e-gate-1-shards e2e-gate-2-shards e2e-v035-upgrade; do
   reset_fixtures
   job="$job" yq -i '.jobs[strenv(job)].needs = []' "$fixture"
   expect failure "$job requires its bundle" "$guard" "$fixture" "$pr_fixture"
 done
+reset_fixtures
+yq -i '.jobs.nix-vm.needs = ["linux-x86_64-bundle"]' "$fixture"
+expect failure 'nix-vm requires the ARM bundle, not the x86 bundle' "$guard" "$fixture" "$pr_fixture"
+reset_fixtures
+yq -i '.jobs.nix-vm.needs += ["linux-x86_64-bundle"]' "$fixture"
+expect failure 'nix-vm cannot add another dependency' "$guard" "$fixture" "$pr_fixture"
 for job in nativelink-memory-tests nix-vm cross-build linux-arm64-checks linux-x86_64-shards; do
   reset_fixtures
   job="$job" yq -i '(.jobs[strenv(job)].steps[] | select(.name == "Run NativeLink memory tests" or .name == "Run NixOS VM checks" or .name == "Cross-build gang" or .name == "Test") | .run) = "true"' "$fixture"

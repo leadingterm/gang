@@ -17,7 +17,7 @@ use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
 use rustix::process::{Pid, Signal, kill_process};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
@@ -119,6 +119,7 @@ fn initial_leader(observations: &[Option<LeadershipHealth>]) -> Option<usize> {
 struct LinkState {
     cut: bool,
     stalled: bool,
+    stall_postgres_history: bool,
     stalled_connections: usize,
     flows: Vec<AbortHandle>,
 }
@@ -223,6 +224,8 @@ impl DatabaseLink {
                             state.flows.push(flow);
                             continue;
                         }
+                        let stall_postgres_history = state.stall_postgres_history;
+                        let shared = Arc::clone(&shared);
                         state.flows.retain(|flow| !flow.is_finished());
                         let target = target.clone();
                         let flow = flows.spawn(async move {
@@ -234,7 +237,16 @@ impl DatabaseLink {
                                 }
                                 LinkTarget::Unix(path) => {
                                     if let Ok(mut outgoing) = UnixStream::connect(path).await {
-                                        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+                                        if stall_postgres_history {
+                                            let (read, mut write) = incoming.split();
+                                            let (mut response, request) = outgoing.split();
+                                            tokio::select! {
+                                                _ = forward_postgres_preparation(read, request, &shared) => {}
+                                                _ = tokio::io::copy(&mut response, &mut write) => {}
+                                            }
+                                        } else {
+                                            let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+                                        }
                                     }
                                 }
                             }
@@ -260,6 +272,50 @@ impl DatabaseLink {
                 flow.abort();
             }
         }
+    }
+}
+
+// PostgreSQL's initial authentication reads fail fast on timeout. Let those and schema setup
+// finish, then hold the read-only history import, which retries without requesting takeover.
+async fn forward_postgres_preparation(
+    mut incoming: impl AsyncRead + Unpin,
+    mut outgoing: impl AsyncWrite + Unpin,
+    state: &Mutex<LinkState>,
+) -> std::io::Result<()> {
+    const HISTORY_QUERY: &[u8] = b"SELECT id, body, version, expires_at FROM expiring_records";
+    let mut startup = true;
+    let mut header = [0; 5];
+    let mut payload = Vec::new();
+    loop {
+        let prefix = usize::from(!startup);
+        let header = &mut header[..4 + prefix];
+        incoming.read_exact(header).await?;
+        let length = u32::from_be_bytes([
+            header[prefix],
+            header[prefix + 1],
+            header[prefix + 2],
+            header[prefix + 3],
+        ]);
+        let length = length.checked_sub(4).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid postgres frame length",
+            )
+        })?;
+        payload.resize(length as usize, 0);
+        incoming.read_exact(&mut payload).await?;
+        if !startup
+            && matches!(header[0], b'P' | b'Q')
+            && payload
+                .windows(HISTORY_QUERY.len())
+                .any(|part| part == HISTORY_QUERY)
+        {
+            state.lock().stalled_connections += 1;
+            std::future::pending::<()>().await;
+        }
+        outgoing.write_all(header).await?;
+        outgoing.write_all(&payload).await?;
+        startup = false;
     }
 }
 
@@ -892,7 +948,13 @@ impl<'a> Cluster<'a> {
             || -> Result<SocketAddr> { Ok(SocketAddr::from(([127, 0, 0, 1], ports::reserve()?))) };
         let (public, worker, health) = (addr()?, addr()?, addr()?);
         let database_link = self.start_database_link()?;
-        database_link.state.lock().stalled = true;
+        {
+            let mut state = database_link.state.lock();
+            match &self.database {
+                ClusterDatabase::DynamoDb(_) => state.stalled = true,
+                ClusterDatabase::Postgres { .. } => state.stall_postgres_history = true,
+            }
+        }
         let config = self
             .stack
             .placement()
@@ -907,8 +969,16 @@ impl<'a> Cluster<'a> {
             let start = Instant::now();
             let window = gang_types::health::health_check().healthy_window();
             loop {
-                if child.has_exited()?
-                    || !work_is_held()?
+                if child.has_exited()? {
+                    return Err(self.controller_start_error(
+                        index,
+                        &mut child,
+                        "exited during deliberately stalled preparation",
+                        &self.controller_log_path(index),
+                        false,
+                    ));
+                }
+                if !work_is_held()?
                     || !self.controller_is_leader(leader)?
                     || !self.controller_is_healthy(leader)?
                     || self.balancer.healthy(Frontend::Serve).contains(&public)
@@ -2972,6 +3042,69 @@ providers = ["local-workers"]
         restored.write_all(b"b").await?;
         timeout(DEADLINE, server.read_exact(&mut byte)).await??;
         assert_eq!(byte, *b"b");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_stall_allows_bootstrap_but_withholds_fragmented_history_queries() -> TestResult
+    {
+        let frame = |tag, body: &[u8]| {
+            let mut bytes = vec![tag];
+            bytes.extend_from_slice(&u32::try_from(body.len() + 4)?.to_be_bytes());
+            bytes.extend_from_slice(body);
+            Ok::<_, Box<dyn std::error::Error>>(bytes)
+        };
+        for tag in *b"PQ" {
+            let (mut client, incoming) = tokio::io::duplex(4096);
+            let (outgoing, mut backend) = tokio::io::duplex(4096);
+            let state = parking_lot::Mutex::new(super::LinkState::default());
+            let mut forwarding = Box::pin(super::forward_postgres_preparation(
+                incoming, outgoing, &state,
+            ));
+            let startup = b"\0\0\0\x08\0\x03\0\0";
+            let authentication = frame(b'P', b"\0SELECT revoked_at FROM principals\0\0\0")?;
+            let schema = frame(b'Q', b"CREATE TABLE expiring_records (id bytea)\0")?;
+            let bootstrap: Vec<_> = startup
+                .iter()
+                .chain(&authentication)
+                .chain(&schema)
+                .copied()
+                .collect();
+            client.write_all(&bootstrap).await?;
+            assert!(futures::poll!(forwarding.as_mut()).is_pending());
+            let mut received = vec![0; bootstrap.len()];
+            timeout(DEADLINE, backend.read_exact(&mut received)).await??;
+            assert_eq!(received, bootstrap);
+            assert_eq!(state.lock().stalled_connections, 0);
+
+            let query =
+                b"SELECT id, body, version, expires_at FROM expiring_records WHERE kind = $1";
+            let mut body = Vec::new();
+            if tag == b'P' {
+                body.extend_from_slice(b"statement\0");
+            }
+            body.extend_from_slice(query);
+            body.push(0);
+            if tag == b'P' {
+                body.extend_from_slice(&0u16.to_be_bytes());
+            }
+            let history = frame(tag, &body)?;
+            let split = history.len() / 2;
+            client.write_all(&history[..split]).await?;
+            assert!(futures::poll!(forwarding.as_mut()).is_pending());
+            assert_eq!(state.lock().stalled_connections, 0);
+            client.write_all(&history[split..]).await?;
+            assert!(futures::poll!(forwarding.as_mut()).is_pending());
+            assert_eq!(state.lock().stalled_connections, 1);
+            let mut byte = [0];
+            {
+                let read = backend.read(&mut byte);
+                tokio::pin!(read);
+                assert!(futures::poll!(read.as_mut()).is_pending());
+            }
+            drop(forwarding);
+            assert_eq!(timeout(DEADLINE, backend.read(&mut byte)).await??, 0);
+        }
         Ok(())
     }
 

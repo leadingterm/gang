@@ -38,7 +38,7 @@ aws() {
   shift 4
   local site=
   case "$*" in
-    *'ecs describe-services'*) site=refresh ;;
+    *'ecs describe-services'*) site=rollout ;;
     *'ecs describe-tasks'*) site=controller ;;
     *describe-target-health*arn:one*) site=target ;;
     *describe-auto-scaling-groups*worker-one*) site=worker ;;
@@ -46,12 +46,12 @@ aws() {
     *'ssm get-command-invocation '*' --instance-id i-worker-one '*) site=ssm_invocation ;;
   esac
   if [[ $CASE == "global_$site" && ( $site == worker || $site == ssm_send || $site == ssm_invocation ) && $(<"$CLOCK") -lt 2397 ]]; then echo 2397 >"$CLOCK"; fi
-  if [[ $CASE == boundary_refresh && $site == refresh || $CASE == boundary_controller && $site == controller || $CASE == boundary_target && $site == target ]]; then
+  if [[ $CASE == boundary_rollout && $site == rollout || $CASE == boundary_controller && $site == controller || $CASE == boundary_target && $site == target ]]; then
     echo 2397 >"$CLOCK"
   elif [[ $CASE == boundary_worker && $site == worker ]]; then
     echo 2397 >"$CLOCK"
   fi
-  if [[ $CASE == "throttle_$site" || ( $CASE == global_exhaust && $site == refresh ) || ( $CASE == worker_exhaust && $site == worker ) || ( $CASE == "global_$site" && -n $site ) || ( $CASE == expired && $site == refresh ) || ( $CASE == worker_expired && $site == worker ) || ( $CASE == permanent && $site == refresh ) || ( $CASE == "permanent_$site" && -n $site ) || ( $CASE == late && $site == refresh ) || ( $CASE == "late_$site" && -n $site ) ]]; then
+  if [[ $CASE == "throttle_$site" || ( $CASE == global_exhaust && $site == rollout ) || ( $CASE == worker_exhaust && $site == worker ) || ( $CASE == "global_$site" && -n $site ) || ( $CASE == expired && $site == rollout ) || ( $CASE == worker_expired && $site == worker ) || ( $CASE == permanent && $site == rollout ) || ( $CASE == "permanent_$site" && -n $site ) || ( $CASE == late && $site == rollout ) || ( $CASE == "late_$site" && -n $site ) ]]; then
     local count
     count=$(<"$ATTEMPTS")
     count=$((count + 1))
@@ -76,14 +76,14 @@ aws() {
     '--region region-1 ecs describe-services --cluster cluster --services controller --output json')
       if [[ $CASE == aws_failure ]]; then return 1; fi
       local rollout=COMPLETED
-      if [[ $CASE == refresh_failed ]]; then rollout=FAILED; elif [[ $CASE == boundary_refresh ]]; then rollout=IN_PROGRESS; fi
+      if [[ $CASE == rollout_failed ]]; then rollout=FAILED; elif [[ $CASE == boundary_rollout ]]; then rollout=IN_PROGRESS; fi
       printf '{"failures":[],"services":[{"status":"ACTIVE","taskDefinition":"arn:task:7","desiredCount":1,"runningCount":1,"pendingCount":0,"deployments":[{"status":"PRIMARY","rolloutState":"%s","taskDefinition":"arn:task:7"}]}]}\n' "$rollout" ;;
     '--region region-1 ecs list-tasks --cluster cluster --service-name controller --desired-status RUNNING --output json')
       if [[ $CASE == listfail ]]; then return 1; fi
       if [[ $CASE == missingtask ]]; then echo '{"taskArns":[]}'; else echo '{"taskArns":["task-one"]}'; fi ;;
     '--region region-1 ecs describe-tasks --cluster cluster --tasks task-one --output json')
       local definition=arn:task:7 state=RUNNING
-      if [[ $CASE == old_template || $CASE == boundary_controller ]]; then definition=arn:task:6; fi
+      if [[ $CASE == old_task_definition || $CASE == boundary_controller ]]; then definition=arn:task:6; fi
       if [[ $CASE == controller_terminating && ! -e $PENDING_MARKER-controller ]]; then state=STOPPING; : >"$PENDING_MARKER-controller"; fi
       printf '{"failures":[],"tasks":[{"taskArn":"task-one","lastStatus":"%s","healthStatus":"UNKNOWN","taskDefinitionArn":"%s","attachments":[{"type":"ElasticNetworkInterface","status":"ATTACHED","details":[{"name":"privateIPv4Address","value":"10.0.0.1"}]}]}]}\n' "$state" "$definition" ;;
     '--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-one --output json'|'--region region-1 autoscaling describe-auto-scaling-groups --auto-scaling-group-names worker-two --output json')
@@ -195,7 +195,7 @@ sleep() {
   local now
   now=$(<"$CLOCK")
   case $CASE in
-    unhealthy|second_target_unhealthy|old_template|refresh_failed|missingtask|worker_short|worker_missing_pid|worker_missing_output|worker_ssm_failure) now=$((now + 2401)) ;;
+    unhealthy|second_target_unhealthy|old_task_definition|rollout_failed|missingtask|worker_short|worker_missing_pid|worker_missing_output|worker_ssm_failure) now=$((now + 2401)) ;;
     worker_mixed) if [[ -e $PENDING_MARKER-old ]]; then now=$((now + 2401)); else now=$((now + $1)); fi ;;
     worker_delayed_rollover)
       if [[ -e $PENDING_MARKER-rollover && ! -e $PENDING_MARKER-elapsed ]]; then
@@ -208,7 +208,7 @@ sleep() {
   echo "$now" >"$CLOCK"
 }
 export -f tofu aws gang openssl curl sleep date timeout
-for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unhealthy second_target_unhealthy old_template controller_terminating missing aws_failure refresh_failed missingtask listfail worker_missing worker_unhealthy worker_short worker_pending worker_pending_long worker_terminating worker_zero worker_mixed worker_missing_pid worker_missing_output worker_replacement worker_delayed_rollover worker_pending_replacement worker_appearing worker_terminating_mixed worker_ssm_pending worker_invocation_missing worker_registration_pending worker_ssm_failure worker_send_failure worker_invocation_failure boundary_refresh boundary_controller boundary_target boundary_worker throttle_refresh throttle_controller throttle_target throttle_worker throttle_ssm_send throttle_ssm_invocation global_exhaust worker_exhaust global_worker global_ssm_send global_ssm_invocation expired worker_expired permanent permanent_ssm_send permanent_ssm_invocation late late_ssm_send late_ssm_invocation cli_timeout timeout_ssm_send timeout_ssm_invocation; do
+for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unhealthy second_target_unhealthy old_task_definition controller_terminating missing aws_failure rollout_failed missingtask listfail worker_missing worker_unhealthy worker_short worker_pending worker_pending_long worker_terminating worker_zero worker_mixed worker_missing_pid worker_missing_output worker_replacement worker_delayed_rollover worker_pending_replacement worker_appearing worker_terminating_mixed worker_ssm_pending worker_invocation_missing worker_registration_pending worker_ssm_failure worker_send_failure worker_invocation_failure boundary_rollout boundary_controller boundary_target boundary_worker throttle_rollout throttle_controller throttle_target throttle_worker throttle_ssm_send throttle_ssm_invocation global_exhaust worker_exhaust global_worker global_ssm_send global_ssm_invocation expired worker_expired permanent permanent_ssm_send permanent_ssm_invocation late late_ssm_send late_ssm_invocation cli_timeout timeout_ssm_send timeout_ssm_invocation; do
   : >"$CALLS"
   : >"$CURL_CALLS"
   echo 0 >"$CLOCK"
@@ -218,7 +218,7 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
   rm -f "$PENDING_MARKER"-*
   status=0
   (cd "$scratch" && bash --noprofile --norc -euo pipefail "$scratch/step") >"$scratch/out" 2>&1 || status=$?
-  case $CASE in healthy|sqlite|sqlite_lb|long_drain|pending_proceed|controller_terminating|worker_pending|worker_pending_long|worker_terminating|worker_zero|worker_replacement|worker_delayed_rollover|worker_pending_replacement|worker_appearing|worker_terminating_mixed|worker_ssm_pending|worker_invocation_missing|worker_registration_pending|throttle_*) [[ $status == 0 ]] ;; *) [[ $status != 0 ]] ;; esac
+  case $CASE in healthy|sqlite|sqlite_lb|controller_terminating|worker_pending|worker_pending_long|worker_terminating|worker_zero|worker_replacement|worker_delayed_rollover|worker_pending_replacement|worker_appearing|worker_terminating_mixed|worker_ssm_pending|worker_invocation_missing|worker_registration_pending|throttle_*) [[ $status == 0 ]] ;; *) [[ $status != 0 ]] ;; esac
   case $CASE in
     healthy)
       [[ $(grep -c -- '--region region-1 ssm send-command' "$CALLS") -eq 2 ]]
@@ -237,13 +237,13 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
       grep -F -- 'describe-target-health --target-group-arn arn:one' "$CALLS" >/dev/null
       grep -F -- 'describe-target-health --target-group-arn arn:two' "$CALLS" >/dev/null
       grep -F '::error::controller targets did not reach healthy readiness in arn:two' "$scratch/out" >/dev/null ;;
-    old_template|boundary_controller|missingtask)
+    old_task_definition|boundary_controller|missingtask)
       grep -F '::error::controller ECS tasks did not reach current-revision readiness' "$scratch/out" >/dev/null ;;
     wrong_pin) grep -F 'controller CA pin mismatch' "$scratch/out" >/dev/null && [[ $(wc -l <"$CURL_CALLS") -eq 1 ]] ;;
     aws_failure) grep -F '::error::failed to describe controller ECS service' "$scratch/out" >/dev/null ;;
     listfail) grep -F '::error::failed to list controller ECS tasks' "$scratch/out" >/dev/null ;;
-    refresh_failed) grep -F '::error::controller ECS service deployment failed' "$scratch/out" >/dev/null ;;
-    boundary_refresh) grep -F '::error::controller ECS service deployment did not become ready' "$scratch/out" >/dev/null ;;
+    rollout_failed) grep -F '::error::controller ECS service deployment failed' "$scratch/out" >/dev/null ;;
+    boundary_rollout) grep -F '::error::controller ECS service deployment did not become ready' "$scratch/out" >/dev/null ;;
     wrong) grep -F 'server version mismatch: expected 1.2.3, observed 0.0.0' "$scratch/out" >/dev/null ;;
     no_version) grep -F 'server response has no version' "$scratch/out" >/dev/null ;;
     http_failure) grep -F 'failed to query server version' "$scratch/out" >/dev/null ;;
@@ -260,11 +260,7 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
       else
         [[ $(<"$ATTEMPTS") == 8 ]]
       fi
-      if [[ $CASE == throttle_refresh || $CASE == throttle_controller || $CASE == throttle_target ]]; then
-        [[ $(<"$TIMEOUTS") == *$'600\n599\n597\n593\n585\n569\n539\n509'* ]]
-      else
-        [[ $(<"$TIMEOUTS") == *$'2400\n2399\n2397\n2393\n2385\n2369\n2339\n2309'* ]]
-      fi
+      [[ $(<"$TIMEOUTS") == *$'2400\n2399\n2397\n2393\n2385\n2369\n2339\n2309'* ]]
       [[ $(<"$SLEEPS") == $'1\n2\n4\n8\n16\n30\n30\n5\n5' ]]
       grep -F 'fixture throttle' "$scratch/out" >/dev/null
       ! grep -F 'partial output from failed AWS request' "$scratch/out" >/dev/null ;;
@@ -313,7 +309,7 @@ for CASE in healthy sqlite sqlite_lb wrong_pin wrong no_version http_failure unh
       grep -F 'An error occurred (InvalidInstanceId) when calling the SendCommand operation' "$scratch/out" >/dev/null ;;
   esac
   case $CASE in
-    boundary_refresh) expected_calls=1 ;;
+    boundary_rollout) expected_calls=1 ;;
     boundary_controller) expected_calls=3 ;;
     boundary_target) expected_calls=4 ;;
     boundary_worker) expected_calls=6 ;;
