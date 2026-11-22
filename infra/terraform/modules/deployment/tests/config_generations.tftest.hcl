@@ -119,11 +119,21 @@ mock_provider "http" {
 }
 
 override_data {
-  target = data.aws_ami.image
+  target = data.aws_ami.image["072320588884/x86_64/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
   values = {
     name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
     boot_mode        = "uefi"
     tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+    deprecation_time = ""
+  }
+}
+
+override_data {
+  target = data.aws_ami.image["072320588884/aarch64/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+  values = {
+    name             = "gang-aarch64-aaaaaaaaaaaaaaaa"
+    boot_mode        = "uefi"
+    tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }
     deprecation_time = ""
   }
 }
@@ -310,6 +320,14 @@ run "applyA" {
     condition     = output.config_parameter_reference == "${output.config_parameter_name}:1" && startswith(output.config_parameter_name, "${local.config_parameter_name}/generations/") && local.config_parameter_arns == ["arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml/generations/*"]
     error_message = "The pinned generation and readable namespace must be exact."
   }
+  assert {
+    condition     = alltrue([for fleet in var.fleets : local.node_action_environments[fleet.name] == data.aws_ami.image["072320588884/${local.isa_architectures[fleet.isa]}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"].tags["ec2:SharedTag/ActionEnvironment"]])
+    error_message = "Each fleet must use the action identity of its exact owner, architecture and image digest."
+  }
+  assert {
+    condition     = alltrue([for fleet in var.fleets : length(regexall("action_environment = \"${local.node_action_environments[fleet.name]}\"", output.gang_toml)) == 1]) && strcontains(output.gang_toml, "root = \"/etc/gang/action-rootfs\"")
+    error_message = "The applied generation must retain each selected AMI's action identity and the action rootfs."
+  }
 }
 
 run "planUnchanged" {
@@ -347,5 +365,9 @@ run "applyRollbackA" {
   assert {
     condition     = aws_ssm_parameter.config_generation.value == output.gang_toml && aws_ssm_parameter.config_generation.name == output.config_parameter_name && startswith(output.config_parameter_name, "${local.config_parameter_name}/generations/") && output.config_parameter_reference == "${output.config_parameter_name}:1" && aws_ssm_parameter.config_generation.overwrite == false
     error_message = "Rollback must publish its rendered bytes at an immutable pinned generation."
+  }
+  assert {
+    condition     = alltrue([for fleet in var.fleets : local.node_action_environments[fleet.name] == data.aws_ami.image["072320588884/${local.isa_architectures[fleet.isa]}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"].tags["ec2:SharedTag/ActionEnvironment"]]) && alltrue([for fleet in var.fleets : length(regexall("action_environment = \"${local.node_action_environments[fleet.name]}\"", output.gang_toml)) == 1]) && strcontains(output.gang_toml, "root = \"/etc/gang/action-rootfs\"")
+    error_message = "Rollback must retain each selected AMI's real fleet action identity and the action rootfs."
   }
 }

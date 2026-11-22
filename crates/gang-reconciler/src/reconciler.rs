@@ -125,6 +125,7 @@ struct Census {
     busy_cordons: u32,
     replacing: u32,
     unconnected_cordon: bool,
+    handover_retained: u32,
 }
 
 #[derive(Debug, Default)]
@@ -409,18 +410,30 @@ impl Reconciler {
             let orphans = plan.steps.len();
             let mut census = Census::default();
             for (position, instance) in fleet.supply.instances.iter().enumerate() {
-                if instance.lifecycle == InstanceLifecycle::Terminating {
+                let protected = fleet.handover_protected.binary_search(&instance.id).is_ok()
+                    && pass
+                        .hosted
+                        .workers_on(&fleet.policy.name, &instance.id)
+                        .next()
+                        .is_none();
+                if instance.lifecycle == InstanceLifecycle::Terminating && !protected {
                     continue;
                 }
                 census.live = census.live.saturating_add(1);
-                let class = self.classify_instance(
-                    pass,
-                    &view,
-                    (position, instance),
-                    (&mut fleet.past_boot_grace, &mut fleet.outlook.workers),
-                    &mut census,
-                    plan,
-                );
+                let class = if protected {
+                    census.handover_retained = census.handover_retained.saturating_add(1);
+                    fleet.past_boot_grace[position] = false;
+                    Standing::Retained
+                } else {
+                    self.classify_instance(
+                        pass,
+                        &view,
+                        (position, instance),
+                        (&mut fleet.past_boot_grace, &mut fleet.outlook.workers),
+                        &mut census,
+                        plan,
+                    )
+                };
                 match class {
                     Standing::Usable => {
                         census.usable = census.usable.saturating_add(1);
@@ -683,7 +696,6 @@ impl Reconciler {
     ) {
         let index = view.index;
         let census = self.census[index].census;
-        let range = self.census[index].draining.clone();
         let unborn = view.supply.desired.saturating_sub(census.live);
         let usable = self.capacities[index].reliable;
         let resumed = self.resume_drains(pass, view, plan);
@@ -692,28 +704,8 @@ impl Reconciler {
             .filter(|s| matches!(s.action, Action::Terminate { .. }))
             .count()
             .saturating_into();
-        let retaining: u32 = self.draining[range]
-            .iter()
-            .filter(|d| {
-                d.kind != DrainKind::Replacement && !d.resumed && d.end.is_none() && d.running > 0
-            })
-            .count()
-            .saturating_into();
         let from = view.supply.desired.saturating_sub(terminated);
-        let max = view.policy.instances.max().get();
-        let terminated_replacing: u32 = plan.steps[planned..]
-            .iter()
-            .filter(|step| match &step.action {
-                Action::Terminate { instance, .. } => {
-                    pass.hosted
-                        .is_replacing(index, &view.policy.name, instance.as_str())
-                }
-                _ => false,
-            })
-            .count()
-            .saturating_into();
-        let to = purchase_target(view.needed, retaining, max)
-            .saturating_add(census.replacing.saturating_sub(terminated_replacing));
+        let to = self.purchase_target_after_drains(pass, view, planned, from, plan);
         if view.supply.abandoned > 0 && resumed == 0 {
             plan.steps.push(PlanStep {
                 fleet: index,
@@ -774,6 +766,47 @@ impl Reconciler {
             return;
         }
         self.cordon(pass, view, plan);
+    }
+
+    fn purchase_target_after_drains(
+        &self,
+        pass: &Pass<'_>,
+        view: &FleetView<'_>,
+        planned: usize,
+        from: u32,
+        plan: &Plan,
+    ) -> u32 {
+        let census = &self.census[view.index].census;
+        let retaining: u32 = self.draining[self.census[view.index].draining.clone()]
+            .iter()
+            .filter(|d| {
+                d.kind != DrainKind::Replacement && !d.resumed && d.end.is_none() && d.running > 0
+            })
+            .count()
+            .saturating_into();
+        let max = view.policy.instances.max().get();
+        let terminated_replacing: u32 = plan.steps[planned..]
+            .iter()
+            .filter(|step| match &step.action {
+                Action::Terminate { instance, .. } => {
+                    pass.hosted
+                        .is_replacing(view.index, &view.policy.name, instance.as_str())
+                }
+                _ => false,
+            })
+            .count()
+            .saturating_into();
+        let to = purchase_target(
+            view.needed,
+            retaining.saturating_add(census.handover_retained),
+            max,
+        )
+        .saturating_add(census.replacing.saturating_sub(terminated_replacing));
+        if census.handover_retained > 0 {
+            to.min(from.saturating_add(max.saturating_sub(census.live)))
+        } else {
+            to
+        }
     }
 
     fn resume_drains(&mut self, pass: &Pass<'_>, view: &FleetView<'_>, plan: &mut Plan) -> u32 {

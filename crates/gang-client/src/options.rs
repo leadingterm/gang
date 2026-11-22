@@ -32,7 +32,8 @@ pub struct ClientOptions {
     pub api_retry_initial_backoff: NonZeroDuration,
     /// Maximum exponential delay between safe API retries.
     pub api_retry_max_backoff: NonZeroDuration,
-    /// Total time allowed for API attempts and retry delays.
+    /// Total time allowed for API attempts and retry delays. Defaults to the client keepalive
+    /// timeout plus the maximum protocol retry delay.
     pub api_retry_budget: NonZeroDuration,
     /// The largest response body accepted from the server. Must not be zero.
     pub max_response_size: NonZeroBytes,
@@ -81,11 +82,8 @@ impl Default for ClientOptions {
                 gang_types::health::CLIENT_RETRY_MAX_DELAY.as_secs(),
             ),
             api_retry_budget: NonZeroDuration::from_secs(
-                gang_types::handover::handover_window(
-                    gang_types::handover::DEFAULT_RENEW_INTERVAL,
-                    gang_types::handover::DEFAULT_CALL_TIMEOUT,
-                )
-                .as_secs(),
+                gang_types::health::CLIENT_KEEPALIVE_TIMEOUT.as_secs()
+                    + gang_types::health::CLIENT_RETRY_MAX_DELAY.as_secs(),
             ),
             max_response_size: NonZeroBytes::mib(1),
             callback_max_head_size: NonZeroBytes::kib(64),
@@ -123,7 +121,7 @@ mod tests {
             NonZeroDuration::from_millis(100)
         );
         assert_eq!(options.api_retry_max_backoff, NonZeroDuration::from_secs(5));
-        assert_eq!(options.api_retry_budget, NonZeroDuration::from_secs(21));
+        assert_eq!(options.api_retry_budget, NonZeroDuration::from_secs(35));
         assert_eq!(options.max_response_size, NonZeroBytes::mib(1));
         assert_eq!(options.callback_max_head_size, NonZeroBytes::kib(64));
         assert_eq!(

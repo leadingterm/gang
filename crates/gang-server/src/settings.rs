@@ -112,10 +112,8 @@ pub struct ServerSettings {
     pub proxy_protocol: Option<Arc<gang_config::ProxyProtocolConfig>>,
     /// Lease timing for this controller.
     pub leadership: LeadershipConfig,
-    /// Time a newer standby must remain routable before requesting handover.
-    pub standby_routability_delay: Duration,
-    /// Bound on voluntary handover, derived from the process shutdown backstop.
-    pub handoff_timeout: Duration,
+    /// Whole-attempt budget derived from the actual worker transfer and action settings.
+    pub attempt_budget: Duration,
     /// How often to refresh revocations written by other controllers.
     pub revocation_refresh_interval: NonZeroDuration,
     /// How often the control loop runs a reconcile pass.

@@ -29,10 +29,6 @@ pub(crate) enum NativeLinkConfigError {
     )]
     #[failure(config)]
     WorkerEndpointUnresolved,
-    /// Refusal serving requires the controller's configured request deadline.
-    #[error("request_timeout requires controller settings")]
-    #[failure(config)]
-    ControllerRequestTimeoutRequired,
     /// The worker endpoint's scheme does not match whether TLS is configured.
     #[error("worker_endpoint must use {expected}")]
     #[failure(config)]
@@ -110,6 +106,9 @@ pub(crate) enum NativeLinkEmbedError {
     #[error("the controller is already serving")]
     #[failure(config)]
     AlreadyServing,
+    /// The original scheduler could not freeze or observe its owned work.
+    #[error("cannot hand off the original controller")]
+    Drain(#[source] gang_spi::PortError),
 }
 
 impl NativeLinkEmbedError {

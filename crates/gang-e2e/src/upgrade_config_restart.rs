@@ -228,6 +228,31 @@ fn verify_selections(
     Ok(())
 }
 
+/// Joins real fixture selectors to exact bytes in the existing offline SSM/IAM model.
+pub(crate) fn verify_publication(old: &ReleaseFixture, candidate: &ReleaseFixture) -> Result<()> {
+    require_modern(&old.configuration)?;
+    require_modern(&candidate.configuration)?;
+    if old.configuration.controller.reference == candidate.configuration.controller.reference {
+        return Err(E2eError::system(
+            "configuration transition reused its generation",
+        ));
+    }
+    let old_bytes = Arc::from(old.gang_toml.as_str());
+    let candidate_bytes = Arc::from(candidate.gang_toml.as_str());
+    let mut store = Parameters::seeded(&old.configuration, &old_bytes)?;
+    for role in std::iter::once(&old.configuration.controller).chain(&old.configuration.workers) {
+        require_bytes(&store.fetch(&role.reference, role)?, &old_bytes)?;
+    }
+    store.publish(&candidate.configuration, &candidate_bytes)?;
+    verify_selections(
+        &store,
+        &old.configuration,
+        &candidate.configuration,
+        &old_bytes,
+        &candidate_bytes,
+    )
+}
+
 fn require_executable(pid: u32, binary: &Path) -> Result<()> {
     let executable = fs::canonicalize(format!("/proc/{pid}/exe"))
         .map_err(E2eError::io("resolving restarted executable"))?;
@@ -318,8 +343,8 @@ pub(crate) fn config_refetch_restart(
     issuer: &TestIssuer,
 ) -> Result<Vec<Check>> {
     let inputs = published_previous(invocation)?;
-    let old = ReleaseFixture::read(&inputs.previous.fixture)?;
-    let candidate = ReleaseFixture::read(&inputs.candidate_fixture)?;
+    let old = ReleaseFixture::read(&inputs.previous.fixture)?.seeded()?;
+    let candidate = ReleaseFixture::read(&inputs.candidate_fixture)?.seeded()?;
     require_modern(&old.configuration)?;
     require_modern(&candidate.configuration)?;
     if old.configuration.controller.reference == candidate.configuration.controller.reference {

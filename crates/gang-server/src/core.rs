@@ -17,7 +17,7 @@ pub(crate) struct Core<K: Stack> {
     pub(crate) workers: Arc<K::Workers>,
     /// The names and attributes of the session cookies of the public endpoint.
     pub(crate) cookies: SessionCookies,
-    /// Serializes durable principal changes with their local snapshot application.
+    /// Serializes complete durable revocations/restores, local snapshots, and handoff freeze.
     pub(crate) revocation_lock: tokio::sync::Mutex<()>,
 }
 

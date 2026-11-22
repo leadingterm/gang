@@ -62,6 +62,7 @@ fn fixture(permission: Permission) -> (Api<TlsDeployment>, BuildsCell) {
         revocations: Revocations::new(
             Arc::clone(&harness.core),
             RevocationSet::from_serials(Vec::new()),
+            crate::health::Readiness::for_test(),
         ),
         info,
         authorizer: Authorizer::new(vec![role_for(

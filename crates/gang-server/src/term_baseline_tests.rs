@@ -226,15 +226,23 @@ async fn a_new_term_excludes_existing_evictions() -> TestResult {
     Ok(())
 }
 
-// Catches a term that starts before its baseline is taken (traffic during the wait would be in
-// neither the baseline nor the first sample's growth), and a baseline wait that stops the lease
-// renewals, which would let another controller take the lease while this one still thinks it
-// leads.
+// A successor's observational baseline is passive preparation: the original controller
+// must keep renewing and serving until the successor is prepared to request takeover.
 #[tokio::test]
 async fn the_lease_is_renewed_while_the_term_baseline_is_taken() -> TestResult {
-    let (parts, handles, mut settings) = fixture();
+    let (mut parts, mut handles, mut settings) = fixture();
+    let (old_parts, _dials, _old_handles) = plain_parts();
+    parts.repository = old_parts.repository.clone();
+    parts.clock = old_parts.clock.clone();
+    handles.repository = parts.repository.clone();
+    handles.clock = parts.clock.clone();
+    parts.controller = ControllerId::new("baseline-successor");
+    let old = Server::prepare(old_parts, plain_settings()).await?;
+    let old_ready = old.readiness();
+    let mut old = pin!(old.run(pending(), ControllerReady::channel().0));
+    assert!(futures::poll!(old.as_mut()).is_pending());
     let renew_interval = settings.leadership.renew_interval.get();
-    settings.poll_interval = NonZeroDuration::from_secs(60);
+    settings.poll_interval = NonZeroDuration::from_mins(1);
     let release_snapshot = handles.scheduler.hold_snapshot();
     let server = Server::prepare(parts, settings).await?;
     let mut run = pin!(server.run(pending(), ControllerReady::channel().0));
@@ -246,6 +254,11 @@ async fn the_lease_is_renewed_while_the_term_baseline_is_taken() -> TestResult {
         .ok_or("the engine runs before the lease is taken")?;
     for _ in 0..4 {
         handles.clock.advance(renew_interval);
+        assert!(futures::poll!(old.as_mut()).is_pending());
+        assert!(
+            old_ready.ready(),
+            "the original remains healthy during successor preparation"
+        );
         assert!(futures::poll!(run.as_mut()).is_pending());
     }
     let now = handles.clock.wall();
@@ -266,7 +279,7 @@ async fn the_lease_is_renewed_while_the_term_baseline_is_taken() -> TestResult {
         .await?;
     assert!(
         matches!(stolen, Acquisition::Held(_)),
-        "renewals keep the lease past its first expiry"
+        "original renewals keep its lease past the first expiry while the successor prepares"
     );
     assert_eq!(
         follower_status(&controller).await,
@@ -276,6 +289,11 @@ async fn the_lease_is_renewed_while_the_term_baseline_is_taken() -> TestResult {
     release_snapshot
         .send(())
         .map_err(|()| "the baseline snapshot was not being taken")?;
+    assert!(futures::poll!(run.as_mut()).is_pending());
+    handles.clock.advance(renew_interval);
+    if let std::task::Poll::Ready(result) = futures::poll!(old.as_mut()) {
+        result?;
+    }
     assert!(futures::poll!(run.as_mut()).is_pending());
     assert_eq!(
         follower_status(&controller).await,

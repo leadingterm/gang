@@ -15,6 +15,14 @@ pub(crate) struct ReleaseFixture {
     pub(crate) workers: FrontendPlan,
     pub(crate) controller: ControllerPlan,
     pub(crate) configuration: ConfigurationPlan,
+    pub(crate) seed: SeedConfiguration,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SeedConfiguration {
+    pub(crate) gang_toml: String,
+    pub(crate) configuration: ConfigurationPlan,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -55,11 +63,29 @@ pub(crate) struct ControllerPlan {
     pub(crate) health_check_type: String,
     pub(crate) min_healthy_percentage: u32,
     pub(crate) max_healthy_percentage: u32,
-    pub(crate) warmup_seconds: u64,
-    pub(crate) deregistration_delay_seconds: u64,
 }
 
 impl ReleaseFixture {
+    pub(crate) fn seeded(mut self) -> Result<Self> {
+        let config: toml::Value =
+            toml::from_str(&self.seed.gang_toml).map_err(crate::template::template_error)?;
+        if config
+            .get("fleets")
+            .and_then(toml::Value::as_array)
+            .and_then(|fleets| fleets.first())
+            .and_then(|fleet| fleet.get("max_instances"))
+            .and_then(toml::Value::as_integer)
+            != Some(1)
+        {
+            return Err(E2eError::system(
+                "initial fixture must select seed fleet maximum one",
+            ));
+        }
+        self.gang_toml.clone_from(&self.seed.gang_toml);
+        self.configuration = self.seed.configuration.clone();
+        Ok(self)
+    }
+
     pub(crate) fn read(path: &Path) -> Result<Self> {
         let content =
             fs::read(path).map_err(E2eError::io(format!("reading {}", path.display())))?;
@@ -87,20 +113,22 @@ mod tests {
                 "unhealthy_threshold": 2
             }
         });
+        let configuration = json!({
+            "controller": {
+                "reference": "/gang/gang.toml/generations/old:1",
+                "readable_resources": [],
+                "excluded_from_deny": []
+            },
+            "workers": [],
+            "generations_retained": false
+        });
         json!({
             "gang_toml": "rendered",
             "local_config": "local",
             "public": frontend,
             "workers": frontend,
-            "configuration": {
-                "controller": {
-                    "reference": "/gang/gang.toml/generations/old:1",
-                    "readable_resources": [],
-                    "excluded_from_deny": []
-                },
-                "workers": [],
-                "generations_retained": false
-            },
+            "configuration": configuration,
+            "seed": { "gang_toml": "[[fleets]]\nmax_instances = 1", "configuration": configuration },
             "controller": {
                 "instances": 1,
                 "health_check_type": "EC2",
@@ -113,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_transport_and_zero_timing_without_defaults() {
+    fn deserializes_transport_and_ignores_unused_historical_refresh_metadata() {
         let mut value = fixture();
         value["workers"]["proxy_protocol_v2"] = json!(false);
         value["workers"]["preserve_client_ip"] = Value::Null;
@@ -124,8 +152,51 @@ mod tests {
         assert_eq!(fixture.public.preserve_client_ip, Some(false));
         assert!(!fixture.workers.proxy_protocol_v2);
         assert_eq!(fixture.workers.preserve_client_ip, None);
-        assert_eq!(fixture.controller.warmup_seconds, 0);
-        assert_eq!(fixture.controller.deregistration_delay_seconds, 0);
+    }
+
+    #[test]
+    fn requires_complete_seed_and_selects_its_own_configuration() {
+        let mut value = fixture();
+        value["seed"]["configuration"]["controller"]["reference"] = json!("/seed:1");
+        let seeded = serde_json::from_value::<ReleaseFixture>(value)
+            .expect("fixture")
+            .seeded()
+            .expect("seed snapshot");
+        assert_eq!(seeded.gang_toml, "[[fleets]]\nmax_instances = 1");
+        assert_eq!(seeded.configuration.controller.reference, "/seed:1");
+        let mut missing = fixture();
+        missing.as_object_mut().expect("fixture").remove("seed");
+        assert!(serde_json::from_value::<ReleaseFixture>(missing).is_err());
+        for field in ["gang_toml", "configuration"] {
+            let mut missing = fixture();
+            missing["seed"].as_object_mut().expect("seed").remove(field);
+            assert!(serde_json::from_value::<ReleaseFixture>(missing).is_err());
+            let mut malformed = fixture();
+            malformed["seed"][field] = Value::Null;
+            assert!(serde_json::from_value::<ReleaseFixture>(malformed).is_err());
+        }
+        let mut extra = fixture();
+        extra["seed"]["local_config"] = json!("not part of the seed contract");
+        assert!(serde_json::from_value::<ReleaseFixture>(extra).is_err());
+        for field in ["controller", "workers", "generations_retained"] {
+            let mut missing = fixture();
+            missing["seed"]["configuration"]
+                .as_object_mut()
+                .expect("configuration")
+                .remove(field);
+            assert!(serde_json::from_value::<ReleaseFixture>(missing).is_err());
+            let mut malformed = fixture();
+            malformed["seed"]["configuration"][field] = Value::Null;
+            assert!(serde_json::from_value::<ReleaseFixture>(malformed).is_err());
+        }
+        let mut oversized = fixture();
+        oversized["seed"]["gang_toml"] = json!("[[fleets]]\nmax_instances = 2");
+        assert!(
+            serde_json::from_value::<ReleaseFixture>(oversized)
+                .expect("fixture")
+                .seeded()
+                .is_err()
+        );
     }
 
     #[test]
@@ -133,8 +204,6 @@ mod tests {
         for (owner, field) in [
             ("public", "proxy_protocol_v2"),
             ("workers", "proxy_protocol_v2"),
-            ("controller", "warmup_seconds"),
-            ("controller", "deregistration_delay_seconds"),
             ("configuration", "controller"),
             ("configuration", "workers"),
             ("configuration", "generations_retained"),

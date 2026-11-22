@@ -182,7 +182,7 @@ async fn send(controller: &Controller, request: Request<ApiRequestBody>) -> ApiR
         ..Peer::default()
     };
     controller
-        .admit_public(gang_spi::RequestScope::Shared, &peer, &mut parts)
+        .admit_public(gang_spi::RequestScope::Controller, &peer, &mut parts)
         .await
         .expect("the public gate admits the request");
     read(controller.call_api(Request::from_parts(parts, body)).await).await
@@ -218,7 +218,7 @@ async fn recorded_address(controller: &Controller, peer: &Peer, forwarded: &str)
             .into_parts()
             .0;
     controller
-        .admit_public(gang_spi::RequestScope::Shared, peer, &mut parts)
+        .admit_public(gang_spi::RequestScope::Controller, peer, &mut parts)
         .await
         .expect("the public gate admits the open server description");
     parts
@@ -270,7 +270,7 @@ async fn get_from(controller: &Controller, peer: &Peer, forwarded: &str) -> ApiR
     let request = request_with_header("GET", GET_SERVER.template, &[], FORWARDED_FOR, forwarded);
     let (mut parts, body) = request.into_parts();
     controller
-        .admit_public(gang_spi::RequestScope::Shared, peer, &mut parts)
+        .admit_public(gang_spi::RequestScope::Controller, peer, &mut parts)
         .await
         .expect("the public gate admits the request");
     assert_eq!(
@@ -579,7 +579,7 @@ async fn worker_gate_records_no_client_address() {
             .into_parts()
             .0;
             let _outcome = controller
-                .admit_worker(gang_spi::RequestScope::Shared, &peer, &mut parts)
+                .admit_worker(gang_spi::RequestScope::Controller, &peer, &mut parts)
                 .await;
             assert!(
                 parts.extensions.get::<ClientAddress>().is_none(),

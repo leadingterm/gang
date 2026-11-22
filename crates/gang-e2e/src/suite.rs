@@ -51,7 +51,7 @@ use crate::server::ServerKnobs;
 use crate::server_scenarios::{
     api, certificate_rotation, event_paging, request_limits, viewer_cap,
 };
-use crate::settings::{DeploymentInputs, UpgradeProcedure};
+use crate::settings::DeploymentInputs;
 use crate::setup::setup;
 use crate::skipped_pass::skipped_pass;
 use crate::stack::Stack;
@@ -230,10 +230,9 @@ gang_types::string_enum! {
         ControllerLoss = "controller-loss",
         /// Controllers are replaced while a build is in progress.
         RollingDeploy = "rolling-deploy",
-        /// A previous release is replaced by the candidate while work is held.
+        /// Previous-release, candidate-to-candidate and configuration-only ordinary refreshes
+        /// while work is held.
         RollingUpgrade = "rolling-upgrade",
-        /// A previous release is replaced by instance refresh while work is held.
-        RollingUpgradeAutomatic = "rolling-upgrade-automatic",
         /// Published old controllers and workers refetch preserved configuration after publication.
         ConfigRefetchRestart = "config-refetch-restart",
         /// Revocations propagate between controllers.
@@ -247,7 +246,8 @@ gang_types::string_enum! {
         /// Two authenticated builds, cold then warm, are attributed separately with their cache
         /// and execution usage and timestamps visible to the administrator. Gate two only.
         Builds = "builds",
-        /// Followers serve shared requests, refuse leader-only requests, and builds use the leader.
+        /// Passive followers refuse all fresh public requests before handlers start, while builds
+        /// use the sole leader.
         FollowerBuilds = "follower-builds",
         /// A kernel action-pool OOM is classified and requeued without a generic retry.
         PoolOom = "pool-oom",
@@ -314,10 +314,9 @@ impl Scenario {
             Self::Identity => 80,
             Self::Sessions => 60,
             Self::ControllerLoss => 84,
-            Self::RollingDeploy
-            | Self::BurstFromZero
-            | Self::RollingUpgrade
-            | Self::RollingUpgradeAutomatic => 62,
+            Self::RollingDeploy | Self::BurstFromZero => 62,
+            // All three held-build placements use the existing 62-second refresh weight.
+            Self::RollingUpgrade => 3 * 62,
             Self::FollowerBuilds => 66,
             Self::LoginAcross => 15,
             Self::ScheduledMinimum => 5,
@@ -384,7 +383,6 @@ impl Scenario {
             | Self::ControllerLoss
             | Self::RollingDeploy
             | Self::RollingUpgrade
-            | Self::RollingUpgradeAutomatic
             | Self::ConfigRefetchRestart
             | Self::CrossRevocation
             | Self::LeaderFailover
@@ -470,7 +468,7 @@ impl Scenario {
             Self::InputIntegrity => input_integrity_checks(ctx),
             Self::InputRoot => input_root_checks(ctx),
             Self::Restart => restart_checks(ctx),
-            Self::RollingUpgrade | Self::RollingUpgradeAutomatic => upgrade_checks(self, ctx),
+            Self::RollingUpgrade => upgrade_checks(ctx),
             Self::ConfigRefetchRestart => config_restart_checks(ctx),
             Self::ControllerLoss
             | Self::RollingDeploy
@@ -583,17 +581,12 @@ fn lifecycle_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     })
 }
 
-fn upgrade_checks(scenario: Scenario, ctx: &RunContext<'_>) -> Vec<Check> {
+fn upgrade_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    let scenario = Scenario::RollingUpgrade;
     if cfg!(target_os = "linux") {
         attempt(scenario, || {
             let variant = required_cluster_variant(scenario, &ctx.baseline)?;
-            let automatic_inputs = (scenario == Scenario::RollingUpgradeAutomatic).then(|| {
-                let mut inputs = ctx.inputs.clone();
-                inputs.settings.upgrade_procedure = UpgradeProcedure::InstanceRefresh;
-                inputs
-            });
-            let inputs = automatic_inputs.as_ref().unwrap_or(ctx.inputs);
-            crate::rolling_upgrade::rolling_upgrade(inputs, &variant, ctx.issuer)
+            crate::rolling_upgrade::rolling_upgrade(ctx.inputs, &variant, ctx.issuer)
         })
     } else {
         vec![Check::skipped(
@@ -942,7 +935,6 @@ fn cluster_variant(scenario: Scenario, baseline: &Variant) -> Option<Variant> {
         Scenario::ControllerLoss
         | Scenario::RollingDeploy
         | Scenario::RollingUpgrade
-        | Scenario::RollingUpgradeAutomatic
         | Scenario::ConfigRefetchRestart
         | Scenario::FollowerBuilds => Variant::baseline(Sandbox::Noop),
         Scenario::LeaderFailover => Variant {
@@ -1016,7 +1008,7 @@ fn controller_loss_inputs(inputs: &DeploymentInputs) -> Result<DeploymentInputs>
         .and_then(toml::Value::as_table_mut)
         .ok_or_else(|| crate::errors::E2eError::system("missing server configuration"))?;
     let leadership =
-        toml::from_str("ttl = \"10s\"\nrenew_interval = \"3s\"\nclock_skew = \"2s\"\n")
+        toml::from_str("ttl = \"10s\"\nrenew_interval = \"1s\"\nclock_skew = \"2s\"\n")
             .map_err(crate::template::template_error)?;
     server.insert("leadership".into(), leadership);
     invocation.base_config = toml::to_string(&document).map_err(crate::template::template_error)?;
@@ -1635,6 +1627,24 @@ mod tests {
             document["actions"]["cold_start"]["cpu_millicores"].as_integer(),
             Some(250)
         );
+        let leadership = &document["server"]["leadership"];
+        assert_eq!(leadership["ttl"].as_str(), Some("10s"));
+        assert_eq!(leadership["renew_interval"].as_str(), Some("1s"));
+        assert_eq!(leadership["clock_skew"].as_str(), Some("2s"));
+        let renew = gang_types::duration::parse(
+            leadership["renew_interval"]
+                .as_str()
+                .expect("renewal interval"),
+        )
+        .expect("renewal interval parses");
+        let planned = gang_types::handover::handover_window(
+            renew,
+            gang_types::handover::DEFAULT_CALL_TIMEOUT,
+        );
+        assert!(
+            planned + gang_types::handover::DEFAULT_CALL_TIMEOUT
+                < gang_types::handover::minimum_cli_last_attempt(),
+        );
     }
 
     #[test]
@@ -1708,7 +1718,6 @@ mod tests {
             Scenario::ControllerLoss,
             Scenario::RollingDeploy,
             Scenario::RollingUpgrade,
-            Scenario::RollingUpgradeAutomatic,
             Scenario::ConfigRefetchRestart,
             Scenario::FollowerBuilds,
             Scenario::CrossRevocation,
@@ -1730,7 +1739,6 @@ mod tests {
             Scenario::ControllerLoss,
             Scenario::RollingDeploy,
             Scenario::RollingUpgrade,
-            Scenario::RollingUpgradeAutomatic,
             Scenario::ConfigRefetchRestart,
             Scenario::FollowerBuilds,
             Scenario::CrossRevocation,
@@ -1791,10 +1799,6 @@ mod tests {
     fn upgrades_are_gate_two_only_and_selectable_by_name() {
         for (name, scenario) in [
             ("rolling-upgrade", Scenario::RollingUpgrade),
-            (
-                "rolling-upgrade-automatic",
-                Scenario::RollingUpgradeAutomatic,
-            ),
             ("config-refetch-restart", Scenario::ConfigRefetchRestart),
         ] {
             assert_eq!(name.parse::<Scenario>().ok(), Some(scenario));
@@ -1852,7 +1856,6 @@ mod tests {
             Scenario::ControllerLoss,
             Scenario::RollingDeploy,
             Scenario::RollingUpgrade,
-            Scenario::RollingUpgradeAutomatic,
             Scenario::ConfigRefetchRestart,
             Scenario::CrossRevocation,
             Scenario::LeaderFailover,

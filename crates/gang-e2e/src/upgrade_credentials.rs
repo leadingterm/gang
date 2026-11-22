@@ -1,9 +1,9 @@
-//! One-shot previous-client cold mints and a shared-authentication drain witness.
+//! Previous-client cold mints, unchanged warm sessions, and canonical workload proofs.
 
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use gang_client::{ClientOptions, ProofSource};
@@ -15,10 +15,8 @@ use tempfile::TempDir;
 
 use crate::errors::{E2eError, Result};
 use crate::gang_cli::GangCli;
-use crate::identity::Credentials;
 use crate::process::{self, Ran};
 use crate::secured;
-use crate::upgrade_probe::{self, DirectTarget, SharedAuthentication};
 
 /// Two independent cold homes, consumed together without retries or intervening probes.
 ///
@@ -53,7 +51,7 @@ enum SessionKind {
 }
 
 impl ColdHelpers {
-    /// Prepares both isolated homes before the incoming-healthy/pre-stop window.
+    /// Prepares both isolated homes before starting the replacement controller.
     pub(crate) fn prepare(
         cli: &GangCli,
         endpoint: &Url,
@@ -79,17 +77,81 @@ impl ColdHelpers {
 
     /// Runs the two actual previous `gang get` commands serially, returning bearer tokens only.
     ///
-    /// The availability monitor must call this inside the healthy/pre-stop window without
-    /// interleaving other probes. Its clock must keep running throughout both commands. A pair
+    /// The availability monitor calls this while original work is held and the successor is healthy,
+    /// without interleaving other probes. Its clock keeps running throughout both commands. A pair
     /// does not by itself witness which backend served either mint.
     pub(crate) fn mint_pair(self) -> Result<[String; 2]> {
         Ok([self.mint(0)?, self.mint(1)?])
     }
 
-    /// Builds the canonical DTO from the original session only after a warm-pair failure.
-    pub(crate) fn diagnostic_body(cli: &GangCli, endpoint: &Url) -> Result<Bytes> {
+    /// Paces two uncached authentication requests within the installed caller/shared budgets.
+    /// This is test traffic pacing, not a handover wait or a retry after any failure.
+    pub(crate) fn continuity_interval(
+        configuration: &str,
+        probe_interval: Duration,
+    ) -> Result<Duration> {
+        let document: toml::Value =
+            toml::from_str(configuration).map_err(crate::template::template_error)?;
+        let limits: gang_config::RateLimitConfig = match document
+            .get("server")
+            .and_then(|server| server.get("rate_limit"))
+        {
+            Some(value) => value
+                .clone()
+                .try_into()
+                .map_err(crate::template::template_error)?,
+            None => gang_config::RateLimitConfig::default(),
+        };
+        Ok(probe_interval.max(
+            limits
+                .client
+                .refill_interval
+                .get()
+                .max(limits.global.refill_interval.get())
+                .saturating_mul(2),
+        ))
+    }
+
+    /// Captures the opaque original session without logging in or rewriting its bound proof.
+    pub(crate) fn session_bytes(cli: &GangCli, endpoint: &Url) -> Result<Vec<u8>> {
         let bytes = fs::read(client_directory(cli.home()).join("session.json"))
-            .map_err(|_| E2eError::system("warm diagnostic session unavailable"))?;
+            .map_err(|_| E2eError::system("original workload session unavailable"))?;
+        validate_session(&bytes, endpoint)?;
+        Ok(bytes)
+    }
+
+    /// Reuses the actual old helper home, rejecting any replacement of its original session.
+    pub(crate) fn warm_token(
+        cli: &GangCli,
+        endpoint: &Url,
+        original_session: &[u8],
+        timeout: Duration,
+    ) -> Result<String> {
+        if Self::session_bytes(cli, endpoint)? != original_session {
+            return Err(E2eError::system("original warm workload session changed"));
+        }
+        let request = serde_json::json!({ "uri": endpoint.as_str() }).to_string();
+        let answer = process::run(cli.get(), Some(request.as_bytes()), timeout)?;
+        if !answer.succeeded() {
+            return Err(E2eError::system(
+                "original warm gang get failed; helper output withheld to protect credentials",
+            ));
+        }
+        let token = secured::bearer_of(&answer.stdout).map_err(|_| {
+            E2eError::system("original warm gang get returned no bearer authorization")
+        })?;
+        if Self::session_bytes(cli, endpoint)? != original_session {
+            return Err(E2eError::system(
+                "original warm gang get replaced its session",
+            ));
+        }
+        Ok(token)
+    }
+
+    /// Builds a canonical proof request from the original session and current bound proof.
+    pub(crate) fn proof_request(cli: &GangCli, endpoint: &Url) -> Result<Bytes> {
+        let bytes = fs::read(client_directory(cli.home()).join("session.json"))
+            .map_err(|_| E2eError::system("original workload session unavailable"))?;
         let session = validate_session(&bytes, endpoint)?;
         let SessionKind::Workload { source } = session.kind;
         authentication_body(&session.provider, &source)
@@ -214,6 +276,11 @@ fn project_answer(answer: &Ran, index: usize) -> Result<String> {
 // v0.3.2 record.rs renders this exact uncolored, piped failure prefix. Inspect only the
 // fixed status position, never search server-controlled message/body/continuation lines.
 fn helper_failure(stderr: &str) -> String {
+    // This dedicated ClientError never contains a server-controlled message. Keep its
+    // classification anchored to the complete first record, not arbitrary later output.
+    if stderr.lines().next() == Some("  fail  gang get: the server is rate limiting this client") {
+        return "helper_stage=rate_limited; helper_http_status=429".to_owned();
+    }
     let Some(status) = stderr
         .as_bytes()
         .strip_prefix(b"  fail  gang get: the server answered ")
@@ -226,90 +293,6 @@ fn helper_failure(stderr: &str) -> String {
         return "helper_stage=unknown; helper_http_status=unknown".to_owned();
     };
     format!("helper_stage=server_response; helper_http_status={status}")
-}
-
-/// A third independent, one-shot old-client helper reserved for the live-drain witness.
-#[must_use]
-pub(crate) struct DrainCredentials {
-    helper: ColdHelper,
-    endpoint: Url,
-    provider: ProviderName,
-    source: ProofSource,
-    mint_timeout: Duration,
-}
-
-/// Secret-free evidence that shared authentication issued a bearer accepted by the original NLB.
-#[derive(Debug)]
-pub(crate) struct SharedCredentialWitness {
-    pub(crate) status: u16,
-    pub(crate) marker_absent: bool,
-    pub(crate) token_valid: bool,
-}
-
-/// Secret-free offsets from witness entry; success requires every recorded phase to finish.
-#[derive(Debug)]
-pub(crate) struct DrainCredentialWitness {
-    pub(crate) shared_started: Duration,
-    pub(crate) shared_finished: Duration,
-    pub(crate) shared: SharedCredentialWitness,
-    pub(crate) shared_verification_started: Duration,
-    pub(crate) shared_verification_finished: Duration,
-    pub(crate) mint_started: Duration,
-    pub(crate) mint_finished: Duration,
-    pub(crate) verification_started: Duration,
-    pub(crate) verification_finished: Duration,
-    pub(crate) token_valid: bool,
-}
-
-impl DrainCredentials {
-    /// Copies only the opaque original session, before any incoming-controller warmup.
-    pub(crate) fn prepare(
-        cli: &GangCli,
-        endpoint: &Url,
-        root: &Path,
-        mint_timeout: Duration,
-    ) -> Result<Self> {
-        let bytes = fs::read(client_directory(cli.home()).join("session.json")).map_err(
-            E2eError::io("reading the previous client's drain-probe session"),
-        )?;
-        let session = validate_session(&bytes, endpoint)?;
-        gang_os::fs::require_private_dir(root).map_err(E2eError::system_from(
-            "preparing the drain credential probe root",
-        ))?;
-        let SessionKind::Workload { source } = session.kind;
-        Ok(Self {
-            helper: prepare_home(cli, root, &bytes)?,
-            endpoint: endpoint.clone(),
-            provider: session.provider,
-            source,
-            mint_timeout,
-        })
-    }
-
-    /// Uses one absolute budget for shared authentication and a cold NLB mint.
-    pub(crate) fn witness(
-        self,
-        target: DirectTarget,
-        credentials: &Credentials,
-        probe_timeout: Duration,
-        budget: Duration,
-    ) -> Result<DrainCredentialWitness> {
-        let mint_timeout = self.mint_timeout;
-        observe_drain(
-            &mut DrainAttempt {
-                prepared: self,
-                target,
-                credentials,
-            },
-            probe_timeout,
-            mint_timeout,
-            budget,
-        )
-    }
-
-    fn authentication_body(&self) -> Result<Bytes> {
-        authentication_body(&self.provider, &self.source)
-    }
 }
 
 fn authentication_body(provider: &ProviderName, source: &ProofSource) -> Result<Bytes> {
@@ -326,156 +309,6 @@ fn authentication_body(provider: &ProviderName, source: &ProofSource) -> Result<
     })
     .map(Bytes::from)
     .map_err(|_| E2eError::system("serializing the authentication request unavailable"))
-}
-
-// The ordered protocol has one clock and no retry/fallback path. This seam also lets regression
-// tests drive failures and elapsed time without running helpers or opening network connections.
-trait DrainSteps {
-    fn now(&self) -> Instant;
-    fn original_token(&self) -> &str;
-    fn authenticate(&mut self, deadline: Instant) -> Result<SharedAuthentication>;
-    fn mint(&mut self, deadline: Instant) -> Result<String>;
-    fn verify(&mut self, token: String, deadline: Instant) -> Result<()>;
-}
-
-struct DrainAttempt<'a> {
-    prepared: DrainCredentials,
-    target: DirectTarget,
-    credentials: &'a Credentials,
-}
-
-impl DrainSteps for DrainAttempt<'_> {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-
-    fn original_token(&self) -> &str {
-        &self.credentials.token
-    }
-
-    fn authenticate(&mut self, deadline: Instant) -> Result<SharedAuthentication> {
-        let body = self.prepared.authentication_body()?;
-        upgrade_probe::probe_shared_authentication(
-            &self.prepared.endpoint,
-            self.credentials,
-            self.target,
-            body,
-            remaining(deadline, self.now())?,
-        )
-    }
-
-    fn mint(&mut self, deadline: Instant) -> Result<String> {
-        ensure_cold(self.prepared.helper.cli.home())?;
-        let request = serde_json::json!({ "uri": self.prepared.endpoint.as_str() }).to_string();
-        let answer = process::run(
-            self.prepared.helper.cli.get(),
-            Some(request.as_bytes()),
-            remaining(deadline, self.now())?,
-        )
-        .map_err(|_| {
-            E2eError::system("drain credential probe could not run the previous gang get")
-        })?;
-        project_answer(&answer, 3)
-    }
-
-    fn verify(&mut self, token: String, deadline: Instant) -> Result<()> {
-        let minted = Credentials {
-            principal: self.credentials.principal.clone(),
-            home: self.prepared.helper.cli.home().to_path_buf(),
-            token,
-            authority: self.credentials.authority.clone(),
-        };
-        upgrade_probe::probe_capabilities(
-            &self.prepared.endpoint,
-            &minted,
-            remaining(deadline, self.now())?,
-        )
-    }
-}
-
-fn observe_drain(
-    steps: &mut dyn DrainSteps,
-    probe_timeout: Duration,
-    mint_timeout: Duration,
-    budget: Duration,
-) -> Result<DrainCredentialWitness> {
-    let started = steps.now();
-    if budget.is_zero() {
-        return Err(E2eError::system(
-            "drain credential witness requires a budget",
-        ));
-    }
-    let deadline = started
-        .checked_add(budget)
-        .ok_or_else(|| E2eError::system("drain credential witness deadline overflow"))?;
-    let shared_started = steps.now().duration_since(started);
-    let shared_deadline = phase_deadline(steps.now(), deadline, probe_timeout)?;
-    let shared_limit = remaining(shared_deadline, steps.now())?;
-    let shared = steps.authenticate(shared_deadline)?;
-    remaining(shared_deadline, steps.now())?;
-    if shared.elapsed >= shared_limit || shared.status != 200 || !shared.marker_absent {
-        return Err(E2eError::system(format!(
-            "drain shared authentication requires timely HTTP 200 without admission marker: status={}, marker_absent={}",
-            shared.status, shared.marker_absent
-        )));
-    }
-    let shared_finished = steps.now().duration_since(started);
-    let shared_verification_started = steps.now().duration_since(started);
-    let shared_verification_deadline = phase_deadline(steps.now(), deadline, probe_timeout)?;
-    verify_fresh(steps, shared.token, shared_verification_deadline)?;
-    let shared_verification_finished = steps.now().duration_since(started);
-    let mint_started = steps.now().duration_since(started);
-    let mint_deadline = phase_deadline(steps.now(), deadline, mint_timeout)?;
-    let token = steps.mint(mint_deadline)?;
-    remaining(mint_deadline, steps.now())?;
-    let mint_finished = steps.now().duration_since(started);
-    let verification_started = steps.now().duration_since(started);
-    let verification_deadline = phase_deadline(steps.now(), deadline, probe_timeout)?;
-    verify_fresh(steps, token, verification_deadline)?;
-    Ok(DrainCredentialWitness {
-        shared_started,
-        shared_finished,
-        shared: SharedCredentialWitness {
-            status: shared.status,
-            marker_absent: shared.marker_absent,
-            token_valid: true,
-        },
-        shared_verification_started,
-        shared_verification_finished,
-        mint_started,
-        mint_finished,
-        verification_started,
-        verification_finished: steps.now().duration_since(started),
-        token_valid: true,
-    })
-}
-
-fn verify_fresh(steps: &mut dyn DrainSteps, token: String, deadline: Instant) -> Result<()> {
-    if token.is_empty() || token == steps.original_token() {
-        return Err(E2eError::system(
-            "drain credential witness requires a fresh nonempty bearer",
-        ));
-    }
-    steps.verify(token, deadline)?;
-    remaining(deadline, steps.now())?;
-    Ok(())
-}
-
-fn remaining(deadline: Instant, now: Instant) -> Result<Duration> {
-    deadline
-        .checked_duration_since(now)
-        .filter(|duration| !duration.is_zero())
-        .ok_or_else(|| E2eError::system("drain credential witness deadline expired"))
-}
-
-fn phase_deadline(now: Instant, deadline: Instant, limit: Duration) -> Result<Instant> {
-    if limit.is_zero() {
-        return Err(E2eError::system(
-            "drain credential witness phase budget is zero",
-        ));
-    }
-    now.checked_add(limit.min(remaining(deadline, now)?))
-        .ok_or_else(|| E2eError::system("drain credential witness deadline overflow"))
 }
 
 #[cfg(test)]
@@ -518,6 +351,31 @@ mod tests {
         .expect("the old rc exists");
         let cli = GangCli::new(root.join("previous-gang"), root.join("previous.toml"), home);
         (cli, endpoint, session)
+    }
+
+    #[test]
+    fn warm_reuse_rejects_a_replaced_session_before_running_the_old_helper() {
+        let root = private_tempdir();
+        let (cli, endpoint, session) = stored_client(root.path());
+        assert_eq!(
+            ColdHelpers::session_bytes(&cli, &endpoint).expect("original session is readable"),
+            session,
+        );
+        let mut changed = session.clone();
+        changed.push(b'\n');
+        fs::write(client_directory(cli.home()).join("session.json"), changed)
+            .expect("replace session without changing its parsed content");
+        let error = ColdHelpers::warm_token(&cli, &endpoint, &session, Duration::from_secs(1))
+            .expect_err("even a byte-level session replacement must fail before helper execution");
+        assert!(
+            error
+                .to_string()
+                .contains("original warm workload session changed")
+        );
+        assert_eq!(
+            fs::read_to_string(cli.home().join("proof.jwt")).expect("original proof remains"),
+            "original proof with unchanged lifetime",
+        );
     }
 
     #[test]
@@ -805,92 +663,66 @@ mod tests {
     }
 
     #[test]
-    fn drain_preparation_adds_one_private_cold_home_without_changing_original_or_pair() {
-        let root = private_tempdir();
-        let (cli, endpoint, session) = stored_client(root.path());
-        let pair = ColdHelpers::prepare(&cli, &endpoint, root.path(), Duration::from_secs(4))
-            .expect("original pair");
-        let originals = [
-            client_directory(cli.home()).join("session.json"),
-            client_directory(cli.home()).join("token"),
-            cli.home().join("proof.jwt"),
-            cli.home().join(".bazelrc"),
-        ];
-        let snapshots = originals.each_ref().map(|path| {
-            (
-                fs::read(path).expect("original bytes"),
-                fs::metadata(path)
-                    .expect("original metadata")
-                    .modified()
-                    .expect("mtime"),
-            )
-        });
-        let drain_root = root.path().join("drain-credentials");
-        let drain = DrainCredentials::prepare(&cli, &endpoint, &drain_root, Duration::from_secs(4))
-            .expect("missing private child is created");
-        let home = drain.helper.cli.home();
-        assert!(pair.helpers.iter().all(|helper| helper.cli.home() != home));
-        assert_ne!(home, cli.home());
+    fn cold_pair_cadence_obeys_actual_default_and_explicit_buckets() {
+        let probe = Duration::from_millis(100);
         assert_eq!(
-            fs::read_dir(&drain_root).expect("one third home").count(),
-            1
+            ColdHelpers::continuity_interval("[server]", probe).expect("default limits"),
+            gang_config::RateLimitConfig::default()
+                .client
+                .refill_interval
+                .get()
+                .saturating_mul(2),
         );
-        let store = client_directory(home);
-        assert_eq!(fs::read_dir(&store).expect("session only").count(), 1);
-        assert_eq!(
-            fs::read(store.join("session.json")).expect("opaque copy"),
-            session
-        );
-        assert!(!store.join("token").exists());
-        for path in [drain_root.as_path(), home, &home.join(".config"), &store] {
+        for (client, global, expected) in [("3s", "1s", 6), ("1s", "5s", 10)] {
+            let configuration = format!(
+                "[server.rate_limit.client]\nburst=30\nrefill_interval='{client}'\n\
+                 [server.rate_limit.global]\nburst=500\nrefill_interval='{global}'"
+            );
             assert_eq!(
-                fs::metadata(path)
-                    .expect("private directory")
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o700
+                ColdHelpers::continuity_interval(&configuration, probe).expect("installed limits"),
+                Duration::from_secs(expected),
             );
         }
         assert_eq!(
-            fs::metadata(store.join("session.json"))
-                .expect("private session")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
+            ColdHelpers::continuity_interval("[server]", Duration::from_secs(8))
+                .expect("slower probe"),
+            Duration::from_secs(8),
         );
-        for (path, (bytes, modified)) in originals.iter().zip(snapshots) {
-            assert_eq!(fs::read(path).expect("unchanged original"), bytes);
-            assert_eq!(
-                fs::metadata(path)
-                    .expect("unchanged metadata")
-                    .modified()
-                    .expect("mtime"),
-                modified
-            );
-        }
-        for helper in &pair.helpers {
-            ensure_cold(helper.cli.home()).expect("original pair remains cold");
-            assert_eq!(
-                fs::read(client_directory(helper.cli.home()).join("session.json"))
-                    .expect("pair session"),
-                session
-            );
-        }
-        let third_home = home.to_path_buf();
-        drop(drain);
-        assert!(!third_home.exists());
+        assert!(
+            ColdHelpers::continuity_interval("[server.rate_limit.client]\nburst=0", probe).is_err()
+        );
     }
 
     #[test]
-    fn drain_request_reads_rotated_proof_with_canonical_source_and_wire_semantics() {
+    fn dedicated_rate_limit_failure_remains_fatal_without_disclosing_output() {
+        let message = "  fail  gang get: the server is rate limiting this client";
+        let answer = Ran {
+            code: Some(1),
+            stdout: "secret-bearer".to_owned(),
+            stderr: format!("{message}\nsecret-proof"),
+        };
+        let error = project_answer(&answer, 1).expect_err("429 is not a successful mint");
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains("helper_stage=rate_limited"));
+        assert!(rendered.contains("helper_http_status=429"));
+        assert!(!rendered.contains("secret"));
+        for stderr in [
+            format!("  fail  gang get: unknown\n{message}"),
+            format!("{message}secret-proof"),
+        ] {
+            assert_eq!(
+                helper_failure(&stderr),
+                "helper_stage=unknown; helper_http_status=unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn refusal_request_reads_rotated_proof_with_canonical_wire_semantics() {
         let root = private_tempdir();
         let (cli, endpoint, _) = stored_client(root.path());
-        let drain = DrainCredentials::prepare(&cli, &endpoint, root.path(), Duration::from_secs(4))
-            .expect("prepared before proof rotation");
         fs::write(cli.home().join("proof.jwt"), " \nrotated-proof\t ").expect("rotated proof");
-        let body = drain.authentication_body().expect("canonical request");
+        let body = ColdHelpers::proof_request(&cli, &endpoint).expect("canonical request");
         let request: AuthenticateRequest = serde_json::from_slice(&body).expect("canonical DTO");
         assert_eq!(request.provider.as_str(), "test");
         let Credential::Proof(proof) = request.credential else {
@@ -899,425 +731,24 @@ mod tests {
         assert_eq!(proof.expose(), "rotated-proof");
         let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire object");
         assert_eq!(wire.as_object().expect("object").len(), 2);
-        assert_eq!(wire["provider"], "test");
         assert_eq!(wire["proof"], "rotated-proof");
-        assert!(wire.get("refreshToken").is_none());
     }
 
     #[test]
-    fn drain_proof_errors_do_not_fall_back_to_original_cache_or_disclose_proof() {
+    fn refusal_proof_errors_do_not_fall_back_to_cached_bearer() {
         let root = private_tempdir();
         let (cli, endpoint, _) = stored_client(root.path());
-        let drain = DrainCredentials::prepare(&cli, &endpoint, root.path(), Duration::from_secs(4))
-            .expect("prepared");
         let proof = cli.home().join("proof.jwt");
         for invalid in [b" \n\t ".as_slice(), b"secret-proof\xff"] {
             fs::write(&proof, invalid).expect("invalid proof");
-            let error = drain
-                .authentication_body()
-                .expect_err("proof read must fail");
+            let error = ColdHelpers::proof_request(&cli, &endpoint).expect_err("invalid proof");
             assert!(!format!("{error:?}").contains("secret-proof"));
         }
-        fs::remove_file(proof).expect("proof removed after preparation");
-        assert!(drain.authentication_body().is_err());
+        fs::remove_file(proof).expect("proof removed");
+        assert!(ColdHelpers::proof_request(&cli, &endpoint).is_err());
         assert_eq!(
             fs::read_to_string(client_directory(cli.home()).join("token")).expect("original cache"),
             "original cached bearer"
         );
-    }
-
-    struct ModeledDrain {
-        now: Instant,
-        elapsed: [Duration; 4],
-        calls: Vec<(usize, Duration)>,
-        verified: Vec<String>,
-        expected_tokens: [&'static str; 2],
-        failure: Option<usize>,
-        shared: SharedAuthentication,
-        stdout: &'static str,
-    }
-
-    impl ModeledDrain {
-        fn new(elapsed: [Duration; 4]) -> Self {
-            Self {
-                now: Instant::now(),
-                elapsed,
-                calls: Vec::new(),
-                verified: Vec::new(),
-                expected_tokens: ["shared-token", "minted-token"],
-                failure: None,
-                shared: SharedAuthentication {
-                    status: 200,
-                    marker_absent: true,
-                    token: "shared-token".to_owned(),
-                    elapsed: elapsed[0],
-                },
-                stdout: r#"{"headers":{"authorization":["Bearer minted-token"]}}"#,
-            }
-        }
-
-        fn complete(&mut self, phase: usize, deadline: Instant) -> Result<()> {
-            self.calls.push((phase, remaining(deadline, self.now)?));
-            self.now += self.elapsed[phase];
-            if self.failure == Some(phase) {
-                return Err(E2eError::system(
-                    "modeled transport or authentication rejection",
-                ));
-            }
-            Ok(())
-        }
-
-        fn observe(&mut self, budget: Duration) -> Result<DrainCredentialWitness> {
-            observe_drain(self, Duration::from_secs(4), Duration::from_secs(4), budget)
-        }
-    }
-
-    impl DrainSteps for ModeledDrain {
-        fn now(&self) -> Instant {
-            self.now
-        }
-
-        fn original_token(&self) -> &'static str {
-            "original-cached-token"
-        }
-
-        fn authenticate(&mut self, deadline: Instant) -> Result<SharedAuthentication> {
-            self.complete(0, deadline)?;
-            Ok(SharedAuthentication {
-                status: self.shared.status,
-                marker_absent: self.shared.marker_absent,
-                token: std::mem::take(&mut self.shared.token),
-                elapsed: self.shared.elapsed,
-            })
-        }
-
-        fn mint(&mut self, deadline: Instant) -> Result<String> {
-            self.complete(2, deadline)?;
-            project_answer(
-                &Ran {
-                    code: Some(0),
-                    stdout: self.stdout.to_owned(),
-                    stderr: "secret-helper-output".to_owned(),
-                },
-                3,
-            )
-        }
-
-        fn verify(&mut self, token: String, deadline: Instant) -> Result<()> {
-            let index = self.verified.len();
-            self.complete(if index == 0 { 1 } else { 3 }, deadline)?;
-            if self.expected_tokens.get(index).copied() != Some(token.as_str()) {
-                return Err(E2eError::system("modeled bearer rejected by NLB"));
-            }
-            self.verified.push(token);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn modeled_witness_uses_exact_tokens_and_all_raw_offsets() {
-        let mut steps = ModeledDrain::new([
-            Duration::from_secs(1),
-            Duration::from_millis(500),
-            Duration::from_secs(2),
-            Duration::from_millis(250),
-        ]);
-        let witness = steps
-            .observe(Duration::from_secs(5))
-            .expect("all four modeled steps finish before the shared deadline");
-        assert_eq!(
-            steps.calls,
-            vec![
-                (0, Duration::from_secs(4)),
-                (1, Duration::from_secs(4)),
-                (2, Duration::from_millis(3500)),
-                (3, Duration::from_millis(1500)),
-            ]
-        );
-        assert_eq!(steps.verified, ["shared-token", "minted-token"]);
-        assert_eq!(witness.shared_started, Duration::ZERO);
-        assert_eq!(witness.shared_finished, Duration::from_secs(1));
-        assert_eq!(witness.shared_verification_started, witness.shared_finished);
-        assert_eq!(
-            witness.shared_verification_finished,
-            Duration::from_millis(1500)
-        );
-        assert_eq!(witness.mint_started, witness.shared_verification_finished);
-        assert_eq!(witness.mint_finished, Duration::from_millis(3500));
-        assert_eq!(witness.verification_started, witness.mint_finished);
-        assert_eq!(witness.verification_finished, Duration::from_millis(3750));
-        assert_eq!(witness.shared.status, 200);
-        assert!(witness.shared.marker_absent && witness.shared.token_valid);
-        assert!(witness.token_valid);
-        let receipt = format!("{witness:?}");
-        for secret in ["shared-token", "minted-token", "original-cached-token"] {
-            assert!(!receipt.contains(secret));
-        }
-    }
-
-    #[test]
-    fn modeled_each_phase_enforces_its_cap_and_the_single_absolute_budget() {
-        for phase in 0..4 {
-            for elapsed in [Duration::from_secs(4), Duration::from_secs(5)] {
-                let mut durations = [Duration::ZERO; 4];
-                durations[phase] = elapsed;
-                let mut steps = ModeledDrain::new(durations);
-                assert!(steps.observe(Duration::from_secs(8)).is_err());
-                assert_eq!(steps.calls.len(), phase + 1);
-            }
-        }
-        let mut steps = ModeledDrain::new([Duration::from_secs(1); 4]);
-        assert!(steps.observe(Duration::from_millis(3500)).is_err());
-        assert_eq!(steps.calls.len(), 4);
-        assert_eq!(steps.calls[3], (3, Duration::from_millis(500)));
-        let mut steps = ModeledDrain::new([Duration::ZERO; 4]);
-        assert!(steps.observe(Duration::ZERO).is_err());
-        assert!(steps.calls.is_empty());
-        assert!(remaining(steps.now, steps.now).is_err());
-    }
-
-    #[test]
-    fn modeled_network_and_old_cli_keep_their_independent_existing_caps() {
-        let mut steps = ModeledDrain::new([
-            Duration::from_millis(100),
-            Duration::from_millis(100),
-            Duration::from_secs(3),
-            Duration::from_millis(100),
-        ]);
-        observe_drain(
-            &mut steps,
-            Duration::from_secs(2),
-            Duration::from_secs(4),
-            Duration::from_secs(6),
-        )
-        .expect("mint retains its four-second cap while every network cap stays two seconds");
-        assert_eq!(
-            steps.calls,
-            vec![
-                (0, Duration::from_secs(2)),
-                (1, Duration::from_secs(2)),
-                (2, Duration::from_secs(4)),
-                (3, Duration::from_secs(2)),
-            ]
-        );
-    }
-
-    #[test]
-    fn modeled_reported_network_elapsed_cannot_override_deadlines() {
-        for reported_late in [false, true] {
-            let mut durations = [Duration::ZERO; 4];
-            if !reported_late {
-                durations[0] = Duration::from_secs(4);
-            }
-            let mut steps = ModeledDrain::new(durations);
-            steps.shared.elapsed = if reported_late {
-                Duration::from_secs(4)
-            } else {
-                Duration::ZERO
-            };
-            assert!(steps.observe(Duration::from_secs(8)).is_err());
-            assert_eq!(steps.calls.len(), 1);
-        }
-    }
-
-    #[test]
-    fn modeled_transport_rejection_and_late_errors_are_terminal_without_retry() {
-        for phase in 0..4 {
-            for duration in [Duration::ZERO, Duration::from_secs(5)] {
-                let mut durations = [Duration::ZERO; 4];
-                durations[phase] = duration;
-                let mut steps = ModeledDrain::new(durations);
-                steps.failure = Some(phase);
-                assert!(steps.observe(Duration::from_secs(8)).is_err());
-                assert_eq!(steps.calls.len(), phase + 1);
-            }
-        }
-    }
-
-    #[test]
-    fn modeled_false_shared_evidence_never_reaches_cold_mint() {
-        let shared_mutations: [fn(&mut SharedAuthentication); 4] = [
-            |s| s.status = 503,
-            |s| s.status = 500,
-            |s| s.marker_absent = false,
-            |s| s.token.clear(),
-        ];
-        for mutate in shared_mutations {
-            let mut steps = ModeledDrain::new([Duration::ZERO; 4]);
-            mutate(&mut steps.shared);
-            assert!(steps.observe(Duration::from_secs(8)).is_err());
-            assert_eq!(steps.calls.len(), 1);
-        }
-    }
-
-    #[test]
-    fn modeled_cached_or_unverified_tokens_and_helper_secrets_cannot_make_a_witness() {
-        let mut steps = ModeledDrain::new([Duration::ZERO; 4]);
-        steps.shared.token = steps.original_token().to_owned();
-        assert!(steps.observe(Duration::from_secs(8)).is_err());
-        assert_eq!(steps.calls.len(), 1);
-        let mut steps = ModeledDrain::new([Duration::ZERO; 4]);
-        steps.stdout = r#"{"headers":{"authorization":["Bearer original-cached-token"]}}"#;
-        assert!(steps.observe(Duration::from_secs(8)).is_err());
-        assert_eq!(steps.calls.len(), 3);
-        for phase in [0, 1] {
-            let mut steps = ModeledDrain::new([Duration::ZERO; 4]);
-            steps.expected_tokens[phase] = "different-accepted-token";
-            assert!(steps.observe(Duration::from_secs(8)).is_err());
-            assert_eq!(steps.calls.len(), if phase == 0 { 2 } else { 4 });
-        }
-        let mut steps = ModeledDrain::new([Duration::ZERO; 4]);
-        steps.stdout = r#"{"headers":{"authorization":["Bearer secret-invalid\r\n"]}}"#;
-        let error = steps
-            .observe(Duration::from_secs(8))
-            .expect_err("invalid helper output must never reach verification");
-        assert_eq!(steps.calls.len(), 3);
-        assert!(!format!("{error:?}").contains("secret-"));
-    }
-
-    #[test]
-    fn modeled_equal_fresh_bearers_still_require_cold_mint_and_both_verifications() {
-        let mut steps = ModeledDrain::new([Duration::ZERO; 4]);
-        steps.stdout = r#"{"headers":{"authorization":["Bearer shared-token"]}}"#;
-        steps.expected_tokens[1] = "shared-token";
-        let witness = steps
-            .observe(Duration::from_secs(8))
-            .expect("independent mints can produce identical fresh bearers");
-        assert_eq!(
-            steps.calls,
-            vec![
-                (0, Duration::from_secs(4)),
-                (1, Duration::from_secs(4)),
-                (2, Duration::from_secs(4)),
-                (3, Duration::from_secs(4)),
-            ]
-        );
-        assert_eq!(steps.verified, ["shared-token", "shared-token"]);
-        assert!(witness.shared.token_valid && witness.token_valid);
-    }
-
-    #[test]
-    fn modeled_zero_caps_never_run_the_disallowed_phase() {
-        for (probe, mint, count) in [
-            (Duration::ZERO, Duration::from_secs(4), 0),
-            (Duration::from_secs(4), Duration::ZERO, 2),
-        ] {
-            let mut steps = ModeledDrain::new([Duration::ZERO; 4]);
-            assert!(observe_drain(&mut steps, probe, mint, Duration::from_secs(8),).is_err());
-            assert_eq!(steps.calls.len(), count);
-        }
-    }
-
-    #[test]
-    fn consuming_witness_cleans_third_home_on_preflight_and_proof_errors() {
-        for failure in 0..3 {
-            let root = private_tempdir();
-            let (cli, endpoint, _) = stored_client(root.path());
-            let prepared =
-                DrainCredentials::prepare(&cli, &endpoint, root.path(), Duration::from_secs(4))
-                    .expect("prepared cold");
-            let home = prepared.helper.cli.home().to_path_buf();
-            let originals = [
-                client_directory(cli.home()).join("session.json"),
-                client_directory(cli.home()).join("token"),
-                cli.home().join(".bazelrc"),
-            ];
-            let snapshots = originals
-                .each_ref()
-                .map(|path| fs::read(path).expect("original"));
-            if failure == 2 {
-                fs::write(cli.home().join("proof.jwt"), " \n\t ").expect("invalid current proof");
-            }
-            let credentials = Credentials {
-                principal: "test:principal".to_owned(),
-                home: cli.home().to_path_buf(),
-                token: "original-cached-token".to_owned(),
-                authority: None,
-            };
-            let error = prepared
-                .witness(
-                    DirectTarget {
-                        address: "127.0.0.1:8443".parse().expect("literal address"),
-                        proxy_protocol_v2: false,
-                    },
-                    &credentials,
-                    if failure == 0 {
-                        Duration::ZERO
-                    } else {
-                        Duration::from_secs(4)
-                    },
-                    if failure == 1 {
-                        Duration::ZERO
-                    } else {
-                        Duration::from_secs(8)
-                    },
-                )
-                .expect_err("preflight and invalid proof errors precede all network or CLI work");
-            assert!(!home.exists());
-            assert!(!format!("{error:?}").contains("original-cached-token"));
-            for (path, bytes) in originals.iter().zip(snapshots) {
-                assert_eq!(fs::read(path).expect("unchanged original"), bytes);
-            }
-        }
-    }
-
-    #[test]
-    fn drain_home_warmed_after_preparation_fails_before_running_old_cli() {
-        let root = private_tempdir();
-        let (cli, endpoint, _) = stored_client(root.path());
-        let prepared =
-            DrainCredentials::prepare(&cli, &endpoint, root.path(), Duration::from_secs(4))
-                .expect("prepared cold");
-        fs::write(
-            client_directory(prepared.helper.cli.home()).join("token"),
-            "intervening-cache",
-        )
-        .expect("intervening cache");
-        let credentials = Credentials {
-            principal: "test:principal".to_owned(),
-            home: cli.home().to_path_buf(),
-            token: "original-token".to_owned(),
-            authority: None,
-        };
-        let mut attempt = DrainAttempt {
-            prepared,
-            target: DirectTarget {
-                address: "127.0.0.1:8443".parse().expect("literal address"),
-                proxy_protocol_v2: false,
-            },
-            credentials: &credentials,
-        };
-        let error = attempt
-            .mint(Instant::now() + Duration::from_secs(4))
-            .expect_err("a warm helper must fail before the nonexistent old binary is launched");
-        assert!(error.to_string().contains("bearer cache"));
-        let home = attempt.prepared.helper.cli.home().to_path_buf();
-        drop(attempt);
-        assert!(!home.exists());
-        assert_eq!(
-            fs::read_to_string(client_directory(cli.home()).join("token")).expect("original cache"),
-            "original cached bearer"
-        );
-    }
-
-    #[test]
-    fn drain_insecure_root_is_refused_without_modifying_its_mode() {
-        let root = private_tempdir();
-        let (cli, endpoint, _) = stored_client(root.path());
-        let probes = root.path().join("public-root");
-        fs::create_dir(&probes).expect("probe root");
-        fs::set_permissions(&probes, fs::Permissions::from_mode(0o755)).expect("public mode");
-        assert!(
-            DrainCredentials::prepare(&cli, &endpoint, &probes, Duration::from_secs(4)).is_err()
-        );
-        assert_eq!(
-            fs::metadata(&probes)
-                .expect("unmodified root")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755
-        );
-        assert_eq!(fs::read_dir(probes).expect("no helper home").count(), 0);
     }
 }

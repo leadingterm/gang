@@ -80,7 +80,7 @@ data "aws_iam_policy_document" "this" {
     content {
       sid       = "ControllerLifecycle"
       effect    = "Allow"
-      actions   = ["autoscaling:CompleteLifecycleAction"]
+      actions   = ["autoscaling:CompleteLifecycleAction", "autoscaling:RecordLifecycleActionHeartbeat"]
       resources = ["arn:${data.aws_partition.this.partition}:autoscaling:${data.aws_region.this.region}:${data.aws_caller_identity.this.account_id}:autoScalingGroup:*:autoScalingGroupName/${var.name}"]
     }
   }
@@ -93,6 +93,31 @@ data "aws_iam_policy_document" "this" {
       effect    = "Allow"
       actions   = ["autoscaling:DescribeLifecycleHooks"]
       resources = ["*"]
+    }
+  }
+
+  # AWS lists no resource types for DescribeTargetHealth:
+  # https://docs.aws.amazon.com/service-authorization/latest/reference/list_elbv2.html
+  dynamic "statement" {
+    for_each = local.group_shape ? [1] : []
+    content {
+      sid       = "DescribeControllerTargetHealth"
+      effect    = "Allow"
+      actions   = ["elasticloadbalancing:DescribeTargetHealth"]
+      resources = ["*"]
+    }
+  }
+
+  # AWS supports target-group resources, but no condition restricting the target instance.
+  # The adapter registers only its own IMDS instance ID in its ASG's target groups.
+  # https://docs.aws.amazon.com/service-authorization/latest/reference/list_elbv2.html
+  dynamic "statement" {
+    for_each = local.group_shape ? [1] : []
+    content {
+      sid       = "RegisterControllerTarget"
+      effect    = "Allow"
+      actions   = ["elasticloadbalancing:RegisterTargets"]
+      resources = var.target_group_arns
     }
   }
 

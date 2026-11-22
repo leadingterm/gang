@@ -59,6 +59,7 @@ struct State {
     controller_hosts: BTreeMap<InstanceId, CandidateGeneration>,
     records: BTreeMap<RecordKey, Record>,
     record_apply_hold: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    record_page_holds: BTreeMap<RecordKind, (oneshot::Sender<()>, oneshot::Receiver<()>)>,
     failures: BTreeSet<Failure>,
     fail_revoke_serial: Option<CertSerial>,
     forget_certificates: bool,
@@ -111,6 +112,22 @@ impl FakeRepository {
         let (release, hold) = oneshot::channel();
         self.state.lock().record_apply_hold = Some((entered, hold));
         (committed, release)
+    }
+
+    /// Holds the next page read of `kind` before reading records. The first receiver signals
+    /// entry; sending or dropping the returned sender releases the read.
+    #[must_use]
+    pub fn hold_next_record_page(
+        &self,
+        kind: RecordKind,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered, observed) = oneshot::channel();
+        let (release, hold) = oneshot::channel();
+        self.state
+            .lock()
+            .record_page_holds
+            .insert(kind, (entered, hold));
+        (observed, release)
     }
 
     /// Pauses a successful restore after its durable mutation until `gate` is notified.
@@ -717,6 +734,11 @@ impl ExpiringRecordPort for FakeRepository {
         now: Timestamp,
         into: &mut Vec<(RecordId, Record)>,
     ) -> Result<bool, PortError> {
+        let hold = self.state.lock().record_page_holds.remove(&kind);
+        if let Some((entered, release)) = hold {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
         let state = self.state.lock();
         if state.fails(Failure::Records) {
             return Err(PortError::unavailable("expiring records are unavailable"));
@@ -1331,6 +1353,52 @@ mod tests {
                 .map(|record| record.version),
             Some(RecordVersion::new(42))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn held_record_page_affects_only_next_matching_read() -> TestResult {
+        let repository = FakeRepository::default();
+        let (entered, release) = repository.hold_next_record_page(RecordKind::ResourceHistory);
+        let mut other = Vec::new();
+        repository
+            .records(
+                RecordKind::DurationHistory,
+                None,
+                NonZeroUsize::MIN,
+                Timestamp::UNIX_EPOCH,
+                &mut other,
+            )
+            .await?;
+        let runner = repository.clone();
+        let task = tokio::spawn(async move {
+            let mut records = Vec::new();
+            runner
+                .records(
+                    RecordKind::ResourceHistory,
+                    None,
+                    NonZeroUsize::MIN,
+                    Timestamp::UNIX_EPOCH,
+                    &mut records,
+                )
+                .await
+        });
+        entered.await?;
+        assert!(!task.is_finished());
+        let mut next = Vec::new();
+        assert!(
+            !repository
+                .records(
+                    RecordKind::ResourceHistory,
+                    None,
+                    NonZeroUsize::MIN,
+                    Timestamp::UNIX_EPOCH,
+                    &mut next,
+                )
+                .await?
+        );
+        release.send(()).map_err(|()| "held page disappeared")?;
+        assert!(!task.await??);
         Ok(())
     }
 

@@ -1,5 +1,5 @@
 {
-  "checksum": "97b5c30e184e932ed451e9758133b7f7246e3ee8785a94fa5e644071fb9179e5",
+  "checksum": "8afc9660ab7aff35842047a8455ed41b31aae5d70fdb79caa781971915ff0fbe",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -2433,6 +2433,129 @@
         },
         "edition": "2021",
         "version": "1.275.0"
+      },
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": "LICENSE"
+    },
+    "aws-sdk-elasticloadbalancingv2 1.138.0": {
+      "name": "aws-sdk-elasticloadbalancingv2",
+      "version": "1.138.0",
+      "package_url": "https://github.com/awslabs/aws-sdk-rust",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/aws-sdk-elasticloadbalancingv2/1.138.0/download",
+          "sha256": "dd292df47c40229072ba7991f57d7f0a7a19224baa0cc62d5964343b9bb6e0ec"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "aws_sdk_elasticloadbalancingv2",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "aws_sdk_elasticloadbalancingv2",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "behavior-version-latest",
+            "rt-tokio"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "arc-swap 1.9.3",
+              "target": "arc_swap"
+            },
+            {
+              "id": "aws-credential-types 1.3.1",
+              "target": "aws_credential_types"
+            },
+            {
+              "id": "aws-runtime 1.10.4",
+              "target": "aws_runtime"
+            },
+            {
+              "id": "aws-smithy-async 1.3.1",
+              "target": "aws_smithy_async"
+            },
+            {
+              "id": "aws-smithy-http 0.64.3",
+              "target": "aws_smithy_http"
+            },
+            {
+              "id": "aws-smithy-json 0.65.1",
+              "target": "aws_smithy_json"
+            },
+            {
+              "id": "aws-smithy-observability 0.3.1",
+              "target": "aws_smithy_observability"
+            },
+            {
+              "id": "aws-smithy-query 0.64.0",
+              "target": "aws_smithy_query"
+            },
+            {
+              "id": "aws-smithy-runtime 1.16.4",
+              "target": "aws_smithy_runtime"
+            },
+            {
+              "id": "aws-smithy-runtime-api 1.22.0",
+              "target": "aws_smithy_runtime_api"
+            },
+            {
+              "id": "aws-smithy-schema 1.2.0",
+              "target": "aws_smithy_schema"
+            },
+            {
+              "id": "aws-smithy-types 1.9.4",
+              "target": "aws_smithy_types"
+            },
+            {
+              "id": "aws-smithy-xml 0.64.1",
+              "target": "aws_smithy_xml"
+            },
+            {
+              "id": "aws-types 1.7.0",
+              "target": "aws_types"
+            },
+            {
+              "id": "fastrand 2.5.0",
+              "target": "fastrand"
+            },
+            {
+              "id": "http 1.5.0",
+              "target": "http",
+              "alias": "http_1x"
+            },
+            {
+              "id": "regex-lite 0.1.9",
+              "target": "regex_lite"
+            },
+            {
+              "id": "tracing 0.1.44",
+              "target": "tracing"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "1.138.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13480,9 +13603,9 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
-    "gang-authn 0.3.5": {
+    "gang-authn 0.3.6": {
       "name": "gang-authn",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13555,7 +13678,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13563,9 +13686,9 @@
       ],
       "license_file": null
     },
-    "gang-aws 0.3.5": {
+    "gang-aws 0.3.6": {
       "name": "gang-aws",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13604,6 +13727,10 @@
             {
               "id": "aws-sdk-ec2 1.275.0",
               "target": "aws_sdk_ec2"
+            },
+            {
+              "id": "aws-sdk-elasticloadbalancingv2 1.138.0",
+              "target": "aws_sdk_elasticloadbalancingv2"
             },
             {
               "id": "aws-sdk-kms 1.129.0",
@@ -13702,7 +13829,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13710,9 +13837,9 @@
       ],
       "license_file": null
     },
-    "gang-aws-sdk 0.3.5": {
+    "gang-aws-sdk 0.3.6": {
       "name": "gang-aws-sdk",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13777,7 +13904,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13785,9 +13912,9 @@
       ],
       "license_file": null
     },
-    "gang-bindings 0.3.5": {
+    "gang-bindings 0.3.6": {
       "name": "gang-bindings",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [],
@@ -13818,7 +13945,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13826,9 +13953,9 @@
       ],
       "license_file": null
     },
-    "gang-bwrap 0.3.5": {
+    "gang-bwrap 0.3.6": {
       "name": "gang-bwrap",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13893,7 +14020,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13901,9 +14028,9 @@
       ],
       "license_file": null
     },
-    "gang-cgroup 0.3.5": {
+    "gang-cgroup 0.3.6": {
       "name": "gang-cgroup",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -13968,7 +14095,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -13976,9 +14103,9 @@
       ],
       "license_file": null
     },
-    "gang-client 0.3.5": {
+    "gang-client 0.3.6": {
       "name": "gang-client",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14075,7 +14202,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14083,9 +14210,9 @@
       ],
       "license_file": null
     },
-    "gang-clock 0.3.5": {
+    "gang-clock 0.3.6": {
       "name": "gang-clock",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14146,7 +14273,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14154,9 +14281,9 @@
       ],
       "license_file": null
     },
-    "gang-config 0.3.5": {
+    "gang-config 0.3.6": {
       "name": "gang-config",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14213,7 +14340,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14221,9 +14348,9 @@
       ],
       "license_file": null
     },
-    "gang-deploy 0.3.5": {
+    "gang-deploy 0.3.6": {
       "name": "gang-deploy",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14279,7 +14406,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14287,9 +14414,9 @@
       ],
       "license_file": null
     },
-    "gang-dynamodb 0.3.5": {
+    "gang-dynamodb 0.3.6": {
       "name": "gang-dynamodb",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14356,7 +14483,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14364,9 +14491,9 @@
       ],
       "license_file": null
     },
-    "gang-e2e 0.3.5": {
+    "gang-e2e 0.3.6": {
       "name": "gang-e2e",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14487,6 +14614,10 @@
               "target": "tokio"
             },
             {
+              "id": "tokio-postgres 0.7.18",
+              "target": "tokio_postgres"
+            },
+            {
               "id": "tokio-rustls 0.26.6",
               "target": "tokio_rustls"
             },
@@ -14547,7 +14678,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14555,9 +14686,9 @@
       ],
       "license_file": null
     },
-    "gang-embed 0.3.5": {
+    "gang-embed 0.3.6": {
       "name": "gang-embed",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14606,7 +14737,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14614,9 +14745,9 @@
       ],
       "license_file": null
     },
-    "gang-exec 0.3.5": {
+    "gang-exec 0.3.6": {
       "name": "gang-exec",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14689,7 +14820,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14697,9 +14828,9 @@
       ],
       "license_file": null
     },
-    "gang-insight 0.3.5": {
+    "gang-insight 0.3.6": {
       "name": "gang-insight",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14731,7 +14862,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14739,9 +14870,9 @@
       ],
       "license_file": null
     },
-    "gang-local 0.3.5": {
+    "gang-local 0.3.6": {
       "name": "gang-local",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14838,7 +14969,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14846,9 +14977,9 @@
       ],
       "license_file": null
     },
-    "gang-macros 0.3.5": {
+    "gang-macros 0.3.6": {
       "name": "gang-macros",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -14888,7 +15019,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14896,9 +15027,9 @@
       ],
       "license_file": null
     },
-    "gang-main 0.3.5": {
+    "gang-main 0.3.6": {
       "name": "gang-main",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15015,7 +15146,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15023,9 +15154,9 @@
       ],
       "license_file": null
     },
-    "gang-mtls 0.3.5": {
+    "gang-mtls 0.3.6": {
       "name": "gang-mtls",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15114,7 +15245,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15122,9 +15253,9 @@
       ],
       "license_file": null
     },
-    "gang-nativelink 0.3.5": {
+    "gang-nativelink 0.3.6": {
       "name": "gang-nativelink",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15300,7 +15431,7 @@
           ],
           "selects": {}
         },
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15308,9 +15439,9 @@
       ],
       "license_file": null
     },
-    "gang-noop 0.3.5": {
+    "gang-noop 0.3.6": {
       "name": "gang-noop",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15367,7 +15498,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15375,9 +15506,9 @@
       ],
       "license_file": null
     },
-    "gang-oidc 0.3.5": {
+    "gang-oidc 0.3.6": {
       "name": "gang-oidc",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15458,7 +15589,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15466,9 +15597,9 @@
       ],
       "license_file": null
     },
-    "gang-os 0.3.5": {
+    "gang-os 0.3.6": {
       "name": "gang-os",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15516,7 +15647,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15524,9 +15655,9 @@
       ],
       "license_file": null
     },
-    "gang-postgres 0.3.5": {
+    "gang-postgres 0.3.6": {
       "name": "gang-postgres",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15599,7 +15730,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15607,9 +15738,9 @@
       ],
       "license_file": null
     },
-    "gang-reconciler 0.3.5": {
+    "gang-reconciler 0.3.6": {
       "name": "gang-reconciler",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15670,7 +15801,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15678,9 +15809,9 @@
       ],
       "license_file": null
     },
-    "gang-server 0.3.5": {
+    "gang-server 0.3.6": {
       "name": "gang-server",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15809,7 +15940,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15817,9 +15948,9 @@
       ],
       "license_file": null
     },
-    "gang-spi 0.3.5": {
+    "gang-spi 0.3.6": {
       "name": "gang-spi",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15904,7 +16035,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15912,9 +16043,9 @@
       ],
       "license_file": null
     },
-    "gang-sqlite 0.3.5": {
+    "gang-sqlite 0.3.6": {
       "name": "gang-sqlite",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -15971,7 +16102,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -15979,9 +16110,9 @@
       ],
       "license_file": null
     },
-    "gang-state 0.3.5": {
+    "gang-state 0.3.6": {
       "name": "gang-state",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -16038,7 +16169,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -16046,9 +16177,9 @@
       ],
       "license_file": null
     },
-    "gang-testkit 0.3.5": {
+    "gang-testkit 0.3.6": {
       "name": "gang-testkit",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -16177,7 +16308,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -16185,9 +16316,9 @@
       ],
       "license_file": null
     },
-    "gang-tls 0.3.5": {
+    "gang-tls 0.3.6": {
       "name": "gang-tls",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -16296,7 +16427,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -16304,9 +16435,9 @@
       ],
       "license_file": null
     },
-    "gang-types 0.3.5": {
+    "gang-types 0.3.6": {
       "name": "gang-types",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -16387,7 +16518,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -16395,9 +16526,9 @@
       ],
       "license_file": null
     },
-    "gang-ui 0.3.5": {
+    "gang-ui 0.3.6": {
       "name": "gang-ui",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -16433,7 +16564,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -16441,9 +16572,9 @@
       ],
       "license_file": null
     },
-    "gang-wire 0.3.5": {
+    "gang-wire 0.3.6": {
       "name": "gang-wire",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -16495,7 +16626,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -16503,9 +16634,9 @@
       ],
       "license_file": null
     },
-    "gang-worker 0.3.5": {
+    "gang-worker 0.3.6": {
       "name": "gang-worker",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -16566,7 +16697,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -26909,9 +27040,9 @@
       ],
       "license_file": null
     },
-    "opentofu-runner 0.3.5": {
+    "opentofu-runner 0.3.6": {
       "name": "opentofu-runner",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -26967,7 +27098,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -45431,9 +45562,9 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
-    "workspace-architecture 0.3.5": {
+    "workspace-architecture 0.3.6": {
       "name": "workspace-architecture",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "package_url": null,
       "repository": null,
       "targets": [
@@ -45486,7 +45617,7 @@
           "selects": {}
         },
         "edition": "2024",
-        "version": "0.3.5"
+        "version": "0.3.6"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -47094,43 +47225,43 @@
   },
   "binary_crates": [],
   "workspace_members": {
-    "gang-authn 0.3.5": "crates/gang-authn",
-    "gang-aws 0.3.5": "crates/gang-aws",
-    "gang-aws-sdk 0.3.5": "crates/gang-aws-sdk",
-    "gang-bindings 0.3.5": "crates/gang-bindings",
-    "gang-bwrap 0.3.5": "crates/gang-bwrap",
-    "gang-cgroup 0.3.5": "crates/gang-cgroup",
-    "gang-client 0.3.5": "crates/gang-client",
-    "gang-clock 0.3.5": "crates/gang-clock",
-    "gang-config 0.3.5": "crates/gang-config",
-    "gang-deploy 0.3.5": "crates/gang-deploy",
-    "gang-dynamodb 0.3.5": "crates/gang-dynamodb",
-    "gang-e2e 0.3.5": "crates/gang-e2e",
-    "gang-embed 0.3.5": "crates/gang-embed",
-    "gang-exec 0.3.5": "crates/gang-exec",
-    "gang-insight 0.3.5": "crates/gang-insight",
-    "gang-local 0.3.5": "crates/gang-local",
-    "gang-macros 0.3.5": "crates/gang-macros",
-    "gang-main 0.3.5": "crates/gang-main",
-    "gang-mtls 0.3.5": "crates/gang-mtls",
-    "gang-nativelink 0.3.5": "crates/gang-nativelink",
-    "gang-noop 0.3.5": "crates/gang-noop",
-    "gang-oidc 0.3.5": "crates/gang-oidc",
-    "gang-os 0.3.5": "crates/gang-os",
-    "gang-postgres 0.3.5": "crates/gang-postgres",
-    "gang-reconciler 0.3.5": "crates/gang-reconciler",
-    "gang-server 0.3.5": "crates/gang-server",
-    "gang-spi 0.3.5": "crates/gang-spi",
-    "gang-sqlite 0.3.5": "crates/gang-sqlite",
-    "gang-state 0.3.5": "crates/gang-state",
-    "gang-testkit 0.3.5": "crates/gang-testkit",
-    "gang-tls 0.3.5": "crates/gang-tls",
-    "gang-types 0.3.5": "crates/gang-types",
-    "gang-ui 0.3.5": "crates/gang-ui",
-    "gang-wire 0.3.5": "crates/gang-wire",
-    "gang-worker 0.3.5": "crates/gang-worker",
-    "opentofu-runner 0.3.5": "bazel/opentofu/runner",
-    "workspace-architecture 0.3.5": "bazel/architecture"
+    "gang-authn 0.3.6": "crates/gang-authn",
+    "gang-aws 0.3.6": "crates/gang-aws",
+    "gang-aws-sdk 0.3.6": "crates/gang-aws-sdk",
+    "gang-bindings 0.3.6": "crates/gang-bindings",
+    "gang-bwrap 0.3.6": "crates/gang-bwrap",
+    "gang-cgroup 0.3.6": "crates/gang-cgroup",
+    "gang-client 0.3.6": "crates/gang-client",
+    "gang-clock 0.3.6": "crates/gang-clock",
+    "gang-config 0.3.6": "crates/gang-config",
+    "gang-deploy 0.3.6": "crates/gang-deploy",
+    "gang-dynamodb 0.3.6": "crates/gang-dynamodb",
+    "gang-e2e 0.3.6": "crates/gang-e2e",
+    "gang-embed 0.3.6": "crates/gang-embed",
+    "gang-exec 0.3.6": "crates/gang-exec",
+    "gang-insight 0.3.6": "crates/gang-insight",
+    "gang-local 0.3.6": "crates/gang-local",
+    "gang-macros 0.3.6": "crates/gang-macros",
+    "gang-main 0.3.6": "crates/gang-main",
+    "gang-mtls 0.3.6": "crates/gang-mtls",
+    "gang-nativelink 0.3.6": "crates/gang-nativelink",
+    "gang-noop 0.3.6": "crates/gang-noop",
+    "gang-oidc 0.3.6": "crates/gang-oidc",
+    "gang-os 0.3.6": "crates/gang-os",
+    "gang-postgres 0.3.6": "crates/gang-postgres",
+    "gang-reconciler 0.3.6": "crates/gang-reconciler",
+    "gang-server 0.3.6": "crates/gang-server",
+    "gang-spi 0.3.6": "crates/gang-spi",
+    "gang-sqlite 0.3.6": "crates/gang-sqlite",
+    "gang-state 0.3.6": "crates/gang-state",
+    "gang-testkit 0.3.6": "crates/gang-testkit",
+    "gang-tls 0.3.6": "crates/gang-tls",
+    "gang-types 0.3.6": "crates/gang-types",
+    "gang-ui 0.3.6": "crates/gang-ui",
+    "gang-wire 0.3.6": "crates/gang-wire",
+    "gang-worker 0.3.6": "crates/gang-worker",
+    "opentofu-runner 0.3.6": "bazel/opentofu/runner",
+    "workspace-architecture 0.3.6": "bazel/architecture"
   },
   "conditions": {
     "aarch64-apple-darwin": [
@@ -47407,6 +47538,7 @@
     "aws-sdk-cloudwatch 1.144.0",
     "aws-sdk-dynamodb 1.137.0",
     "aws-sdk-ec2 1.275.0",
+    "aws-sdk-elasticloadbalancingv2 1.138.0",
     "aws-sdk-kms 1.129.0",
     "aws-sdk-sqs 1.122.0",
     "aws-sdk-sts 1.124.0",

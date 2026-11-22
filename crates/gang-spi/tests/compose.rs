@@ -166,8 +166,6 @@ endpoint = "http://127.0.0.1:9443"
 [server]
 transport = "plaintext"
 
-[server.http2]
-shutdown_grace = "0s"
 
 [authentication.clients.none]
 number = 12
@@ -613,6 +611,8 @@ fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
         fleets: &catalog,
         max_workers: 8,
         client_action_timeout: Duration::from_mins(1),
+        attempt_budget: gang_config::WorkerConfig::default()
+            .attempt_budget(gang_config::ActionsConfig::default().timeout),
         observations: &observations,
     };
     let connections = ControllerConnections {

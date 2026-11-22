@@ -29,12 +29,16 @@ pub(crate) struct Standing {
     proven: AtomicBool,
     /// Requests whose responses are not yet sent or dropped.
     in_flight: AtomicUsize,
-    /// Woken on every change of the two above.
+    /// Set when a request reaches the gate, before its response can be buffered by Hyper.
+    received_request: AtomicBool,
+    /// Woken when proof or the request count changes.
     changed: Notify,
     /// The canonical first admission or retry decision.
     admission: AtomicU8,
     /// Explicit leadership retirement is independent of the first admission decision.
     leadership_retired: AtomicBool,
+    /// Marks a pre-handoff connection for retirement if its pending admission later succeeds.
+    handoff_pending: AtomicBool,
     /// Wakes the connection's sole retry waiter.
     retry: Notify,
 }
@@ -42,7 +46,7 @@ pub(crate) struct Standing {
 impl Standing {
     /// Permits a request unless retirement won before any request was admitted.
     pub(crate) fn admit(&self) -> bool {
-        match self.admission.compare_exchange(
+        let admitted = match self.admission.compare_exchange(
             Admission::Fresh as u8,
             Admission::Admitted as u8,
             Ordering::AcqRel,
@@ -50,7 +54,11 @@ impl Standing {
         ) {
             Ok(_) => true,
             Err(state) => state == Admission::Admitted as u8,
+        };
+        if admitted && self.handoff_pending.load(Ordering::Acquire) {
+            self.retire_leadership();
         }
+        admitted
     }
 
     /// Requests graceful retirement only if no request has yet been admitted.
@@ -79,13 +87,27 @@ impl Standing {
     pub(crate) async fn retry_requested(&self) {
         loop {
             let notified = self.retry.notified();
-            if self.leadership_retired.load(Ordering::Acquire)
-                || self.admission.load(Ordering::Acquire) == Admission::Retrying as u8
-            {
+            if self.is_retiring() {
                 return;
             }
             notified.await;
         }
+    }
+
+    pub(crate) fn hand_off(&self) {
+        self.handoff_pending.store(true, Ordering::Release);
+        if self.is_admitted() {
+            self.retire_leadership();
+        }
+    }
+
+    fn is_retiring(&self) -> bool {
+        self.leadership_retired.load(Ordering::Acquire)
+            || self.admission.load(Ordering::Acquire) == Admission::Retrying as u8
+    }
+
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.admission.load(Ordering::Acquire) == Admission::Admitted as u8
     }
 
     /// Whether the gate has admitted an authenticated request on the connection.
@@ -97,6 +119,9 @@ impl Standing {
     pub(crate) fn is_busy(&self) -> bool {
         self.in_flight.load(Ordering::Acquire) > 0
     }
+    pub(crate) fn has_request(&self) -> bool {
+        self.received_request.load(Ordering::Acquire)
+    }
 
     /// Records that the gate admitted an authenticated request on the connection.
     pub(crate) fn prove(&self) {
@@ -106,24 +131,27 @@ impl Standing {
 
     /// Counts a request in flight until the returned guard drops.
     pub(crate) fn begin(self: &Arc<Self>) -> Busy {
+        self.received_request.store(true, Ordering::Release);
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         self.changed.notify_one();
         Busy(Arc::clone(self))
     }
 
     /// Completes once the connection has stayed unproven with no request in flight for `idle` of
-    /// `clock`, counted afresh each time it becomes idle; never once it is proven.
+    /// `clock`, counted afresh each time it becomes idle. Retirement is owned by graceful flush.
     pub(crate) async fn expired(&self, clock: &impl Clock, idle: Duration) {
         loop {
             let changed = self.changed.notified();
-            if self.is_proven() {
+            if self.is_proven() || self.is_retiring() {
                 return std::future::pending::<()>().await;
             }
             if self.is_busy() {
                 changed.await;
             } else {
                 tokio::select! {
-                    () = clock.sleep(idle) => return,
+                    () = clock.sleep(idle) => {
+                        if !self.is_proven() && !self.is_retiring() && !self.is_busy() { return; }
+                    },
                     () = changed => {}
                 }
             }
@@ -245,6 +273,41 @@ mod tests {
         assert!(futures::poll!(&mut expired).is_pending());
         clock.advance(TICK);
         assert!(futures::poll!(&mut expired).is_ready());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_ready_idle_timer_does_not_expire_a_request_that_began_before_repoll() {
+        for notify_expiry in [false, true] {
+            let standing = Arc::new(Standing::default());
+            let clock = TestClock::new(Timestamp::UNIX_EPOCH);
+            let changed = standing.changed.notified();
+            tokio::pin!(changed);
+            if !notify_expiry {
+                // Notify is FIFO: reserve the request's wake so only the timer can win.
+                // The other case leaves both select branches ready.
+                assert!(futures::poll!(&mut changed).is_pending());
+            }
+            let expired = standing.expired(&clock, IDLE);
+            tokio::pin!(expired);
+            assert!(futures::poll!(&mut expired).is_pending());
+            clock.advance(IDLE);
+            let busy = standing.begin();
+            if !notify_expiry {
+                assert!(futures::poll!(&mut changed).is_ready());
+            }
+            assert!(
+                futures::poll!(&mut expired).is_pending(),
+                "a ready idle timer must recheck request ownership"
+            );
+            clock.advance(IDLE * 2);
+            assert!(futures::poll!(&mut expired).is_pending());
+            drop(busy);
+            assert!(futures::poll!(&mut expired).is_pending());
+            clock.advance(BEFORE_IDLE);
+            assert!(futures::poll!(&mut expired).is_pending());
+            clock.advance(TICK);
+            assert!(futures::poll!(&mut expired).is_ready());
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

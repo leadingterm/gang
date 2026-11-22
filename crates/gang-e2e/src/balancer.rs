@@ -258,6 +258,11 @@ impl Balancer {
         self.listener(frontend).healthy()
     }
 
+    /// Whether a target is registered, independently of its observed health.
+    pub(crate) fn registered(&self, frontend: Frontend, address: SocketAddr) -> bool {
+        self.listener(frontend).registered(address)
+    }
+
     pub(crate) fn set_policy(&self, frontend: Frontend, policy: Policy) {
         self.listener(frontend).set_policy(policy);
     }
@@ -289,6 +294,10 @@ impl Listener {
     pub(crate) fn deregister(&self, address: SocketAddr) {
         self.targets.lock().entries.remove(&address);
         self.changes.notify();
+    }
+
+    pub(crate) fn registered(&self, address: SocketAddr) -> bool {
+        self.targets.lock().entries.contains_key(&address)
     }
 
     pub(crate) fn healthy(&self) -> Vec<SocketAddr> {
@@ -795,6 +804,9 @@ mod tests {
             register(&balancer, Frontend::Serve, good.address, good.address),
             register(&balancer, Frontend::Serve, bad.address, bad.address),
         ];
+        assert!(balancer.registered(Frontend::Serve, good.address));
+        assert!(balancer.registered(Frontend::Serve, bad.address));
+        assert!(balancer.healthy(Frontend::Serve).is_empty());
         let threshold = Probe::default().threshold.get();
         for count in 1..=threshold {
             round(&clock, &targets, false).await;
@@ -813,6 +825,17 @@ mod tests {
                 count < threshold
             );
             assert!(!balancer.healthy(Frontend::Serve).contains(&bad.address));
+        }
+        // A registered prepared503 target is not made healthy by registration or elapsed time.
+        // It enters rotation only after actual successful readiness replies meet the threshold.
+        bad.status.store(StatusCode::OK.as_u16(), Ordering::SeqCst);
+        for count in 1..=threshold {
+            round(&clock, &targets, false).await;
+            assert!(!balancer.healthy(Frontend::Serve).contains(&good.address));
+            assert_eq!(
+                balancer.healthy(Frontend::Serve).contains(&bad.address),
+                count == threshold,
+            );
         }
         Ok(())
     }

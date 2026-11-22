@@ -112,23 +112,18 @@ pub trait SchedulerPort: Send + Sync {
     /// The URL the controller's worker listener is dialed on.
     fn endpoints(&self) -> ControllerEndpoints;
 
-    /// Prepares the process-owned shared stores and services once, builds the term's scheduler
-    /// and leader services, and serves the supplied connections. Public connections carry client
-    /// services and `api` over HTTP/1.1 or HTTP/2; worker connections carry worker services over
-    /// HTTP/2. The caller may supply both streams before promotion. Each request passes its
-    /// listener's gate with its service scope, and leader-scoped dispatch requires admission.
-    /// Listening, TLS, and authentication belong to the caller.
+    /// Builds one original controller engine and serves the supplied connections. Public
+    /// connections carry client services and `api` over HTTP/1.1 or HTTP/2; worker connections
+    /// carry worker services over HTTP/2. Each request passes its listener's gate with its
+    /// service scope. Listening, TLS, and authentication belong to the caller.
     /// It sends `ready` once the controller is built and before it serves the first connection;
     /// a run that fails before that drops `ready` unsent.
     ///
-    /// Once every connection stream has ended, the controller hands off: it assigns no new
-    /// action to any worker, ends with `UNAVAILABLE` every client operation stream whose action
-    /// is not executing (so the client submits it again elsewhere), asks every client
-    /// connection to go away once its streams finish, and releases each worker the moment it
-    /// runs nothing (the worker reconnects). Worker connections are never asked to go away, so a
-    /// worker reports the actions it runs on the connection that dispatched them. The run
-    /// returns once no connection remains or the plugin's shutdown grace has elapsed; dropping
-    /// the returned future closes every connection at once.
+    /// [`SchedulerPort::hand_off`] freezes new dispatch and worker admission while the original
+    /// engine retains admitted work and listeners continue to refuse new public requests. The
+    /// caller waits for the handoff to complete and then for [`crate::HostMilestone::Unrouted`]
+    /// before ending the supplied streams and shutting down the final transport. Dropping the
+    /// returned future closes its remaining connections at once.
     ///
     /// # Errors
     ///
@@ -141,22 +136,14 @@ pub trait SchedulerPort: Send + Sync {
         ready: ControllerReady,
     ) -> Result<(), PortError>;
 
-    /// Serves the prepared shared services using the supplied gates and API while deliberately
-    /// refusing leader-scoped requests before dispatch. This can run while an existing controller
-    /// drains: it must not build or publish another controller, signal readiness, schedule work,
-    /// or access learned history.
+    /// Freezes dispatch and worker admission, initiates public GOAWAY, and refreshes the
+    /// workers and completion state of the original controller's drain.
     ///
-    /// Once both streams end, finishes pending responses within the backend's configured
-    /// shutdown bounds. Dropping the future closes its remaining connections.
+    /// Repeated calls reuse the supplied buffers and report actual remaining work.
     ///
     /// # Errors
-    ///
-    /// [`PortError::Unavailable`] if shared services have not been prepared; a port error if
-    /// the standby transport cannot be configured or fails.
-    async fn serve_standby<P: RequestGate, W: RequestGate, A: ApiService>(
-        &self,
-        connections: ControllerConnections<P, W, A>,
-    ) -> Result<(), PortError>;
+    /// Returns an error if the controller cannot start or observe its drain.
+    async fn hand_off(&self, into: &mut ControllerDrain) -> Result<(), PortError>;
 
     /// Builds one worker, connects it to the controller's worker listener, and runs it until
     /// `stop` completes, the worker fails, or a [`WorkerLifetime::SingleUse`] worker has
@@ -182,6 +169,27 @@ pub trait SchedulerPort: Send + Sync {
         tls: WorkerTls<'_>,
         stop: impl Future<Output = ()> + Send,
     ) -> Result<(), PortError>;
+}
+
+/// A physical worker retaining attempts dispatched by the old controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainingWorker {
+    /// The worker's fleet.
+    pub fleet: FleetName,
+    /// The worker's physical instance.
+    pub instance: InstanceId,
+    /// Latest deadline of its still-owned attempts.
+    pub deadline: Timestamp,
+}
+
+/// Reusable snapshot of the original controller's handover.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControllerDrain {
+    /// Workers still retaining controller-origin attempts, unique and sorted by
+    /// `(fleet, instance)` in ascending order.
+    pub workers: Vec<DrainingWorker>,
+    /// All owned attempts and pre-handoff public response streams have finished.
+    pub complete: bool,
 }
 
 /// One versioned learned history and its original expiration.
@@ -468,10 +476,10 @@ pub enum Admitted {
 /// The service plane a request needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestScope {
-    /// Services available independently of leadership after preparation.
-    Shared,
-    /// Services that require the controller to admit leader work.
-    Leader,
+    /// Public requests and worker registration require active leadership.
+    Controller,
+    /// Worker store operations needed by a previously leading draining controller.
+    WorkerStore,
 }
 
 /// The gate's decision before a request reaches a service.
@@ -479,7 +487,7 @@ pub enum RequestScope {
 pub enum GateDecision {
     /// The request may proceed with the given caller identity.
     Admit(Admitted),
-    /// Leader-scoped work is unavailable on this controller.
+    /// Controller-scoped work is unavailable on this host.
     NotLeading,
 }
 
@@ -643,6 +651,8 @@ pub struct ControllerSpec<'a> {
     pub max_workers: u64,
     /// The timeout the controller applies to client actions.
     pub client_action_timeout: Duration,
+    /// Maximum elapsed time for one attempt, including input and output transfers.
+    pub attempt_budget: Duration,
     /// Where the controller's observers send what builds do.
     pub observations: &'a ObservationSink,
 }
@@ -659,6 +669,7 @@ impl std::fmt::Debug for ControllerSpec<'_> {
             .field("fleets", &self.fleets)
             .field("max_workers", &self.max_workers)
             .field("client_action_timeout", &self.client_action_timeout)
+            .field("attempt_budget", &self.attempt_budget)
             .field("observations", &self.observations)
             .finish_non_exhaustive()
     }

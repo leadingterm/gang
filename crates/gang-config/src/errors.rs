@@ -252,18 +252,18 @@ pub enum ConfigError {
         /// Controller worker eviction timeout.
         worker_timeout: Duration,
     },
-    /// Scheduler hand-off is not strictly below a fleet's boot grace.
-    #[error("{key} {shutdown_grace:?} must be below fleets `{fleet}` boot_grace {boot_grace:?}")]
-    #[fix("set {key} below fleets boot_grace")]
-    ShutdownGraceNotBelowBootGrace {
-        /// Full TOML key.
-        key: &'static str,
-        /// Controller hand-off duration.
-        shutdown_grace: Duration,
-        /// Fleet whose boot grace is too short.
-        fleet: FleetName,
-        /// Fleet boot grace.
-        boot_grace: Duration,
+    /// A planned handover must leave a call timeout before the oldest supported CLI's final retry.
+    #[error(
+        "planned handover {window:?} plus call timeout {call_timeout:?} must be below the minimum CLI last retry {last_attempt:?}"
+    )]
+    #[fix("lower server.leadership.renew_interval or call_timeout")]
+    HandoverOutlastsCli {
+        /// Planned handover window.
+        window: Duration,
+        /// Time reserved for the retried call.
+        call_timeout: Duration,
+        /// Last retry of the minimum-supported CLI.
+        last_attempt: Duration,
     },
     /// The worker endpoint is omitted but `worker_listen` is not loopback.
     #[error("{key} is required when worker_listen `{listen}` is not a loopback address")]
@@ -458,11 +458,10 @@ mod tests {
                 connect_timeout: Duration::from_secs(20),
                 worker_timeout: Duration::from_secs(10),
             },
-            ConfigError::ShutdownGraceNotBelowBootGrace {
-                key: "server.http2.shutdown_grace",
-                shutdown_grace: Duration::from_secs(30),
-                fleet: fleet(),
-                boot_grace: Duration::from_secs(30),
+            ConfigError::HandoverOutlastsCli {
+                window: Duration::from_secs(15),
+                call_timeout: Duration::from_secs(2),
+                last_attempt: Duration::from_millis(16_300),
             },
             ConfigError::WorkerEndpointRequired {
                 key: "worker_endpoint",

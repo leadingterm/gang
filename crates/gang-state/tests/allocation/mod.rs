@@ -309,6 +309,7 @@ fn world() -> Result<World, Box<dyn Error>> {
             supply,
             outlook: outlook(),
             past_boot_grace: Vec::new(),
+            handover_protected: Vec::new(),
         })
         .collect();
     let mut snapshot = scheduler_snapshot()?;

@@ -100,6 +100,7 @@ pub(crate) struct ControlLoop<'a, P: PluginSet, F, S, R, C> {
     /// Failed termination calls awaiting reconciliation with a fresh supply.
     pending_terminations: Vec<PlanStep>,
     reconciler: Reconciler,
+    protection: crate::protection::Incoming,
     poll_interval: NonZeroDuration,
     max_boot_grace: Duration,
     provisioner: &'a F,
@@ -174,6 +175,7 @@ where
             plan: Plan::new(),
             pending_terminations: Vec::new(),
             reconciler,
+            protection: crate::protection::Incoming::default(),
             poll_interval: settings.poll_interval,
             max_boot_grace,
             provisioner,
@@ -235,6 +237,13 @@ where
             return Err(SkipReason::LeadershipLapsed);
         }
         let time = PassTime::read(self.clock);
+        self.protection
+            .refresh(self.repository, time.wall, &self.incoming, &mut self.passes)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "cannot read old-controller worker protection; skipping pass");
+                SkipReason::ProvisionerUnavailable
+            })?;
         let live: Vec<_> = self
             .passes
             .iter()
@@ -259,6 +268,13 @@ where
             let Action::Terminate { instance, .. } = &pending.action else {
                 return false;
             };
+            if self.passes[pending.fleet]
+                .handover_protected
+                .binary_search(instance)
+                .is_ok()
+            {
+                return false;
+            }
             if let Some(planned) = self
                 .plan
                 .steps

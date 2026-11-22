@@ -61,6 +61,7 @@ const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 const AUTO_SCALING_NS: &str = "http://autoscaling.amazonaws.com/doc/2011-01-01/";
 const EC2_NS: &str = "http://ec2.amazonaws.com/doc/2016-11-15/";
 const STS_NS: &str = "https://sts.amazonaws.com/doc/2011-06-15/";
+const ELBV2_NS: &str = "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/";
 const REQUEST_ID: &str = "00000000-0000-0000-0000-000000000000";
 const ACTIVITY_ID: &str = "00000000-0000-0000-0000-000000000001";
 const ACTIVITY_STATUS: &str = "InProgress";
@@ -106,6 +107,9 @@ const GRANTED_ACTIONS: &[&str] = &[
     "DescribeScalingActivities",
     "DescribeLifecycleHooks",
     "CompleteLifecycleAction",
+    "RecordLifecycleActionHeartbeat",
+    "DescribeTargetHealth",
+    "RegisterTargets",
     "ReceiveMessage",
     "DeleteMessage",
 ];
@@ -248,6 +252,14 @@ pub(crate) struct FakeState {
     pub(crate) lifecycle_hooks: HashMap<String, Vec<(String, String)>>,
     /// Completed lifecycle actions, as (group, hook, instance).
     pub(crate) lifecycle_completions: Vec<(String, String, String)>,
+    /// Apply the next completion but return a transient failure, modeling a lost response.
+    pub(crate) lose_completion_response: bool,
+    /// Complete termination concurrently with the next heartbeat and lose its response.
+    pub(crate) complete_during_heartbeat: bool,
+    /// Hook heartbeat timeout returned by lifecycle discovery.
+    pub(crate) hook_heartbeat_seconds: u32,
+    /// Target health by target group ARN and instance id.
+    pub(crate) target_health: HashMap<String, Vec<(String, String)>>,
     /// EC2 instance id to RFC 3339 launch time; EC2 knows only these instances.
     pub(crate) launch_times: HashMap<String, String>,
     /// EC2 state-reason code by instance, including recently terminated instances.
@@ -300,6 +312,10 @@ impl Default for FakeState {
             groups: Vec::new(),
             lifecycle_hooks: HashMap::new(),
             lifecycle_completions: Vec::new(),
+            lose_completion_response: false,
+            complete_during_heartbeat: false,
+            hook_heartbeat_seconds: crate::host::HOOK_HEARTBEAT_SECONDS,
+            target_health: HashMap::new(),
             launch_times: HashMap::new(),
             state_reasons: HashMap::new(),
             kms: None,
@@ -367,6 +383,7 @@ pub(crate) struct FakeGroup {
     /// Whether a scaling activity is in progress; `SetDesiredCapacity` with `HonorCooldown` is refused meanwhile.
     pub(crate) in_cooldown: bool,
     pub(crate) instances: Vec<FakeInstance>,
+    pub(crate) target_group_arns: Vec<String>,
     pub(crate) availability_zones: Vec<String>,
     /// Explicit instance types in the mixed instances policy overrides.
     pub(crate) instance_types: Vec<String>,
@@ -394,6 +411,7 @@ impl FakeGroup {
             min_size: 0,
             max_size: GROUP_MAX_SIZE,
             in_cooldown: false,
+            target_group_arns: Vec::new(),
             instances: instances
                 .iter()
                 .map(|(id, lifecycle_state)| FakeInstance {
@@ -478,6 +496,7 @@ enum QueryService {
     AutoScaling,
     Ec2,
     Sts,
+    Elbv2,
 }
 
 impl QueryService {
@@ -485,6 +504,7 @@ impl QueryService {
         match action {
             "DescribeInstances" => Self::Ec2,
             "GetWebIdentityToken" => Self::Sts,
+            "DescribeTargetHealth" | "RegisterTargets" => Self::Elbv2,
             _ => Self::AutoScaling,
         }
     }
@@ -494,6 +514,7 @@ impl QueryService {
             Self::AutoScaling => AUTO_SCALING_NS,
             Self::Ec2 => EC2_NS,
             Self::Sts => STS_NS,
+            Self::Elbv2 => ELBV2_NS,
         }
     }
 }
@@ -640,7 +661,26 @@ fn query(state: &Shared, body: &[u8]) -> Response {
         &action,
         &parameters,
         Some(access_denied(ACCESS_DENIED)),
-        |fake, params| query_operation(fake, &action, params),
+        |fake, params| {
+            let response = query_operation(fake, &action, params)?;
+            let lost = action == "CompleteLifecycleAction"
+                && std::mem::take(&mut fake.lose_completion_response);
+            let concurrent_completion = action == "RecordLifecycleActionHeartbeat"
+                && std::mem::take(&mut fake.complete_during_heartbeat);
+            if concurrent_completion {
+                let mut completion = params.clone();
+                completion.insert("LifecycleActionResult".into(), "CONTINUE".into());
+                complete_lifecycle_action(fake, &completion)?;
+            }
+            if lost || concurrent_completion {
+                return Err(FakeFailure {
+                    status: 500,
+                    code: "InternalFailure",
+                    message: "lifecycle response lost",
+                });
+            }
+            Ok(response)
+        },
     );
     let service = QueryService::of(&action);
     match outcome {
@@ -660,51 +700,48 @@ fn query_operation(
             action,
             Some(&describe_lifecycle_hooks(state, params)?),
         )),
-        "CompleteLifecycleAction" => {
-            let no_action = || invalid("no active lifecycle action");
-            let group_name = params.get("AutoScalingGroupName").ok_or_else(no_action)?;
-            let hook_name = params.get("LifecycleHookName").ok_or_else(no_action)?;
-            let instance_id = params.get("InstanceId").ok_or_else(no_action)?;
-            let result = required(params, "LifecycleActionResult")?;
-            if !matches!(result, "CONTINUE" | "ABANDON") {
-                return Err(invalid("invalid lifecycle action result"));
+        "DescribeTargetHealth" => Ok(query_ok(
+            QueryService::Elbv2,
+            action,
+            Some(&describe_target_health(state, params)?),
+        )),
+        "RegisterTargets" => {
+            let arn = required(params, "TargetGroupArn")?;
+            let id = required(params, "Targets.member.1.Id")?;
+            let targets = state
+                .target_health
+                .get_mut(arn)
+                .ok_or_else(|| invalid("unknown target group"))?;
+            if !targets.iter().any(|(target, _)| target == id) {
+                targets.push((id.to_owned(), "initial".to_owned()));
             }
-            let transition = state
-                .lifecycle_hooks
-                .get(group_name)
-                .and_then(|hooks| hooks.iter().find(|(name, _)| name == hook_name))
-                .map(|(_, transition)| transition.as_str())
-                .ok_or_else(no_action)?;
-            let (waiting, proceeding) = match transition {
-                "autoscaling:EC2_INSTANCE_LAUNCHING" => ("Pending:Wait", "Pending:Proceed"),
-                "autoscaling:EC2_INSTANCE_TERMINATING" => {
-                    ("Terminating:Wait", "Terminating:Proceed")
-                }
-                _ => return Err(no_action()),
-            };
-            let member = state
-                .groups
-                .iter_mut()
-                .find(|group| group.name == *group_name)
-                .and_then(|group| {
-                    group
-                        .instances
-                        .iter_mut()
-                        .find(|member| member.id == *instance_id)
+            Ok(query_ok(QueryService::Elbv2, action, None))
+        }
+        "RecordLifecycleActionHeartbeat" => {
+            let group_name = required(params, "AutoScalingGroupName")?;
+            let hook_name = required(params, "LifecycleHookName")?;
+            let id = required(params, "InstanceId")?;
+            let valid_hook = state.lifecycle_hooks.get(group_name).is_some_and(|hooks| {
+                hooks.iter().any(|(name, transition)| {
+                    name == hook_name && transition == "autoscaling:EC2_INSTANCE_TERMINATING"
                 })
-                .filter(|member| member.lifecycle_state == waiting)
-                .ok_or_else(no_action)?;
-            member.lifecycle_state = if result == "ABANDON" {
-                "Terminating:Proceed"
-            } else {
-                proceeding
+            });
+            let waiting = state
+                .groups
+                .iter()
+                .find(|group| group.name == group_name)
+                .is_some_and(|group| {
+                    group.instances.iter().any(|instance| {
+                        instance.id == id && instance.lifecycle_state == "Terminating:Wait"
+                    })
+                });
+            if !valid_hook || !waiting {
+                return Err(invalid("no active lifecycle action"));
             }
-            .to_owned();
-            state.lifecycle_completions.push((
-                group_name.clone(),
-                hook_name.clone(),
-                instance_id.clone(),
-            ));
+            Ok(query_ok(QueryService::AutoScaling, action, None))
+        }
+        "CompleteLifecycleAction" => {
+            complete_lifecycle_action(state, params)?;
             Ok(query_ok(QueryService::AutoScaling, action, None))
         }
         "DescribeAutoScalingGroups" => Ok(query_ok(
@@ -755,11 +792,75 @@ fn describe_lifecycle_hooks(state: &FakeState, params: &Parameters) -> Result<St
     let group = required(params, "AutoScalingGroupName")?;
     let mut hooks = String::new();
     for (name, transition) in state.lifecycle_hooks.get(group).into_iter().flatten() {
-        write!(hooks, "<member><LifecycleHookName>{name}</LifecycleHookName><AutoScalingGroupName>{group}</AutoScalingGroupName><LifecycleTransition>{transition}</LifecycleTransition></member>").expect("writing to a String cannot fail");
+        write!(hooks, "<member><LifecycleHookName>{name}</LifecycleHookName><AutoScalingGroupName>{group}</AutoScalingGroupName><LifecycleTransition>{transition}</LifecycleTransition><HeartbeatTimeout>{}</HeartbeatTimeout></member>", state.hook_heartbeat_seconds).expect("writing to a String cannot fail");
     }
     Ok(format!("<LifecycleHooks>{hooks}</LifecycleHooks>"))
 }
 
+/// Describes target health in the seeded order without changing the registrations.
+fn describe_target_health(state: &FakeState, params: &Parameters) -> Result<String, FakeFailure> {
+    let arn = required(params, "TargetGroupArn")?;
+    let targets = state
+        .target_health
+        .get(arn)
+        .ok_or_else(|| invalid("unknown target group"))?;
+    let mut descriptions = String::new();
+    for (id, health) in targets {
+        write!(descriptions, "<member><Target><Id>{id}</Id></Target><TargetHealth><State>{health}</State></TargetHealth></member>")
+            .expect("writing to a String cannot fail");
+    }
+    Ok(format!(
+        "<TargetHealthDescriptions>{descriptions}</TargetHealthDescriptions>"
+    ))
+}
+
+/// Completes an active lifecycle action and records the accepted completion.
+fn complete_lifecycle_action(
+    state: &mut FakeState,
+    params: &Parameters,
+) -> Result<(), FakeFailure> {
+    let no_action = || invalid("no active lifecycle action");
+    let group_name = params.get("AutoScalingGroupName").ok_or_else(no_action)?;
+    let hook_name = params.get("LifecycleHookName").ok_or_else(no_action)?;
+    let instance_id = params.get("InstanceId").ok_or_else(no_action)?;
+    let result = required(params, "LifecycleActionResult")?;
+    if !matches!(result, "CONTINUE" | "ABANDON") {
+        return Err(invalid("invalid lifecycle action result"));
+    }
+    let transition = state
+        .lifecycle_hooks
+        .get(group_name)
+        .and_then(|hooks| hooks.iter().find(|(name, _)| name == hook_name))
+        .map(|(_, transition)| transition.as_str())
+        .ok_or_else(no_action)?;
+    let (waiting, proceeding) = match transition {
+        "autoscaling:EC2_INSTANCE_LAUNCHING" => ("Pending:Wait", "Pending:Proceed"),
+        "autoscaling:EC2_INSTANCE_TERMINATING" => ("Terminating:Wait", "Terminating:Proceed"),
+        _ => return Err(no_action()),
+    };
+    let member = state
+        .groups
+        .iter_mut()
+        .find(|group| group.name == *group_name)
+        .and_then(|group| {
+            group
+                .instances
+                .iter_mut()
+                .find(|member| member.id == *instance_id)
+        })
+        .filter(|member| member.lifecycle_state == waiting)
+        .ok_or_else(no_action)?;
+    member.lifecycle_state = if result == "ABANDON" {
+        "Terminating:Proceed"
+    } else {
+        proceeding
+    }
+    .to_owned();
+    state
+        .lifecycle_completions
+        .push((group_name.clone(), hook_name.clone(), instance_id.clone()));
+    Ok(())
+}
 fn describe_groups(state: &FakeState, params: &Parameters) -> Result<String, FakeFailure> {
     if let Some((token, failure)) = &state.group_page_failure
         && params.get(NEXT_TOKEN) == Some(token)
@@ -914,8 +1015,12 @@ fn group_xml(group: &FakeGroup) -> String {
             "<LaunchTemplate><LaunchTemplateId>lt-test</LaunchTemplateId><Version>2</Version></LaunchTemplate>".to_owned()
         }
     };
+    let mut target_groups = String::new();
+    for arn in &group.target_group_arns {
+        write!(target_groups, "<member>{arn}</member>").expect("writing to a String cannot fail");
+    }
     format!(
-        "<member><AutoScalingGroupName>{name}</AutoScalingGroupName><AvailabilityZones>{availability_zones}</AvailabilityZones><CreatedTime>{CREATED_TIME}</CreatedTime><DefaultCooldown>{DEFAULT_COOLDOWN}</DefaultCooldown><DesiredCapacity>{desired}</DesiredCapacity><MinSize>{min_size}</MinSize><MaxSize>{max_size}</MaxSize><HealthCheckType>EC2</HealthCheckType><Instances>{instances}</Instances><NewInstancesProtectedFromScaleIn>{protected}</NewInstancesProtectedFromScaleIn>{warm_pool}{template}</member>",
+        "<member><AutoScalingGroupName>{name}</AutoScalingGroupName><AvailabilityZones>{availability_zones}</AvailabilityZones><CreatedTime>{CREATED_TIME}</CreatedTime><DefaultCooldown>{DEFAULT_COOLDOWN}</DefaultCooldown><DesiredCapacity>{desired}</DesiredCapacity><MinSize>{min_size}</MinSize><MaxSize>{max_size}</MaxSize><HealthCheckType>EC2</HealthCheckType><Instances>{instances}</Instances><TargetGroupARNs>{target_groups}</TargetGroupARNs><NewInstancesProtectedFromScaleIn>{protected}</NewInstancesProtectedFromScaleIn>{warm_pool}{template}</member>",
         name = group.name,
         desired = group.desired,
         min_size = group.min_size,
