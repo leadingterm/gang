@@ -582,6 +582,11 @@ run "instance_shape_has_no_group_permissions" {
     condition     = length(aws_launch_template.controller) == 0 && length(aws_autoscaling_group.controller) == 0 && output.autoscaling_group_name == null && !anytrue([for s in data.aws_iam_policy_document.this.statement : contains(["ControllerLifecycle", "Database"], s.sid)])
     error_message = "The instance shape must not create a group or grant group and database permissions."
   }
+
+  assert {
+    condition     = length(aws_autoscaling_lifecycle_hook.controller_launch) == 0 && length(aws_autoscaling_lifecycle_hook.controller_terminate) == 0
+    error_message = "The SQLite instance shape must not create controller lifecycle hooks."
+  }
 }
 
 run "invalid_shape" {

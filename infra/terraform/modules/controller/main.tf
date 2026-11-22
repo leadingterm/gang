@@ -242,6 +242,12 @@ resource "aws_autoscaling_group" "controller" {
     default_result       = "CONTINUE"
   }
 
+  lifecycle {
+    # Inline hooks protect the first instances at creation; standalone resources
+    # own subsequent hook updates without replacing the group.
+    ignore_changes = [initial_lifecycle_hook]
+  }
+
   dynamic "tag" {
     for_each = merge(var.tags, { Name = var.name })
     content {
@@ -250,4 +256,24 @@ resource "aws_autoscaling_group" "controller" {
       propagate_at_launch = true
     }
   }
+}
+
+resource "aws_autoscaling_lifecycle_hook" "controller_launch" {
+  count = local.group_shape ? 1 : 0
+
+  name                   = "launch"
+  autoscaling_group_name = aws_autoscaling_group.controller[0].name
+  lifecycle_transition   = "autoscaling:EC2_INSTANCE_LAUNCHING"
+  heartbeat_timeout      = local.hook.heartbeat_timeout_seconds
+  default_result         = "ABANDON"
+}
+
+resource "aws_autoscaling_lifecycle_hook" "controller_terminate" {
+  count = local.group_shape ? 1 : 0
+
+  name                   = "terminate"
+  autoscaling_group_name = aws_autoscaling_group.controller[0].name
+  lifecycle_transition   = "autoscaling:EC2_INSTANCE_TERMINATING"
+  heartbeat_timeout      = local.hook.heartbeat_timeout_seconds
+  default_result         = "CONTINUE"
 }
