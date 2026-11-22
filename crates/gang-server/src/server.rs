@@ -1854,6 +1854,11 @@ mod tests {
 
     #[tokio::test]
     async fn shared_account_throttle_preserves_handover_and_serving() -> gang_testkit::TestResult {
+        // This test drives both servers with a manual clock, not an executor turn per tick.
+        tokio::task::unconstrained(account_handover()).await
+    }
+
+    async fn account_handover() -> gang_testkit::TestResult {
         use gang_clock::Clock;
         use gang_spi::{ControllerHostIdentity, ControllerId, ControllerReady};
         use std::time::Duration;
@@ -2246,7 +2251,7 @@ mod tests {
             clock.advance(interval);
             assert!(futures::poll!(identity.as_mut()).is_pending());
             assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-            clock.advance(host_timeout - interval);
+            clock.advance(host_timeout.saturating_sub(interval));
             assert!(futures::poll!(identity.as_mut()).is_pending());
             assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         }
