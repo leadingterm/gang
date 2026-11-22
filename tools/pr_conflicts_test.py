@@ -222,6 +222,29 @@ class ReconcileTest(unittest.TestCase):
         bot.reconcile(self.api, BASE, self.pr, [])
         self.assertEqual(self.api.comments[1], [self.user_comment, quoted])
 
+    def test_forbidden_pr_writes_fail_with_safe_operation_context(self):
+        for resource in ("labels", "comments"):
+            with self.subTest(resource=resource):
+                api = FakeApi()
+                route = f"/repos/example/repo/issues/1/{resource}"
+                request = api.request
+
+                def deny(method, requested_route, payload=None):
+                    if method == "POST" and requested_route == route:
+                        raise GitHubApiError("GitHub API HTTP 403", status=403)
+                    return request(method, requested_route, payload)
+
+                stderr = io.StringIO()
+                with mock.patch.object(api, "request", side_effect=deny), \
+                     mock.patch.object(bot, "fetch_head", return_value=True), \
+                     mock.patch.object(bot, "conflict_paths", return_value=["private-conflict-path"]), \
+                     contextlib.redirect_stderr(stderr):
+                    self.assertEqual(bot.main(["--base", BASE], api), 1)
+                self.assertIn(f"POST {route}: GitHub API HTTP 403", stderr.getvalue())
+                self.assertNotIn("private-conflict-path", stderr.getvalue())
+                self.assertEqual(api.comments[1], [])
+                self.assertEqual(api.labels[2], [])
+
     def test_api_errors_and_invalid_data_are_not_success(self):
         self.api.failure = "/repos/example/repo/pulls?state=open&per_page=100"
         with contextlib.redirect_stderr(io.StringIO()):
