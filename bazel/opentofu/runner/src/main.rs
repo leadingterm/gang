@@ -5,7 +5,7 @@
 //! `OPENTOFU_ROOT` (relative to the sources directory) and `OPENTOFU_TEST_FILE` (relative to the
 //! root). The current directory holds the `infra/` tree. `OPENTOFU_TEST_EXPECTATIONS`, when set,
 //! names a JSON runfile resolved against that directory. `OPENTOFU_ROOT_OVERLAYS`, when set,
-//! is a JSON array of test-only override runfiles copied into the disposable root.
+//! is a JSON array of test-only configuration runfiles copied into the disposable root.
 //! The work directory is a fresh directory under `TEST_TMPDIR`, removed when the run ends.
 
 use std::env;
@@ -55,7 +55,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         test_file: required("OPENTOFU_TEST_FILE")?.into(),
         test_expectations: env::var_os("OPENTOFU_TEST_EXPECTATIONS").map(|path| cwd.join(path)),
         root_overlays: env::var_os("OPENTOFU_ROOT_OVERLAYS")
-            .map(|paths| serde_json::from_slice::<Vec<std::path::PathBuf>>(paths.as_encoded_bytes()))
+            .map(|paths| {
+                serde_json::from_slice::<Vec<std::path::PathBuf>>(paths.as_encoded_bytes())
+            })
             .transpose()?
             .unwrap_or_default()
             .into_iter()

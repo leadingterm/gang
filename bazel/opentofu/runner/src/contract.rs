@@ -26,7 +26,7 @@ pub struct Contract {
     pub test_file: PathBuf,
     /// Optional absolute runfile containing test expectations.
     pub test_expectations: Option<PathBuf>,
-    /// Test-only override files copied into the staged root, never the source module.
+    /// New test-only `*_test.tf` and `*_override.tf` files copied into the staged root.
     pub root_overlays: Vec<PathBuf>,
 }
 
@@ -749,7 +749,7 @@ fn check_lifecycle(
     Ok(())
 }
 
-/// Installs test-only overrides in the disposable root before configuration loading.
+/// Installs test-only configuration in the disposable root before loading.
 fn stage_root_overlays(root: &Path, overlays: &[PathBuf]) -> Result<(), RunError> {
     for overlay in overlays {
         let name = overlay
@@ -757,10 +757,12 @@ fn stage_root_overlays(root: &Path, overlays: &[PathBuf]) -> Result<(), RunError
             .ok_or_else(|| evidence("root overlay has no file name"))?;
         if !name
             .to_str()
-            .is_some_and(|name| name.ends_with("_override.tf"))
+            .is_some_and(|name| name.ends_with("_test.tf") || name.ends_with("_override.tf"))
             || root.join(name).exists()
         {
-            return Err(evidence("root overlays must add new *_override.tf files"));
+            return Err(evidence(
+                "root overlays must add new *_test.tf or *_override.tf files",
+            ));
         }
         fs::copy(overlay, root.join(name)).map_err(|source| RunError::Stage {
             source,
@@ -923,6 +925,13 @@ mod tests {
         fs::copy(&original, work.path().join("main.tf")).expect("stage original");
 
         stage_root_overlays(work.path(), std::slice::from_ref(&overlay)).expect("stage overlay");
+        let primary = source.path().join("transition_test.tf");
+        fs::write(&primary, "variable \"heartbeat\" { default = 420 }\n").expect("primary");
+        stage_root_overlays(work.path(), std::slice::from_ref(&primary)).expect("stage primary");
+        assert_eq!(
+            fs::read_to_string(work.path().join("transition_test.tf")).expect("staged primary"),
+            fs::read_to_string(&primary).expect("source primary")
+        );
 
         assert_eq!(
             fs::read_to_string(work.path().join("transition_override.tf")).expect("staged overlay"),
@@ -941,14 +950,16 @@ mod tests {
         let ordinary = source.path().join("main.tf");
         fs::write(&ordinary, "").expect("ordinary source");
         assert!(stage_root_overlays(work.path(), &[ordinary]).is_err());
-        let overlay = source.path().join("test_override.tf");
-        fs::write(&overlay, "").expect("overlay");
-        fs::write(work.path().join("test_override.tf"), "original").expect("existing source");
-        assert!(stage_root_overlays(work.path(), &[overlay]).is_err());
-        assert_eq!(
-            fs::read_to_string(work.path().join("test_override.tf")).expect("unchanged source"),
-            "original"
-        );
+        for name in ["test_override.tf", "fixture_test.tf"] {
+            let overlay = source.path().join(name);
+            fs::write(&overlay, "").expect("overlay");
+            fs::write(work.path().join(name), "original").expect("existing source");
+            assert!(stage_root_overlays(work.path(), &[overlay]).is_err());
+            assert_eq!(
+                fs::read_to_string(work.path().join(name)).expect("unchanged source"),
+                "original"
+            );
+        }
     }
 
     #[test]

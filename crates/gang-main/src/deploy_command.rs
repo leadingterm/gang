@@ -305,16 +305,29 @@ mod tests {
                 "change": {"actions": ["create", "delete"]}},
             {"address": second, "type": "aws_autoscaling_group",
                 "change": {"actions": ["delete", "create"]}}
-        ]}).to_string();
+        ]})
+        .to_string();
         let fixtures = Fixtures::new();
-        for allowed in [vec![], vec![first], vec![first, second], vec!["module.gang"]] {
+        for allowed in [
+            vec![],
+            vec![first],
+            vec![first, second],
+            vec!["module.gang"],
+        ] {
             let blocked = allowed.len() != 2;
             let mut args = vec!["policy"];
             for address in &allowed {
                 args.extend(["--allow-asg-destroy", address]);
             }
             let (code, stdout, stderr) = gang_deploy(&args, &plan);
-            assert_eq!(code, if blocked { ExitCode::from(3) } else { ExitCode::SUCCESS });
+            assert_eq!(
+                code,
+                if blocked {
+                    ExitCode::from(3)
+                } else {
+                    ExitCode::SUCCESS
+                }
+            );
             assert_eq!(stdout, format!("has_changes=true\nblocked={blocked}\n"));
             assert_eq!(!stderr.is_empty(), blocked);
             for source in [
@@ -331,12 +344,16 @@ mod tests {
                 let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap();
                 let body = payload["body"].as_str().unwrap();
                 assert_eq!(body.contains("**Blocked:"), blocked);
-                assert_eq!(body.contains("Explicitly allowed Auto Scaling group destructions:"),
-                    allowed.contains(&first));
+                assert_eq!(
+                    body.contains("Explicitly allowed Auto Scaling group destructions:"),
+                    allowed.contains(&first)
+                );
             }
         }
         let (code, _, _) = gang_deploy(
-            &["policy", "--allow-asg-destroy", "aws_kms_key.state"], BLOCKED_PLAN);
+            &["policy", "--allow-asg-destroy", "aws_kms_key.state"],
+            BLOCKED_PLAN,
+        );
         assert_eq!(code, ExitCode::from(3));
     }
 

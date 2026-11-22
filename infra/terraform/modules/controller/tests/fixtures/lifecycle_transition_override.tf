@@ -8,16 +8,6 @@ terraform {
   }
 }
 
-variable "test_legacy_hooks" {
-  type    = bool
-  default = false
-}
-
-variable "test_managed_heartbeat" {
-  type    = number
-  default = null
-}
-
 locals {
   hook = merge(jsondecode(file("${path.module}/lifecycle-hook.json")), var.test_legacy_hooks ? { heartbeat_timeout_seconds = 420 } : var.test_managed_heartbeat == null ? {} : { heartbeat_timeout_seconds = var.test_managed_heartbeat })
 }

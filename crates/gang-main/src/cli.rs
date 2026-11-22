@@ -1019,26 +1019,27 @@ const COMMENT_MANIFEST: &str = "manifest";
 
 impl Args for CommentArgs {
     fn augment_args(cmd: clap::Command) -> clap::Command {
-        PolicyArgs::augment_args(cmd).arg(
-            Arg::new(COMMENT_TREE)
-                .long("tree")
-                .value_name("SHA")
-                .value_parser(clap::value_parser!(Sha))
-                .help("The tree of the checked-out commit, when no plan was stored"),
-        )
-        .arg(
-            Arg::new(COMMENT_MANIFEST)
-                .long("manifest")
-                .value_name("FILE")
-                .value_parser(clap::value_parser!(PathBuf))
-                .help("The manifest of the stored plan"),
-        )
-        .group(
-            ArgGroup::new("source")
-                .args([COMMENT_TREE, COMMENT_MANIFEST])
-                .required(true)
-                .multiple(false),
-        )
+        PolicyArgs::augment_args(cmd)
+            .arg(
+                Arg::new(COMMENT_TREE)
+                    .long("tree")
+                    .value_name("SHA")
+                    .value_parser(clap::value_parser!(Sha))
+                    .help("The tree of the checked-out commit, when no plan was stored"),
+            )
+            .arg(
+                Arg::new(COMMENT_MANIFEST)
+                    .long("manifest")
+                    .value_name("FILE")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .help("The manifest of the stored plan"),
+            )
+            .group(
+                ArgGroup::new("source")
+                    .args([COMMENT_TREE, COMMENT_MANIFEST])
+                    .required(true)
+                    .multiple(false),
+            )
     }
 
     fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
@@ -2009,7 +2010,13 @@ mod tests {
         for prefix in [
             vec!["gang", "deploy", "policy"],
             vec!["gang", "deploy", "comment", "--tree", SHA],
-            vec!["gang", "deploy", "comment", "--manifest", "plan manifest.json"],
+            vec![
+                "gang",
+                "deploy",
+                "comment",
+                "--manifest",
+                "plan manifest.json",
+            ],
         ] {
             let mut args = prefix;
             for address in addresses {

@@ -111,7 +111,7 @@ _opentofu_contract_test = rule(
         ),
         "root_overlays": attr.label_list(
             allow_files = [".tf"],
-            doc = "Test-only override files copied into the disposable root before loading.",
+            doc = "New test-only *_test.tf and *_override.tf files copied into the disposable root.",
         ),
         "srcs": attr.label_list(
             allow_files = True,
@@ -137,7 +137,7 @@ def opentofu_contract_test(name, test_file = None, deps = [], test_expectations 
         test_file: Test file relative to the package; defaults to tests/<package name>.tftest.hcl.
         deps: Further files the root needs, such as module `sources`, files in configs/, or //:Cargo.toml.
         test_expectations: Optional JSON label containing test expectations.
-        root_overlays: Test-only override runfiles installed only in the staged root.
+        root_overlays: New test-only configuration runfiles installed only in the staged root.
     """
     if not native.existing_rule("sources"):
         native.filegroup(

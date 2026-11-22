@@ -315,7 +315,13 @@ mod tests {
                 .expect("visible exceptions");
             assert!(!verdict.contains(&format!("`{first}` (aws_autoscaling_group")));
             assert!(exceptions.contains(&format!("`{first}` (aws_autoscaling_group:")));
-            assert!(!exceptions.split("| Action").next().unwrap().contains(second));
+            assert!(
+                !exceptions
+                    .split("| Action")
+                    .next()
+                    .unwrap()
+                    .contains(second)
+            );
             if changes.len() > 1 {
                 assert!(verdict.contains(second));
                 assert!(verdict.contains("aws_dynamodb_table: delete"));

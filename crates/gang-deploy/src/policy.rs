@@ -257,7 +257,9 @@ mod tests {
 
     #[test]
     fn creating_an_aws_kms_key_passes() {
-        assert!(!plan(&[resource("aws_kms_key", "aws_kms_key.state", &["create"])]).is_blocked(&[]));
+        assert!(
+            !plan(&[resource("aws_kms_key", "aws_kms_key.state", &["create"])]).is_blocked(&[])
+        );
         assert!(!fixture("created").is_blocked(&[]));
     }
 
@@ -383,7 +385,8 @@ mod tests {
     #[test]
     fn a_real_plan_lists_each_protected_change_in_plan_order() {
         let plan = fixture("blocked");
-        let protected: Vec<String> = plan.protected_changes(&[])
+        let protected: Vec<String> = plan
+            .protected_changes(&[])
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -414,8 +417,9 @@ mod tests {
                 assert!(plan.is_blocked(&[address[..address.len() - 1].to_owned()]));
             }
             for actions in [&["create"][..], &["update"], &["no-op"]] {
-                assert!(!plan(&[resource("aws_autoscaling_group", address, actions)])
-                    .is_blocked(&[]));
+                assert!(
+                    !plan(&[resource("aws_autoscaling_group", address, actions)]).is_blocked(&[])
+                );
             }
         }
     }
@@ -441,8 +445,10 @@ mod tests {
             }
         }
         let generation = "module.gang.aws_ssm_parameter.config_generation";
-        assert!(plan(&[resource("aws_ssm_parameter", generation, &["delete"])])
-            .is_blocked(&[generation.to_owned()]));
+        assert!(
+            plan(&[resource("aws_ssm_parameter", generation, &["delete"])])
+                .is_blocked(&[generation.to_owned()])
+        );
     }
 
     /// The protected changes of the `blocked` fixture, as the shell's `protected_changes` jq
