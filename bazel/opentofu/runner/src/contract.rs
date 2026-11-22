@@ -26,6 +26,8 @@ pub struct Contract {
     pub test_file: PathBuf,
     /// Optional absolute runfile containing test expectations.
     pub test_expectations: Option<PathBuf>,
+    /// Test-only override files copied into the staged root, never the source module.
+    pub root_overlays: Vec<PathBuf>,
 }
 
 /// A step of a contract run.
@@ -77,6 +79,7 @@ impl Contract {
                 path: self.test_file.clone(),
             });
         }
+        stage_root_overlays(&root, &self.root_overlays)?;
 
         let mut fmt = self.command(&root);
         fmt.args(["fmt", "-check", "-recursive", "-no-color"]);
@@ -746,6 +749,27 @@ fn check_lifecycle(
     Ok(())
 }
 
+/// Installs test-only overrides in the disposable root before configuration loading.
+fn stage_root_overlays(root: &Path, overlays: &[PathBuf]) -> Result<(), RunError> {
+    for overlay in overlays {
+        let name = overlay
+            .file_name()
+            .ok_or_else(|| evidence("root overlay has no file name"))?;
+        if !name
+            .to_str()
+            .is_some_and(|name| name.ends_with("_override.tf"))
+            || root.join(name).exists()
+        {
+            return Err(evidence("root overlays must add new *_override.tf files"));
+        }
+        fs::copy(overlay, root.join(name)).map_err(|source| RunError::Stage {
+            source,
+            path: overlay.clone(),
+        })?;
+    }
+    Ok(())
+}
+
 /// Copies `infra/`, optional `configs/`, and optional `Cargo.toml` into `work`.
 ///
 /// Symlinks are followed, so the copy holds regular files only.
@@ -858,6 +882,7 @@ mod tests {
             root: PathBuf::from(root),
             test_file: PathBuf::from("tests/greeting.tftest.hcl"),
             test_expectations: None,
+            root_overlays: Vec::new(),
         }
     }
 
@@ -885,6 +910,45 @@ mod tests {
         );
         assert!(work.path().join("infra").is_dir());
         assert!(!work.path().join("configs").exists());
+    }
+
+    #[test]
+    fn root_overlays_change_only_the_disposable_copy() {
+        let source = tempfile::tempdir().expect("source");
+        let work = tempfile::tempdir().expect("work");
+        let overlay = source.path().join("transition_override.tf");
+        let original = source.path().join("main.tf");
+        fs::write(&overlay, "locals { heartbeat = 420 }\n").expect("overlay");
+        fs::write(&original, "locals { heartbeat = 3600 }\n").expect("original");
+        fs::copy(&original, work.path().join("main.tf")).expect("stage original");
+
+        stage_root_overlays(work.path(), std::slice::from_ref(&overlay)).expect("stage overlay");
+
+        assert_eq!(
+            fs::read_to_string(work.path().join("transition_override.tf")).expect("staged overlay"),
+            fs::read_to_string(&overlay).expect("source overlay")
+        );
+        assert_eq!(
+            fs::read_to_string(&original).expect("unchanged source"),
+            "locals { heartbeat = 3600 }\n"
+        );
+    }
+
+    #[test]
+    fn root_overlays_cannot_replace_module_sources() {
+        let source = tempfile::tempdir().expect("source");
+        let work = tempfile::tempdir().expect("work");
+        let ordinary = source.path().join("main.tf");
+        fs::write(&ordinary, "").expect("ordinary source");
+        assert!(stage_root_overlays(work.path(), &[ordinary]).is_err());
+        let overlay = source.path().join("test_override.tf");
+        fs::write(&overlay, "").expect("overlay");
+        fs::write(work.path().join("test_override.tf"), "original").expect("existing source");
+        assert!(stage_root_overlays(work.path(), &[overlay]).is_err());
+        assert_eq!(
+            fs::read_to_string(work.path().join("test_override.tf")).expect("unchanged source"),
+            "original"
+        );
     }
 
     #[test]

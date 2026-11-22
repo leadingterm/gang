@@ -83,6 +83,9 @@ def _opentofu_contract_test_impl(ctx):
     if ctx.file.test_expectations:
         files.append(ctx.file.test_expectations)
         environment["OPENTOFU_TEST_EXPECTATIONS"] = ctx.file.test_expectations.short_path
+    files.extend(ctx.files.root_overlays)
+    if ctx.files.root_overlays:
+        environment["OPENTOFU_ROOT_OVERLAYS"] = json.encode([file.short_path for file in ctx.files.root_overlays])
     runfiles = ctx.runfiles(files = files)
     runfiles = runfiles.merge(ctx.attr._runner[DefaultInfo].default_runfiles)
     return [
@@ -106,6 +109,10 @@ _opentofu_contract_test = rule(
             allow_single_file = [".json"],
             doc = "Explicit JSON file specifying plan, state and retention expectations.",
         ),
+        "root_overlays": attr.label_list(
+            allow_files = [".tf"],
+            doc = "Test-only override files copied into the disposable root before loading.",
+        ),
         "srcs": attr.label_list(
             allow_files = True,
             doc = "Runtime files from infra/, configs/, or //:Cargo.toml that the test needs.",
@@ -119,7 +126,7 @@ _opentofu_contract_test = rule(
     toolchains = ["@rules_tf//:tf_toolchain_type"],
 )
 
-def opentofu_contract_test(name, test_file = None, deps = [], test_expectations = None):
+def opentofu_contract_test(name, test_file = None, deps = [], test_expectations = None, root_overlays = []):
     """Runs `tofu fmt`, `init`, `validate` and `test` for the OpenTofu root in the current package.
 
     The package must live under infra/. The macro declares the public `sources` filegroup of the
@@ -130,6 +137,7 @@ def opentofu_contract_test(name, test_file = None, deps = [], test_expectations 
         test_file: Test file relative to the package; defaults to tests/<package name>.tftest.hcl.
         deps: Further files the root needs, such as module `sources`, files in configs/, or //:Cargo.toml.
         test_expectations: Optional JSON label containing test expectations.
+        root_overlays: Test-only override runfiles installed only in the staged root.
     """
     if not native.existing_rule("sources"):
         native.filegroup(
@@ -142,6 +150,7 @@ def opentofu_contract_test(name, test_file = None, deps = [], test_expectations 
         root = native.package_name(),
         test_file = test_file if test_file != None else "tests/{}.tftest.hcl".format(native.package_name().split("/")[-1]),
         test_expectations = test_expectations,
+        root_overlays = root_overlays,
         srcs = [":sources"] + deps + native.glob(["tests/*.tftest.hcl"]),
         # The watchdog only, never a verdict: long, so load does not kill the run.
         timeout = "long",

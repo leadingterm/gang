@@ -21,3 +21,28 @@ opentofu_contract_test(
         "//infra/terraform/modules/load-balancer:sources",
     ],
 )
+
+opentofu_contract_test(
+    name = "controller_lifecycle_transition_contract",
+    test_expectations = "tests/controller_lifecycle_transition.expectations.json",
+    test_file = "tests/controller_lifecycle_transition.tftest.hcl",
+    root_overlays = ["tests/fixtures/lifecycle_transition_override.tf"],
+    deps = [
+        "//infra/terraform/modules/instance-role:sources",
+        "//infra/terraform/modules/load-balancer:sources",
+    ],
+)
+
+opentofu_contract_test(
+    name = "controller_lifecycle_replacement_control",
+    test_expectations = "tests/controller_lifecycle_control.expectations.json",
+    test_file = "tests/controller_lifecycle_transition.tftest.hcl",
+    root_overlays = [
+        "tests/fixtures/lifecycle_transition_override.tf",
+        "tests/fixtures/zz_lifecycle_control_override.tf",
+    ],
+    deps = [
+        "//infra/terraform/modules/instance-role:sources",
+        "//infra/terraform/modules/load-balancer:sources",
+    ],
+)
