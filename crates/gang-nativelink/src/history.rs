@@ -150,6 +150,7 @@ impl Histories {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nativelink_config::schedulers::CpuReservationPercentile;
     use nativelink_scheduler::resource_sketch::{Budget, Observation, Policy};
     use std::num::NonZeroUsize;
     use std::time::Duration;
@@ -158,6 +159,7 @@ mod tests {
         let resource = ResourceSketch::with_shards(
             Policy {
                 headroom_percent: 0,
+                cpu_reservation_percentile: CpuReservationPercentile::P95,
                 classes: vec![],
                 reserve_cpu: true,
                 reserve_memory: true,

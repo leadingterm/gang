@@ -240,8 +240,8 @@ run "rds_group_shape" {
     error_message = "The PostgreSQL group must use one client endpoint and the private worker endpoint."
   }
   assert {
-    condition     = strcontains(output.gang_toml, "standby_routability_delay = \"${local.health.interval_seconds * local.health.threshold}s\"") && strcontains(output.gang_toml, "[server.leadership]\nrenew_interval = \"${local.health.renew_interval_seconds}s\"\ncall_timeout = \"${local.health.call_timeout_seconds}s\"")
-    error_message = "PostgreSQL must render the same routing, renewal and call timeout policy as the controller refresh."
+    condition     = !strcontains(output.gang_toml, "standby_routability_delay") && strcontains(output.gang_toml, "[server.leadership]\nrenew_interval = \"${local.health.renew_interval_seconds}s\"\ncall_timeout = \"${local.health.call_timeout_seconds}s\"")
+    error_message = "PostgreSQL must render leadership intervals without a standby delay."
   }
 
   assert {

@@ -323,14 +323,20 @@ async fn http1_get(
     Ok((status, body))
 }
 
+/// The fleet and execution policy owned by one controller fixture.
+struct ControllerPolicy {
+    fleets: FleetCatalog,
+    actions: Arc<gang_config::ActionsConfig>,
+    attempt_budget: Duration,
+}
+
 /// Starts the controller in a task. The task builds its own specs from owned stores and serves
 /// the connections accepted on its listeners, recording into `observations`. The public listener
 /// applies `public_gate` and labels its connections with `public_peers`. The readiness receiver
 /// resolves when built; the serving receiver resolves once it polls its public connections.
 fn spawn_controller(
     plugin: Arc<NativeLink>,
-    fleets: FleetCatalog,
-    actions: Arc<gang_config::ActionsConfig>,
+    policy: ControllerPolicy,
     listeners: (TcpListener, TcpListener),
     public_gate: TestGate,
     public_peers: Vec<Peer>,
@@ -344,6 +350,11 @@ fn spawn_controller(
     let (ready, readiness) = ControllerReady::channel();
     let (public, worker) = listeners;
     let controller = tokio::spawn(async move {
+        let ControllerPolicy {
+            fleets,
+            actions,
+            attempt_budget,
+        } = policy;
         let content = RenderedStoreSpec(json!({"memory": {}}));
         let action = RenderedStoreSpec(json!({"memory": {}}));
         let spec = ControllerSpec {
@@ -357,6 +368,7 @@ fn spawn_controller(
             max_workers: 8,
             observations: &observations,
             client_action_timeout: CLIENT_ACTION_TIMEOUT,
+            attempt_budget,
         };
         let connections = ControllerConnections {
             public: Listening {
@@ -500,6 +512,7 @@ impl Harness {
         let public_port = public.local_addr()?.port();
         let worker_port = worker.local_addr()?.port();
         let actions = Arc::new(actions);
+        let attempt_budget = worker_config.attempt_budget(actions.timeout);
         let mut config = config(worker_port)?;
         config.worker = worker_config;
         let plugin = Arc::new(build_plugin(config)?);
@@ -508,8 +521,11 @@ impl Harness {
             ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
         let (mut controller, serving, readiness) = spawn_controller(
             Arc::clone(&plugin),
-            fleets,
-            Arc::clone(&actions),
+            ControllerPolicy {
+                fleets,
+                actions: Arc::clone(&actions),
+                attempt_budget,
+            },
             (public, worker),
             public_gate,
             public_peers,
@@ -830,6 +846,8 @@ async fn a_second_controller_is_refused() -> TestResult {
         max_workers: 8,
         observations: &observations,
         client_action_timeout: CLIENT_ACTION_TIMEOUT,
+        attempt_budget: gang_config::WorkerConfig::default()
+            .attempt_budget(gang_config::ActionsConfig::default().timeout),
     };
     let (ready, readiness) = ControllerReady::channel();
     let result = harness
@@ -842,8 +860,7 @@ async fn a_second_controller_is_refused() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sequential_controller_terms_drain_and_republish() -> TestResult {
-    let plugin = build_plugin(config(0)?)?;
+async fn one_original_controller_drains_and_fresh_adapters_republish() -> TestResult {
     let content = RenderedStoreSpec(json!({"memory": {}}));
     let action = RenderedStoreSpec(json!({"memory": {}}));
     let fleets = FleetCatalog::try_new(vec![default_fleet()?])?;
@@ -859,8 +876,12 @@ async fn sequential_controller_terms_drain_and_republish() -> TestResult {
         max_workers: 8,
         observations: &observations,
         client_action_timeout: CLIENT_ACTION_TIMEOUT,
+        attempt_budget: gang_config::WorkerConfig::default()
+            .attempt_budget(gang_config::ActionsConfig::default().timeout),
     };
     for _ in 0..2 {
+        // A fresh adapter models a fresh host process, never another term on the old engine.
+        let plugin = build_plugin(config(0)?)?;
         let (public_tx, public_rx) = futures::channel::mpsc::unbounded::<Accepted>();
         let (worker_tx, worker_rx) = futures::channel::mpsc::unbounded::<Accepted>();
         let connections = ControllerConnections {
@@ -881,21 +902,48 @@ async fn sequential_controller_terms_drain_and_republish() -> TestResult {
             result = &mut run => return Err(format!("controller stopped early: {result:?}").into()),
             result = readiness => result?,
         }
-        plugin.snapshot(&mut SchedulerSnapshot::default()).await?;
-        let (other_ready, _) = ControllerReady::channel();
-        assert!(matches!(
-            plugin
-                .run_controller(&spec, no_connections(), other_ready)
-                .await,
-            Err(PortError::Config(_))
-        ));
+        let mut snapshot = SchedulerSnapshot::default();
+        plugin.snapshot(&mut snapshot).await?;
+        assert!(snapshot.workers.is_empty());
+        assert!(snapshot.queued.is_empty());
+        assert!(snapshot.executing.is_empty());
+        assert_controller_reuse_rejected(&plugin, &spec).await?;
+        let mut drain = gang_spi::ControllerDrain::default();
+        plugin.hand_off(&mut drain).await?;
+        assert!(
+            drain.complete,
+            "the empty original engine is drained before intake ends"
+        );
         drop((public_tx, worker_tx));
         run.await?;
         assert!(matches!(
             plugin.snapshot(&mut SchedulerSnapshot::default()).await,
             Err(PortError::Unavailable(_))
         ));
+        assert_controller_reuse_rejected(&plugin, &spec).await?;
     }
+    Ok(())
+}
+
+async fn assert_controller_reuse_rejected(
+    plugin: &NativeLink,
+    spec: &ControllerSpec<'_>,
+) -> TestResult {
+    let (ready, readiness) = ControllerReady::channel();
+    let Err(error) = plugin.run_controller(spec, no_connections(), ready).await else {
+        return Err("an adapter serves exactly one original controller".into());
+    };
+    assert!(matches!(&error, PortError::Config(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("the controller is already serving"),
+        "reuse has an unambiguous error: {error:?}"
+    );
+    assert!(
+        readiness.await.is_err(),
+        "a rejected second run never republishes readiness"
+    );
     Ok(())
 }
 
@@ -2372,17 +2420,21 @@ impl gang_spi::AuthenticationPort for WorkerAnonymous {
 
 impl gang_spi::CredentialLifecyclePort for WorkerAnonymous {}
 
-fn worker_server_settings(port: u16) -> Result<gang_server::ServerSettings, Box<dyn Error>> {
+fn worker_server_settings(
+    port: u16,
+    worker: &gang_config::WorkerConfig,
+) -> Result<gang_server::ServerSettings, Box<dyn Error>> {
+    let actions = Arc::new(gang_config::ActionsConfig {
+        kill_grace: NonZeroDuration::from_secs(7),
+        ..gang_config::ActionsConfig::default()
+    });
+    let attempt_budget = worker.attempt_budget(actions.timeout);
     Ok(gang_server::ServerSettings {
-        actions: Arc::new(gang_config::ActionsConfig {
-            kill_grace: NonZeroDuration::from_secs(7),
-            ..gang_config::ActionsConfig::default()
-        }),
+        actions,
         scaling: Arc::new(gang_config::ScalingConfig::default()),
         proxy_protocol: None,
         leadership: gang_config::LeadershipConfig::default(),
-        standby_routability_delay: Duration::ZERO,
-        handoff_timeout: Duration::from_mins(1),
+        attempt_budget,
         revocation_refresh_interval: NonZeroDuration::from_secs(1),
         poll_interval: NonZeroDuration::from_secs(1),
         client_action_timeout: NonZeroDuration::from_mins(1),
@@ -2452,7 +2504,9 @@ struct WorkerServer {
     plugin: Arc<NativeLink>,
     repository: gang_testkit::FakeRepository,
     clock: Arc<gang_clock::TestClock>,
+    renew_interval: Duration,
     properties: FleetProperties,
+    worker_config: gang_config::WorkerConfig,
     public: WorkerMemoryDialer,
     worker: WorkerMemoryDialer,
     stop: Option<oneshot::Sender<()>>,
@@ -2491,6 +2545,7 @@ impl WorkerServer {
         let properties = fleets.catalog().fleets()[0].clone();
         let mut native_config = config(9001)?;
         native_config.worker.connect_timeout = gang_config::WholeSeconds::from_units(2);
+        let worker_config = native_config.worker.clone();
         let plugin = Arc::new(build_plugin(native_config)?);
         let provisioner = gang_testkit::FakeProvisioner::default();
         let convergences = gang_testkit::CallCount::new();
@@ -2521,7 +2576,9 @@ impl WorkerServer {
             clients: WorkerAnonymous(Arc::clone(&identity)),
             workers: WorkerAnonymous(identity),
         };
-        let server = gang_server::Server::prepare(parts, worker_server_settings(9000)?).await?;
+        let settings = worker_server_settings(9000, &worker_config)?;
+        let renew_interval = settings.leadership.renew_interval.get();
+        let server = gang_server::Server::prepare(parts, settings).await?;
         let (stop, stopped) = oneshot::channel();
         let (ready, prepared) = ControllerReady::channel();
         let task = tokio::spawn(server.run(
@@ -2534,7 +2591,9 @@ impl WorkerServer {
             plugin,
             repository,
             clock,
+            renew_interval,
             properties,
+            worker_config,
             public,
             worker,
             stop: Some(stop),
@@ -3046,7 +3105,7 @@ async fn trigger_worker_drain(server: &mut WorkerServer, cause: DrainCause) -> T
                     )?),
                 )
                 .await?;
-            let settings = worker_server_settings(9000)?;
+            let settings = worker_server_settings(9000, &server.worker_config)?;
             let now = server.clock.wall();
             let outcome = server
                 .repository
@@ -3119,6 +3178,7 @@ async fn observe_worker_keepalives(
     pressure: &PressureProbe,
 ) -> TestResult {
     for _ in 0..3 {
+        server.clock.advance(Duration::from_secs(1));
         tokio::time::advance(Duration::from_secs(1)).await;
         let operation = worker.action.operation_id.clone();
         let stream = worker.stream()?;
@@ -3196,8 +3256,20 @@ async fn worker_wire_drain(cause: DrainCause) -> TestResult {
         if matches!(cause, DrainCause::Voluntary) {
             server.stop();
         }
-        waiting_for = "server and W2 connection shutdown";
-        (&mut server.task).await??;
+        waiting_for = "server shutdown after the original engine completes";
+        // Runtime drain refreshes use the injected owner clock, not Tokio's clock.
+        // Keep driving that existing cadence until the real server ends its feeds.
+        let finish = async {
+            loop {
+                server.clock.advance(server.renew_interval);
+                tokio::time::advance(server.renew_interval).await;
+            }
+        };
+        tokio::select! {
+            stopped = &mut server.task => stopped??,
+            () = finish => unreachable!("the owner clock driver runs until server shutdown"),
+        }
+        waiting_for = "W2 in-band GOAWAY after server shutdown";
         (&mut w2.connection.driver.0).await??;
         w2.connection.finish_witness().await;
         Ok(())

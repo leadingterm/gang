@@ -8,7 +8,7 @@ use gang_clock::Timestamp;
 use gang_config::HistoryWindow;
 use gang_spi::{LearnedHistory, PortError};
 use nativelink_config::cas_server::SchedulerConfig;
-use nativelink_config::schedulers::SchedulerSpec;
+use nativelink_config::schedulers::{CpuReservationPercentile, SchedulerSpec};
 use nativelink_scheduler::historical_resource_scheduler::HistoricalResourceScheduler;
 use nativelink_scheduler::resource_sketch::{Budget, Policy, ResourceSketch};
 use parking_lot::Mutex;
@@ -107,6 +107,7 @@ pub fn source_with_cap(
 pub fn tiny_source() -> HistoryFixture {
     let policy = Policy {
         headroom_percent: 25,
+        cpu_reservation_percentile: CpuReservationPercentile::P95,
         classes: Vec::new(),
         reserve_cpu: true,
         reserve_memory: true,

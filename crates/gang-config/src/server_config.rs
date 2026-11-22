@@ -121,9 +121,9 @@ pub const DEFAULT_WORKER_TIMEOUT: WholeSeconds = WholeSeconds::from_units(10);
 pub struct LeadershipConfig {
     /// Lease lifetime. Defaults to ten seconds.
     pub ttl: NonZeroDuration,
-    /// Interval between renewals. Defaults to three seconds.
+    /// Interval between renewals. Defaults to one second.
     pub renew_interval: NonZeroDuration,
-    /// Minimum validity required before a provisioner mutation. Defaults to two seconds.
+    /// Minimum validity required before a provisioner mutation. Defaults to one second.
     pub call_timeout: NonZeroDuration,
     /// Allowance for clock skew. Defaults to two seconds.
     #[serde(with = "gang_types::duration")]
@@ -200,8 +200,6 @@ pub struct ServerConfig {
     pub proxy_protocol: Option<ProxyProtocolConfig>,
     /// Controller leadership timing. Defaults to the values on [`LeadershipConfig`].
     pub leadership: LeadershipConfig,
-    /// Time a newer standby must be routable before requesting handover. Defaults to zero.
-    pub standby_routability_delay: Duration,
     /// Interval between revocation refreshes. Defaults to five seconds.
     pub revocation_refresh_interval: NonZeroDuration,
     /// How many health listener connections may be open at once; further connections wait in the
@@ -244,8 +242,6 @@ struct RawServer {
     rate_limit: RateLimitConfig,
     proxy_protocol: Option<ProxyProtocolConfig>,
     leadership: LeadershipConfig,
-    #[serde(with = "gang_types::duration")]
-    standby_routability_delay: Duration,
     revocation_refresh_interval: NonZeroDuration,
     health_max_connections: NonZeroUsize,
     health_max_header_size: Bytes,
@@ -276,7 +272,6 @@ impl Default for RawServer {
             rate_limit: RateLimitConfig::default(),
             proxy_protocol: None,
             leadership: LeadershipConfig::default(),
-            standby_routability_delay: Duration::ZERO,
             revocation_refresh_interval: DEFAULT_REVOCATION_REFRESH_INTERVAL,
             health_max_connections: DEFAULT_HEALTH_MAX_CONNECTIONS,
             health_max_header_size: DEFAULT_HEALTH_MAX_HEADER_SIZE,
@@ -335,7 +330,6 @@ impl TryFrom<RawServer> for ServerConfig {
             rate_limit: raw.rate_limit,
             proxy_protocol: raw.proxy_protocol,
             leadership: raw.leadership,
-            standby_routability_delay: raw.standby_routability_delay,
             revocation_refresh_interval: raw.revocation_refresh_interval,
             health_max_connections: raw.health_max_connections,
             health_max_header_size: raw.health_max_header_size,
@@ -372,7 +366,6 @@ impl From<ServerConfig> for RawServer {
             rate_limit: config.rate_limit,
             proxy_protocol: config.proxy_protocol,
             leadership: config.leadership,
-            standby_routability_delay: config.standby_routability_delay,
             revocation_refresh_interval: config.revocation_refresh_interval,
             health_max_connections: config.health_max_connections,
             health_max_header_size: config.health_max_header_size,
@@ -400,23 +393,6 @@ mod tests {
             toml::from_str::<ServerConfig>(&toml::to_string(&config)?)?,
             config
         );
-        Ok(())
-    }
-
-    #[test]
-    fn standby_routability_delay_defaults_and_round_trips() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let default: ServerConfig = toml::from_str("transport = 'plaintext'")?;
-        assert_eq!(default.standby_routability_delay, std::time::Duration::ZERO);
-        let config: ServerConfig =
-            toml::from_str("transport = 'plaintext'\nstandby_routability_delay = '10s'")?;
-        assert_eq!(
-            config.standby_routability_delay,
-            std::time::Duration::from_secs(10)
-        );
-        let serialized = toml::to_string(&config)?;
-        let reparsed: ServerConfig = toml::from_str(&serialized)?;
-        assert_eq!(reparsed, config);
         Ok(())
     }
 

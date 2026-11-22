@@ -3,14 +3,14 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
+use std::process::{Command, ExitStatus};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use gang_clock::SystemClock;
 use gang_testkit::{FakeDynamoDb, PostgresServer, SUPERUSER};
-use gang_tls::{HttpProtocol, HttpRequest, HttpTransport, ServerTrust};
+use gang_tls::ServerTrust;
 use gang_types::{CaPin, Url};
 use gang_wire::{Event, Frame, State};
 use hyper::{Request, StatusCode};
@@ -31,7 +31,7 @@ use crate::gang_cli::GangCli;
 use crate::host::Host;
 use crate::issuer::TestIssuer;
 use crate::ports;
-use crate::process::{self, Supervised};
+use crate::process::{self, ControllerHost, Supervised};
 use crate::report::ProbeReport;
 use crate::settings::DeploymentInputs;
 use crate::stack::{Stack, is_announcement, local_evidence};
@@ -112,39 +112,6 @@ fn initial_leader(observations: &[Option<LeadershipHealth>]) -> Option<usize> {
         return None;
     }
     Some(leader)
-}
-
-/// Sends one bounded HTTP/2 request over the deployment's pinned TLS transport.
-fn probe_http(client: &crate::http::Http, address: SocketAddr, path: &str) -> Result<String> {
-    let url = Url::parse(&format!("https://{address}{path}"))
-        .map_err(E2eError::system_from("forming diagnostic url"))?;
-    let reply = client.send(HttpRequest {
-        method: http::Method::GET,
-        url: &url,
-        bearer: None,
-        headers: &[],
-        body: None,
-    })?;
-    if path == gang_wire::routes::GET_SERVER.template {
-        let document: serde_json::Value = serde_json::from_slice(&reply.body)
-            .map_err(E2eError::system_from("decoding server information"))?;
-        Ok(format!(
-            "HTTP/2 status={} remote_executor={} remote_cache={}",
-            reply.status,
-            document
-                .get("remoteExecutor")
-                .map_or_else(|| "<missing>".to_owned(), ToString::to_string),
-            document
-                .get("remoteCache")
-                .map_or_else(|| "<missing>".to_owned(), ToString::to_string),
-        ))
-    } else {
-        Ok(format!(
-            "HTTP/2 GET status={} grpc-status={:?}",
-            reply.status,
-            reply.headers.get("grpc-status")
-        ))
-    }
 }
 
 /// State shared between the synchronous partition control and the forwarding task.
@@ -314,7 +281,7 @@ struct Controller {
     health_policy: Arc<Policy>,
     identity: Arc<str>,
     config: PathBuf,
-    child: Option<Supervised>,
+    child: Option<ControllerHost>,
     exit_status: Option<ExitStatus>,
     database_link: DatabaseLink,
     paused: bool,
@@ -322,7 +289,7 @@ struct Controller {
 
 pub(crate) struct Retiring {
     index: usize,
-    child: Supervised,
+    child: ControllerHost,
 }
 
 /// Controllers with shared database, S3, local provisioner state and signing key.
@@ -532,8 +499,7 @@ impl<'a> Cluster<'a> {
         let identity = self.controller_identity(index)?;
         let start = Instant::now();
         loop {
-            let item = self.leader_lease_item()?;
-            let lease = decode_leader_lease(item.as_ref())?;
+            let lease = self.observe_leader_lease()?;
             let now = unix_millis()?;
             if lease
                 .as_ref()
@@ -559,10 +525,9 @@ impl<'a> Cluster<'a> {
 
     pub(crate) fn controller_is_leader(&self, index: usize) -> Result<bool> {
         let identity = self.controller_identity(index)?;
-        let item = self.leader_lease_item()?;
+        let lease = self.observe_leader_lease()?;
         let now = unix_millis()?;
-        Ok(decode_leader_lease(item.as_ref())?
-            .is_some_and(|lease| lease.is_held_by(&identity, now)))
+        Ok(lease.is_some_and(|lease| lease.is_held_by(&identity, now)))
     }
 
     /// The identity emitted by this process before its completed startup announcement.
@@ -570,16 +535,53 @@ impl<'a> Cluster<'a> {
         self.controllers
             .lock()
             .get(index)
-            .map(|controller| Arc::clone(&controller.identity))
+            .map(|controller| {
+                controller.child.as_ref().map_or_else(
+                    || Arc::clone(&controller.identity),
+                    ControllerHost::identity,
+                )
+            })
             .ok_or_else(|| E2eError::system("unknown controller"))
     }
 
-    fn leader_lease_item(&self) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    fn observe_leader_lease(&self) -> Result<Option<LeaderLease>> {
         match &self.database {
-            ClusterDatabase::DynamoDb(database) => Ok(database.item(TABLE, "lease", "leader")),
-            ClusterDatabase::Postgres { .. } => Err(E2eError::system(
-                "direct lease observation requires the dynamodb cluster",
-            )),
+            ClusterDatabase::DynamoDb(database) => {
+                let item = database.item(TABLE, "lease", "leader");
+                decode_leader_lease(item.as_ref())
+            }
+            ClusterDatabase::Postgres { server, database, .. } => self.runtime.block_on(
+                crate::tls_client::within(DIAGNOSTIC_TIMEOUT, "observing postgresql leader lease", async {
+                    let (client, connection) = tokio_postgres::Config::new()
+                        .host_path(server.socket_dir())
+                        .port(server.port())
+                        .user(SUPERUSER)
+                        .dbname(database)
+                        .connect(tokio_postgres::NoTls)
+                        .await
+                        .map_err(E2eError::system_from("connecting to observe postgresql lease"))?;
+                    let mut drivers = JoinSet::new();
+                    drivers.spawn(connection);
+                    let row = client.query_opt(
+                        "SELECT holder, epoch, floor(extract(epoch FROM expires_at) * 1000)::bigint AS expires_at_ms FROM leases WHERE name = $1",
+                        &[&"leader"],
+                    ).await.map_err(E2eError::system_from("reading postgresql leader lease"))?;
+                    drop(client);
+                    drivers.join_next().await
+                        .ok_or_else(|| E2eError::system("postgresql lease connection driver missing"))?
+                        .map_err(E2eError::system_from("joining postgresql lease connection"))?
+                        .map_err(E2eError::system_from("driving postgresql lease connection"))?;
+                    row.map(|row| {
+                        let holder = row.try_get("holder")
+                            .map_err(E2eError::system_from("decoding postgresql lease holder"))?;
+                        let epoch: i64 = row.try_get("epoch")
+                            .map_err(E2eError::system_from("decoding postgresql lease epoch"))?;
+                        let expiry: i64 = row.try_get("expires_at_ms")
+                            .map_err(E2eError::system_from("decoding postgresql lease expiry"))?;
+                        LeaderLease::from_postgres(holder, epoch, expiry)
+                    }).transpose()
+                }),
+            ),
         }
     }
 
@@ -688,7 +690,7 @@ impl<'a> Cluster<'a> {
         let probes: Vec<_> = controllers
             .iter()
             .enumerate()
-            .filter(|(_, controller)| !controller.paused && controller.exit_status.is_none())
+            .filter(|(_, controller)| !controller.paused && controller.child.is_some())
             .map(|(index, controller)| {
                 (
                     index,
@@ -872,7 +874,6 @@ impl<'a> Cluster<'a> {
             self.write_controller_config(&config, public, worker, health, &database_link)?;
         }
         let public_proxy_protocol_v2 = controller_public_proxy_protocol(&config)?;
-        let (mut child, log_start) = self.spawn_controller(index, binary, &config)?;
         let log = self.controller_log_path(index);
         for (frontend, address) in [(Frontend::Serve, public), (Frontend::Workers, worker)] {
             self.balancer.register(
@@ -883,6 +884,25 @@ impl<'a> Cluster<'a> {
                 },
             );
         }
+        for (frontend, address) in [(Frontend::Serve, public), (Frontend::Workers, worker)] {
+            if !self.balancer.registered(frontend, address)
+                || self.balancer.healthy(frontend).contains(&address)
+            {
+                return Err(E2eError::system(
+                    "new target must be registered and unhealthy before launch",
+                ));
+            }
+        }
+        self.release_evidence.lock().push(format!(
+            "controller {index}: targets registered and initially unhealthy before process launch; health path={}",
+            health_policy.path,
+        ));
+        let (mut child, log_start) =
+            self.spawn_controller(index, binary, &config)
+                .inspect_err(|_| {
+                    self.balancer.deregister(Frontend::Serve, public);
+                    self.balancer.deregister(Frontend::Workers, worker);
+                })?;
         let startup = await_controller_start(&mut child, &log, log_start, timeout);
         let identity = match startup {
             Ok(identity) => identity,
@@ -901,6 +921,14 @@ impl<'a> Cluster<'a> {
                 ));
             }
         };
+        let child = ControllerHost::start(
+            child,
+            Arc::clone(&identity),
+            self.controller_command(binary, &config),
+            log,
+            timeout,
+            await_controller_start,
+        )?;
         controllers.push(Controller {
             public,
             public_proxy_protocol_v2,
@@ -971,6 +999,11 @@ impl<'a> Cluster<'a> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(E2eError::io("measuring controller startup log")(error)),
         };
+        let mut command = self.controller_command(binary, config);
+        Ok((Supervised::spawn(&mut command, &log)?, log_start))
+    }
+
+    fn controller_command(&self, binary: &Path, config: &Path) -> Command {
         let cli = GangCli::new(
             binary.to_path_buf(),
             config.to_path_buf(),
@@ -979,7 +1012,7 @@ impl<'a> Cluster<'a> {
         let mut command = cli.server();
         configure_fake_aws(&mut command);
         command.env("GANG_LOG", "info");
-        Ok((Supervised::spawn(&mut command, &log)?, log_start))
+        command
     }
 
     fn write_release_config(
@@ -1073,7 +1106,7 @@ impl<'a> Cluster<'a> {
     ) -> Result<()> {
         let timeout = self.stack.settings().startup_timeout;
         let start = Instant::now();
-        let startup = {
+        let startup = (|| {
             let mut controllers = self.controllers.lock();
             let controller = controllers
                 .get_mut(index)
@@ -1082,26 +1115,41 @@ impl<'a> Cluster<'a> {
                 .child
                 .as_mut()
                 .ok_or_else(|| E2eError::system("controller is not running"))?;
-            install_fetched_config(&controller.config, fetched)?;
             let status = child.terminate(timeout.saturating_sub(start.elapsed()))?;
             controller.exit_status = Some(status);
             controller.child = None;
-            let (child, log_start) = self.spawn_controller(index, binary, &controller.config)?;
-            controller.child = Some(child);
-            controller.exit_status = None;
-            controller.paused = false;
-            let child = controller
-                .child
-                .as_mut()
-                .ok_or_else(|| E2eError::system("restarted controller has no process"))?;
-            await_controller_start(
-                child,
+            install_fetched_config(&controller.config, fetched)?;
+            let (mut child, log_start) =
+                self.spawn_controller(index, binary, &controller.config)?;
+            let identity = match await_controller_start(
+                &mut child,
                 &self.controller_log_path(index),
                 log_start,
                 timeout.saturating_sub(start.elapsed()),
-            )
-            .map(|identity| controller.identity = identity)
-        };
+            ) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    // An explicit configuration restart begins a new observation. Preserve that
+                    // attempted child's rejection, not the successful stop of the prior child.
+                    child.kill()?;
+                    controller.exit_status =
+                        Some(child.wait_within(Duration::ZERO, "failed configuration restart")?);
+                    return Err(error);
+                }
+            };
+            controller.child = Some(ControllerHost::start(
+                child,
+                Arc::clone(&identity),
+                self.controller_command(binary, &controller.config),
+                self.controller_log_path(index),
+                timeout.saturating_sub(start.elapsed()),
+                await_controller_start,
+            )?);
+            controller.identity = identity;
+            controller.exit_status = None;
+            controller.paused = false;
+            Ok::<(), E2eError>(())
+        })();
         startup.map_err(|error| {
             let log = self.log(index).map_or_else(
                 |error| format!("unreadable: {error}"),
@@ -1187,7 +1235,7 @@ impl<'a> Cluster<'a> {
     }
 
     /// Transfers a controller's process handle without bypassing balancer health checks.
-    fn take_controller(&self, index: usize) -> Result<Supervised> {
+    fn take_controller(&self, index: usize) -> Result<ControllerHost> {
         let mut controllers = self.controllers.lock();
         let controller = controllers
             .get_mut(index)
@@ -1218,10 +1266,7 @@ impl<'a> Cluster<'a> {
     pub(crate) fn finish_retire(&self, mut retiring: Retiring) -> Result<ExitStatus> {
         let status = retiring
             .child
-            .wait_within(
-                self.stack.settings().startup_timeout,
-                "the process to exit after SIGTERM",
-            )
+            .wait_stopped(self.stack.settings().startup_timeout)
             .map_err(|error| self.timeout_evidence(error))?;
         self.remember_exit(retiring.index, status);
         Ok(status)
@@ -1234,29 +1279,54 @@ impl<'a> Cluster<'a> {
     pub fn retire(&self, index: usize) -> Result<ExitStatus> {
         self.finish_retire(self.begin_retire(index)?)
     }
-    /// Waits for a controller to exit on its own, within the startup deadline.
+    /// Waits for the original controller child to exit, without stopping its host supervisor.
     ///
-    /// A controller that does not exit before the deadline is killed when its handle is dropped.
+    /// A successful drain may already have produced a fresh passive process when this returns.
     ///
     /// # Errors
-    /// Returns an error for an unknown controller, a failed process observation, or a timeout.
+    /// Returns an error for an unknown controller, failed observation, or timeout.
     pub fn wait_exit(&self, index: usize) -> Result<ExitStatus> {
-        if let Some(status) = self
-            .controllers
-            .lock()
-            .get(index)
-            .and_then(|controller| controller.exit_status)
-        {
+        let timeout = self.stack.settings().startup_timeout;
+        let mut controllers = self.controllers.lock();
+        let controller = controllers
+            .get_mut(index)
+            .ok_or_else(|| E2eError::system("unknown controller"))?;
+        if let Some(status) = controller.exit_status {
             return Ok(status);
         }
-        let mut child = self.take_controller(index)?;
-        let timeout = self.stack.settings().startup_timeout;
-        let condition = format!("controller {index} (pid {}) to exit", child.pid());
-        let status = child
-            .wait_within(timeout, &condition)
-            .map_err(|error| self.timeout_evidence(error))?;
-        self.remember_exit(index, status);
-        Ok(status)
+        let child = controller
+            .child
+            .as_mut()
+            .ok_or_else(|| E2eError::system("controller is not running"))?;
+        child.wait_within(timeout, &format!("original controller {index} to exit"))
+    }
+
+    /// Proves a natural drain caused a fresh passive child on the same local host.
+    pub(crate) fn wait_for_host_restart(
+        &self,
+        index: usize,
+        original_pid: u32,
+        original_holder: &str,
+    ) -> Result<u32> {
+        let (pid, identity) = {
+            let controllers = self.controllers.lock();
+            let child = controllers
+                .get(index)
+                .and_then(|controller| controller.child.as_ref())
+                .ok_or_else(|| E2eError::system("controller host is not running"))?;
+            child.wait_restarted(self.stack.settings().startup_timeout)?
+        };
+        if pid == original_pid || identity.as_ref() == original_holder {
+            return Err(E2eError::system(
+                "host restart retained original PID or holder",
+            ));
+        }
+        if self.controller_is_leader(index)? {
+            return Err(E2eError::system(
+                "older restarted host reacquired leadership",
+            ));
+        }
+        Ok(pid)
     }
 
     /// Reads the captured standard output and standard error of a controller.
@@ -1287,7 +1357,7 @@ impl<'a> Cluster<'a> {
         let pid = controller
             .child
             .as_ref()
-            .map(Supervised::pid)
+            .map(ControllerHost::pid)
             .ok_or_else(|| E2eError::system("controller is not running"))?;
         let raw = i32::try_from(pid).map_err(E2eError::system_from("converting controller pid"))?;
         let target =
@@ -1305,6 +1375,16 @@ impl<'a> Cluster<'a> {
     /// # Errors
     /// Returns an error if the controller cannot be signalled.
     pub fn pause(&self, index: usize) -> Result<()> {
+        if let Some(child) = self
+            .controllers
+            .lock()
+            .get_mut(index)
+            .and_then(|c| c.child.as_mut())
+        {
+            // This deliberate zombie fault observes the original process after resumption,
+            // not a fresh, legitimately contending host process.
+            child.suppress_restart();
+        }
         self.signal(index, Signal::STOP, true)
     }
 
@@ -1331,9 +1411,6 @@ impl<'a> Cluster<'a> {
         let controller = controllers
             .get_mut(index)
             .ok_or_else(|| E2eError::system("unknown controller public target"))?;
-        if controller.exit_status.is_some() {
-            return Err(E2eError::system("controller public target has exited"));
-        }
         let child = controller
             .child
             .as_mut()
@@ -1396,7 +1473,14 @@ impl<'a> Cluster<'a> {
     /// # Panics
     /// Panics if `index` does not identify a controller started by this cluster.
     pub fn cut_database(&self, index: usize, cut: bool) {
-        self.controllers.lock()[index].database_link.set_cut(cut);
+        let mut controllers = self.controllers.lock();
+        let controller = &mut controllers[index];
+        if cut && let Some(child) = controller.child.as_mut() {
+            // Preserve the original fenced process's exit and mutation witnesses during this
+            // deliberate partition. Healing does not silently introduce a fresh contender.
+            child.suppress_restart();
+        }
+        controller.database_link.set_cut(cut);
     }
 
     /// The shared database, including its outage controls.
@@ -1449,7 +1533,8 @@ impl<'a> Cluster<'a> {
     }
 
     /// Performs a bounded, pinned TLS handshake and reports its negotiated ALPN.
-    fn probe_execution_tls(&self, address: SocketAddr, pin: &CaPin) -> Result<String> {
+    fn probe_execution_tls(&self, target: DirectTarget, pin: &CaPin) -> Result<String> {
+        let address = target.address;
         let config = gang_tls::client_config(
             ServerTrust::Pin(pin),
             None,
@@ -1464,9 +1549,21 @@ impl<'a> Cluster<'a> {
             DIAGNOSTIC_TIMEOUT,
             format!("tls handshake to {address}"),
             async move {
-                let tcp = TcpStream::connect(address)
+                let mut tcp = TcpStream::connect(address)
                     .await
                     .map_err(E2eError::io(format!("connecting to {address}")))?;
+                if target.proxy_protocol_v2 {
+                    let source = tcp
+                        .local_addr()
+                        .map_err(E2eError::io("reading diagnostic PROXY source"))?;
+                    let (SocketAddr::V4(source), SocketAddr::V4(destination)) = (source, address)
+                    else {
+                        return Err(E2eError::system("diagnostic PROXY framing requires IPv4"));
+                    };
+                    tcp.write_all(&crate::balancer::proxy_v2_tcp_header(source, destination))
+                        .await
+                        .map_err(E2eError::io("writing diagnostic PROXY header"))?;
+                }
                 let stream = connector
                     .connect(name, tcp)
                     .await
@@ -1514,43 +1611,59 @@ impl<'a> Cluster<'a> {
                 return lines.join("\n");
             }
         };
-        let client = crate::http::Http::try_new(
-            HttpTransport::Tls {
-                trust: ServerTrust::Pin(&pin),
-            },
-            HttpProtocol::Http2,
-            DIAGNOSTIC_TIMEOUT,
-        );
+        let client = self
+            .stack
+            .administrator()
+            .and_then(|administrator| administrator.credentials(&pin))
+            .and_then(|credentials| {
+                self.frontend_url(Frontend::Serve, "https")
+                    .map(|endpoint| (credentials, endpoint))
+            });
         let controllers: Vec<_> = self
             .controllers
             .lock()
             .iter()
             .enumerate()
-            .map(|(index, controller)| (index, controller.public))
+            .map(|(index, controller)| {
+                (
+                    index,
+                    DirectTarget {
+                        address: controller.public,
+                        proxy_protocol_v2: controller.public_proxy_protocol_v2,
+                    },
+                )
+            })
             .collect();
         let mut public: Vec<_> = controllers
             .iter()
-            .map(|(index, address)| (format!("controller {index} public"), *address))
+            .map(|(index, target)| (format!("controller {index} public"), *target))
             .collect();
         public.push((
             "balancer serve".to_owned(),
-            self.balancer.address(Frontend::Serve),
+            DirectTarget {
+                address: self.balancer.address(Frontend::Serve),
+                proxy_protocol_v2: false,
+            },
         ));
-        for (name, address) in public {
-            let result = match &client {
-                Ok(client) => probe_http(client, address, gang_wire::routes::GET_SERVER.template)
-                    .unwrap_or_else(|error| format!("error: {}", gang_types::error_chain(&error))),
-                Err(error) => format!("client error: {}", gang_types::error_chain(error)),
+        for (name, target) in public {
+            let address = target.address;
+            let probe = |path| match &client {
+                Ok((credentials, endpoint)) => crate::upgrade_probe::probe_public(
+                    endpoint,
+                    credentials,
+                    target,
+                    path,
+                    DIAGNOSTIC_TIMEOUT,
+                )
+                .unwrap_or_else(|error| format!("error: {}", gang_types::error_chain(&error))),
+                Err(_) => "authenticated diagnostic client unavailable".to_owned(),
             };
+            let result = probe(gang_wire::routes::GET_SERVER.template);
             lines.push(format!("{name} {address} GET /v1/server: {result}"));
             let tls = self
-                .probe_execution_tls(address, &pin)
+                .probe_execution_tls(target, &pin)
                 .unwrap_or_else(|error| format!("error: {}", gang_types::error_chain(&error)));
-            let request = match &client {
-                Ok(client) => probe_http(client, address, CAPABILITIES_PATH)
-                    .unwrap_or_else(|error| format!("error: {}", gang_types::error_chain(&error))),
-                Err(error) => format!("client error: {}", gang_types::error_chain(error)),
-            };
+            let request = probe(CAPABILITIES_PATH);
             lines.push(format!("{name} {address}: {tls}; {request}"));
         }
         lines.join("\n")
@@ -1591,13 +1704,7 @@ impl<'a> Cluster<'a> {
                     let pid = child.pid();
                     match child.has_exited() {
                         Ok(false) => format!("alive pid={pid}, paused={}", controller.paused),
-                        Ok(true) => match child.terminate(Duration::ZERO) {
-                            Ok(status) => {
-                                controller.exit_status = Some(status);
-                                format!("exited pid={pid}, status={status}")
-                            }
-                            Err(error) => format!("exited pid={pid}, status unavailable: {error}"),
-                        },
+                        Ok(true) => format!("current child exited pid={pid}"),
                         Err(error) => format!("pid={pid}, status unavailable: {error}"),
                     }
                 } else if let Some(status) = controller.exit_status {
@@ -1750,31 +1857,35 @@ fn startup_identity(log: &str) -> Result<&str> {
     identity.ok_or_else(|| E2eError::system("missing starting controller INFO identity"))
 }
 
-struct LeaderLease<'a> {
-    holder: Option<&'a str>,
+#[derive(Debug, PartialEq, Eq)]
+struct LeaderLease {
+    holder: Option<String>,
     epoch: u64,
     expires_at: u64,
 }
 
-impl std::fmt::Debug for LeaderLease<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LeaderLease")
-            .field("holder", &self.holder)
-            .field("epoch", &self.epoch)
-            .field("expires_at", &self.expires_at)
-            .finish()
-    }
-}
-
-impl LeaderLease<'_> {
+impl LeaderLease {
     fn is_held_by(&self, identity: &str, now: u64) -> bool {
-        self.holder == Some(identity) && self.expires_at > now
+        self.epoch > 0 && self.holder.as_deref() == Some(identity) && self.expires_at > now
+    }
+
+    fn from_postgres(holder: Option<String>, epoch: i64, expires_at: i64) -> Result<Self> {
+        if holder.as_deref() == Some("") {
+            return Err(E2eError::system("empty postgresql lease holder"));
+        }
+        Ok(Self {
+            holder,
+            epoch: u64::try_from(epoch)
+                .map_err(E2eError::system_from("negative postgresql lease epoch"))?,
+            expires_at: u64::try_from(expires_at)
+                .map_err(E2eError::system_from("negative postgresql lease expiry"))?,
+        })
     }
 }
 
 fn decode_leader_lease(
     item: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Result<Option<LeaderLease<'_>>> {
+) -> Result<Option<LeaderLease>> {
     let Some(item) = item else { return Ok(None) };
     let number = |name: &str| -> Result<u64> {
         item.get(name)
@@ -1802,7 +1913,7 @@ fn decode_leader_lease(
         })
         .transpose()?;
     Ok(Some(LeaderLease {
-        holder,
+        holder: holder.map(str::to_owned),
         epoch: number("epoch")?,
         expires_at: number("expires_at")?,
     }))
@@ -2047,7 +2158,6 @@ fn adapt_fleet(
             fleet.insert("action_environment".into(), value.clone());
         }
     }
-    fleet.insert("max_instances".into(), toml::Value::Integer(1));
     Ok(())
 }
 
@@ -2182,10 +2292,20 @@ impl System for Cluster<'_> {
 
 impl Drop for Cluster<'_> {
     fn drop(&mut self) {
-        for controller in self.controllers.get_mut().iter_mut() {
+        let controllers = self.controllers.get_mut();
+        // Stop every supervisor before stopping any child or worker. Otherwise another active
+        // controller could replace workers while cleanup is walking the shared local topology.
+        for controller in controllers.iter_mut() {
+            if let Some(child) = controller.child.as_mut() {
+                child.suppress_restart();
+            }
+        }
+        for controller in controllers.iter_mut() {
             if let Some(mut child) = controller.child.take() {
                 let _ = child.kill();
             }
+        }
+        for controller in controllers.iter() {
             if let Err(error) = process::terminate_workers(&controller.config) {
                 eprintln!(
                     "worker cleanup for {}: {error}",
@@ -2213,6 +2333,21 @@ mod tests {
     const DEADLINE: Duration = Duration::from_secs(5);
 
     const CONTROLLER_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn local_adaptation_preserves_the_selected_generation_maximum() -> TestResult {
+        let local: toml::Value = toml::from_str("[[fleets]]")?;
+        for maximum in [1, 2] {
+            let mut config: toml::Value =
+                toml::from_str(&format!("[[fleets]]\nmax_instances = {maximum}"))?;
+            super::adapt_fleet(config.as_table_mut().expect("root table"), &local, &local)?;
+            assert_eq!(
+                config["fleets"][0]["max_instances"].as_integer(),
+                Some(maximum)
+            );
+        }
+        Ok(())
+    }
 
     fn leadership_policy(path: &str) -> crate::balancer::Policy {
         let probe = crate::balancer::Probe::default();
@@ -2422,6 +2557,15 @@ mod tests {
             }),
         )?;
         let lease = super::decode_leader_lease(Some(&item))?.ok_or("missing lease")?;
+        let postgres = super::LeaderLease::from_postgres(Some(identity.to_owned()), 7, 1001)?;
+        assert_eq!(lease, postgres);
+        assert!(super::LeaderLease::from_postgres(Some(identity.to_owned()), -1, 1001).is_err());
+        assert!(super::LeaderLease::from_postgres(Some(identity.to_owned()), 7, -1).is_err());
+        assert!(super::LeaderLease::from_postgres(Some(String::new()), 7, 1001).is_err());
+        assert!(
+            !super::LeaderLease::from_postgres(Some(identity.to_owned()), 0, 1001)?
+                .is_held_by(identity, 1000)
+        );
         assert!(lease.is_held_by(identity, 1000));
         assert!(!lease.is_held_by("another-warm-controller", 1000));
         assert!(!lease.is_held_by(identity, 1001));
@@ -2429,6 +2573,7 @@ mod tests {
         assert!(format!("{lease:?}").contains("epoch: 7"));
         item.remove("holder");
         let released = super::decode_leader_lease(Some(&item))?.ok_or("missing released lease")?;
+        assert_eq!(released, super::LeaderLease::from_postgres(None, 7, 1001)?);
         assert!(!released.is_held_by(identity, 1000));
         assert_eq!(released.epoch, 7);
         assert_eq!(released.expires_at, 1001);

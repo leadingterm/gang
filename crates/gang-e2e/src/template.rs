@@ -431,7 +431,6 @@ impl ConfigTemplate {
         if let Some(policy) = &variant.execution.resource_policy {
             render_resource_policy(document, policy);
         }
-        constrain_shutdown_grace(document);
         Ok(self)
     }
 
@@ -827,16 +826,6 @@ fn render_control_cpu(document: &mut Document<Plugins>, knobs: &ControlKnobs) ->
         document.actions.cold_start.cpu_millicores = millicores;
     }
     Ok(())
-}
-
-/// Keeps scheduler drain below every fleet's boot grace. When it does not fit, use half the
-/// smallest boot grace; otherwise preserve the configured drain bound.
-fn constrain_shutdown_grace(document: &mut Document<Plugins>) {
-    if let Some(boot_grace) = document.fleets.iter().map(|fleet| fleet.boot_grace).min()
-        && document.server.http2.shutdown_grace >= boot_grace
-    {
-        document.server.http2.shutdown_grace = boot_grace / 2;
-    }
 }
 
 /// Applies request, viewer and certificate tuning.

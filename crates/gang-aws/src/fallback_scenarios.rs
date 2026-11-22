@@ -7,14 +7,14 @@ use std::time::Duration;
 
 use gang_aws_sdk::CallError;
 use gang_clock::Timestamp;
-use gang_spi::{FleetSupply, TerminationMode};
+use gang_spi::{FleetSupply, InfrastructureEventKind, TerminationMode};
 use gang_types::InstanceId;
 
 use crate::config::{
     AwsFleetOptions, Capacity, CooldownPolicy, RetrySpotAfter, RetrySpotAfterError, SpotFallback,
 };
 use crate::errors::AwsError;
-use crate::fake_aws::{FakeFailure, FakeGroup, FakeInstance};
+use crate::fake_aws::{FakeActivity, FakeFailure, FakeGroup, FakeInstance, FakeTemplateKind};
 use crate::fleet_harness::{FLEET, Harness, fleet_with, rfc3339_ago};
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -25,6 +25,9 @@ const TWIN: &str = "gang-fleet-on-demand";
 const RETRY_SPOT_AFTER: Duration = Duration::from_mins(5);
 /// Launch time seeded for the spot members that have one.
 const SPOT_LAUNCH: &str = "2026-01-01T00:00:00.000Z";
+const SPOT_FAILURE: &str =
+    "There is no Spot capacity available that matches your request. Launching EC2 instance failed.";
+const ON_DEMAND_FAILURE: &str = "InsufficientInstanceCapacity: no On-Demand capacity available";
 /// Unix milliseconds of [`SPOT_LAUNCH`].
 const SPOT_LAUNCH_MILLIS: u64 = 1_767_225_600_000;
 /// Launch time seeded for the on-demand members that have one, one day after [`SPOT_LAUNCH`].
@@ -53,12 +56,59 @@ fn plain_options() -> AwsFleetOptions {
     }
 }
 
-/// A group with scale-in protection on new instances, as an opted-in fleet requires.
+/// A protected group with one explicit launch candidate, as fallback scenarios require.
 fn protected(name: &str, desired: i32, instances: &[(&str, &str)]) -> FakeGroup {
     FakeGroup {
         new_instances_protected: true,
+        template_kind: FakeTemplateKind::Mixed,
+        instance_types: vec!["c7g.large".to_owned()],
+        availability_zones: vec!["us-east-1a".to_owned()],
         ..FakeGroup::new(name, desired, instances)
     }
+}
+
+/// An explicit single launch candidate, allowing its failure to prove the group is blocked.
+fn single_candidate(name: &str, desired: i32) -> FakeGroup {
+    protected(name, desired, &[])
+}
+
+/// Records an activity with its original message and the default candidate's zone for failures.
+fn activity(harness: &Harness, group: &str, status: &str, age: u64, message: Option<&str>) {
+    let mut state = harness.fake.state();
+    let index = state.activities.len();
+    state.activities.push(FakeActivity {
+        group: group.to_owned(),
+        status_code: status.to_owned(),
+        start_time: rfc3339_ago(age),
+        message: message.map(str::to_owned),
+    });
+    state.activity_details.insert(
+        index,
+        (
+            format!("00000000-0000-0000-0002-{index:012}"),
+            String::new(),
+            "Launching a new EC2 instance".to_owned(),
+        ),
+    );
+    if status == "Failed" {
+        state.activity_zones.insert(index, "us-east-1a".to_owned());
+    }
+}
+
+/// Records a launch activity scoped to an availability zone, without narrowing the instance type.
+fn zonal_activity(harness: &Harness, status: &str, age: u64, zone: &str, message: Option<&str>) {
+    activity(harness, FLEET, status, age, message);
+    let mut state = harness.fake.state();
+    let index = state.activities.len() - 1;
+    state.activity_zones.insert(index, zone.to_owned());
+}
+
+/// Two types across two zones, as in a real multi-candidate Spot group.
+fn two_zone_spot() -> FakeGroup {
+    let mut group = protected(FLEET, 4, &[]);
+    group.instance_types = vec!["c7g.large".to_owned(), "m7g.large".to_owned()];
+    group.availability_zones = vec!["us-east-1a".to_owned(), "us-east-1b".to_owned()];
+    group
 }
 
 /// The on-demand twin with a warm pool that reuses instances on scale-in. Its members are
@@ -190,18 +240,9 @@ async fn lowering_withdraws_twin_before_spot_and_keeps_live_members() -> TestRes
 
 #[tokio::test]
 async fn supply_reports_first_unmet_failing_group_spot_before_twin() -> TestResult {
-    let harness = harness_with(vec![protected(FLEET, 1, &[]), protected(TWIN, 1, &[])]).await?;
-    for (group, message) in [(FLEET, "spot failed"), (TWIN, "twin failed")] {
-        harness
-            .fake
-            .state()
-            .activities
-            .push(crate::fake_aws::FakeActivity {
-                group: group.to_owned(),
-                status_code: "Failed".to_owned(),
-                start_time: rfc3339_ago(600),
-                message: Some(message.to_owned()),
-            });
+    let harness = harness_with(vec![single_candidate(FLEET, 1), single_candidate(TWIN, 1)]).await?;
+    for (group, message) in [(FLEET, SPOT_FAILURE), (TWIN, ON_DEMAND_FAILURE)] {
+        activity(&harness, group, "Failed", 600, Some(message));
     }
     let fleet = fleet_with(FLEET, fallback_options(true)?)?;
     let mut supply = FleetSupply::default();
@@ -211,7 +252,7 @@ async fn supply_reports_first_unmet_failing_group_spot_before_twin() -> TestResu
             .launch_failure
             .as_ref()
             .map(|failure| failure.reason.as_str()),
-        Some("spot failed")
+        Some(SPOT_FAILURE)
     );
     Ok(())
 }
@@ -220,28 +261,20 @@ async fn supply_reports_first_unmet_failing_group_spot_before_twin() -> TestResu
 async fn mixed_group_failure_does_not_mark_in_flight_fleet_failed() -> TestResult {
     for activities in [
         vec![
-            (FLEET, "Failed", 600, Some("spot failed")),
+            (FLEET, "Failed", 600, Some(SPOT_FAILURE)),
             (TWIN, "InProgress", 60, None),
         ],
         vec![
             (FLEET, "InProgress", 60, None),
-            (TWIN, "Failed", 600, Some("twin failed")),
+            (TWIN, "Failed", 600, Some(ON_DEMAND_FAILURE)),
         ],
-        vec![(FLEET, "Failed", 600, Some("spot failed"))],
-        vec![(TWIN, "Failed", 600, Some("twin failed"))],
+        vec![(FLEET, "Failed", 600, Some(SPOT_FAILURE))],
+        vec![(TWIN, "Failed", 600, Some(ON_DEMAND_FAILURE))],
     ] {
-        let harness = harness_with(vec![protected(FLEET, 1, &[]), protected(TWIN, 1, &[])]).await?;
+        let harness =
+            harness_with(vec![single_candidate(FLEET, 1), single_candidate(TWIN, 1)]).await?;
         for (group, status_code, age, message) in activities {
-            harness
-                .fake
-                .state()
-                .activities
-                .push(crate::fake_aws::FakeActivity {
-                    group: group.to_owned(),
-                    status_code: status_code.to_owned(),
-                    start_time: rfc3339_ago(age),
-                    message: message.map(str::to_owned),
-                });
+            activity(&harness, group, status_code, age, message);
         }
         let fleet = fleet_with(FLEET, fallback_options(true)?)?;
         let mut supply = FleetSupply::default();
@@ -249,6 +282,179 @@ async fn mixed_group_failure_does_not_mark_in_flight_fleet_failed() -> TestResul
         assert_eq!(supply.desired, 2);
         assert_eq!(supply.abandoned, 0);
         assert!(supply.launch_failure.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_spot_prevents_abandonment_until_launch_settles() -> TestResult {
+    let harness = harness_with(vec![
+        protected(FLEET, 4, &[("i-pending", "Pending")]),
+        protected(TWIN, 0, &[]),
+    ])
+    .await?;
+    harness.add_activity(FLEET, "Failed", &rfc3339_ago(30));
+    let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+    let mut supply = FleetSupply::default();
+
+    harness.fleets.supply(fleet.view(), &mut supply).await?;
+    assert_eq!(supply.desired, 4);
+    assert_eq!(supply.abandoned, 0);
+    assert!(supply.launch_failure.is_none());
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 5)
+            .await
+    })
+    .await?;
+    assert_eq!(writes(&harness), vec![write(FLEET, "5")]);
+    assert_eq!(harness.desired(TWIN), Some(0));
+
+    {
+        let mut state = harness.fake.state();
+        let spot = state
+            .groups
+            .iter_mut()
+            .find(|group| group.name == FLEET)
+            .ok_or("the spot group is seeded")?;
+        spot.instances[0].lifecycle_state = "InService".to_owned();
+    }
+    harness.fleets.supply(fleet.view(), &mut supply).await?;
+    assert_eq!(supply.desired, 1);
+    assert_eq!(supply.abandoned, 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn partial_candidate_failure_warns_without_abandoning_spot_or_raising_twin() -> TestResult {
+    const REASON: &str = "The instance type 'r8id.4xlarge' is not supported in your requested Availability Zone 'us-east-1b'. Launching EC2 instance failed. Status Reason: InvalidFleetConfiguration";
+    let mut spot = protected(FLEET, 4, &[]);
+    spot.template_kind = FakeTemplateKind::Mixed;
+    spot.instance_types = vec!["r8id.4xlarge".to_owned(), "c7g.large".to_owned()];
+    spot.availability_zones = vec!["us-east-1a".to_owned(), "us-east-1b".to_owned()];
+    let harness = harness_with(vec![spot, protected(TWIN, 0, &[])]).await?;
+    zonal_activity(&harness, "Failed", 30, "us-east-1b", Some(REASON));
+    let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+    let mut supply = FleetSupply::default();
+
+    harness.fleets.supply(fleet.view(), &mut supply).await?;
+    assert_eq!(supply.desired, 4);
+    assert_eq!(supply.abandoned, 0);
+    assert!(supply.launch_failure.is_none());
+    assert!(supply.events.iter().any(|event| matches!(
+        &event.kind,
+        InfrastructureEventKind::CapacityUnavailable { reason } if reason == REASON
+    )));
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 5)
+            .await
+    })
+    .await?;
+    assert_eq!(writes(&harness), vec![write(FLEET, "5")]);
+    assert_eq!(harness.desired(TWIN), Some(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unattributed_or_foreign_stockout_warns_without_fallback() -> TestResult {
+    for zone in [None, Some("us-east-1b")] {
+        let harness =
+            harness_with(vec![single_candidate(FLEET, 4), single_candidate(TWIN, 0)]).await?;
+        activity(&harness, FLEET, "Failed", 30, Some(SPOT_FAILURE));
+        {
+            let mut state = harness.fake.state();
+            let index = state.activities.len() - 1;
+            if let Some(zone) = zone {
+                state.activity_zones.insert(index, zone.to_owned());
+            } else {
+                state.activity_zones.remove(&index);
+            }
+        }
+        let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+        let mut supply = FleetSupply::default();
+        harness.fleets.supply(fleet.view(), &mut supply).await?;
+        assert_eq!(supply.desired, 4);
+        assert_eq!(supply.abandoned, 0);
+        assert!(supply.launch_failure.is_none());
+        assert!(supply.events.iter().any(|event| matches!(
+            &event.kind,
+            InfrastructureEventKind::CapacityUnavailable { reason } if reason == SPOT_FAILURE
+        )));
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet.view(), 5)
+                .await
+        })
+        .await?;
+        assert_eq!(writes(&harness), vec![write(FLEET, "5")]);
+        assert_eq!(harness.desired(TWIN), Some(0));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn zonal_stockouts_require_all_zones_before_fallback() -> TestResult {
+    const REASON: &str = SPOT_FAILURE;
+    let harness = harness_with(vec![two_zone_spot(), protected(TWIN, 0, &[])]).await?;
+    let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+    let mut supply = FleetSupply::default();
+    zonal_activity(&harness, "Failed", 90, "us-east-1a", Some(REASON));
+
+    harness.fleets.supply(fleet.view(), &mut supply).await?;
+    assert_eq!(supply.desired, 4);
+    assert_eq!(supply.abandoned, 0);
+    assert!(supply.launch_failure.is_none());
+    assert!(supply.events.iter().any(|event| matches!(
+        &event.kind,
+        InfrastructureEventKind::CapacityUnavailable { reason } if reason == REASON
+    )));
+    assert!(writes(&harness).is_empty());
+
+    zonal_activity(&harness, "Failed", 60, "us-east-1b", Some(REASON));
+    harness.fleets.supply(fleet.view(), &mut supply).await?;
+    assert_eq!(supply.desired, 0);
+    assert_eq!(supply.abandoned, 4);
+    gang_testkit::fence::with_held(async |held| {
+        harness
+            .fleets
+            .set_desired_capacity(held, fleet.view(), 4)
+            .await
+    })
+    .await?;
+    assert_eq!(writes(&harness), vec![write(TWIN, "4")]);
+    assert_eq!(harness.desired(FLEET), Some(4));
+    assert_eq!(harness.desired(TWIN), Some(4));
+    Ok(())
+}
+
+#[tokio::test]
+async fn newer_launch_progress_clears_zonal_stockouts() -> TestResult {
+    const REASON: &str = "InsufficientInstanceCapacity: no Spot capacity available";
+    for status in ["Successful", "InProgress"] {
+        let harness = harness_with(vec![two_zone_spot(), protected(TWIN, 0, &[])]).await?;
+        zonal_activity(&harness, "Failed", 90, "us-east-1a", Some(REASON));
+        zonal_activity(&harness, "Failed", 60, "us-east-1b", Some(REASON));
+        zonal_activity(&harness, status, 30, "us-east-1a", None);
+        let fleet = fleet_with(FLEET, fallback_options(true)?)?;
+        let mut supply = FleetSupply::default();
+
+        harness.fleets.supply(fleet.view(), &mut supply).await?;
+        assert_eq!(supply.desired, 4);
+        assert_eq!(supply.abandoned, 0);
+        assert!(supply.launch_failure.is_none());
+        gang_testkit::fence::with_held(async |held| {
+            harness
+                .fleets
+                .set_desired_capacity(held, fleet.view(), 5)
+                .await
+        })
+        .await?;
+        assert_eq!(writes(&harness), vec![write(FLEET, "5")]);
+        assert_eq!(harness.desired(TWIN), Some(0));
     }
     Ok(())
 }
@@ -281,7 +487,7 @@ async fn met_plain_spot_fleet_skips_capacity_probes_and_twin() -> TestResult {
     })
     .await?;
 
-    assert_eq!(harness.activity_probes(), 0);
+    assert_eq!(harness.requests("DescribeScalingActivities"), 1);
     assert!(harness.request_log().iter().all(|(_, parameters)| {
         parameters
             .values()
@@ -323,10 +529,13 @@ async fn healthy_spot_raise_goes_to_spot_only() -> TestResult {
     assert_eq!(writes(&harness), vec![write(FLEET, "10")]);
     assert_eq!(harness.desired(TWIN), Some(0));
 
-    let activities_before = harness.activity_probes();
+    let activities_before = harness.requests("DescribeScalingActivities");
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 10);
-    assert_eq!(harness.activity_probes() - activities_before, 2);
+    assert_eq!(
+        harness.requests("DescribeScalingActivities") - activities_before,
+        4
+    );
     Ok(())
 }
 
@@ -496,10 +705,14 @@ async fn first_failure_withdraws_spot_then_raises_on_demand() -> TestResult {
     .await?;
     assert_eq!(writes(&harness), vec![write(FLEET, "6"), write(TWIN, "4")]);
 
-    let activities_before = harness.activity_probes();
+    let activities_before = harness.requests("DescribeScalingActivities");
     harness.fleets.supply(fleet.view(), &mut into).await?;
     assert_eq!(into.desired, 10);
-    assert_eq!(harness.activity_probes() - activities_before, 1);
+    assert_eq!(
+        harness.requests("DescribeScalingActivities") - activities_before,
+        1,
+        "only the unmet twin needs a bounded launch assessment"
+    );
     Ok(())
 }
 

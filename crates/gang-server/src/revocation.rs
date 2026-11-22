@@ -22,15 +22,21 @@ use crate::resources::{wire_certificate, wire_principal};
 pub(crate) struct Revocations<K: Stack> {
     core: Arc<Core<K>>,
     revoked_certificates: RevocationSet,
+    readiness: crate::health::Readiness,
 }
 
 impl<K: Stack> Revocations<K> {
     /// Builds the revocation service over the core and the live set of revoked certificates.
     #[must_use]
-    pub(crate) fn new(core: Arc<Core<K>>, revoked_certificates: RevocationSet) -> Self {
+    pub(crate) fn new(
+        core: Arc<Core<K>>,
+        revoked_certificates: RevocationSet,
+        readiness: crate::health::Readiness,
+    ) -> Self {
         Self {
             core,
             revoked_certificates,
+            readiness,
         }
     }
 
@@ -45,6 +51,8 @@ impl<K: Stack> Revocations<K> {
         &self,
         serial: &CertSerial,
     ) -> Result<Certificate, PortError> {
+        let _guard = self.core.revocation_lock.lock().await;
+        self.require_leading()?;
         let Core { host, workers, .. } = &*self.core;
         // A clients plugin presenting mTLS is refused at startup (ServerError::ClientScheme).
         if !workers.capabilities().certificates {
@@ -72,9 +80,10 @@ impl<K: Stack> Revocations<K> {
         &self,
         identity: &Identity,
     ) -> Result<RevokePrincipalResponse, PortError> {
+        let _guard = self.core.revocation_lock.lock().await;
+        self.require_leading()?;
         let Core { host, workers, .. } = &*self.core;
         let principal = {
-            let _guard = self.core.revocation_lock.lock().await;
             let principal = host
                 .repository
                 .revoke_principal(identity, host.now())
@@ -105,9 +114,18 @@ impl<K: Stack> Revocations<K> {
     ) -> Result<Principal, PortError> {
         let host = &self.core.host;
         let _guard = self.core.revocation_lock.lock().await;
+        self.require_leading()?;
         let principal = host.repository.restore_principal(identity).await?;
         host.revoked_principals.restore(identity);
         Ok(wire_principal(principal))
+    }
+
+    fn require_leading(&self) -> Result<(), PortError> {
+        if self.readiness.is_leading() {
+            Ok(())
+        } else {
+            Err(PortError::unavailable("controller no longer leads"))
+        }
     }
 
     /// Cuts the revoked serials off the live set.

@@ -293,23 +293,24 @@ variable "fleets" {
         disk      = optional(string)
       }), {})
     }), {})
-    capacity                 = string
-    machine_class            = optional(string, null)
-    image                    = optional(object({ owner = string, sha256 = string }), null)
-    instance_types           = list(string)
-    spot_allocation_strategy = optional(string, "price-capacity-optimized")
-    max_instances            = number
-    min_instances            = optional(number, 0)
-    vcpus_per_instance       = number
-    disk_per_instance        = string
-    idle_timeout             = optional(string, "10m")
-    max_drain_wait           = optional(string, "25m")
-    boot_grace               = optional(string, "10m")
-    scratch_volume_gib       = optional(number, null)
-    root_volume_gib          = optional(number)
-    warm_pool_size           = optional(number, 0)
-    fallback                 = optional(object({ retry_spot_after = optional(string, "5m"), drain_on_demand_first = optional(bool, true) }), null)
-    scheduled_minimum        = optional(list(object({ instances = number, days = list(string), start = string, end = string, time_zone = string })), [])
+    capacity                   = string
+    machine_class              = optional(string, null)
+    image                      = optional(object({ owner = string, sha256 = string }), null)
+    instance_types             = list(string)
+    minimum_availability_zones = optional(number, 2)
+    spot_allocation_strategy   = optional(string, "price-capacity-optimized")
+    max_instances              = number
+    min_instances              = optional(number, 0)
+    vcpus_per_instance         = number
+    disk_per_instance          = string
+    idle_timeout               = optional(string, "10m")
+    max_drain_wait             = optional(string, "25m")
+    boot_grace                 = optional(string, "10m")
+    scratch_volume_gib         = optional(number, null)
+    root_volume_gib            = optional(number)
+    warm_pool_size             = optional(number, 0)
+    fallback                   = optional(object({ retry_spot_after = optional(string, "5m"), drain_on_demand_first = optional(bool, true) }), null)
+    scheduled_minimum          = optional(list(object({ instances = number, days = list(string), start = string, end = string, time_zone = string })), [])
   }))
   description = <<-EOT
     Worker fleets in preference order: the scheduler tries them in list order. Each fleet is one Auto Scaling group; a fleet with `fallback` also has an on-demand twin group `<name>-on-demand`.
@@ -319,7 +320,8 @@ variable "fleets" {
     capacity: spot or on-demand. Selects the Auto Scaling group purchase option and is written to [fleets.options].capacity.
     machine_class: optional qualitative machine class (for example gpu), written to [fleets.options].machine_class when set.
     image: optional image of this fleet (for example a GPU image), {owner, sha256} as in images; null uses images[<the isa's architecture>]. The selected AMI supplies this fleet's action environment.
-    instance_types: EC2 instance types. Order is the on-demand launch priority (the first type is tried first); capacity-optimized-prioritized Spot uses it on a best-effort basis after capacity considerations. Every type needs Nitro instance-store SSD (NVMe) unless scratch_volume_gib is set. The fleet's groups span only the private subnets whose availability zone offers at least one of these types; the plan fails when no zone offers any.
+    instance_types: EC2 instance types. Order is the on-demand launch priority (the first type is tried first); capacity-optimized-prioritized Spot uses it on a best-effort basis after capacity considerations. Every type needs Nitro instance-store SSD (NVMe) unless scratch_volume_gib is set. The fleet's groups span only private subnets in availability zones offering every configured type.
+    minimum_availability_zones: minimum number of common availability zones required for the fleet, a positive integer defaulting to 2. The plan fails if too few allowed zones offer every type. Not written to gang.toml.
     spot_allocation_strategy: Spot allocation strategy, default price-capacity-optimized. Set to capacity-optimized-prioritized to prefer instance type order after capacity considerations.
     max_instances: upper bound of the Auto Scaling group.
     min_instances, vcpus_per_instance, idle_timeout,
@@ -400,6 +402,11 @@ variable "fleets" {
   validation {
     condition     = alltrue([for fleet in var.fleets : fleet.max_instances >= 1 && fleet.max_instances <= 4294967295 && floor(fleet.max_instances) == fleet.max_instances])
     error_message = "Each fleet max_instances must be a whole number from 1 to 4294967295."
+  }
+
+  validation {
+    condition     = alltrue([for fleet in var.fleets : fleet.minimum_availability_zones > 0 && floor(fleet.minimum_availability_zones) == fleet.minimum_availability_zones])
+    error_message = "Each fleet minimum_availability_zones must be a positive whole number."
   }
 
   validation {
@@ -553,8 +560,8 @@ variable "extra_config_toml" {
     and CI identity providers, tunables), never bare top-level keys: a key there would join the last table. TOML tables
     already opened by this module cannot be reopened here, even for settings omitted from the template such as
     [database.sqlite].busy_timeout and [authentication.workers.mtls].certificate_ttl. The module always opens
-    [server.http2] and owns max_connections; for "postgres" and "dynamodb" it also owns shutdown_grace.
-    Unexposed settings such as receive_window retain their runtime defaults. For load-balanced shared databases, the
+    [server.http2] and owns max_connections. Unexposed settings such as receive_window retain their runtime defaults.
+    For load-balanced shared databases, the
     module also opens [server.proxy_protocol], so it cannot be reopened here; header_timeout, max_pending_headers, and
     max_header_size are not exposed and retain their runtime defaults. Its first non-blank, non-comment line must start
     with "[". Content is public: it lands in the SSM parameter (gang.toml), not

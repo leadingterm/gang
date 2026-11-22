@@ -52,9 +52,15 @@ pub(crate) fn scheduler(
             requirement: "must be strictly greater than the native client keepalive duration",
         });
     }
+    let attempt_timeout = WholeSeconds::try_new(spec.attempt_budget)
+        .map_err(|_| NativeLinkConfigError::Duration {
+            field: "attempt_budget",
+            requirement: "must be a whole number of seconds, at least 1s and at most about 584 years",
+        })?.as_units();
     let mut simple = json!({
         "supported_platform_properties": supported_platform_properties(spec.fleets),
         "client_action_timeout_s": client_action_timeout,
+        "attempt_timeout_s": attempt_timeout,
         "worker_timeout_s": config.worker_timeout.as_units(),
         "retain_completed_for_s": spec.actions.retain_completed_for.as_units(),
         "max_job_retries": spec.actions.max_job_retries,
@@ -65,6 +71,7 @@ pub(crate) fn scheduler(
         "learn_from_workers": true,
         "cpu_property_name": property::CPU_MILLICORES,
         "headroom_percent": spec.actions.reservation_headroom_percent,
+        "cpu_reservation_percentile": spec.actions.cpu_reservation_percentile,
         "window_days": spec.actions.history_window.as_units(),
         "memory_budget_bytes": spec.actions.history_memory_budget.get().get(),
         "scheduler": { "simple": simple },
@@ -582,6 +589,8 @@ mod tests {
             max_workers: 8,
             observations: observations(),
             client_action_timeout: Duration::from_mins(10),
+            attempt_budget: gang_config::WorkerConfig::default()
+                .attempt_budget(gang_config::ActionsConfig::default().timeout),
         }
     }
 
@@ -624,14 +633,17 @@ mod tests {
         let content = memory_store();
         let action = memory_store();
         let fleets = catalog();
-        let scheduler =
-            scheduler(&config(), &controller_spec(&content, &action, &fleets)).expect("scheduler");
+        let mut spec = controller_spec(&content, &action, &fleets);
+        std::sync::Arc::make_mut(&mut spec.actions).cpu_reservation_percentile =
+            gang_types::Percent::from_percent(75);
+        let scheduler = scheduler(&config(), &spec).expect("scheduler");
         assert_eq!(scheduler.name, "MAIN_SCHEDULER");
         let SchedulerSpec::HistoricalResource(historical) = &scheduler.spec else {
             panic!("expected historical_resource, got {:?}", scheduler.spec);
         };
         assert!(historical.learn_from_workers);
         assert_eq!(historical.headroom_percent, 20);
+        assert_eq!(historical.cpu_reservation_percentile.get(), 75);
         assert_eq!(historical.window_days, 7);
         assert_eq!(historical.cpu_property_name, property::CPU_MILLICORES);
         assert_eq!(

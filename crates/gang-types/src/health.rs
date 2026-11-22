@@ -123,8 +123,6 @@ mod tests {
             "threshold": check.threshold().get(),
             "renew_interval_seconds": crate::handover::DEFAULT_RENEW_INTERVAL.as_secs(),
             "call_timeout_seconds": crate::handover::DEFAULT_CALL_TIMEOUT.as_secs(),
-            "promotion_seconds": crate::handover::PROMOTION_ALLOWANCE.as_secs(),
-            "handover_margin_seconds": crate::handover::RETRY_MARGIN.as_secs(),
         });
         assert_eq!(
             actual,

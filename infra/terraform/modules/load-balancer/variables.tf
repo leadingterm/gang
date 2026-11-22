@@ -176,27 +176,15 @@ variable "workers_port" {
   }
 }
 
-variable "shutdown_grace" {
-  description = "Controller shutdown grace period in seconds."
-  type        = number
-  default     = 300
-  nullable    = false
-
-  validation {
-    condition     = var.shutdown_grace >= 0 && floor(var.shutdown_grace) == var.shutdown_grace
-    error_message = "shutdown_grace must be a nonnegative integer number of seconds."
-  }
-}
-
 variable "deregistration_delay" {
-  description = "Target deregistration delay in seconds; must cover shutdown_grace."
+  description = "Target deregistration delay in seconds; existing connections are preserved independently."
   type        = number
-  default     = 300
+  default     = 0
   nullable    = false
 
   validation {
-    condition     = var.deregistration_delay >= var.shutdown_grace && var.deregistration_delay <= 3600 && floor(var.deregistration_delay) == var.deregistration_delay
-    error_message = "deregistration_delay must be an integer between shutdown_grace and 3600 seconds."
+    condition     = var.deregistration_delay >= 0 && var.deregistration_delay <= 3600 && floor(var.deregistration_delay) == var.deregistration_delay
+    error_message = "deregistration_delay must be an integer between 0 and 3600 seconds."
   }
 }
 

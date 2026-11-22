@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use gang_clock::TestClock;
 use gang_spi::{
-    ControllerHostIdentity, ControllerHostPort, FleetSupply, Held, HostMilestone, InstanceIdentity,
-    LaunchFailure, MountedScratchVolume, NodeLifecyclePort, PortError, PreemptionNotice,
-    ProvisionerPort, ScratchVolumePort, ServerEndpoints, Sidecar, TerminationMode,
-    WorkloadCredentialPort,
+    ControllerHostIdentity, ControllerHostPort, ControllerHostState, FleetSupply, Held,
+    HostMilestone, InstanceIdentity, LaunchFailure, MountedScratchVolume, NodeLifecyclePort,
+    PortError, PreemptionNotice, ProvisionerPort, ScratchVolumePort, ServerEndpoints, Sidecar,
+    TerminationMode, WorkloadCredentialPort,
 };
 use gang_types::{
     Bytes, Fleet, FleetName, InstanceId, InstanceLifecycle, Isa, NameError, Proof, WorkerLifetime,
@@ -74,6 +74,7 @@ struct State {
     desired: Vec<(FleetName, u32)>,
     terminations: Vec<(InstanceId, TerminationMode)>,
     milestones: Vec<HostMilestone>,
+    prepared_hold: Option<oneshot::Receiver<()>>,
     serving_hold: Option<oneshot::Receiver<()>>,
     failures: Failures,
     advance_on_supply: Option<(Arc<TestClock>, Duration)>,
@@ -106,6 +107,7 @@ pub struct FakeProvisioner {
     credential_requests: CallCount,
     parked_polls: CallCount,
     attach_requests: CallCount,
+    prepared_attempts: CallCount,
     serving_attempts: CallCount,
 }
 
@@ -149,6 +151,7 @@ impl FakeProvisioner {
                 desired: Vec::new(),
                 terminations: Vec::new(),
                 milestones: Vec::new(),
+                prepared_hold: None,
                 serving_hold: None,
                 failures: Failures::default(),
                 advance_on_supply: None,
@@ -172,6 +175,7 @@ impl FakeProvisioner {
             credential_requests: CallCount::new(),
             parked_polls: CallCount::new(),
             attach_requests: CallCount::new(),
+            prepared_attempts: CallCount::new(),
             serving_attempts: CallCount::new(),
         }
     }
@@ -246,6 +250,20 @@ impl FakeProvisioner {
     pub fn milestones(&self) -> Vec<HostMilestone> {
         self.state.lock().milestones.clone()
     }
+    /// Holds the next prepared milestone until the returned sender is completed or dropped.
+    #[must_use]
+    pub fn hold_prepared(&self) -> oneshot::Sender<()> {
+        let (release, hold) = oneshot::channel();
+        self.state.lock().prepared_hold = Some(hold);
+        release
+    }
+
+    /// Returns the number of prepared milestone attempts started.
+    #[must_use]
+    pub fn prepared_attempts(&self) -> CallCount {
+        self.prepared_attempts.clone()
+    }
+
     /// Holds the next serving milestone until the returned sender is completed or dropped.
     #[must_use]
     pub fn hold_serving(&self) -> oneshot::Sender<()> {
@@ -488,6 +506,22 @@ impl ProvisionerPort for FakeProvisioner {
 }
 
 impl ControllerHostPort for FakeProvisioner {
+    async fn state(&self) -> Result<ControllerHostState, PortError> {
+        Ok(if *self.retirement.borrow() {
+            ControllerHostState::Retiring
+        } else {
+            ControllerHostState::Active
+        })
+    }
+
+    async fn drain_limit(&self) -> Result<Option<Duration>, PortError> {
+        Ok(None)
+    }
+
+    async fn heartbeat(&self) -> Result<(), PortError> {
+        Ok(())
+    }
+
     async fn incarnation(&self) -> Result<ControllerHostIdentity, PortError> {
         self.state
             .lock()
@@ -506,6 +540,13 @@ impl ControllerHostPort for FakeProvisioner {
     }
 
     async fn reached(&self, milestone: HostMilestone) -> Result<(), PortError> {
+        if milestone == HostMilestone::Prepared {
+            let hold = self.state.lock().prepared_hold.take();
+            self.prepared_attempts.bump();
+            if let Some(hold) = hold {
+                let _ = hold.await;
+            }
+        }
         if milestone == HostMilestone::Serving {
             let hold = self.state.lock().serving_hold.take();
             self.serving_attempts.bump();
@@ -699,16 +740,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_hold_records_only_after_release() -> crate::TestResult {
+        let fake = FakeProvisioner::default();
+        let release = fake.hold_prepared();
+        let worker = fake.clone();
+        let run = tokio::spawn(async move { worker.reached(HostMilestone::Prepared).await });
+        fake.prepared_attempts().reached(1).await;
+        assert!(fake.milestones().is_empty());
+        assert!(!run.is_finished());
+        release.send(()).map_err(|()| "prepared hold disappeared")?;
+        run.await??;
+        assert_eq!(fake.milestones(), vec![HostMilestone::Prepared]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn records_host_milestones_in_order() -> crate::TestResult {
         let fake = FakeProvisioner::default();
         let shared = fake.clone();
         assert!(fake.milestones().is_empty());
+        fake.reached(HostMilestone::Prepared).await?;
         fake.reached(HostMilestone::Serving).await?;
         shared.reached(HostMilestone::HandedOff).await?;
         fake.reached(HostMilestone::Serving).await?;
         assert_eq!(
             shared.milestones(),
             vec![
+                HostMilestone::Prepared,
                 HostMilestone::Serving,
                 HostMilestone::HandedOff,
                 HostMilestone::Serving,

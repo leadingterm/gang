@@ -52,6 +52,13 @@ struct Fixture {
     workers: Frontend,
     controller: Controller,
     configuration: Configuration,
+    seed: SeedConfiguration,
+}
+
+#[derive(Serialize)]
+struct SeedConfiguration {
+    gang_toml: String,
+    configuration: Configuration,
 }
 
 #[derive(Serialize)]
@@ -394,13 +401,25 @@ fn extract(stdout: &[u8], local_config: String) -> Result<Fixture> {
     let (public, public_delay) = frontend(plan, &resources, public_port, "TLS")?;
     let (workers, workers_delay) = frontend(plan, &resources, worker_port, "TCP")?;
     let deregistration_delay_seconds = public_delay.max(workers_delay);
+    let configuration = configuration(&evidence, &config)?;
+    let seed_gang = state_output(&evidence.seed, "gang_toml")?;
+    let seed_config = toml::from_str(seed_gang)?;
+    let seed = SeedConfiguration {
+        gang_toml: seed_gang.into(),
+        configuration: state_configuration(
+            &evidence.seed,
+            &seed_config,
+            configuration.generations_retained,
+        )?,
+    };
     Ok(Fixture {
         gang_toml: gang.into(),
         local_config,
         public,
         workers,
         controller: controller(plan, &resources, deregistration_delay_seconds)?,
-        configuration: configuration(&evidence, &config)?,
+        configuration,
+        seed,
     })
 }
 
@@ -465,8 +484,18 @@ fn configuration(evidence: &Evidence, config: &toml::Value) -> Result<Configurat
     if state_output(&evidence.seed, "gang_toml")? == state_output(&evidence.promote, "gang_toml")? {
         return Err("configuration transition did not change rendered bytes".into());
     }
-    let active = state_output(&evidence.promote, "config_parameter_reference")?;
-    let generation = &resource(&promoted, "aws_ssm_parameter.config_generation")?["values"];
+    let retained = generation_retention(evidence, &seed, &promoted)?;
+    state_configuration(&evidence.promote, config, retained)
+}
+
+fn state_configuration(
+    state: &Value,
+    config: &toml::Value,
+    generations_retained: bool,
+) -> Result<Configuration> {
+    let resources = state_resources(state)?;
+    let active = state_output(state, "config_parameter_reference")?;
+    let generation = &resource(&resources, "aws_ssm_parameter.config_generation")?["values"];
     let arn = string(generation, "arn")?;
     let (arn_prefix, _) = arn
         .split_once(":parameter/")
@@ -476,20 +505,15 @@ fn configuration(evidence: &Evidence, config: &toml::Value) -> Result<Configurat
         .rsplit_once("/generations/")
         .ok_or("invalid generation name")?;
     let namespace = format!("{arn_prefix}:parameter{name_prefix}/generations/*");
-    let generations_retained = generation_retention(evidence, &seed, &promoted)?;
-    validate_reference(
-        active,
-        &promoted,
-        state_output(&evidence.promote, "gang_toml")?,
-    )?;
+    validate_reference(active, &resources, state_output(state, "gang_toml")?)?;
     let controller = role_access(
-        &promoted,
+        &resources,
         "module.controller",
         "controller",
         active,
         &namespace,
     )?;
-    let workers = worker_access(&promoted, config, active, &namespace)?;
+    let workers = worker_access(&resources, config, active, &namespace)?;
     Ok(Configuration {
         controller,
         workers,
@@ -1153,7 +1177,7 @@ mod tests {
                 "address":"module.controller.aws_autoscaling_group.controller[0]",
                 "change":{"actions":["no-op"],"after_unknown":{}}
             }],
-            "output_changes": {"gang_toml": {"after": format!("poll_interval = \"50ms\"\n{gang}\n[[fleets]]\nname = \"gang-worker-x86-64\"\n")}},
+            "output_changes": {"gang_toml": {"after": format!("poll_interval = \"50ms\"\n{gang}\n[[fleets]]\nname = \"gang-worker-x86-64\"\nmax_instances = 2\n")}},
             "planned_values": {"root_module": {"child_modules": [{"resources": [
                 listener("this", 443, "TLS"), target("this", 8443),
                 listener("unrelated[0]", 9443, "TLS"), target("unrelated[0]", 9444),
@@ -1193,7 +1217,11 @@ mod tests {
         let gang = plan["output_changes"]["gang_toml"]["after"]
             .as_str()
             .expect("gang");
-        let seed = state(&gang.replace("50ms", "51ms"), unrelated, false);
+        let seed = state(
+            &gang.replace("max_instances = 2", "max_instances = 1"),
+            unrelated,
+            false,
+        );
         let promote = state(gang, unrelated, true);
         let changes = vec![json!({"address":"aws_ssm_parameter.config_generation",
             "change":{"actions":["forget","create"]}})];
@@ -1325,6 +1353,8 @@ mod tests {
             assert!(fixture.configuration.generations_retained);
             for access in std::iter::once(&fixture.configuration.controller)
                 .chain(&fixture.configuration.workers)
+                .chain(std::iter::once(&fixture.seed.configuration.controller))
+                .chain(&fixture.seed.configuration.workers)
             {
                 assert_eq!(access.readable_resources.len(), 1);
                 assert_eq!(access.excluded_from_deny.len(), 1);
@@ -1337,6 +1367,104 @@ mod tests {
                 fixture.configuration.workers[0].reference
             );
         }
+    }
+
+    #[test]
+    fn emits_applied_seed_and_promoted_max_only_transition() {
+        let events = synthetic_events(&plan(GANG), false);
+        let encoded = encode_events(&events);
+        let evidence = selected_evidence(&encoded).expect("evidence");
+        let fixture = extract(&encoded, "local".into()).expect("fixture");
+        assert_eq!(
+            fixture.seed.gang_toml,
+            state_output(&evidence.seed, "gang_toml").expect("seed")
+        );
+        assert_eq!(
+            fixture.gang_toml,
+            state_output(&evidence.promote, "gang_toml").expect("promoted")
+        );
+        let mut seed: toml::Value = toml::from_str(&fixture.seed.gang_toml).expect("seed TOML");
+        let promoted: toml::Value = toml::from_str(&fixture.gang_toml).expect("promoted TOML");
+        assert_eq!(seed["poll_interval"].as_str(), Some("50ms"));
+        assert_eq!(seed["fleets"][0]["max_instances"].as_integer(), Some(1));
+        assert_eq!(promoted["fleets"][0]["max_instances"].as_integer(), Some(2));
+        seed["fleets"][0]["max_instances"] = toml::Value::Integer(2);
+        assert_eq!(seed, promoted);
+        assert_eq!(fixture.controller.instances, 1);
+        assert!(fixture.seed.configuration.generations_retained);
+        assert_eq!(fixture.seed.configuration.workers.len(), 1);
+        let old = &fixture.seed.configuration.controller.reference;
+        let new = &fixture.configuration.controller.reference;
+        assert_eq!(
+            old,
+            state_output(&evidence.seed, "config_parameter_reference").expect("seed selector")
+        );
+        assert_eq!(
+            new,
+            state_output(&evidence.promote, "config_parameter_reference")
+                .expect("promoted selector")
+        );
+        assert_ne!(old, new);
+        assert!(old.ends_with(":1") && new.ends_with(":1"));
+        assert_eq!(old, &fixture.seed.configuration.workers[0].reference);
+        let namespace = &fixture.configuration.controller.readable_resources[0];
+        assert!(
+            old.rsplit_once(':').expect("version").0.starts_with(
+                namespace
+                    .split_once(":parameter")
+                    .expect("parameter ARN")
+                    .1
+                    .trim_end_matches('*')
+            )
+        );
+        let serialized = serde_json::to_value(&fixture).expect("JSON fixture");
+        assert_eq!(
+            serialized["seed"]
+                .as_object()
+                .expect("mandatory seed")
+                .len(),
+            2
+        );
+        assert!(serialized["seed"]["configuration"].is_object());
+    }
+
+    #[test]
+    fn rejects_unproven_seed_access_and_generation() {
+        for (address, field, invalid) in [
+            ("aws_ssm_parameter.config_generation", "version", json!(2)),
+            (
+                "module.controller.aws_launch_template.controller[0]",
+                "user_data",
+                json!(
+                    base64::engine::general_purpose::STANDARD
+                        .encode("controller /wrong/generation:1")
+                ),
+            ),
+            (
+                "module.worker_fleet.module.instance_role.data.aws_iam_policy_document.base",
+                "statement",
+                json!([]),
+            ),
+        ] {
+            let mut events = synthetic_events(&plan(GANG), false);
+            let seed = event_payload(&mut events, "seed", "test_state");
+            let resource = seed["values"]["root_module"]["resources"]
+                .as_array_mut()
+                .expect("seed resources")
+                .iter_mut()
+                .find(|resource| resource["address"] == address)
+                .expect("seed resource");
+            resource["values"][field] = invalid;
+            assert!(
+                extract(&encode_events(&events), "local".into()).is_err(),
+                "{address}"
+            );
+        }
+        let mut events = synthetic_events(&plan(GANG), false);
+        let seed = event_payload(&mut events, "seed", "test_state");
+        seed["values"]["outputs"]["config_parameter_reference"]["value"] =
+            json!("/gang/gang.toml/generations/22222222-2222-4222-8222-222222222222:1");
+        assert!(extract(&encode_events(&events), "local".into()).is_err());
     }
 
     #[test]

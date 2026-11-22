@@ -44,7 +44,7 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-version = "0.3.5"
+version = "0.3.6"
 
 [workspace.lints.rust]
 missing_docs = "deny"
@@ -83,6 +83,10 @@ aws-sdk-ec2 = { default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",
 ], version = "1.275" }
+aws-sdk-elasticloadbalancingv2 = { default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+], version = "1.138" }
 aws-sdk-kms = { default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",
@@ -207,18 +211,18 @@ jsonwebtoken = { features = [
 libc = "0.2.191"
 lru = "0.18.5"
 mimalloc = { version = "0.1" }
-# Carried fork of TraceMachina/nativelink v1.8.3: branch gang is the upstream
-# tag plus fix commits listed in docs/SPECIFICATION.md §3.2. Remove when a
-# pinned upstream release contains them.
-nativelink-config = { git = "https://github.com/leadingterm/nativelink", rev = "a32e74fa544da60ed5296224cf800ed16a3b7315" }
-nativelink-error = { git = "https://github.com/leadingterm/nativelink", rev = "a32e74fa544da60ed5296224cf800ed16a3b7315" }
-nativelink-metric = { git = "https://github.com/leadingterm/nativelink", rev = "a32e74fa544da60ed5296224cf800ed16a3b7315" }
-nativelink-proto = { git = "https://github.com/leadingterm/nativelink", rev = "a32e74fa544da60ed5296224cf800ed16a3b7315" }
-nativelink-scheduler = { git = "https://github.com/leadingterm/nativelink", rev = "a32e74fa544da60ed5296224cf800ed16a3b7315" }
-nativelink-service = { git = "https://github.com/leadingterm/nativelink", rev = "a32e74fa544da60ed5296224cf800ed16a3b7315" }
-nativelink-store = { git = "https://github.com/leadingterm/nativelink", rev = "a32e74fa544da60ed5296224cf800ed16a3b7315" }
-nativelink-util = { git = "https://github.com/leadingterm/nativelink", rev = "a32e74fa544da60ed5296224cf800ed16a3b7315" }
-nativelink-worker = { git = "https://github.com/leadingterm/nativelink", rev = "a32e74fa544da60ed5296224cf800ed16a3b7315" }
+# Immutable carried fork of TraceMachina/nativelink v1.8.3; source patches are
+# recorded in docs/SPECIFICATION.md §3.2. Remove when a pinned upstream release
+# contains equivalent changes.
+nativelink-config = { git = "https://github.com/leadingterm/nativelink", rev = "9b94041b6ba9030b23b2b1656cfedd89fa35e9e1" }
+nativelink-error = { git = "https://github.com/leadingterm/nativelink", rev = "9b94041b6ba9030b23b2b1656cfedd89fa35e9e1" }
+nativelink-metric = { git = "https://github.com/leadingterm/nativelink", rev = "9b94041b6ba9030b23b2b1656cfedd89fa35e9e1" }
+nativelink-proto = { git = "https://github.com/leadingterm/nativelink", rev = "9b94041b6ba9030b23b2b1656cfedd89fa35e9e1" }
+nativelink-scheduler = { git = "https://github.com/leadingterm/nativelink", rev = "9b94041b6ba9030b23b2b1656cfedd89fa35e9e1" }
+nativelink-service = { git = "https://github.com/leadingterm/nativelink", rev = "9b94041b6ba9030b23b2b1656cfedd89fa35e9e1" }
+nativelink-store = { git = "https://github.com/leadingterm/nativelink", rev = "9b94041b6ba9030b23b2b1656cfedd89fa35e9e1" }
+nativelink-util = { git = "https://github.com/leadingterm/nativelink", rev = "9b94041b6ba9030b23b2b1656cfedd89fa35e9e1" }
+nativelink-worker = { git = "https://github.com/leadingterm/nativelink", rev = "9b94041b6ba9030b23b2b1656cfedd89fa35e9e1" }
 num-traits = { default-features = false, version = "0.2.19" }
 object = { default-features = false, features = [
     "elf",

@@ -202,7 +202,7 @@ export const EVENT_VIEW = {
         case "instanceTerminated":
           return <span>AWS: {idOf(k.instance)} terminated: {k.reason === "OTHER" ? (k.reasonDetail ?? "other") : k.reason.toLowerCase().replaceAll("_", " ")}</span>;
         case "capacityUnavailable":
-          return <span>AWS: capacity unavailable: {k.reason}</span>;
+          return <span>AWS: launch warning: {k.reason}</span>;
         default:
           return <span>AWS: infrastructure event</span>;
       }

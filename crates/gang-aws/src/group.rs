@@ -3,7 +3,8 @@
 
 use aws_sdk_autoscaling::operation::describe_auto_scaling_groups::DescribeAutoScalingGroupsOutput;
 use aws_sdk_autoscaling::types::{
-    Instance as AutoScalingInstance, InstanceReusePolicy, LifecycleState,
+    AutoScalingGroup, Instance as AutoScalingInstance, InstanceReusePolicy,
+    LaunchTemplateOverrides, LifecycleState,
 };
 use gang_types::{FleetName, InstanceId, InstanceLifecycle};
 
@@ -26,9 +27,34 @@ pub(crate) struct Member {
     pub current_generation: bool,
 }
 
-/// An auto scaling group as read from AWS, with the warm-pool rules that govern its release.
+/// Borrowed explicit overrides and zones for a completely known set of launch candidates.
+///
+/// Both lists are nonempty, every zone and instance type is nonempty, and no override has
+/// instance requirements. Duplicates are retained; callers must not count pairs as distinct.
+/// The immutable AWS snapshot retains ownership of both lists.
 #[derive(Debug)]
-pub(crate) struct Group {
+pub(crate) struct LaunchCandidates<'snapshot> {
+    overrides: &'snapshot [LaunchTemplateOverrides],
+    zones: &'snapshot [String],
+}
+
+impl LaunchCandidates<'_> {
+    /// Iterates over the configured instance-type and availability-zone Cartesian product.
+    pub(crate) fn pairs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.overrides
+            .iter()
+            .filter_map(|item| item.instance_type())
+            .flat_map(move |instance_type| {
+                self.zones
+                    .iter()
+                    .map(move |zone| (instance_type, zone.as_str()))
+            })
+    }
+}
+
+/// An auto scaling group with owned operational state and metadata borrowed from its snapshot.
+#[derive(Debug)]
+pub(crate) struct Group<'snapshot> {
     /// The group's name.
     pub name: String,
     /// The desired capacity; a negative capacity reads as zero.
@@ -43,13 +69,17 @@ pub(crate) struct Group {
     pub protects_new_instances: bool,
     /// The instances parked in the group's warm pool; `0` without one.
     pub warm: u32,
+    /// Complete configured candidate metadata, or `None` when it is not fully known.
+    pub(crate) launch_candidates: Option<LaunchCandidates<'snapshot>>,
 }
 
-impl Group {
+impl<'snapshot> Group<'snapshot> {
     /// Reads the group named `name` from a `DescribeAutoScalingGroups` response.
     ///
     /// A group that reuses warm instances on scale-in must also protect new instances from
     /// scale-in, or a scale-in could terminate an instance the warm pool expects to keep.
+    ///
+    /// Complete candidate metadata is borrowed without changing the immutable response.
     ///
     /// # Errors
     ///
@@ -57,7 +87,7 @@ impl Group {
     /// [`AwsError::MalformedResponse`] when the group or an instance lacks a field the adapter
     /// needs, and [`AwsError::Config`] when warm-pool reuse is configured without protection.
     pub(crate) fn read(
-        output: &DescribeAutoScalingGroupsOutput,
+        output: &'snapshot DescribeAutoScalingGroupsOutput,
         name: &str,
     ) -> Result<Self, AwsError> {
         let group = output
@@ -98,6 +128,8 @@ impl Group {
             .iter()
             .map(|instance| member(instance, template))
             .collect::<Result<Vec<_>, _>>()?;
+        let warm = group.warm_pool_size().map_or(0, capacity_of);
+        let launch_candidates = launch_candidates(group);
         Ok(Self {
             name: name.to_owned(),
             desired: capacity_of(desired),
@@ -105,7 +137,8 @@ impl Group {
             members,
             reuse_on_scale_in,
             protects_new_instances,
-            warm: group.warm_pool_size().map_or(0, capacity_of),
+            warm,
+            launch_candidates,
         })
     }
 
@@ -114,6 +147,14 @@ impl Group {
     pub(crate) fn live(&self) -> u32 {
         let count = self.members.iter().filter(|member| is_live(member)).count();
         u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
+    /// Whether any group member is still launching.
+    #[must_use]
+    pub(crate) fn launching(&self) -> bool {
+        self.members
+            .iter()
+            .any(|member| member.lifecycle == InstanceLifecycle::Pending)
     }
 
     /// The capacity the group reports: its desired capacity, or its live instances if those
@@ -171,14 +212,34 @@ impl Group {
     }
 }
 
-impl From<&Group> for Counts {
+impl From<&Group<'_>> for Counts {
     /// Counts the group's desired capacity and its live members.
-    fn from(group: &Group) -> Self {
+    fn from(group: &Group<'_>) -> Self {
         Self {
             desired: group.desired,
             live: group.live(),
         }
     }
+}
+
+/// Borrows candidate metadata only when the entire configured set is known.
+fn launch_candidates(group: &AutoScalingGroup) -> Option<LaunchCandidates<'_>> {
+    let zones = group.availability_zones();
+    if zones.is_empty() || zones.iter().any(String::is_empty) {
+        return None;
+    }
+    let overrides = group
+        .mixed_instances_policy()?
+        .launch_template()?
+        .overrides();
+    if overrides.is_empty()
+        || overrides.iter().any(|item| {
+            item.instance_requirements().is_some() || item.instance_type().is_none_or(str::is_empty)
+        })
+    {
+        return None;
+    }
+    Some(LaunchCandidates { overrides, zones })
 }
 
 /// Converts one listed instance of a group to a member.
@@ -267,7 +328,9 @@ pub(crate) fn lifecycle_of(state: &LifecycleState) -> InstanceLifecycle {
 mod tests {
     use aws_sdk_autoscaling::operation::describe_auto_scaling_groups::DescribeAutoScalingGroupsOutput;
     use aws_sdk_autoscaling::types::{
-        AutoScalingGroup, Instance, InstanceReusePolicy, LifecycleState, WarmPoolConfiguration,
+        AutoScalingGroup, Instance, InstanceRequirements, InstanceReusePolicy, LaunchTemplate,
+        LaunchTemplateOverrides, LaunchTemplateSpecification, LifecycleState, MixedInstancesPolicy,
+        WarmPoolConfiguration,
     };
     use gang_types::InstanceId;
 
@@ -304,11 +367,260 @@ mod tests {
             .build()
     }
 
-    fn read(group: AutoScalingGroup) -> Result<Group, AwsError> {
-        let output = DescribeAutoScalingGroupsOutput::builder()
+    fn snapshot(group: AutoScalingGroup) -> DescribeAutoScalingGroupsOutput {
+        DescribeAutoScalingGroupsOutput::builder()
             .auto_scaling_groups(group)
+            .build()
+    }
+
+    fn candidates(zones: &[&str], overrides: Vec<LaunchTemplateOverrides>) -> AutoScalingGroup {
+        AutoScalingGroup::builder()
+            .auto_scaling_group_name(GROUP)
+            .desired_capacity(1)
+            .max_size(1000)
+            .set_availability_zones(Some(zones.iter().map(|zone| (*zone).to_owned()).collect()))
+            .mixed_instances_policy(
+                MixedInstancesPolicy::builder()
+                    .launch_template(
+                        LaunchTemplate::builder()
+                            .set_overrides(Some(overrides))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+    }
+
+    fn explicit(instance_type: &str) -> LaunchTemplateOverrides {
+        LaunchTemplateOverrides::builder()
+            .instance_type(instance_type)
+            .build()
+    }
+
+    #[test]
+    fn borrows_original_candidate_vectors_and_iterates_all_pairs() -> TestResult {
+        let raw = candidates(
+            &["us-east-1a", "us-east-1b", "us-east-1a"],
+            vec![
+                explicit("c7g.large"),
+                explicit("m7g.large"),
+                explicit("c7g.large"),
+            ],
+        );
+        let zones_ptr = raw
+            .availability_zones
+            .as_ref()
+            .ok_or("missing zones")?
+            .as_ptr();
+        let overrides_ptr = raw
+            .mixed_instances_policy
+            .as_ref()
+            .and_then(|policy| policy.launch_template.as_ref())
+            .and_then(|launch| launch.overrides.as_ref())
+            .ok_or("missing overrides")?
+            .as_ptr();
+        let output = snapshot(raw);
+        let group = Group::read(&output, GROUP)?;
+        let launch = group.launch_candidates.ok_or("missing candidates")?;
+        assert_eq!(launch.zones.as_ptr(), zones_ptr);
+        assert_eq!(launch.overrides.as_ptr(), overrides_ptr);
+        let raw = &output.auto_scaling_groups()[0];
+        assert!(std::ptr::eq(launch.zones, raw.availability_zones()));
+        let overrides = raw
+            .mixed_instances_policy()
+            .and_then(|policy| policy.launch_template())
+            .ok_or("missing launch template")?
+            .overrides();
+        assert!(std::ptr::eq(launch.overrides, overrides));
+        // A second view borrows the same intact snapshot, as a cached observation does.
+        let reread = Group::read(&output, GROUP)?;
+        let reread = reread
+            .launch_candidates
+            .ok_or("missing reread candidates")?;
+        assert!(std::ptr::eq(reread.zones, launch.zones));
+        assert!(std::ptr::eq(reread.overrides, launch.overrides));
+        assert_eq!(
+            launch.pairs().collect::<Vec<_>>(),
+            vec![
+                ("c7g.large", "us-east-1a"),
+                ("c7g.large", "us-east-1b"),
+                ("c7g.large", "us-east-1a"),
+                ("m7g.large", "us-east-1a"),
+                ("m7g.large", "us-east-1b"),
+                ("m7g.large", "us-east-1a"),
+                ("c7g.large", "us-east-1a"),
+                ("c7g.large", "us-east-1b"),
+                ("c7g.large", "us-east-1a"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn borrowing_candidates_preserves_template_and_current_generation() -> TestResult {
+        let template = LaunchTemplateSpecification::builder()
+            .launch_template_id("lt-123")
+            .version("2")
             .build();
-        Group::read(&output, GROUP)
+        let instance = Instance::builder()
+            .instance_id("i-a")
+            .lifecycle_state(LifecycleState::InService)
+            .launch_template(template.clone())
+            .build();
+        let raw = AutoScalingGroup::builder()
+            .auto_scaling_group_name(GROUP)
+            .desired_capacity(1)
+            .max_size(1000)
+            .availability_zones("us-east-1a")
+            .instances(instance)
+            .mixed_instances_policy(
+                MixedInstancesPolicy::builder()
+                    .launch_template(
+                        LaunchTemplate::builder()
+                            .launch_template_specification(template)
+                            .overrides(explicit("c7g.large"))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build();
+        let output = snapshot(raw);
+        let group = Group::read(&output, GROUP)?;
+        assert!(group.members[0].current_generation);
+        assert!(group.launch_candidates.is_some());
+        let raw = &output.auto_scaling_groups()[0];
+        let launch = raw
+            .mixed_instances_policy()
+            .and_then(|policy| policy.launch_template())
+            .ok_or("missing launch template")?;
+        assert_eq!(
+            launch
+                .launch_template_specification()
+                .and_then(|template| template.version()),
+            Some("2")
+        );
+        let candidates = group
+            .launch_candidates
+            .as_ref()
+            .ok_or("missing candidates")?;
+        assert!(std::ptr::eq(candidates.zones, raw.availability_zones()));
+        assert!(std::ptr::eq(candidates.overrides, launch.overrides()));
+        assert_eq!(raw.availability_zones(), &["us-east-1a"]);
+        assert_eq!(launch.overrides()[0].instance_type(), Some("c7g.large"));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_candidate_metadata_cannot_prove_exhaustion() -> TestResult {
+        let no_policy = AutoScalingGroup::builder()
+            .auto_scaling_group_name(GROUP)
+            .desired_capacity(1)
+            .max_size(1000)
+            .availability_zones("us-east-1a")
+            .launch_template(LaunchTemplateSpecification::builder().build())
+            .build();
+        let no_launch_template = AutoScalingGroup::builder()
+            .auto_scaling_group_name(GROUP)
+            .desired_capacity(1)
+            .max_size(1000)
+            .availability_zones("us-east-1a")
+            .mixed_instances_policy(MixedInstancesPolicy::builder().build())
+            .build();
+        let mut no_zones = candidates(&["us-east-1a"], vec![explicit("c7g.large")]);
+        no_zones.availability_zones = None;
+        let no_overrides = AutoScalingGroup::builder()
+            .auto_scaling_group_name(GROUP)
+            .desired_capacity(1)
+            .max_size(1000)
+            .availability_zones("us-east-1a")
+            .mixed_instances_policy(
+                MixedInstancesPolicy::builder()
+                    .launch_template(LaunchTemplate::builder().build())
+                    .build(),
+            )
+            .build();
+        let cases = [
+            no_policy,
+            no_launch_template,
+            no_zones,
+            no_overrides,
+            candidates(&[], vec![explicit("c7g.large")]),
+            candidates(&[""], vec![explicit("c7g.large")]),
+            candidates(&["us-east-1a", ""], vec![explicit("c7g.large")]),
+            candidates(&["us-east-1a"], vec![]),
+            candidates(
+                &["us-east-1a"],
+                vec![LaunchTemplateOverrides::builder().build()],
+            ),
+            candidates(&["us-east-1a"], vec![explicit("")]),
+            candidates(&["us-east-1a"], vec![explicit("c7g.large"), explicit("")]),
+            candidates(
+                &["us-east-1a"],
+                vec![
+                    explicit("c7g.large"),
+                    LaunchTemplateOverrides::builder()
+                        .instance_requirements(InstanceRequirements::builder().build())
+                        .build(),
+                ],
+            ),
+            candidates(
+                &["us-east-1a"],
+                vec![
+                    LaunchTemplateOverrides::builder()
+                        .instance_type("c7g.large")
+                        .instance_requirements(InstanceRequirements::builder().build())
+                        .build(),
+                ],
+            ),
+        ];
+        for raw in cases {
+            let metadata = |group: &AutoScalingGroup| {
+                (
+                    group.availability_zones.as_ref().map(Vec::as_ptr),
+                    group
+                        .mixed_instances_policy
+                        .as_ref()
+                        .and_then(|policy| policy.launch_template.as_ref())
+                        .and_then(|launch| launch.overrides.as_ref())
+                        .map(Vec::as_ptr),
+                )
+            };
+            let original = metadata(&raw);
+            let output = snapshot(raw);
+            let group = Group::read(&output, GROUP)?;
+            assert!(group.launch_candidates.is_none());
+            assert_eq!(metadata(&output.auto_scaling_groups()[0]), original);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn launching_detects_each_pending_state() -> TestResult {
+        for state in ["Pending", "Pending:Wait", "Pending:Proceed"] {
+            let output = snapshot(reuse_group(
+                2,
+                vec![
+                    instance("i-a", "InService", true),
+                    instance("i-b", state, false),
+                ],
+                true,
+            ));
+            let group = Group::read(&output, GROUP)?;
+            assert!(group.launching(), "state {state}");
+        }
+        let output = snapshot(reuse_group(
+            2,
+            vec![
+                instance("i-a", "InService", true),
+                instance("i-b", "Terminating", false),
+            ],
+            true,
+        ));
+        let group = Group::read(&output, GROUP)?;
+        assert!(!group.launching());
+        let output = snapshot(reuse_group(1, vec![], true));
+        assert!(!Group::read(&output, GROUP)?.launching());
+        Ok(())
     }
 
     #[test]
@@ -368,7 +680,7 @@ mod tests {
 
     #[test]
     fn reported_is_the_larger_of_desired_and_live() -> TestResult {
-        let group = read(reuse_group(
+        let output = snapshot(reuse_group(
             1,
             vec![
                 instance("i-a", "InService", true),
@@ -376,22 +688,25 @@ mod tests {
                 instance("i-c", "Terminating:Wait", false),
             ],
             true,
-        ))?;
+        ));
+        let group = Group::read(&output, GROUP)?;
         assert_eq!(group.live(), 2);
         assert_eq!(group.reported(), 2);
 
-        let group = read(reuse_group(
+        let output = snapshot(reuse_group(
             5,
             vec![instance("i-a", "InService", true)],
             true,
-        ))?;
+        ));
+        let group = Group::read(&output, GROUP)?;
         assert_eq!(group.reported(), 5);
 
-        let group = read(reuse_group(
+        let output = snapshot(reuse_group(
             -3,
             vec![instance("i-c", "Terminating:Wait", false)],
             true,
-        ))?;
+        ));
+        let group = Group::read(&output, GROUP)?;
         assert_eq!(group.desired, 0);
         assert_eq!(group.reported(), 0);
         Ok(())
@@ -399,39 +714,42 @@ mod tests {
 
     #[test]
     fn release_target_drops_the_releasing_member() -> TestResult {
-        let group = read(reuse_group(
+        let output = snapshot(reuse_group(
             2,
             vec![
                 instance("i-a", "InService", true),
                 instance("i-b", "InService", true),
             ],
             true,
-        ))?;
+        ));
+        let group = Group::read(&output, GROUP)?;
         assert_eq!(group.release_target(&InstanceId::try_new("i-a")?)?, 1);
         Ok(())
     }
 
     #[test]
     fn release_target_keeps_in_flight_scale_out() -> TestResult {
-        let group = read(reuse_group(
+        let output = snapshot(reuse_group(
             4,
             vec![
                 instance("i-a", "InService", true),
                 instance("i-b", "InService", true),
             ],
             true,
-        ))?;
+        ));
+        let group = Group::read(&output, GROUP)?;
         assert_eq!(group.release_target(&InstanceId::try_new("i-a")?)?, 3);
         Ok(())
     }
 
     #[test]
     fn release_target_is_unchanged_once_desired_is_lowered() -> TestResult {
-        let group = read(reuse_group(
+        let output = snapshot(reuse_group(
             1,
             vec![instance("i-b", "InService", true)],
             true,
-        ))?;
+        ));
+        let group = Group::read(&output, GROUP)?;
         let target = group.release_target(&InstanceId::try_new("i-a")?)?;
         assert_eq!(target, group.desired);
         Ok(())
@@ -439,28 +757,30 @@ mod tests {
 
     #[test]
     fn release_target_keeps_pending_members() -> TestResult {
-        let group = read(reuse_group(
+        let output = snapshot(reuse_group(
             2,
             vec![
                 instance("i-a", "InService", true),
                 instance("i-p", "Pending", false),
             ],
             true,
-        ))?;
+        ));
+        let group = Group::read(&output, GROUP)?;
         assert_eq!(group.release_target(&InstanceId::try_new("i-a")?)?, 1);
         Ok(())
     }
 
     #[test]
     fn release_target_refuses_unprotected_member_without_a_lowering() -> TestResult {
-        let group = read(reuse_group(
+        let output = snapshot(reuse_group(
             2,
             vec![
                 instance("i-a", "InService", true),
                 instance("i-b", "InService", false),
             ],
             true,
-        ))?;
+        ));
+        let group = Group::read(&output, GROUP)?;
         let Err(AwsError::Config { field, reason }) =
             group.release_target(&InstanceId::try_new("i-a")?)
         else {
@@ -474,25 +794,27 @@ mod tests {
 
     #[test]
     fn release_target_allows_unprotected_member_while_a_release_is_in_flight() -> TestResult {
-        let group = read(reuse_group(
+        let output = snapshot(reuse_group(
             1,
             vec![
                 instance("i-a", "InService", true),
                 instance("i-b", "InService", false),
             ],
             true,
-        ))?;
+        ));
+        let group = Group::read(&output, GROUP)?;
         assert_eq!(group.release_target(&InstanceId::try_new("i-a")?)?, 0);
         Ok(())
     }
 
     #[test]
     fn reuse_without_protected_new_instances_is_a_config_error() -> TestResult {
-        let Err(AwsError::Config { reason, .. }) = read(reuse_group(
+        let output = snapshot(reuse_group(
             1,
             vec![instance("i-a", "InService", false)],
             false,
-        )) else {
+        ));
+        let Err(AwsError::Config { reason, .. }) = Group::read(&output, GROUP) else {
             return Err("expected a config error".into());
         };
         assert!(reason.contains(GROUP), "reason {reason:?}");

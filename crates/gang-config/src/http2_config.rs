@@ -1,7 +1,6 @@
 //! HTTP/2 connection limits and timeouts for the server.
 
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::time::Duration;
 
 use gang_types::{BoundedBytes, NonZeroBytes, NonZeroDuration};
 use serde::{Deserialize, Serialize};
@@ -45,9 +44,6 @@ pub struct Http2Config {
     pub stream_idle_timeout: WholeSeconds,
     /// Interval of HTTP/2 keepalive pings sent to clients. Default: `30s`.
     pub keepalive_interval: NonZeroDuration,
-    /// Time for open connections to finish after connection streams end. Default: `30s`.
-    #[serde(with = "gang_types::duration")]
-    pub shutdown_grace: Duration,
     /// Time allowed to send an HTTP/1.1 request head. Default: `30s`.
     pub header_read_timeout: NonZeroDuration,
 }
@@ -63,7 +59,6 @@ impl Default for Http2Config {
             receive_window: ReceiveWindow::from_units(16 * 1024 * 1024),
             stream_idle_timeout: WholeSeconds::from_units(10),
             keepalive_interval: NonZeroDuration::from_secs(30),
-            shutdown_grace: Duration::from_secs(30),
             header_read_timeout: NonZeroDuration::from_secs(30),
         }
     }

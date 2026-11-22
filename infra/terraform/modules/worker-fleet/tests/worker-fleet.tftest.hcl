@@ -315,11 +315,12 @@ run "accepts_i8g_local_nvme" {
 
   variables {
     fleets = [{
-      name           = "gang-worker-aarch64"
-      capacity       = "spot"
-      ami_id         = "ami-0000000000000002"
-      instance_types = ["i8g.4xlarge"]
-      max_instances  = 4
+      name                       = "gang-worker-aarch64"
+      capacity                   = "spot"
+      ami_id                     = "ami-0000000000000002"
+      instance_types             = ["i8g.4xlarge"]
+      minimum_availability_zones = 1
+      max_instances              = 4
     }]
   }
 
@@ -1111,63 +1112,168 @@ run "groups_span_every_subnet_when_every_zone_offers_their_types" {
   }
 
   assert {
-    condition     = data.aws_ec2_instance_type_offerings.this.location_type == "availability-zone"
-    error_message = "Instance type offerings must be read per availability zone."
-  }
-
-  assert {
-    condition = (
-      toset(one([for f in data.aws_ec2_instance_type_offerings.this.filter : f.values if f.name == "location"])) == toset(["eu-north-1a", "eu-north-1b"])
-      && toset(one([for f in data.aws_ec2_instance_type_offerings.this.filter : f.values if f.name == "instance-type"])) == toset(["c6id.4xlarge", "c7gd.4xlarge", "m7g.2xlarge"])
-    )
-    error_message = "Instance type offerings must be filtered to the subnet zones and the fleets' instance types."
+    condition = alltrue([
+      for fleet in var.fleets :
+      data.aws_ec2_instance_type_offerings.this[fleet.name].location_type == "availability-zone" &&
+      toset(one([for f in data.aws_ec2_instance_type_offerings.this[fleet.name].filter : f.values if f.name == "location"])) == toset(keys(var.subnet_ids)) &&
+      toset(one([for f in data.aws_ec2_instance_type_offerings.this[fleet.name].filter : f.values if f.name == "instance-type"])) == toset(fleet.instance_types)
+    ])
+    error_message = "Each fleet's offerings lookup must filter by its own instance types and supplied zones."
   }
 }
 
-run "zone_offering_none_of_a_fleets_types_drops_its_subnet" {
+run "common_zones_preserve_all_prioritized_types" {
   command = plan
+
+  variables {
+    subnet_ids = {
+      "eu-north-1a" = "subnet-a"
+      "eu-north-1b" = "subnet-b"
+      "eu-north-1c" = "subnet-c"
+    }
+    fleets = [{
+      name                     = "x86"
+      capacity                 = "spot"
+      ami_id                   = "ami-0000000000000001"
+      instance_types           = ["r6idn.4xlarge", "m6idn.4xlarge", "m8id.4xlarge", "r8id.4xlarge"]
+      spot_allocation_strategy = "capacity-optimized-prioritized"
+      max_instances            = 4
+      fallback                 = {}
+    }]
+  }
 
   override_data {
     target = data.aws_ec2_instance_type_offerings.this
     values = {
-      instance_types = ["c6id.4xlarge", "c6id.4xlarge", "c7gd.4xlarge", "c7gd.4xlarge", "m7g.2xlarge"]
-      locations      = ["eu-north-1a", "eu-north-1b", "eu-north-1a", "eu-north-1b", "eu-north-1a"]
+      instance_types = ["r6idn.4xlarge", "r6idn.4xlarge", "r6idn.4xlarge", "m6idn.4xlarge", "m6idn.4xlarge", "m6idn.4xlarge", "m8id.4xlarge", "m8id.4xlarge", "r8id.4xlarge", "r8id.4xlarge"]
+      locations      = ["eu-north-1a", "eu-north-1b", "eu-north-1c", "eu-north-1a", "eu-north-1b", "eu-north-1c", "eu-north-1a", "eu-north-1c", "eu-north-1a", "eu-north-1c"]
     }
   }
 
   assert {
-    condition     = aws_autoscaling_group.this["gang-worker-aarch64"].vpc_zone_identifier == toset(["subnet-0000000000000001"])
-    error_message = "A zone that offers none of a fleet's instance types must drop its subnet from the fleet's group."
-  }
-
-  assert {
-    condition     = aws_autoscaling_group.this["gang-worker-x86-64"].vpc_zone_identifier == toset(["subnet-0000000000000001", "subnet-0000000000000002"])
-    error_message = "A type missing from one fleet must not drop subnets from a fleet whose types every zone offers."
-  }
-}
-
-run "zone_offering_one_of_a_fleets_types_keeps_its_subnet" {
-  command = plan
-
-  override_data {
-    target = data.aws_ec2_instance_type_offerings.this
-    values = {
-      instance_types = ["c6id.4xlarge", "c7gd.4xlarge", "m7g.2xlarge", "m7g.2xlarge"]
-      locations      = ["eu-north-1a", "eu-north-1b", "eu-north-1a", "eu-north-1b"]
-    }
-  }
-
-  assert {
-    condition     = aws_autoscaling_group.this["gang-worker-x86-64"].vpc_zone_identifier == toset(["subnet-0000000000000001", "subnet-0000000000000002"])
-    error_message = "A zone that offers at least one of a fleet's instance types must keep its subnet in the fleet's group."
+    condition     = aws_autoscaling_group.this["x86"].vpc_zone_identifier == toset(["subnet-a", "subnet-c"]) && aws_autoscaling_group.this["x86-on-demand"].vpc_zone_identifier == toset(["subnet-a", "subnet-c"])
+    error_message = "Both fleet groups must use only the zones offering every type."
   }
 
   assert {
     condition = [
-      for o in aws_autoscaling_group.this["gang-worker-x86-64"].mixed_instances_policy[0].launch_template[0].override : o.instance_type
-    ] == ["c6id.4xlarge", "c7gd.4xlarge"]
-    error_message = "Zone filtering must keep every instance type as a group-wide override, in priority order."
+      for o in aws_autoscaling_group.this["x86"].mixed_instances_policy[0].launch_template[0].override : o.instance_type
+    ] == ["r6idn.4xlarge", "m6idn.4xlarge", "m8id.4xlarge", "r8id.4xlarge"] && aws_autoscaling_group.this["x86"].mixed_instances_policy[0].instances_distribution[0].spot_allocation_strategy == "capacity-optimized-prioritized"
+    error_message = "Intersection must preserve every override and its priority order."
   }
+
+  assert {
+    condition     = toset(local.fleet_missing_offerings["x86"]) == toset(["m8id.4xlarge in eu-north-1b", "r8id.4xlarge in eu-north-1b"])
+    error_message = "The missing offerings must identify each absent type and zone."
+  }
+}
+
+run "disjoint_arm_offerings_fail_default_minimum" {
+  command = plan
+
+  variables {
+    fleets = [{
+      name           = "arm"
+      capacity       = "spot"
+      ami_id         = "ami-0000000000000002"
+      instance_types = ["c7gd.4xlarge", "m7g.2xlarge"]
+      max_instances  = 4
+    }]
+  }
+
+  override_data {
+    target = data.aws_ec2_instance_type_offerings.this
+    values = {
+      instance_types = ["c7gd.4xlarge", "m7g.2xlarge"]
+      locations      = ["eu-north-1a", "eu-north-1b"]
+    }
+  }
+
+  expect_failures = [aws_autoscaling_group.this]
+}
+
+run "default_minimum_rejects_one_common_zone" {
+  command = plan
+  variables {
+    fleets = [{
+      name           = "arm"
+      capacity       = "spot"
+      ami_id         = "ami-0000000000000002"
+      instance_types = ["c7gd.4xlarge", "m7g.2xlarge"]
+      max_instances  = 4
+    }]
+  }
+  override_data {
+    target = data.aws_ec2_instance_type_offerings.this
+    values = {
+      instance_types = ["c7gd.4xlarge", "c7gd.4xlarge", "m7g.2xlarge"]
+      locations      = ["eu-north-1a", "eu-north-1b", "eu-north-1a"]
+    }
+  }
+  expect_failures = [aws_autoscaling_group.this]
+}
+
+run "rejects_too_few_supplied_zones_without_offering_gaps" {
+  command = plan
+
+  variables {
+    subnet_ids = {
+      "eu-north-1a" = "subnet-a"
+    }
+    fleets = [{
+      name                       = "arm"
+      capacity                   = "spot"
+      ami_id                     = "ami-0000000000000002"
+      instance_types             = ["c7gd.4xlarge", "m7g.2xlarge"]
+      max_instances              = 4
+      minimum_availability_zones = 2
+    }]
+  }
+
+  override_data {
+    target = data.aws_ec2_instance_type_offerings.this
+    values = {
+      instance_types = ["c7gd.4xlarge", "m7g.2xlarge"]
+      locations      = ["eu-north-1a", "eu-north-1a"]
+    }
+  }
+
+  expect_failures = [aws_autoscaling_group.this]
+
+  assert {
+    condition     = length(local.fleet_missing_offerings["arm"]) == 0
+    error_message = "Every fleet type must be offered in the supplied zone."
+  }
+}
+
+run "rejects_zero_minimum_availability_zones" {
+  command = plan
+  variables {
+    fleets = [{
+      name                       = "x86"
+      capacity                   = "spot"
+      ami_id                     = "ami-0000000000000001"
+      instance_types             = ["c6id.4xlarge"]
+      max_instances              = 4
+      minimum_availability_zones = 0
+    }]
+  }
+  expect_failures = [var.fleets]
+}
+
+run "rejects_fractional_minimum_availability_zones" {
+  command = plan
+  variables {
+    fleets = [{
+      name                       = "x86"
+      capacity                   = "spot"
+      ami_id                     = "ami-0000000000000001"
+      instance_types             = ["c6id.4xlarge"]
+      max_instances              = 4
+      minimum_availability_zones = 1.5
+    }]
+  }
+  expect_failures = [var.fleets]
 }
 
 run "fallback_twin_spans_the_same_zones_as_its_spot_group" {
@@ -1176,12 +1282,13 @@ run "fallback_twin_spans_the_same_zones_as_its_spot_group" {
   variables {
     fleets = [
       {
-        name           = "gang-worker-x86-64"
-        capacity       = "spot"
-        ami_id         = "ami-0000000000000001"
-        instance_types = ["m6id.4xlarge"]
-        max_instances  = 4
-        fallback       = {}
+        name                       = "gang-worker-x86-64"
+        capacity                   = "spot"
+        ami_id                     = "ami-0000000000000001"
+        instance_types             = ["m6id.4xlarge"]
+        max_instances              = 4
+        minimum_availability_zones = 1
+        fallback                   = {}
       },
     ]
   }

@@ -163,7 +163,11 @@ where
     ) -> Result<Response<ApiResponseBody>, PortError> {
         let (mut parts, body) = request.into_parts();
         self.gate
-            .admit(gang_spi::RequestScope::Shared, &Peer::default(), &mut parts)
+            .admit(
+                gang_spi::RequestScope::Controller,
+                &Peer::default(),
+                &mut parts,
+            )
             .await?;
         let request = Request::from_parts(parts, body);
         let route = UiRoute::of(request.uri().path()).expect("a server ui path");

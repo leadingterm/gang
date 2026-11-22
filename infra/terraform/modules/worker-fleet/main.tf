@@ -28,16 +28,25 @@ locals {
     fleet.fallback == null ? [fleet.name] : [fleet.name, "${fleet.name}${local.on_demand_suffix}"]
   ])
 
-  # Per fleet, the worker subnets whose zone offers at least one of its instance types; the
-  # on-demand twin uses its fleet's list. Capacity pools are per instance type and zone, and a
-  # mixed-instances group chooses among the pools of the zone it launches in, so one offered type
-  # makes a zone usable. Requiring every type would drop usable zones and shrink the fleet.
+  # Each group, including an on-demand twin, uses only zones offering every fleet type.
+  fleet_missing_offerings = {
+    for fleet in var.fleets : fleet.name => flatten([
+      for type in fleet.instance_types : [
+        for zone in keys(var.subnet_ids) : "${type} in ${zone}"
+        if !anytrue([
+          for index, offered_zone in data.aws_ec2_instance_type_offerings.this[fleet.name].locations :
+          offered_zone == zone && data.aws_ec2_instance_type_offerings.this[fleet.name].instance_types[index] == type
+        ])
+      ]
+    ])
+  }
+
   fleet_subnet_ids = {
     for fleet in var.fleets : fleet.name => [
       for zone, subnet_id in var.subnet_ids : subnet_id
-      if anytrue([
-        for index, offered_zone in data.aws_ec2_instance_type_offerings.this.locations :
-        offered_zone == zone && contains(fleet.instance_types, data.aws_ec2_instance_type_offerings.this.instance_types[index])
+      if alltrue([
+        for type in fleet.instance_types :
+        !contains(local.fleet_missing_offerings[fleet.name], "${type} in ${zone}")
       ])
     ]
   }
@@ -55,6 +64,8 @@ data "aws_ami" "this" {
 
 # Which worker subnet zones offer which instance types. Read at plan time, so each group spans only zones that can launch its fleet.
 data "aws_ec2_instance_type_offerings" "this" {
+  for_each = local.fleets
+
   location_type = "availability-zone"
 
   filter {
@@ -64,7 +75,7 @@ data "aws_ec2_instance_type_offerings" "this" {
 
   filter {
     name   = "instance-type"
-    values = distinct(flatten(var.fleets[*].instance_types))
+    values = each.value.instance_types
   }
 }
 
@@ -222,8 +233,8 @@ resource "aws_autoscaling_group" "this" {
     ignore_changes = [desired_capacity, max_size]
 
     precondition {
-      condition     = length(local.fleet_subnet_ids[each.value.fleet]) > 0
-      error_message = "Fleet ${each.value.fleet}: no worker subnet zone (${join(", ", keys(var.subnet_ids))}) offers any of its instance types (${join(", ", local.fleets[each.value.fleet].instance_types)})."
+      condition     = length(local.fleet_subnet_ids[each.value.fleet]) >= local.fleets[each.value.fleet].minimum_availability_zones
+      error_message = "Fleet ${each.value.fleet}: minimum ${local.fleets[each.value.fleet].minimum_availability_zones} availability zones required, selected ${length(local.fleet_subnet_ids[each.value.fleet])}; ${length(local.fleet_missing_offerings[each.value.fleet]) > 0 ? "missing type/AZ offerings: ${join(", ", local.fleet_missing_offerings[each.value.fleet])}." : "all supplied zones offer all instance types, but only ${length(var.subnet_ids)} allowed AZs were supplied; add subnets or lower the minimum."}"
     }
   }
 }

@@ -1,4 +1,4 @@
-//! Followers serve shared requests and refuse leader-only requests while builds use the leader.
+//! Passive controllers completely refuse new public requests while builds use the sole leader.
 
 use std::sync::Arc;
 
@@ -38,22 +38,16 @@ fn discovery_body(answer: &Answer) -> std::result::Result<serde_json::Value, Str
     Ok(body)
 }
 
-fn shared_check(follower: usize, leader: &Answer, response: &Answer) -> Check {
-    let marker = gang_types::handover::REQUEST_NOT_STARTED_HEADER;
-    let leader_body = discovery_body(leader);
-    let follower_body = discovery_body(response);
+fn leader_discovery_check(response: &Answer) -> Check {
+    let body = discovery_body(response);
     Check::expect(
-        format!("follower {follower}: shared HTTP response matches leader"),
-        response.status == leader.status
-            && matches!((&leader_body, &follower_body), (Ok(left), Ok(right)) if left == right)
-            && response.header("content-type") == leader.header("content-type")
-            && response.header(marker) != Some("true")
-            && leader.header(marker) != Some("true"),
-        || {
-            format!(
-                "leader {leader:?}, follower {response:?}, normalized bodies: {leader_body:?}, {follower_body:?}"
-            )
-        },
+        "leader: discovery succeeds without a not-started marker",
+        response.status == 200
+            && body.is_ok()
+            && response
+                .header(gang_types::handover::REQUEST_NOT_STARTED_HEADER)
+                .is_none(),
+        || format!("leader {response:?}, normalized discovery: {body:?}"),
     )
 }
 
@@ -64,6 +58,12 @@ fn refusal_check(follower: usize, path: &str, response: &Answer, grpc: bool) -> 
         format!("follower {follower}: {path} is refused before starting"),
         response.status == expected_status
             && marker == Some("true")
+            && response
+                .headers
+                .iter()
+                .filter(|(name, _)| name == gang_types::handover::REQUEST_NOT_STARTED_HEADER)
+                .count()
+                == 1
             && (!grpc || response.header("grpc-status") == Some("14")),
         || {
             format!(
@@ -81,12 +81,13 @@ fn check_leader_only(
     follower: usize,
     checks: &mut Vec<Check>,
 ) -> Result<()> {
-    for path in ["/v1/builds", "/v1/state"] {
+    for path in ["/v1/server", "/v1/builds", "/v1/state"] {
         let request = Request::get(path).presenting(Presented::Bearer(token.to_owned()));
         let response = crate::login_across::exchange(client, endpoint, &request)?;
         checks.push(refusal_check(follower, path, &response, false));
     }
     for path in [
+        "/build.bazel.remote.execution.v2.ActionCache/GetActionResult",
         "/build.bazel.remote.execution.v2.Execution/Execute",
         "/build.bazel.remote.execution.v2.Execution/WaitExecution",
         "/google.longrunning.Operations/GetOperation",
@@ -100,7 +101,7 @@ fn check_leader_only(
     Ok(())
 }
 
-/// Checks shared and leader-only follower routes and cold and warm leader builds.
+/// Checks complete passive refusals on HTTP and gRPC routes, and cold and warm leader builds.
 ///
 /// # Errors
 /// Returns an error if the cluster, clients, or builds cannot be operated.
@@ -147,30 +148,16 @@ pub fn follower_builds(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
         &RequestMetadata::default(),
         stack.settings().command_timeout,
     )?;
-    let mut checks = Vec::new();
+    let mut checks = vec![
+        leader_discovery_check(&leader_response),
+        Check::expect(
+            "leader: malformed ActionCache request reaches its handler",
+            leader_grpc.is_some() && leader_grpc != Some(14),
+            || format!("leader grpc-status {leader_grpc:?}"),
+        ),
+    ];
     for follower in (0..CONTROLLERS).filter(|&index| index != leader) {
         let endpoint = cluster.direct_endpoint(follower);
-        let response = crate::login_across::exchange(&client, &endpoint, &shared_request)?;
-        checks.push(shared_check(follower, &leader_response, &response));
-        let mut channel = match H2Channel::connect(
-            Arc::clone(&config),
-            &endpoint,
-            Some(&credentials.token),
-            stack.settings().handshake_timeout,
-        )? {
-            Admission::Accepted(channel) => channel,
-            Admission::Refused => return Err(E2eError::system("follower refused TLS connection")),
-        };
-        let grpc = channel.get_action_result(
-            &GetActionResultRequest::default(),
-            &RequestMetadata::default(),
-            stack.settings().command_timeout,
-        )?;
-        checks.push(Check::expect(
-            format!("follower {follower}: malformed ActionCache baseline matches leader code {leader_grpc:?}"),
-            leader_grpc.is_some() && grpc == leader_grpc,
-            || format!("follower grpc-status {grpc:?}, leader {leader_grpc:?}"),
-        ));
         check_leader_only(
             &client,
             &endpoint,
@@ -209,7 +196,7 @@ pub fn follower_builds(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{refusal_check, shared_check};
+    use super::{leader_discovery_check, refusal_check};
     use crate::server::Answer;
 
     async fn certificate(seed: u8) -> gang_types::CertificatePem {
@@ -237,36 +224,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_response_matches_only_contract_fields() {
+    async fn leader_discovery_requires_valid_certificate_and_unmarked_success() {
         let first = certificate(1).await;
-        let second = certificate(1).await;
-        let other = certificate(2).await;
-        assert_ne!(first.as_str(), second.as_str());
-        let leader = discovery(first.as_str(), "server").with_header("date", "leader");
-        let follower = discovery(second.as_str(), "server").with_header("date", "follower");
-        assert!(shared_check(1, &leader, &follower).is_passed());
-        assert!(shared_check(1, &leader, &discovery(other.as_str(), "server")).is_failure());
-        assert!(shared_check(1, &leader, &discovery(second.as_str(), "other")).is_failure());
-        let mut different = follower.clone();
-        different.status = 503;
-        assert!(shared_check(1, &leader, &different).is_failure());
-        different = follower.clone();
-        different.body = b"not json".to_vec();
-        assert!(shared_check(1, &leader, &different).is_failure());
-        assert!(shared_check(1, &different, &different).is_failure());
-        assert!(shared_check(1, &leader, &discovery("not a certificate", "server")).is_failure());
+        let leader = discovery(first.as_str(), "server");
+        assert!(leader_discovery_check(&leader).is_passed());
+        assert!(leader_discovery_check(&Answer::empty(503)).is_failure());
+        assert!(leader_discovery_check(&discovery("not a certificate", "server")).is_failure());
         let missing = Answer::json(200, &serde_json::json!({"name": "server"}))
             .expect("discovery serializes");
-        assert!(shared_check(1, &leader, &missing).is_failure());
-        different = follower.clone();
-        different.headers.retain(|(name, _)| name != "content-type");
-        different = different.with_header("content-type", "text/plain");
-        assert!(shared_check(1, &leader, &different).is_failure());
-        different = follower
-            .clone()
-            .with_header(gang_types::handover::REQUEST_NOT_STARTED_HEADER, "true");
-        assert!(shared_check(1, &leader, &different).is_failure());
-        assert!(shared_check(1, &different, &different).is_failure());
+        assert!(leader_discovery_check(&missing).is_failure());
+        let marked = leader.with_header(gang_types::handover::REQUEST_NOT_STARTED_HEADER, "true");
+        assert!(leader_discovery_check(&marked).is_failure());
     }
 
     #[test]
@@ -274,6 +242,8 @@ mod tests {
         let marker = gang_types::handover::REQUEST_NOT_STARTED_HEADER;
         let http = Answer::empty(503).with_header(marker, "true");
         assert!(refusal_check(1, "/v1/state", &http, false).is_passed());
+        let duplicate = http.clone().with_header(marker, "true");
+        assert!(refusal_check(1, "/v1/server", &duplicate, false).is_failure());
         assert!(refusal_check(1, "/v1/state", &Answer::empty(503), false).is_failure());
         assert!(
             refusal_check(

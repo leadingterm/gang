@@ -228,7 +228,11 @@ async fn leader_api_refuses_before_handlers_and_preserves_decision_precedence() 
     let unmounted = Api::new(ApiParts {
         readiness: crate::health::Readiness::default(),
         core: core.clone(),
-        revocations: Revocations::new(core.clone(), RevocationSet::from_serials(Vec::new())),
+        revocations: Revocations::new(
+            core.clone(),
+            RevocationSet::from_serials(Vec::new()),
+            crate::health::Readiness::default(),
+        ),
         info: info.clone(),
         authorizer: Authorizer::new(vec![role_for("administrator", PermissionSet::all(), ADMIN)]),
         limits: settings.limits,
@@ -249,7 +253,11 @@ async fn leader_api_refuses_before_handlers_and_preserves_decision_precedence() 
     let api = Api::new(ApiParts {
         readiness: crate::health::Readiness::default(),
         core: core.clone(),
-        revocations: Revocations::new(core.clone(), RevocationSet::from_serials(Vec::new())),
+        revocations: Revocations::new(
+            core.clone(),
+            RevocationSet::from_serials(Vec::new()),
+            crate::health::Readiness::default(),
+        ),
         info,
         authorizer: Authorizer::new(vec![role_for("administrator", PermissionSet::all(), ADMIN)]),
         limits: settings.limits,
@@ -427,7 +435,11 @@ async fn idempotent_principal_operations_leave_the_live_epoch_unchanged() {
     let api = Api::new(ApiParts {
         readiness: readiness.clone(),
         core: core.clone(),
-        revocations: Revocations::new(core.clone(), RevocationSet::from_serials(Vec::new())),
+        revocations: Revocations::new(
+            core.clone(),
+            RevocationSet::from_serials(Vec::new()),
+            readiness.clone(),
+        ),
         info,
         authorizer: Authorizer::new(vec![role_for("administrator", PermissionSet::all(), ADMIN)]),
         limits: tls_settings().limits,

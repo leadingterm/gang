@@ -26,18 +26,15 @@ const PROBES: [Probe; 8] = [
     Probe::ControllerLoss7,
 ];
 
-// A retiring leader retains its lease until executing work and the final history flush finish.
-fn replacement(cluster: &Cluster<'_>, retired: usize) -> Result<usize> {
-    cluster.wait_for_leader_except(Some(retired))
-}
-
-fn complete_retirements<T>(
+// Release only after an actual successor is healthy, never after a guessed routing delay.
+fn release_after_promotion(
+    promote: impl FnOnce() -> Result<()>,
+    observe_held: impl FnOnce() -> Result<()>,
     release: impl FnOnce() -> Result<()>,
-    handles: [T; 2],
-    mut finish: impl FnMut(T) -> Result<ExitStatus>,
-) -> Result<Vec<ExitStatus>> {
-    release()?;
-    handles.into_iter().map(&mut finish).collect()
+) -> Result<()> {
+    promote()?;
+    observe_held()?;
+    release()
 }
 
 fn verdicts(
@@ -105,6 +102,20 @@ fn held_attempts(journal: &Journal, run: &Run, attempts: &mut Attempts) -> Resul
         .count())
 }
 
+fn retire_original_hosts(
+    cluster: &Cluster<'_>,
+    leader: usize,
+    natural: ExitStatus,
+) -> Result<Vec<ExitStatus>> {
+    let mut statuses = Vec::with_capacity(2);
+    for index in [0, 1] {
+        cluster.deregister_controller(index)?;
+        let stopped = cluster.retire(index)?;
+        statuses.push(if index == leader { natural } else { stopped });
+    }
+    Ok(statuses)
+}
+
 /// Replaces the initial controllers while the build is held, then judges its journal.
 ///
 /// # Errors
@@ -140,27 +151,45 @@ pub fn rolling_deploy(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
                     state.queue.total > 0
                 })?;
             let initial_leader = cluster.wait_for_leader()?;
-            cluster.start_controller()?;
+            let original_pid = cluster.controller_pid(initial_leader)?;
+            let original_holder = cluster.controller_identity(initial_leader)?;
+            let original_attempts: BTreeMap<_, _> = attempts
+                .iter()
+                .map(|(key, attempt)| (key.clone(), (attempt.worker, attempt.start)))
+                .collect();
+            let next = cluster.start_controller()?;
             let retired_leader = initial_leader == 0 || initial_leader == 1;
-            let first = cluster.begin_retire(0)?;
-            if initial_leader == 0 {
-                pending.release()?;
-                replacement(cluster, 0)?;
-            }
-            cluster.start_controller()?;
-            let leader = cluster.wait_for_leader()?;
-            let second = cluster.begin_retire(1)?;
-            let statuses = complete_retirements(
+            release_after_promotion(
                 || {
-                    pending.release()?;
-                    if leader == 1 {
-                        replacement(cluster, 1)?;
+                    cluster.wait_for_leader_matching(
+                        cluster.stack().settings().startup_timeout,
+                        |leader| leader == next,
+                    )?;
+                    cluster.wait_for_controller_health(next)
+                },
+                || {
+                    if build.is_finished()
+                        || !pending.is_held()?
+                        || cluster.controller_pid(initial_leader)? != original_pid
+                        || original_attempts.iter().any(|(key, &(worker, start))| {
+                            !attempts.get(key).is_some_and(|attempt| {
+                                attempt.worker == worker
+                                    && attempt.start == start
+                                    && attempt.end.is_none()
+                            })
+                        })
+                    {
+                        return Err(E2eError::system(
+                            "original controller/worker/timestamp changed while work was held",
+                        ));
                     }
                     Ok(())
                 },
-                [first, second],
-                |retiring| cluster.finish_retire(retiring),
+                || pending.release(),
             )?;
+            let natural = cluster.wait_exit(initial_leader)?;
+            cluster.wait_for_host_restart(initial_leader, original_pid, &original_holder)?;
+            let statuses = retire_original_hosts(cluster, initial_leader, natural)?;
             Ok((held, retired_leader, statuses))
         })();
         let settled = pending.settle(observation, || {
@@ -190,37 +219,38 @@ pub fn rolling_deploy(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::os::unix::process::ExitStatusExt;
-
     use parking_lot::Mutex;
 
     use super::*;
 
     #[test]
-    fn release_precedes_retirement_completion_for_former_leaders() {
-        for former_leader in [0, 1] {
-            let released = Cell::new(false);
-            let events = Mutex::new(Vec::new());
-            let result = complete_retirements(
-                || {
-                    events.lock().push("release");
-                    released.set(true);
-                    Ok(())
-                },
-                [0, 1],
-                |index| {
-                    events
-                        .lock()
-                        .push(if index == 0 { "finish 0" } else { "finish 1" });
-                    if index == former_leader && !released.get() {
-                        return Err(E2eError::system("former leader is still draining"));
-                    }
-                    Ok(ExitStatus::from_raw(0))
-                },
-            );
-            assert!(result.is_ok(), "former leader {former_leader}: {result:?}");
-            assert_eq!(*events.lock(), ["release", "finish 0", "finish 1"]);
-        }
+    fn successor_health_and_original_identity_precede_release() {
+        let events = Mutex::new(Vec::new());
+        release_after_promotion(
+            || {
+                events.lock().push("healthy");
+                Ok(())
+            },
+            || {
+                events.lock().push("original held");
+                Ok(())
+            },
+            || {
+                events.lock().push("release");
+                Ok(())
+            },
+        )
+        .expect("handover");
+        assert_eq!(events.into_inner(), ["healthy", "original held", "release"]);
+    }
+
+    #[test]
+    fn failed_promotion_never_releases_original_work() {
+        release_after_promotion(
+            || Err(E2eError::system("successor unhealthy")),
+            || panic!("must not observe after failed promotion"),
+            || panic!("must not release after failed promotion"),
+        )
+        .expect_err("unhealthy successor");
     }
 }

@@ -19,7 +19,7 @@ variable "iam_permissions_boundary_arn" {
 }
 
 variable "subnet_ids" {
-  description = "Private subnet ID per availability zone name. Each worker Auto Scaling group launches into the subnets whose zone offers at least one of its fleet's instance types."
+  description = "Private subnet ID per availability zone name. Each worker Auto Scaling group launches into subnets whose zone offers every instance type in its fleet."
   type        = map(string)
   nullable    = false
 
@@ -42,7 +42,8 @@ variable "fleets" {
     - `capacity`: `spot` or `on-demand`. Spot fleets buy interruptible capacity; on-demand fleets buy only on-demand capacity.
     - `spot_allocation_strategy`: Spot allocation strategy, default `price-capacity-optimized`. With `capacity-optimized-prioritized`, Spot prioritizes capacity first and uses instance type order on a best-effort basis.
     - `ami_id`: the worker AMI for this fleet.
-    - `instance_types`: instance types, one mixed-instances override each. List order is the on-demand priority: the first type is tried first. Spot uses the order only with `capacity-optimized-prioritized`, after capacity considerations. Types must be distinct. Unless `scratch_volume_gib` is set, every type must have Nitro instance-store SSD (NVMe). Each of the fleet's groups spans only the subnets whose availability zone offers at least one of these types; the plan fails when no zone offers any.
+    - `instance_types`: instance types, one mixed-instances override each. List order is the on-demand priority: the first type is tried first. Spot uses the order only with `capacity-optimized-prioritized`, after capacity considerations. Types must be distinct. Unless `scratch_volume_gib` is set, every type must have Nitro instance-store SSD (NVMe). Each group's subnets must offer every type.
+    - `minimum_availability_zones`: minimum number of supplied subnet zones offering every instance type, a positive integer defaulting to 2. The plan fails if fewer qualify.
     - `max_instances`: the ASG maximum size.
     - `scratch_volume_gib`: size of an encrypted gp3 EBS data volume at `/dev/sdf`, for EBS-only instance types. `null` attaches no scratch volume.
     - `root_volume_gib`: size of the encrypted gp3 root volume. Defaults to 30 GiB.
@@ -50,16 +51,17 @@ variable "fleets" {
     - `fallback`: opts a spot fleet in to on-demand fallback. The fleet keeps its spot group and gains the on-demand twin, which takes capacity while Spot is unavailable. Presence opts in; `null` keeps Spot only. Requires `capacity` `spot`.
   EOT
   type = list(object({
-    name                     = string
-    capacity                 = string
-    ami_id                   = string
-    instance_types           = list(string)
-    spot_allocation_strategy = optional(string, "price-capacity-optimized")
-    max_instances            = number
-    scratch_volume_gib       = optional(number, null)
-    root_volume_gib          = optional(number, 30)
-    warm_pool_size           = optional(number, 0)
-    fallback                 = optional(object({}), null)
+    name                       = string
+    capacity                   = string
+    ami_id                     = string
+    instance_types             = list(string)
+    minimum_availability_zones = optional(number, 2)
+    spot_allocation_strategy   = optional(string, "price-capacity-optimized")
+    max_instances              = number
+    scratch_volume_gib         = optional(number, null)
+    root_volume_gib            = optional(number, 30)
+    warm_pool_size             = optional(number, 0)
+    fallback                   = optional(object({}), null)
   }))
   nullable = false
 
@@ -96,6 +98,11 @@ variable "fleets" {
   validation {
     condition     = alltrue([for fleet in var.fleets : length(distinct(fleet.instance_types)) == length(fleet.instance_types)])
     error_message = "Each fleet's instance types must be distinct."
+  }
+
+  validation {
+    condition     = alltrue([for fleet in var.fleets : fleet.minimum_availability_zones >= 1 && floor(fleet.minimum_availability_zones) == fleet.minimum_availability_zones])
+    error_message = "Each fleet's minimum_availability_zones must be a positive integer."
   }
 
   validation {

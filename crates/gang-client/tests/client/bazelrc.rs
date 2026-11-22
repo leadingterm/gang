@@ -1,9 +1,12 @@
 //! The Bazel rc rendering: the settings the server answers with, the CA certificate it carries,
 //! the write-free contract on the client home, and the refusals before and after the request.
 
-use gang_client::{BazelrcRequest, ClientError};
+use std::time::Duration;
+
+use gang_client::{BazelrcRequest, Client, ClientError, ClientOptions};
 use gang_types::Url;
 
+use super::api::deadline_clock;
 use super::support::*;
 
 const HELPER: &str = "/usr/local/bin/gang";
@@ -99,18 +102,28 @@ async fn server_error_status_is_a_server_error() {
     );
     let server = harness.server.url();
 
-    let error = harness
-        .client_with(gang_client::ClientOptions {
+    let budget = Duration::from_secs(1);
+    let clock = deadline_clock(harness.clock.clone(), budget);
+    let client = Client::new(
+        harness.home.clone(),
+        ClientOptions {
             api_retry_budget: gang_types::NonZeroDuration::from_secs(1),
-            ..gang_client::ClientOptions::default()
-        })
-        .bazelrc(&BazelrcRequest {
-            server: &server,
-            ca_pin: None,
-            helper: HELPER,
-        })
-        .await
-        .expect_err("the server answers an error status");
+            ..ClientOptions::default()
+        },
+        harness.providers.clone(),
+        harness.console().clone(),
+        clock.clone(),
+    );
+    let request = BazelrcRequest {
+        server: &server,
+        ca_pin: None,
+        helper: HELPER,
+    };
+    let (result, ()) = tokio::join!(client.bazelrc(&request), async {
+        clock.sleeping.notified().await;
+        harness.clock.advance(budget);
+    });
+    let error = result.expect_err("the server answers an error status");
 
     assert!(
         matches!(

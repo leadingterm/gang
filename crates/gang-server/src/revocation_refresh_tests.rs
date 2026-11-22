@@ -175,7 +175,11 @@ async fn unchanged_epoch_does_not_reload_snapshots() -> TestResult {
 async fn restore_in_flight_is_not_undone_by_a_refresh() -> TestResult {
     let core = fixture();
     let certificates = RevocationSet::default();
-    let operations = Revocations::new(core.clone(), certificates.clone());
+    let operations = Revocations::new(
+        core.clone(),
+        certificates.clone(),
+        crate::health::Readiness::for_test(),
+    );
     let identity = alice();
     operations.revoke_principal(&identity).await?;
     let gate = Arc::new(tokio::sync::Notify::new());
@@ -230,7 +234,11 @@ async fn a_successful_certificate_revoke_cuts_off_before_a_later_failure() -> Te
             .await?;
     }
     core.host.repository.fail_revoke_serial(second.clone());
-    let operations = Revocations::new(core, certificates.clone());
+    let operations = Revocations::new(
+        core,
+        certificates.clone(),
+        crate::health::Readiness::for_test(),
+    );
     assert!(operations.revoke_principal(&alice()).await.is_err());
     assert!(certificates.is_revoked(&first));
     assert!(!certificates.is_revoked(&second));
@@ -281,7 +289,11 @@ async fn issuance_crossing_revocation_cannot_revive_after_restore() -> TestResul
     let mut issue = Box::pin(core.workers.issue_certificate(&core.host, &request));
     assert!(poll!(issue.as_mut()).is_pending());
 
-    let operations = Revocations::new(core.clone(), RevocationSet::default());
+    let operations = Revocations::new(
+        core.clone(),
+        RevocationSet::default(),
+        crate::health::Readiness::for_test(),
+    );
     operations.revoke_principal(&identity).await?;
     gate.notify_one();
     let issued = issue.await;
@@ -495,5 +507,46 @@ async fn failed_snapshot_preserves_both_sets_and_retries() -> TestResult {
     assert!(poll!(refresh.as_mut()).is_pending());
     assert!(certificates.is_revoked(&serial));
     assert!(core.host.revoked_principals.contains(&alice()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn handoff_waits_for_complete_revocation_and_refuses_queued_old_mutators() -> TestResult {
+    let core = fixture();
+    let readiness = crate::health::Readiness::for_test();
+    let operations = Revocations::new(core.clone(), RevocationSet::default(), readiness.clone());
+    let identity = alice();
+    operations.revoke_principal(&identity).await?;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    core.host.repository.gate_restore(gate.clone());
+    let mut restore = Box::pin(operations.restore_principal(&identity));
+    assert!(poll!(restore.as_mut()).is_pending());
+    let epoch = core.host.repository.revocation_epoch().await?;
+    let mut freeze = Box::pin(async {
+        let _guard = core.revocation_lock.lock().await;
+        readiness.stop();
+    });
+    assert!(
+        poll!(freeze.as_mut()).is_pending(),
+        "handoff waits for the old mutation acknowledgement"
+    );
+    let mut queued = Box::pin(operations.revoke_principal(&identity));
+    assert!(poll!(queued.as_mut()).is_pending());
+    gate.notify_one();
+    assert!(matches!(
+        poll!(restore.as_mut()),
+        std::task::Poll::Ready(Ok(_))
+    ));
+    assert!(poll!(freeze.as_mut()).is_ready());
+    assert!(matches!(
+        poll!(queued.as_mut()),
+        std::task::Poll::Ready(Err(PortError::Unavailable(_)))
+    ));
+    assert_eq!(
+        core.host.repository.revocation_epoch().await?,
+        epoch,
+        "queued old writes cannot commit after freeze"
+    );
+    assert!(!core.host.revoked_principals.contains(&identity));
     Ok(())
 }

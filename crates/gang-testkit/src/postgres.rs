@@ -506,6 +506,14 @@ impl PostgresServer {
     }
 }
 
+/// A Linux `/proc` entry can disappear between opening and reading `stat`.
+/// The process may be unrelated to `PostgreSQL`; a reaped entry returns `ESRCH`.
+#[cfg(target_os = "linux")]
+fn process_vanished(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+}
+
 #[cfg(target_os = "linux")]
 fn signal_children(parent: Pid, signal: Signal) -> Result<(), PostgresError> {
     let entries = fs::read_dir("/proc").map_err(io_error("read process directory"))?;
@@ -521,7 +529,7 @@ fn signal_children(parent: Pid, signal: Signal) -> Result<(), PostgresError> {
         };
         let stat = match fs::read_to_string(entry.path().join("stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if process_vanished(&error) => continue,
             Err(error) => return Err(io_error("read process status")(error)),
         };
         let parent_id = stat
@@ -590,12 +598,42 @@ pub fn shared_postgres() -> Result<Arc<PostgresServer>, PostgresError> {
 mod tests {
     use super::{
         DROP_TIMEOUT_HOOK, PostgresError, PostgresServer, START_TIMEOUT_HOOK, SUPERUSER,
-        kill_server, signal_children,
+        kill_server, process_vanished, signal_children,
     };
     use crate::TestResult;
     use rustix::process::{Pid, Signal, kill_process};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn reaped_process_stat_read_is_treated_as_vanished() -> TestResult {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read value"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        let stat = std::fs::File::open(format!("/proc/{}/stat", child.id()))?;
+        child.kill()?;
+        child.wait()?;
+        let error = std::io::read_to_string(stat).expect_err("reaped process stat must fail");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::SRCH.raw_os_error())
+        );
+        assert!(process_vanished(&error));
+        Ok(())
+    }
+
+    #[test]
+    fn process_vanished_preserves_other_io_errors() {
+        assert!(process_vanished(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!process_vanished(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!process_vanished(&std::io::Error::other("unrelated")));
+    }
 
     fn stop_children(parent: Pid) -> TestResult<Vec<Pid>> {
         let deadline = Instant::now() + Duration::from_secs(15);

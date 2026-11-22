@@ -26,6 +26,9 @@
 //! - `autoscaling:DescribeScalingActivities`
 //! - `autoscaling:DescribeLifecycleHooks`
 //! - `autoscaling:CompleteLifecycleAction`
+//! - `autoscaling:RecordLifecycleActionHeartbeat`
+//! - `elasticloadbalancing:DescribeTargetHealth`
+//! - `elasticloadbalancing:RegisterTargets`
 //! - `autoscaling:SetDesiredCapacity`
 //! - `autoscaling:UpdateAutoScalingGroup`
 //! - `autoscaling:SetInstanceProtection`
@@ -34,6 +37,7 @@
 //! - `sts:GetWebIdentityToken`
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use aws_config::SdkConfig;
 use gang_clock::{Clock, SystemClock};
@@ -59,6 +63,7 @@ use gang_aws_sdk as sdk;
 pub struct Aws {
     pub(crate) config: AwsConfig,
     pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) retirement_seen: AtomicBool,
     scratch: Arc<Scratch<SystemMachine>>,
     managed: Arc<Managed>,
     runtime: OnceCell<Runtime>,
@@ -68,6 +73,7 @@ pub struct Aws {
 pub(crate) struct Runtime {
     fleets: Fleets,
     pub(crate) autoscaling: aws_sdk_autoscaling::Client,
+    pub(crate) elbv2: aws_sdk_elasticloadbalancingv2::Client,
     pub(crate) metadata: Metadata,
     web_identity: WebIdentity,
     #[cfg(test)]
@@ -105,6 +111,7 @@ impl Runtime {
             )
             .with_observation_interval(config.supply_poll_interval.get()),
             autoscaling,
+            elbv2: aws_sdk_elasticloadbalancingv2::Client::new(sdk),
             metadata: Metadata::new(imds, config.fleet_tag_key.as_str()),
             web_identity: WebIdentity::new(sdk, config),
             #[cfg(test)]
@@ -142,6 +149,7 @@ impl Aws {
         );
         Self {
             clock: Arc::new(SystemClock::new()),
+            retirement_seen: AtomicBool::new(false),
             managed: Arc::clone(&runtime.managed),
             scratch: Arc::new(scratch),
             runtime: OnceCell::new_with(Some(runtime)),
@@ -182,6 +190,7 @@ impl Plugin for Aws {
         );
         Ok(Self {
             config,
+            retirement_seen: AtomicBool::new(false),
             clock: Arc::new(SystemClock::new()),
             managed: Arc::new(Managed::default()),
             scratch: Arc::new(scratch),
@@ -326,7 +335,7 @@ mod tests {
 
     use super::*;
     use crate::config::{AwsFleetOptions, Capacity, RetrySpotAfter, SpotFallback};
-    use crate::fake_aws::{FakeAws, FakeFailure, FakeGroup};
+    use crate::fake_aws::{FakeAws, FakeFailure, FakeGroup, FakeTemplateKind};
     use crate::fleet_harness::{Harness, NOW_MILLIS, fleet, fleet_with, rfc3339_ago};
     use crate::test_support::context;
     use gang_clock::{Sleep, TestClock, Tick, Timestamp};
@@ -519,10 +528,16 @@ mod tests {
     async fn abandoned_requests_follow_the_provisioner_contract() -> TestResult {
         let harness = Harness::start().await?;
         harness.add_group_with(FakeGroup {
+            availability_zones: vec!["us-east-1a".to_owned()],
+            instance_types: vec!["c7g.large".to_owned()],
+            template_kind: FakeTemplateKind::Mixed,
             new_instances_protected: true,
             ..FakeGroup::new(GROUP, 4, &[])
         });
         harness.add_group_with(FakeGroup {
+            availability_zones: vec!["us-east-1a".to_owned()],
+            instance_types: vec!["c7g.large".to_owned()],
+            template_kind: FakeTemplateKind::Mixed,
             new_instances_protected: true,
             ..FakeGroup::new("gang-worker-x86-64-on-demand", 0, &[])
         });

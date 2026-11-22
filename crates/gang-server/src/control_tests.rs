@@ -429,10 +429,10 @@ async fn mid_pass_lapse_forgets_unapplied_termination() -> TestResult {
                     gang_spi::CandidateGeneration::default(),
                 ),
             },
-            &crate::health::Readiness::default(),
-            Duration::ZERO,
+            &fleet.inner,
         )
-        .await;
+        .await?
+        .ok_or("active test host acquires the lease")?;
     let hold = leader.hold(&mut lease);
     futures::pin_mut!(hold);
     assert!(poll!(hold.as_mut()).is_pending());
@@ -590,10 +590,10 @@ async fn lapsed_leader_does_not_record_worker_registration() -> TestResult {
                     gang_spi::CandidateGeneration::default(),
                 ),
             },
-            &crate::health::Readiness::default(),
-            Duration::ZERO,
+            &fleet,
         )
-        .await;
+        .await?
+        .ok_or("active test host acquires the lease")?;
     control.pass().await;
     assert_eq!(repository.scaling_events().len(), 1);
     Ok(())
@@ -927,10 +927,10 @@ async fn exit_survives_leadership_lapse() -> TestResult {
                     gang_spi::CandidateGeneration::default(),
                 ),
             },
-            &crate::health::Readiness::default(),
-            Duration::ZERO,
+            &fleet,
         )
-        .await;
+        .await?
+        .ok_or("active test host acquires the lease")?;
     let hold = leader.hold(&mut lease);
     futures::pin_mut!(hold);
     assert!(poll!(hold.as_mut()).is_pending());

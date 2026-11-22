@@ -14,14 +14,6 @@ resource "terraform_data" "input_checks" {
       error_message = "default_isa must be the isa of some fleet."
     }
     precondition {
-      condition = !local.group || alltrue([for fleet in var.fleets : try(
-        tonumber(regex("^(0*[1-9][0-9]*)(ms|s|m|h|d)$", fleet.boot_grace)[0]) *
-        { ms = 1, s = 1000, m = 60000, h = 3600000, d = 86400000 }[regex("^(0*[1-9][0-9]*)(ms|s|m|h|d)$", fleet.boot_grace)[1]] > local.shutdown_grace_seconds * 1000,
-        false
-      )])
-      error_message = "Each fleet boot_grace must be a valid duration strictly above the controller group shutdown grace."
-    }
-    precondition {
       # The 1011-character SSM limit includes the partition, region, and account ARN prefix.
       condition     = length("arn:${data.aws_partition.this.partition}:ssm:${var.region}:000000000000:parameter${local.config_parameter_name}/generations/00000000-0000-0000-0000-000000000000") <= 1011 && length(split("/", trimprefix(local.config_parameter_name, "/"))) <= 13 && can(regex("^/([A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+$", local.config_parameter_name)) && !can(regex("(?i)^/(aws|ssm)", local.config_parameter_name))
       error_message = "The effective config parameter name must be an absolute SSM path of at most 13 segments, without an aws or ssm prefix, and leave room for the generation ARN within the 1011-character limit for the selected partition and region."
@@ -87,14 +79,13 @@ module "storage" {
 }
 
 locals {
-  config_parameter_name  = coalesce(var.config_parameter_name, "/${var.name}/gang.toml")
-  group                  = var.database.engine != "sqlite"
-  controller_shape       = local.group ? "group" : "instance"
-  public_port            = module.network.public_port
-  worker_port            = module.network.worker_port
-  shutdown_grace_seconds = 300
-  network_granted        = anytrue([for fleet in var.fleets : contains(fleet.actions.grants, "network")])
-  public_subnets         = module.network.public_subnets_by_az
+  config_parameter_name = coalesce(var.config_parameter_name, "/${var.name}/gang.toml")
+  group                 = var.database.engine != "sqlite"
+  controller_shape      = local.group ? "group" : "instance"
+  public_port           = module.network.public_port
+  worker_port           = module.network.worker_port
+  network_granted       = anytrue([for fleet in var.fleets : contains(fleet.actions.grants, "network")])
+  public_subnets        = module.network.public_subnets_by_az
   protected_networks = local.network_granted && var.execution_egress != null ? concat(
     var.execution_egress.protected_networks,
     [module.network.vpc_cidr_block],
@@ -102,12 +93,11 @@ locals {
     local.group ? [] : ["${module.network.controller_public_ip}/32"],
     var.load_balancer == null ? [] : [for ip in module.load_balancer[0].public_static_ips : "${ip}/32"]
   ) : []
-  public_host                       = var.hostname != null ? var.hostname : module.network.controller_public_dns
-  worker_host                       = local.group ? var.hostname : module.network.controller_private_dns
-  endpoint                          = local.group && var.hostname == null ? null : (local.public_port == 443 ? "https://${local.public_host}" : "https://${local.public_host}:${local.public_port}")
-  worker_endpoint                   = local.group && var.hostname == null ? null : "grpcs://${local.worker_host}:${local.worker_port}"
-  health                            = jsondecode(file("${path.module}/../load-balancer/health-check.json"))
-  standby_routability_delay_seconds = local.group && var.load_balancer != null ? local.health.interval_seconds * local.health.threshold : 0
+  public_host     = var.hostname != null ? var.hostname : module.network.controller_public_dns
+  worker_host     = local.group ? var.hostname : module.network.controller_private_dns
+  endpoint        = local.group && var.hostname == null ? null : (local.public_port == 443 ? "https://${local.public_host}" : "https://${local.public_host}:${local.public_port}")
+  worker_endpoint = local.group && var.hostname == null ? null : "grpcs://${local.worker_host}:${local.worker_port}"
+  health          = jsondecode(file("${path.module}/../load-balancer/health-check.json"))
 
   database_secret_parameters = var.database.engine != "postgres" ? {} : merge(
     try(var.database.postgres.rds, null) != null ? {
@@ -158,10 +148,8 @@ locals {
     database_engine                   = var.database.engine
     database_table_name               = module.storage.dynamodb_table_name
     database_postgres                 = local.database_postgres
-    standby_routability_delay_seconds = local.standby_routability_delay_seconds
     leadership_renew_interval_seconds = local.group ? local.health.renew_interval_seconds : null
     leadership_call_timeout_seconds   = local.group ? local.health.call_timeout_seconds : null
-    shutdown_grace_seconds            = local.shutdown_grace_seconds
     scratch_mount_point               = var.scratch_mount_point
     workload_token_audience           = var.workload_token_audience
     client_token_providers            = var.client_token_providers
@@ -217,7 +205,6 @@ module "controller" {
     module.load_balancer[0].internal_serve_target_group_arn,
     module.load_balancer[0].workers_target_group_arn,
   ] : []
-  shutdown_grace_seconds        = local.shutdown_grace_seconds
   config_digest                 = local.group ? local.controller_config_digest : null
   dynamodb_table_arn            = module.storage.dynamodb_table_arn
   ami_id                        = local.node_ami_ids["controller"]
@@ -260,8 +247,6 @@ module "load_balancer" {
   worker_security_group_id       = module.network.worker_security_group_id
   workers_port                   = local.worker_port
   health_port                    = module.network.health_port
-  shutdown_grace                 = local.shutdown_grace_seconds
-  deregistration_delay           = local.shutdown_grace_seconds
   subnet_id                      = module.network.public_subnet_ids[0]
   hostname                       = var.hostname
   port                           = local.public_port
@@ -294,16 +279,17 @@ module "worker_fleet" {
 
   fleets = [
     for fleet in var.fleets : {
-      name                     = fleet.name
-      capacity                 = fleet.capacity
-      ami_id                   = local.node_ami_ids[fleet.name]
-      instance_types           = fleet.instance_types
-      spot_allocation_strategy = fleet.spot_allocation_strategy
-      max_instances            = fleet.max_instances
-      root_volume_gib          = fleet.root_volume_gib
-      scratch_volume_gib       = fleet.scratch_volume_gib
-      warm_pool_size           = fleet.warm_pool_size
-      fallback                 = fleet.fallback == null ? null : {}
+      name                       = fleet.name
+      capacity                   = fleet.capacity
+      ami_id                     = local.node_ami_ids[fleet.name]
+      instance_types             = fleet.instance_types
+      minimum_availability_zones = fleet.minimum_availability_zones
+      spot_allocation_strategy   = fleet.spot_allocation_strategy
+      max_instances              = fleet.max_instances
+      root_volume_gib            = fleet.root_volume_gib
+      scratch_volume_gib         = fleet.scratch_volume_gib
+      warm_pool_size             = fleet.warm_pool_size
+      fallback                   = fleet.fallback == null ? null : {}
     }
   ]
 }

@@ -4,6 +4,7 @@ use gang_config::{ActionsConfig, DiskEnforcement, MemoryEnforcement};
 
 const CUSTOM: &str = r#"
 reservation_headroom_percent = 25
+cpu_reservation_percentile = 75
 cpu_oversubscription = 3
 history_window = "9d"
 history_keys = 321
@@ -48,6 +49,7 @@ disk = "52MiB"
 #[test]
 fn memory_pressure_defaults_parse() {
     let config: ActionsConfig = toml::from_str("").expect("default action policy");
+    assert_eq!(config.cpu_reservation_percentile.get(), 50);
     assert_eq!(config.cpu_oversubscription.get(), 2);
     assert_eq!(config.cold_start.cpu_millicores.get(), 250);
     assert_eq!(config.memory.pressure_stall_percent.get(), 10);
@@ -59,6 +61,7 @@ fn memory_pressure_defaults_parse() {
 fn all_action_fields_parse_with_nondefault_values() {
     let config: ActionsConfig = toml::from_str(CUSTOM).expect("valid action policy");
     assert_eq!(config.reservation_headroom_percent.get(), 25);
+    assert_eq!(config.cpu_reservation_percentile.get(), 75);
     assert_eq!(config.cpu_oversubscription.get(), 3);
     assert_eq!(config.history_window.as_units(), 9);
     assert_eq!(config.history_keys.get(), 321);
@@ -115,6 +118,10 @@ fn all_enforcement_modes_parse_and_memory_guard_is_rejected() {
 #[test]
 fn invalid_values_and_removed_fields_are_rejected() {
     for text in [
+        "cpu_reservation_percentile = 0",
+        "cpu_reservation_percentile = 101",
+        "cpu_reservation_percentile = -1",
+        "cpu_reservation_percentile = 50.5",
         "cpu_oversubscription = 0",
         "history_window = \"0d\"",
         "history_window = \"25h\"",

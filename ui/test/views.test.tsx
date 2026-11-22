@@ -688,6 +688,52 @@ test("fleet launch failure shows the unmet request and provider reason", (t) => 
   t.assert.match(text, /2 of 4 · spot quota exceeded/);
 });
 
+test("fleet shows retained AWS launch warnings as historical observations", (t) => {
+  const fleet = live.fleets[0];
+  if (!fleet) throw new Error("the live recording has a fleet");
+  const at = "2026-01-15T10:00:00Z";
+  const reason = "m7i.large in us-east-1a: InvalidFleetConfiguration: unsupported offering";
+  const warning: ScalingEvent = {
+    ...common, name: "awsEvents/warning", createTime: at, fleet: fleet.name,
+    aws: { event: { id: "warning", at, kind: { type: "capacityUnavailable", reason } } },
+  };
+  const { launchFailure: _launchFailure, ...healthyFleet } = fleet;
+  const f = { ...healthyFleet, desired: 18, instances: { ...fleet.instances, inService: 17, pending: 1 } };
+  const fleetMarkup = (state: typeof live) => {
+    const markup = html({ state }, <Overview />);
+    const row = markup.match(/<li class="fleet(?: is-idle)?"[\s\S]*?<\/li>/);
+    if (!row) throw new Error("fleet row missing");
+    return row[0];
+  };
+  for (const state of [
+    { ...live, fleets: [f], events: [], statusEvents: [warning] },
+    { ...live, fleets: [f], events: [warning], statusEvents: [] },
+  ]) {
+    const row = fleetMarkup(state);
+    t.assert.match(visibleText(row), /launch warning/);
+    t.assert.match(visibleText(row), /Observed 2026-01-15T10:00:00Z · m7i\.large in us-east-1a: InvalidFleetConfiguration: unsupported offering/);
+    t.assert.match(row, /<time datetime="2026-01-15T10:00:00Z">/i);
+    t.assert.doesNotMatch(visibleText(row), /can't launch/);
+  }
+  t.assert.match(visibleText(render(<EventRow e={warning} withCause={false} />)), /AWS: launch warning: m7i\.large in us-east-1a: InvalidFleetConfiguration: unsupported offering/);
+
+  const unrelated: ScalingEvent[] = [
+    { ...warning, fleet: "fleets/other" },
+    { ...common, fleet: f.name, launchFailed: { from: 17, to: 18, reason } },
+    { ...common, name: "awsEvents/other", fleet: f.name, aws: { event: { id: "other", at, kind: { type: "instanceLaunched", instance: "instances/i-success" } } } },
+  ];
+  for (const events of [[], unrelated]) {
+    const row = visibleText(fleetMarkup({ ...live, fleets: [f], events: [], statusEvents: events }));
+    t.assert.doesNotMatch(row, /launch warning|can't launch/);
+  }
+  const failed = { ...f, launchFailure: { reason: "spot quota exceeded" } };
+  const row = visibleText(fleetMarkup({ ...live, fleets: [failed], events: [], statusEvents: [warning] }));
+  t.assert.match(row, /can't launch/);
+  t.assert.match(row, /17 of 18 · spot quota exceeded/);
+  t.assert.doesNotMatch(row, /launch warning/);
+});
+
+
 const recentState = (count: number) => {
   const last = Math.floor(ms(live.updateTime) / 10000) * 10000;
   return {
@@ -1429,7 +1475,7 @@ test("AWS status messages and the single Activity filter are visible", (t) => {
     [event({ type: "instanceTerminated", instance: "instances/i-old", reason: "SPOT_RECLAIMED" }), /terminated: spot reclaimed/],
     [event({ type: "instanceTerminated", instance: "instances/i-old", reason: "REBALANCE" }), /terminated: rebalance/],
     [event({ type: "instanceTerminated", instance: "instances/i-old", reason: "OTHER", reasonDetail: "user request" }), /terminated: user request/],
-    [event({ type: "capacityUnavailable", reason: "insufficient capacity" }), /capacity unavailable: insufficient capacity/],
+    [event({ type: "capacityUnavailable", reason: "insufficient capacity" }), /launch warning: insufficient capacity/],
   ];
   for (const [e, expected] of cases) t.assert.match(visibleText(render(<EventRow e={e} withCause={false} />)), expected);
   const state = { ...live, statusEvents: [cases[0]![0]] };

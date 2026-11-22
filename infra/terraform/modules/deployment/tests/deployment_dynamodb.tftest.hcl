@@ -214,8 +214,8 @@ run "dynamodb_group_shape" {
   }
 
   assert {
-    condition     = can(regex("(?s)\\[server\\.http2\\][^\\[]*shutdown_grace = \"300s\"", output.gang_toml))
-    error_message = "The group must configure shutdown_grace in [server.http2]."
+    condition     = !strcontains(output.gang_toml, "shutdown_grace")
+    error_message = "The generated controller configuration must not specify shutdown grace."
   }
 
   assert {
@@ -223,8 +223,8 @@ run "dynamodb_group_shape" {
     error_message = "The group must use the network health port in its server listener and load balancer."
   }
   assert {
-    condition     = strcontains(output.gang_toml, "standby_routability_delay = \"${local.health.interval_seconds * local.health.threshold}s\"") && strcontains(output.gang_toml, "[server.leadership]\nrenew_interval = \"${local.health.renew_interval_seconds}s\"\ncall_timeout = \"${local.health.call_timeout_seconds}s\"")
-    error_message = "A shared deployment must use the health window and the refresh policy's renewal interval and call timeout."
+    condition     = !strcontains(output.gang_toml, "standby_routability_delay") && strcontains(output.gang_toml, "[server.leadership]\nrenew_interval = \"${local.health.renew_interval_seconds}s\"\ncall_timeout = \"${local.health.call_timeout_seconds}s\"")
+    error_message = "A shared deployment must use the leadership intervals without a standby delay."
   }
 
 
@@ -254,25 +254,6 @@ run "dynamodb_custom_http2_max_connections" {
   }
 }
 
-run "rejects_boot_grace_at_shutdown_grace" {
-  command = plan
-  variables {
-    database      = { engine = "dynamodb" }
-    hostname      = "gang.example.com"
-    load_balancer = {}
-    fleets = [{
-      name               = "gang-worker-x86-64"
-      isa                = "x86-64"
-      capacity           = "spot"
-      instance_types     = ["c6id.4xlarge"]
-      max_instances      = 4
-      vcpus_per_instance = 15
-      disk_per_instance  = "200GiB"
-      boot_grace         = "5m"
-    }]
-  }
-  expect_failures = [terraform_data.input_checks]
-}
 
 run "rejects_dynamodb_without_load_balancer" {
   command = plan

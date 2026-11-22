@@ -1,12 +1,6 @@
 # Changelog
 
-## Unreleased
-
-### Fixed
-
-- Plot only complete steps for dashboard count and rate series, while preserving live gauge values and distinguishing the in-progress control-pass step.
-- Show executing counts without slot denominators and display worker reservations against scheduler admission capacity, preserving unknown values.
-- Show per-fleet instance lifecycle history with historical desired and maximum reference lines, leaving unavailable observations as gaps.
+## 0.3.6 — 2026-11-22
 
 ### Added
 
@@ -20,10 +14,21 @@
 - Retry throttled AWS deployment-verifier reads with bounded backoff within the existing verification deadlines; permanent errors still fail without retry.
 - Automatically cordon and replace workers running an older or unknown Gang version without admitting new work to them. Existing actions finish before replacement, even beyond `max_drain_wait`; obsolete instances are destroyed instead of returned to a warm pool, while ordinary idle scale-in can still reuse current workers. Replacement capacity may temporarily exceed the fleet maximum while stale workers drain. Rootfs image digests remain independent of client and cache identity.
 - Verify the actual running Gang version on every in-service worker through a bounded read-only SSM command after deployment, rather than relying on image or launch-template versions; the check does not require `state.read`.
+- **Planned handover:** shared-database replacement, rolling refresh, configuration-only fleet-limit changes and scale-in preserve valid executing attempts on their original scheduler and worker; crashes retain existing retry and possible re-execution behavior. No operator pre-stop or client configuration regeneration is required.
+- **Upgrade:** `/leader` has been removed; migrate custom health checks to `/ready`. Remove `server.http2.shutdown_grace` and `server.standby_routability_delay` from custom configuration, and remove explicit `shutdown_grace_seconds` arguments from external Terraform module calls; there is no compatibility shim. The deployment module migrates its generated configuration.
+- Attempts now share a dispatch-stamped whole-attempt deadline derived from existing action, download and upload timeouts. AWS rejects budgets beyond its lifecycle-hook limit; no new grace setting is required. SQLite's exclusive fixed instance does not provide replacement HA.
+- Classify partial AWS candidate launch failures as capacity warnings; only complete evidence of a blocked unmet request with no launch in flight establishes fleet launch failure or Spot fallback. Select worker subnets offering every requested instance type, with `minimum_availability_zones` defaulting to `2`; a one-zone deployment must explicitly select `1`.
+- Configure historical CPU reservations with `[actions] cpu_reservation_percentile`, default `50` and bounded from `1` through `100`.
 
 ### Fixed
 
+- Plot only complete steps for dashboard count and rate series, while preserving live gauge values and distinguishing the in-progress control-pass step.
+- Show executing counts without slot denominators and display worker reservations against scheduler admission capacity, preserving unknown values.
+- Show per-fleet instance lifecycle history with historical desired and maximum reference lines, leaving unavailable observations as gaps.
+- Preserve in-flight authentication and buffered refusal responses when idle expiry races request arrival or leadership retirement; close request-bearing connections gracefully rather than dropping their response futures. Peers that never sent a request still expire.
+- Recover drained lone-controller restarts when no replacement remains, and reconcile AWS lifecycle progress after a lost response rather than wedging on a refused SDK retry.
 - Keep remote action shells and paths FHS-compatible: the devShell's later-loaded Bazel rc previously replaced them with host-only Nix store paths. Use `--config=local` for pinned Nix tools and local-only execution.
+- Keep PostgreSQL outage simulation from failing when an unrelated `/proc` entry is reaped during its read; direct PostgreSQL signalling failures remain errors.
 
 ## 0.3.5 — 2026-11-21
 

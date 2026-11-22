@@ -1,8 +1,8 @@
-//! Fresh capabilities and direct shared authentication probes.
+//! Fresh capabilities and complete direct admission-refusal probes.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use gang_clock::SystemClock;
@@ -35,43 +35,25 @@ pub(crate) struct DirectTarget {
     pub proxy_protocol_v2: bool,
 }
 
-/// Sanitized, diagnostic-only authentication response.
+/// Secret-free status and admission marker of one complete authentication response.
 pub(crate) struct AuthenticationObservation {
     pub(crate) status: u16,
     pub(crate) marker: bool,
-    pub(crate) elapsed: Duration,
-}
-
-/// A fully decoded shared-service credential. Never format this secret-bearing value.
-pub(crate) struct SharedAuthentication {
-    pub(crate) status: u16,
-    pub(crate) marker_absent: bool,
-    pub(crate) token: String,
-    pub(crate) elapsed: Duration,
-}
-
-#[derive(Clone, Copy)]
-enum ReceiveMode {
-    Discard,
-    Buffered,
 }
 
 struct DirectExchange {
     request: Request<()>,
     payload: Bytes,
-    mode: ReceiveMode,
 }
 
 struct DirectReply {
     status: u16,
     headers: http::HeaderMap,
     trailers: http::HeaderMap,
-    data: Vec<u8>,
-    elapsed: Duration,
 }
 
-/// Observes status and the exact admission marker without retaining response bodies.
-/// This is diagnostic only, never a positive drain witness.
+/// Observes status and the exact admission marker after the complete response body and trailers.
+/// A connection failure or unfinished response is an error, never a successful refusal.
 pub(crate) fn probe_authentication(
     endpoint: &Url,
     credentials: &Credentials,
@@ -83,54 +65,131 @@ pub(crate) fn probe_authentication(
         endpoint,
         credentials,
         target,
-        authentication_exchange(endpoint, body, ReceiveMode::Discard)?,
+        authentication_exchange(endpoint, body)?,
         timeout,
     )?;
     Ok(AuthenticationObservation {
         status: reply.status,
         marker: refusal_marker(&reply.headers),
-        elapsed: reply.elapsed,
     })
 }
 
-/// Mints a genuine credential through the old controller's shared authentication service.
-pub(crate) fn probe_shared_authentication(
+/// Requires a complete, explicitly not-started HTTP 503 on the original public listener.
+pub(crate) fn probe_refusal(
     endpoint: &Url,
     credentials: &Credentials,
     target: DirectTarget,
     body: Bytes,
     timeout: Duration,
-) -> Result<SharedAuthentication> {
+) -> Result<AuthenticationObservation> {
     let reply = direct_probe(
         endpoint,
         credentials,
         target,
-        authentication_exchange(endpoint, body, ReceiveMode::Buffered)?,
+        authentication_exchange(endpoint, body)?,
         timeout,
     )?;
-    decode_shared_authentication(&reply)
+    decode_refusal(&reply)
 }
 
-fn decode_shared_authentication(reply: &DirectReply) -> Result<SharedAuthentication> {
-    require_direct_success(reply.status)?;
-    require_marker_absent(&reply.headers, &reply.trailers)?;
-    let response: gang_wire::AuthenticateResponse = serde_json::from_slice(&reply.data)
-        .map_err(|_| E2eError::system("invalid shared authentication response"))?;
-    let token = response.token.expose();
-    if token.is_empty()
-        || token.bytes().any(|byte| {
-            !byte.is_ascii_alphanumeric()
-                && !matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
-        })
+fn decode_refusal(reply: &DirectReply) -> Result<AuthenticationObservation> {
+    if reply.status != 503
+        || !refusal_marker(&reply.headers)
+        || reply.trailers.contains_key(REQUEST_NOT_STARTED_HEADER)
     {
-        return Err(E2eError::system("invalid shared authentication bearer"));
+        return Err(E2eError::system(format!(
+            "original controller did not return complete not-started503: status={}",
+            reply.status,
+        )));
     }
-    Ok(SharedAuthentication {
+    Ok(AuthenticationObservation {
         status: reply.status,
-        marker_absent: true,
-        token: token.to_owned(),
-        elapsed: reply.elapsed,
+        marker: true,
     })
+}
+
+/// Probes a public route with the original authority, bearer and actual target framing.
+pub(crate) fn probe_public(
+    endpoint: &Url,
+    credentials: &Credentials,
+    target: DirectTarget,
+    path: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let reply = direct_probe(
+        endpoint,
+        credentials,
+        target,
+        public_exchange(endpoint, credentials, path)?,
+        timeout,
+    )?;
+    let grpc_status = reply
+        .trailers
+        .get("grpc-status")
+        .or_else(|| reply.headers.get("grpc-status"))
+        .and_then(canonical_grpc_status);
+    Ok(format!(
+        "HTTP/2 status={} grpc-status={grpc_status:?} not-started={}",
+        reply.status,
+        refusal_marker(&reply.headers)
+    ))
+}
+
+fn public_exchange(
+    endpoint: &Url,
+    credentials: &Credentials,
+    path: &str,
+) -> Result<DirectExchange> {
+    let grpc = path == CAPABILITIES_PATH;
+    let uri = endpoint
+        .join(path)
+        .map_err(E2eError::system_from("forming public diagnostic URI"))?
+        .to_string()
+        .replacen("grpcs://", "https://", 1);
+    let request = Request::builder()
+        .method(if grpc { Method::POST } else { Method::GET })
+        .uri(uri)
+        .version(Version::HTTP_2)
+        .header(
+            http::header::AUTHORIZATION,
+            format!("Bearer {}", credentials.token),
+        )
+        .header(
+            http::header::CONTENT_TYPE,
+            if grpc {
+                "application/grpc"
+            } else {
+                "application/json"
+            },
+        )
+        .header("te", "trailers")
+        .body(())
+        .map_err(|_| E2eError::system("building authenticated public diagnostic"))?;
+    Ok(DirectExchange {
+        request,
+        payload: if grpc {
+            Bytes::from_static(&[0; 5])
+        } else {
+            Bytes::new()
+        },
+    })
+}
+
+fn direct_h2_error(stage: &'static str) -> impl FnOnce(h2::Error) -> E2eError {
+    move |error| {
+        // Peer debug data and arbitrary I/O messages may contain secrets. Protocol reasons,
+        // error kinds and OS error numbers identify the real cause without reflecting bytes.
+        let io = error
+            .get_io()
+            .map(|error| (error.kind(), error.raw_os_error()));
+        E2eError::system(format!(
+            "{stage}: h2 reason={:?} io={io:?} remote={} reset={} go-away={}",
+            error.reason(),
+            error.is_remote(),
+            error.is_reset(),
+            error.is_go_away(),
+        ))
+    }
 }
 
 fn direct_probe(
@@ -173,7 +232,6 @@ async fn direct_over<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let start = Instant::now();
     tls_client::within(timeout, "receiving direct probe", async {
         let server_name = direct_server_name(endpoint)?;
         let config = tls_client::client_config(
@@ -197,13 +255,25 @@ where
             .map_err(|_| E2eError::system("connecting direct probe TLS"))?;
         let (sender, connection) = h2::client::handshake(tls)
             .await
-            .map_err(|_| E2eError::system("connecting direct probe HTTP/2"))?;
+            .map_err(direct_h2_error("connecting direct probe HTTP/2"))?;
         // The deadline owns the connection driver.
         let mut drivers = JoinSet::new();
         drivers.spawn(connection);
-        let mut reply = receive_direct(sender, exchange).await?;
-        reply.elapsed = start.elapsed();
-        Ok(reply)
+        let response = receive_direct(sender, exchange);
+        tokio::pin!(response);
+        tokio::select! {
+            biased;
+            result = &mut response => result,
+            driver = drivers.join_next() => match driver {
+                Some(Ok(Err(error))) => Err(direct_h2_error("driving direct probe connection")(error)),
+                Some(Err(error)) => Err(E2eError::system(format!(
+                    "joining direct probe driver: cancelled={} panicked={}",
+                    error.is_cancelled(), error.is_panic(),
+                ))),
+                Some(Ok(Ok(()))) => response.await,
+                None => Err(E2eError::system("direct probe driver missing")),
+            },
+        }
     })
     .await
 }
@@ -234,11 +304,7 @@ fn direct_request(endpoint: &Url, path: &str, content_type: &str) -> Result<Requ
         .map_err(|_| E2eError::system("building direct probe request"))
 }
 
-fn authentication_exchange(
-    endpoint: &Url,
-    body: Bytes,
-    mode: ReceiveMode,
-) -> Result<DirectExchange> {
+fn authentication_exchange(endpoint: &Url, body: Bytes) -> Result<DirectExchange> {
     Ok(DirectExchange {
         request: direct_request(
             endpoint,
@@ -246,7 +312,6 @@ fn authentication_exchange(
             "application/json",
         )?,
         payload: body,
-        mode,
     })
 }
 
@@ -257,59 +322,36 @@ async fn receive_direct(
     let mut sender = sender
         .ready()
         .await
-        .map_err(|_| E2eError::system("readying direct probe request"))?;
+        .map_err(direct_h2_error("readying direct probe request"))?;
     let (response, mut outgoing) = sender
         .send_request(exchange.request, false)
-        .map_err(|_| E2eError::system("sending direct probe request"))?;
+        .map_err(direct_h2_error("sending direct probe request"))?;
     outgoing
         .send_data(exchange.payload, true)
-        .map_err(|_| E2eError::system("sending direct probe body"))?;
+        .map_err(direct_h2_error("sending direct probe body"))?;
     let response = response
         .await
-        .map_err(|_| E2eError::system("receiving direct probe response"))?;
+        .map_err(direct_h2_error("receiving direct probe response"))?;
     let (parts, mut body) = response.into_parts();
     let mut reply = DirectReply {
         status: parts.status.as_u16(),
         headers: parts.headers,
         trailers: http::HeaderMap::new(),
-        data: Vec::new(),
-        elapsed: Duration::ZERO,
     };
     let mut size = 0;
     while let Some(chunk) = body.data().await {
-        let chunk = chunk.map_err(|_| E2eError::system("reading direct probe response"))?;
+        let chunk = chunk.map_err(direct_h2_error("reading direct probe response"))?;
         size = direct_response_size(size, chunk.len())?;
         body.flow_control()
             .release_capacity(chunk.len())
-            .map_err(|_| E2eError::system("releasing direct probe flow control"))?;
-        if matches!(exchange.mode, ReceiveMode::Buffered) {
-            append_response(&mut reply.data, &chunk)?;
-        }
+            .map_err(direct_h2_error("releasing direct probe flow control"))?;
     }
     reply.trailers = body
         .trailers()
         .await
-        .map_err(|_| E2eError::system("reading direct probe trailers"))?
+        .map_err(direct_h2_error("reading direct probe trailers"))?
         .unwrap_or_default();
     Ok(reply)
-}
-
-fn require_direct_success(status: u16) -> Result<()> {
-    if status != 200 {
-        return Err(E2eError::system(format!(
-            "direct probe HTTP status {status}"
-        )));
-    }
-    Ok(())
-}
-
-fn require_marker_absent(headers: &http::HeaderMap, trailers: &http::HeaderMap) -> Result<()> {
-    if headers.contains_key(REQUEST_NOT_STARTED_HEADER)
-        || trailers.contains_key(REQUEST_NOT_STARTED_HEADER)
-    {
-        return Err(E2eError::system("unexpected direct probe admission marker"));
-    }
-    Ok(())
 }
 
 fn grpc_payload(data: &[u8]) -> Result<Option<(&[u8], usize)>> {
@@ -521,10 +563,99 @@ impl Availability {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn direct_h2_diagnostics_preserve_cause_without_peer_secrets() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct FailingIo;
+
+        fn failure() -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "secret-token-proof")
+        }
+
+        impl AsyncRead for FailingIo {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+                _buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Err(failure()))
+            }
+        }
+
+        impl AsyncWrite for FailingIo {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+                _buffer: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Err(failure()))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // Let h2 wrap a real transport failure; it does not expose From<io::Error>.
+        let error = match h2::client::handshake(FailingIo).await {
+            Ok((_sender, connection)) => connection.await.expect_err("transport must fail"),
+            Err(error) => error,
+        };
+        let error = direct_h2_error("receiving direct probe response")(error);
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains("UnexpectedEof"));
+        assert!(!rendered.contains("secret-token-proof"));
+        let error =
+            direct_h2_error("receiving direct probe response")(h2::Error::from(h2::Reason::CANCEL));
+        assert!(error.to_string().contains("CANCEL"));
+    }
     use gang_testkit::{ExtendedKeyUsagePurpose, TestAuthority, TestResult};
     use rustls_pki_types::PrivatePkcs8KeyDer;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn public_diagnostics_keep_authority_bearer_and_grpc_framing() -> TestResult {
+        let fixture = WireFixture::new()?;
+        let endpoint = Url::parse("grpcs://nlb.example.test:8443")?;
+        let grpc = public_exchange(&endpoint, &fixture.credentials, CAPABILITIES_PATH)?;
+        assert_eq!(grpc.request.method(), Method::POST);
+        assert_eq!(
+            grpc.request
+                .uri()
+                .authority()
+                .map(http::uri::Authority::as_str),
+            Some("nlb.example.test:8443")
+        );
+        assert_eq!(
+            grpc.request.headers()[http::header::AUTHORIZATION],
+            "Bearer original.private.bearer"
+        );
+        assert_eq!(grpc.payload.as_ref(), &[0; 5]);
+        let discovery = public_exchange(&endpoint, &fixture.credentials, "/v1/server")?;
+        assert_eq!(discovery.request.method(), Method::GET);
+        assert!(discovery.payload.is_empty());
+        let mut invalid = fixture.credentials.clone();
+        invalid.token = "secret-token\r\ninjected".into();
+        let error = public_exchange(&endpoint, &invalid, CAPABILITIES_PATH)
+            .err()
+            .ok_or("invalid header was accepted")?;
+        assert!(!format!("{error:?}").contains("secret-token"));
+        Ok(())
+    }
 
     const WIRE_DEADLINE: Duration = Duration::from_secs(5);
     const MINT_BODY: &[u8] = br#"{"provider":"test","proof":"private-proof"}"#;
@@ -691,16 +822,9 @@ mod tests {
             proxy_protocol_v2: framed,
         };
         let exchange = match kind {
-            WireKind::Authentication => authentication_exchange(
-                &endpoint,
-                Bytes::from_static(MINT_BODY),
-                ReceiveMode::Buffered,
-            )?,
-            WireKind::Diagnostic => authentication_exchange(
-                &endpoint,
-                Bytes::from_static(MINT_BODY),
-                ReceiveMode::Discard,
-            )?,
+            WireKind::Authentication | WireKind::Diagnostic => {
+                authentication_exchange(&endpoint, Bytes::from_static(MINT_BODY))?
+            }
         };
         let transport = async {
             let tcp = TcpStream::connect(target.address)
@@ -754,75 +878,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_authentication_decodes_full_response_without_reflection() -> TestResult {
+    async fn refusal_requires_complete_exact_marked503_without_reflection() -> TestResult {
         let fixture = WireFixture::new()?;
         for framed in [false, true] {
-            let outcome = wire(
-                &fixture,
-                WireKind::Authentication,
-                WireResponse::authentication(),
-                framed,
-            )
-            .await?;
-            let authentication = decode_shared_authentication(&outcome.reply?)?;
-            assert_eq!(authentication.status, 200);
-            assert!(authentication.marker_absent);
-            assert_eq!(authentication.token, "new.private.bearer");
-            assert_ne!(authentication.token, fixture.credentials.token);
-            assert!(authentication.elapsed <= WIRE_DEADLINE);
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn shared_authentication_rejects_malformed_missing_and_marked_responses_privately()
-    -> TestResult {
-        let fixture = WireFixture::new()?;
-        for data in [
-            &b"private-proof"[..],
-            &b"{\"token\":\"new.private.bearer\"}"[..],
-            &b"{\"token\":\"\",\"lifetime\":\"60s\"}"[..],
-            &b"{\"token\":\"secret-status\\n\",\"lifetime\":\"60s\"}"[..],
-            &b"{\"token\":\"new.private.bearer\",\"lifetime\":\"private-proof\"}"[..],
-            &b"{\"token\":\"new.private.bearer\",\"lifetime\":\"60s\"} private-proof"[..],
-        ] {
-            let mut response = WireResponse::authentication();
-            response.data = Bytes::copy_from_slice(data);
-            let outcome = wire(&fixture, WireKind::Authentication, response, true).await?;
-            private_error(
-                &decode_shared_authentication(&outcome.reply?)
-                    .err()
-                    .ok_or("accepted malformed authentication")?,
-            );
-        }
-        for in_trailers in [false, true] {
-            for marker in ["true", "false", "secret-marker", ""] {
+            for (status, marker, accepted) in [
+                (StatusCode::SERVICE_UNAVAILABLE, Some("true"), true),
+                (StatusCode::OK, Some("true"), false),
+                (StatusCode::SERVICE_UNAVAILABLE, Some("false"), false),
+                (StatusCode::SERVICE_UNAVAILABLE, None, false),
+            ] {
                 let mut response = WireResponse::authentication();
-                let headers = if in_trailers {
-                    &mut response.trailers
-                } else {
-                    &mut response.headers
-                };
-                headers.insert(
-                    REQUEST_NOT_STARTED_HEADER,
-                    http::HeaderValue::from_str(marker)?,
-                );
-                let outcome = wire(&fixture, WireKind::Authentication, response, false).await?;
-                private_error(
-                    &decode_shared_authentication(&outcome.reply?)
-                        .err()
-                        .ok_or("accepted marked authentication")?,
-                );
+                response.status = status;
+                if let Some(marker) = marker {
+                    response.headers.insert(
+                        REQUEST_NOT_STARTED_HEADER,
+                        http::HeaderValue::from_str(marker)?,
+                    );
+                }
+                let outcome = wire(&fixture, WireKind::Authentication, response, framed).await?;
+                let observation = decode_refusal(&outcome.reply?);
+                assert_eq!(observation.is_ok(), accepted);
+                if let Err(error) = observation {
+                    private_error(&error);
+                }
             }
         }
-        let mut response = WireResponse::authentication();
-        response.status = StatusCode::SERVICE_UNAVAILABLE;
-        let outcome = wire(&fixture, WireKind::Authentication, response, false).await?;
-        let error = decode_shared_authentication(&outcome.reply?)
-            .err()
-            .ok_or("accepted unavailable authentication")?;
-        assert!(error.to_string().contains("503"));
-        private_error(&error);
         Ok(())
     }
 
@@ -852,7 +932,6 @@ mod tests {
             let reply = outcome.reply?;
             assert_eq!(reply.status, status.as_u16());
             assert_eq!(refusal_marker(&reply.headers), expected);
-            assert!(reply.data.is_empty());
         }
         Ok(())
     }
@@ -865,7 +944,7 @@ mod tests {
             address: "127.0.0.1:9443".parse()?,
             proxy_protocol_v2: false,
         };
-        let exchange = authentication_exchange(&endpoint, Bytes::new(), ReceiveMode::Discard)?;
+        let exchange = authentication_exchange(&endpoint, Bytes::new())?;
         let failed = direct_over(
             &endpoint,
             &fixture.credentials,
@@ -876,7 +955,7 @@ mod tests {
         )
         .await;
         assert!(matches!(failed, Err(E2eError::System { .. })));
-        let exchange = authentication_exchange(&endpoint, Bytes::new(), ReceiveMode::Discard)?;
+        let exchange = authentication_exchange(&endpoint, Bytes::new())?;
         let timed_out = direct_over(
             &endpoint,
             &fixture.credentials,
@@ -921,11 +1000,7 @@ mod tests {
                 .map_err(|error| E2eError::system(format!("serving unfinished fixture: {error}")))
         });
         let mut deadline = std::pin::pin!(tokio::time::sleep(WIRE_DEADLINE));
-        let exchange = authentication_exchange(
-            &endpoint,
-            Bytes::from_static(MINT_BODY),
-            ReceiveMode::Buffered,
-        )?;
+        let exchange = authentication_exchange(&endpoint, Bytes::from_static(MINT_BODY))?;
         let transport = async {
             let tcp = TcpStream::connect(target.address)
                 .await
@@ -980,7 +1055,7 @@ mod tests {
                 address: listener.local_addr()?,
                 proxy_protocol_v2: false,
             };
-            let exchange = authentication_exchange(&endpoint, Bytes::new(), ReceiveMode::Discard)?;
+            let exchange = authentication_exchange(&endpoint, Bytes::new())?;
             let transport = async {
                 let tcp = TcpStream::connect(target.address)
                     .await
@@ -1071,6 +1146,14 @@ mod tests {
             Duration::from_secs(6)
         );
         assert_eq!((samples.successes, samples.failures), (1, 2));
+        // Preparation, health detection or a cold-helper command cannot reset the clock or
+        // turn an unsampled interval into successful fresh connections.
+        samples.sample(Duration::from_secs(20), true);
+        assert_eq!(
+            samples.finish(Duration::from_secs(21)),
+            Duration::from_secs(16)
+        );
+        assert_eq!((samples.successes, samples.failures), (2, 2));
     }
 
     #[test]

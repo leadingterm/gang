@@ -250,6 +250,14 @@ impl Events {
         }
     }
 
+    pub(crate) fn activity_window(&self) -> Duration {
+        self.window
+    }
+
+    pub(crate) fn activity_limit(&self) -> u32 {
+        self.limit
+    }
+
     pub(crate) async fn receive(&self, held: &Held) -> Result<(), AwsError> {
         held.check()?;
         let Some(queue) = &self.queue else {
