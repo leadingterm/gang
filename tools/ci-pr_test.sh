@@ -63,24 +63,24 @@ bazel test
 EOF
 cmp "$scratch/expected" "$LOG"
 
-for MANIFEST in \
-  '{}' \
-  '{"lint":[],"unit":[]}' \
-  '{"lint":["//pkg:ok"],"unit":[],"extra":[]}' \
-  '{"lint":["//pkg:ok"],"lint":["//pkg:ok"],"unit":[]}' \
-  '{"lint":["//pkg:ok"],"unit":["//pkg:bad\n//:injected"]}' \
-  '{"lint":["//pkg:../bad"],"unit":[]}' \
-  '{"lint":[1],"unit":[]}' \
-  'not json'; do
-  export MANIFEST
+while IFS= read -r manifest; do
   : > "$LOG"
-  if "$script" base head; then
+  if env MANIFEST="$manifest" "$script" base head; then
     echo 'Invalid manifest was accepted' >&2
     exit 1
   fi
   printf 'lint --portable\nselector base head\n' > "$scratch/expected"
   cmp "$scratch/expected" "$LOG"
-done
+done <<'EOF'
+{}
+{"lint":[],"unit":[]}
+{"lint":["//pkg:ok"],"unit":[],"extra":[]}
+{"lint":["//pkg:ok"],"lint":["//pkg:ok"],"unit":[]}
+{"lint":["//pkg:ok"],"unit":["//pkg:bad\n//:injected"]}
+{"lint":["//pkg:../bad"],"unit":[]}
+{"lint":[1],"unit":[]}
+not json
+EOF
 export MANIFEST='{"lint":["//:root_clippy_test"],"unit":[]}'
 for failure in FAIL_LINT FAIL_SELECTOR FAIL_BAZEL; do
   : > "$LOG"

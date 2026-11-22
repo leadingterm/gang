@@ -107,6 +107,7 @@ class GitHubApi:
                 link = response.headers.get("Link")
                 status = response.status
         except HTTPError as error:
+            error.close()
             raise GitHubApiError(f"GitHub API HTTP {error.code}", status=error.code) from None
         except (URLError, OSError, ValueError):
             raise GitHubApiError("GitHub API request failed") from None

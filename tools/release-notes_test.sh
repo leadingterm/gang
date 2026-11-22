@@ -23,7 +23,7 @@ export RELEASE_COMMIT=0123456789012345678901234567890123456789
 export RUN_URL=https://github.com/example-org/gang/actions/runs/123
 export SECTION="$scratch/section.md" NOTES="$scratch/notes.md" capture="$scratch/capture"
 export FIXTURE="$scratch/fixture.md"
-printf '%s\n' '## v1.2.3' '' 'Keep `code`, $variables, "quotes", and $(literal) intact.' '' 'Upgrade warning: preserve the database.' > "$FIXTURE"
+printf '%s\n' '## v1.2.3' '' "Keep \`code\`, \$variables, \"quotes\", and \$(literal) intact." '' 'Upgrade warning: preserve the database.' > "$FIXTURE"
 python3() {
   [[ $# == 12 && $1 == .source/tools/changelog.py && $2 == --repo && $3 == .source && $4 == render && $5 == --ref && $6 == "$RELEASE_COMMIT" && $7 == --tag && $8 == "$TAG" && $9 == --output && ${10} == dist/CHANGELOG.md && ${11} == --section-output && ${12} == "$SECTION" ]] || return 1
   if [[ ${RENDER_FAIL:-false} == true ]]; then return 23; fi

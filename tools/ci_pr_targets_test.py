@@ -32,7 +32,7 @@ class SelectorTest(unittest.TestCase):
         self.bazel = str(Path(shutil.which(bazel) or bazel).resolve())
         self.wrapper = temporary / "bazel"
         self.wrapper.write_text(
-            '#!/bin/sh\nexec "$CI_PR_FIXTURE_BAZEL" --batch '
+            '#!/bin/sh\nexec "$CI_PR_FIXTURE_BAZEL" --max_idle_secs=10 '
             '--output_base="$CI_PR_FIXTURE_OUTPUT" --nosystem_rc --nohome_rc "$@"\n',
             encoding="utf-8",
         )
@@ -45,6 +45,7 @@ class SelectorTest(unittest.TestCase):
         self.put(".bazelversion", (SELECTOR.parent.parent / ".bazelversion").read_text(encoding="utf-8"))
         self.put(".bazelrc", "common --incompatible_autoload_externally=\n")
         self.put("MODULE.bazel", 'module(name = "fixture")\n')
+        self.addCleanup(self.shutdown_bazel)
         self.put("defs.bzl", '''def _impl(ctx):
     executable = ctx.actions.declare_file(ctx.label.name + ".sh")
     ctx.actions.write(executable, "#!/bin/sh\\nexit 0\\n", is_executable = True)
@@ -92,15 +93,25 @@ fixture_test(name = "other_clippy_test")
         return subprocess.run(["git", *args], cwd=self.root, check=True,
                               stdout=subprocess.PIPE, text=True).stdout
 
-    def select(self, env=None, base=None):
-        self.git("add", "-A")
-        self.git("commit", "--allow-empty", "-qm", "change")
-        selector_env = {
+    def fixture_environment(self):
+        return {
             **os.environ,
             "BAZEL": str(self.wrapper),
             "CI_PR_FIXTURE_BAZEL": self.bazel,
             "CI_PR_FIXTURE_OUTPUT": str(self.output_base),
         }
+
+    def shutdown_bazel(self):
+        subprocess.run(
+            [str(self.wrapper), "shutdown"], cwd=self.root,
+            env=self.fixture_environment(), check=True, timeout=60,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def select(self, env=None, base=None):
+        self.git("add", "-A")
+        self.git("commit", "--allow-empty", "-qm", "change")
+        selector_env = self.fixture_environment()
         if env is not None:
             selector_env.update(env)
         result = subprocess.run(

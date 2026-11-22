@@ -1,6 +1,8 @@
+import gc
 import io
 import json
 import unittest
+import warnings
 from email.message import Message
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
@@ -98,13 +100,30 @@ class GitHubApiTest(unittest.TestCase):
         self.assertEqual(opener.requests, [])
 
     def test_http_errors_have_status_and_do_not_leak_secrets(self):
-        error = HTTPError('https://example.test/secret-token', 403, 'secret-token', {}, io.BytesIO(b'secret-token'))
+        body = io.BytesIO(b'secret-token')
+        error = HTTPError('https://example.test/secret-token', 403, 'secret-token', {}, body)
         api, _ = self.api(error, Response(b'secret-token', 429), URLError('secret-token'))
         for expected in (403, 429, None):
             with self.subTest(status=expected), self.assertRaises(GitHubApiError) as raised:
                 api.request('GET', '/x')
             self.assertEqual(raised.exception.status, expected)
             self.assertNotIn('secret-token', str(raised.exception))
+        self.assertTrue(error.closed)
+        self.assertTrue(body.closed)
+
+    def test_http_error_cleanup_emits_no_resource_warning(self):
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter('always', ResourceWarning)
+            body = io.BytesIO(b'secret-token')
+            error = HTTPError('https://example.test/', 403, 'forbidden', {}, body)
+            opener = FakeOpener(error)
+            api = GitHubApi('example/repo', 'secret-token', opener=opener)
+            with self.assertRaises(GitHubApiError):
+                api.request('GET', '/x')
+            self.assertTrue(body.closed)
+            del api, opener, error, body
+            gc.collect()
+        self.assertFalse([warning for warning in captured if issubclass(warning.category, ResourceWarning)])
 
     def test_invalid_json_or_payload_fails_without_leaking_contents(self):
         api, _ = self.api(Response(b'secret-token'), Response(b'NaN'), Response(b''))
