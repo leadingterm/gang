@@ -54,7 +54,7 @@ run "terminates_tls_with_http2_and_the_validated_certificate" {
   }
 
   assert {
-    condition     = aws_lb_listener.this.certificate_arn == aws_acm_certificate_validation.this.certificate_arn && aws_lb_listener.this.default_action[0].target_group_arn == aws_lb_target_group.this[0].arn
+    condition     = aws_lb_listener.this.certificate_arn == aws_acm_certificate_validation.this.certificate_arn && aws_lb_listener.this.default_action[0].target_group_arn == aws_lb_target_group.this.arn
     error_message = "The listener must use the validated certificate and forward to the controller target group."
   }
 
@@ -110,22 +110,22 @@ run "forwards_tls_to_the_controller_with_the_client_address" {
   command = apply
 
   assert {
-    condition     = aws_lb_target_group.this[0].protocol == "TLS" && aws_lb_target_group.this[0].port == 443 && aws_lb_target_group.this[0].target_type == "instance" && aws_lb_target_group.this[0].preserve_client_ip == "true" && !aws_lb_target_group.this[0].proxy_protocol_v2
+    condition     = aws_lb_target_group.this.protocol == "TLS" && aws_lb_target_group.this.port == 443 && aws_lb_target_group.this.target_type == "instance" && aws_lb_target_group.this.preserve_client_ip == "true" && !aws_lb_target_group.this.proxy_protocol_v2
     error_message = "The SQLite target group must forward TLS without PROXY while preserving client addresses."
   }
 
   assert {
-    condition     = aws_lb_target_group.this[0].name == var.name && length(output.target_groups) == 0
+    condition     = aws_lb_target_group.this.name == var.name && length(output.target_groups) == 0
     error_message = "SQLite retains its instance target group and exposes no ECS service target groups."
   }
 
   assert {
-    condition     = aws_lb_target_group_attachment.this[0].target_id == var.controller_instance_id && aws_lb_target_group_attachment.this[0].target_group_arn == aws_lb_target_group.this[0].arn
+    condition     = aws_lb_target_group_attachment.this[0].target_id == var.controller_instance_id && aws_lb_target_group_attachment.this[0].target_group_arn == aws_lb_target_group.this.arn
     error_message = "The SQLite controller must be registered with the public target group."
   }
 
   assert {
-    condition     = aws_lb_target_group.this[0].health_check[0].protocol == "HTTP" && aws_lb_target_group.this[0].health_check[0].port == tostring(var.health_port) && aws_lb_target_group.this[0].health_check[0].path == jsondecode(file("${path.module}/health-check.json")).ready_path && aws_lb_target_group.this[0].health_check[0].path == "/ready" && aws_lb_target_group.this[0].health_check[0].matcher == "200" && aws_lb_target_group.this[0].health_check[0].interval == jsondecode(file("${path.module}/health-check.json")).interval_seconds && aws_lb_target_group.this[0].health_check[0].timeout == jsondecode(file("${path.module}/health-check.json")).timeout_seconds && aws_lb_target_group.this[0].health_check[0].healthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold && aws_lb_target_group.this[0].health_check[0].unhealthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold
+    condition     = aws_lb_target_group.this.health_check[0].protocol == "HTTP" && aws_lb_target_group.this.health_check[0].port == tostring(var.health_port) && aws_lb_target_group.this.health_check[0].path == jsondecode(file("${path.module}/health-check.json")).ready_path && aws_lb_target_group.this.health_check[0].path == "/ready" && aws_lb_target_group.this.health_check[0].matcher == "200" && aws_lb_target_group.this.health_check[0].interval == jsondecode(file("${path.module}/health-check.json")).interval_seconds && aws_lb_target_group.this.health_check[0].timeout == jsondecode(file("${path.module}/health-check.json")).timeout_seconds && aws_lb_target_group.this.health_check[0].healthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold && aws_lb_target_group.this.health_check[0].unhealthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold
     error_message = "The controller target group must use the configured HTTP readiness check."
   }
 }
@@ -241,7 +241,7 @@ run "shared_database_load_balancers" {
   }
 
   assert {
-    condition     = aws_lb_listener.this.protocol == "TLS" && aws_lb_listener.this.port == 443 && aws_lb_target_group.service[0].port == 443
+    condition     = aws_lb_listener.this.protocol == "TLS" && aws_lb_listener.this.port == 443 && aws_lb_target_group.this.port == 443
     error_message = "The public NLB must use one TLS client listener on port 443."
   }
   assert {
@@ -249,19 +249,19 @@ run "shared_database_load_balancers" {
     error_message = "The shared public listener must retain its TLS 1.3 policy and HTTP/2 ALPN."
   }
   assert {
-    condition     = aws_lb_target_group.service[0].target_type == "ip" && aws_lb_target_group.service[0].name == "gang-ip" && alltrue([for tg in values(aws_lb_target_group.service_internal) : tg.target_type == "ip" && endswith(tg.name, "-ip")])
-    error_message = "Shared controller target groups must use distinctly named IP targets."
+    condition     = aws_lb_target_group.this.target_type == "instance" && aws_lb_target_group.this.name == var.name && alltrue([for key, tg in aws_lb_target_group.internal : tg.target_type == "instance" && tg.name == "${substr(var.name, 0, 22)}-i-${key}"])
+    error_message = "Shared controllers must use the original instance target group identities."
   }
   assert {
-    condition     = aws_lb.internal[0].internal && toset(keys(aws_lb_listener.internal)) == toset(["serve", "workers"]) && aws_lb_listener.internal["serve"].port == 443 && aws_lb_listener.internal["workers"].port == 9090 && toset(keys(aws_lb_target_group.service_internal)) == toset(["serve", "workers"]) && aws_lb_target_group.service_internal["serve"].port == 443 && aws_lb_target_group.service_internal["workers"].port == 9090 && alltrue([for listener in values(aws_lb_listener.internal) : listener.protocol == "TCP" && listener.certificate_arn == null])
+    condition     = aws_lb.internal[0].internal && toset(keys(aws_lb_listener.internal)) == toset(["serve", "workers"]) && aws_lb_listener.internal["serve"].port == 443 && aws_lb_listener.internal["workers"].port == 9090 && toset(keys(aws_lb_target_group.internal)) == toset(["serve", "workers"]) && aws_lb_target_group.internal["serve"].port == 443 && aws_lb_target_group.internal["workers"].port == 9090 && alltrue([for listener in values(aws_lb_listener.internal) : listener.protocol == "TCP" && listener.certificate_arn == null])
     error_message = "The internal NLB must use TCP passthrough on ports 443 and 9090 only."
   }
   assert {
-    condition     = aws_lb_target_group.service[0].protocol == "TLS" && alltrue([for tg in values(aws_lb_target_group.service_internal) : tg.protocol == "TCP"]) && alltrue([for tg in concat([aws_lb_target_group.service[0]], values(aws_lb_target_group.service_internal)) : tonumber(tg.deregistration_delay) == 120 && !tg.connection_termination && tg.health_check[0].protocol == "HTTP" && tg.health_check[0].port == tostring(var.health_port) && tg.health_check[0].path == jsondecode(file("${path.module}/health-check.json")).ready_path && tg.health_check[0].path == "/ready" && tg.health_check[0].matcher == "200" && tg.health_check[0].interval == jsondecode(file("${path.module}/health-check.json")).interval_seconds && tg.health_check[0].timeout == jsondecode(file("${path.module}/health-check.json")).timeout_seconds && tg.health_check[0].healthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold && tg.health_check[0].unhealthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold])
+    condition     = aws_lb_target_group.this.protocol == "TLS" && alltrue([for tg in values(aws_lb_target_group.internal) : tg.protocol == "TCP"]) && alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : tonumber(tg.deregistration_delay) == 120 && !tg.connection_termination && tg.health_check[0].protocol == "HTTP" && tg.health_check[0].port == tostring(var.health_port) && tg.health_check[0].path == jsondecode(file("${path.module}/health-check.json")).ready_path && tg.health_check[0].path == "/ready" && tg.health_check[0].matcher == "200" && tg.health_check[0].interval == jsondecode(file("${path.module}/health-check.json")).interval_seconds && tg.health_check[0].timeout == jsondecode(file("${path.module}/health-check.json")).timeout_seconds && tg.health_check[0].healthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold && tg.health_check[0].unhealthy_threshold == jsondecode(file("${path.module}/health-check.json")).threshold])
     error_message = "Every shared-database target group must drain gracefully and check readiness."
   }
   assert {
-    condition     = alltrue([for tg in concat([aws_lb_target_group.service[0]], values(aws_lb_target_group.service_internal)) : !tg.target_health_state[0].enable_unhealthy_connection_termination && tg.target_health_state[0].unhealthy_draining_interval == 0])
+    condition     = alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : !tg.target_health_state[0].enable_unhealthy_connection_termination && tg.target_health_state[0].unhealthy_draining_interval == 0])
     error_message = "Unhealthy targets must stop new routing immediately without terminating established connections, independently of the configured deregistration delay."
   }
   assert {
@@ -273,11 +273,11 @@ run "shared_database_load_balancers" {
     error_message = "The internal load balancer must reach the controller health port."
   }
   assert {
-    condition     = alltrue([for tg in concat([aws_lb_target_group.service[0]], values(aws_lb_target_group.service_internal)) : tg.preserve_client_ip == "false" && tg.proxy_protocol_v2])
+    condition     = alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : tg.preserve_client_ip == "false" && tg.proxy_protocol_v2])
     error_message = "All three target groups must send PROXY v2 and disable source preservation."
   }
   assert {
-    condition     = alltrue([for listener in values(aws_lb_listener.internal) : listener.default_action[0].type == "forward"]) && aws_lb_listener.this.default_action[0].type == "forward"
+    condition     = aws_lb_listener.this.default_action[0].target_group_arn == aws_lb_target_group.this.arn && alltrue([for key, listener in aws_lb_listener.internal : listener.default_action[0].type == "forward" && listener.default_action[0].target_group_arn == aws_lb_target_group.internal[key].arn])
     error_message = "Each listener must forward to its controller target group."
   }
   assert {
@@ -303,11 +303,11 @@ run "shared_service_target_group_outputs" {
   assert {
     condition = (
       toset(keys(output.target_groups)) == toset(["serve", "internal_serve", "workers"]) &&
-      output.target_groups.serve.arn == aws_lb_target_group.service[0].arn &&
+      output.target_groups.serve.arn == aws_lb_target_group.this.arn &&
       output.target_groups.serve.port == 443 &&
-      output.target_groups.internal_serve.arn == aws_lb_target_group.service_internal["serve"].arn &&
+      output.target_groups.internal_serve.arn == aws_lb_target_group.internal["serve"].arn &&
       output.target_groups.internal_serve.port == 443 &&
-      output.target_groups.workers.arn == aws_lb_target_group.service_internal["workers"].arn &&
+      output.target_groups.workers.arn == aws_lb_target_group.internal["workers"].arn &&
       output.target_groups.workers.port == 9090
     )
     error_message = "ECS must receive all three target group ARNs and their container ports."
@@ -427,7 +427,7 @@ run "shared_database_defaults_preserve_connections_without_routing_delay" {
     private_zone_id          = "ZPRIVATE"
   }
   assert {
-    condition     = var.deregistration_delay == 0 && alltrue([for tg in concat([aws_lb_target_group.service[0]], values(aws_lb_target_group.service_internal)) : tonumber(tg.deregistration_delay) == 0 && !tg.connection_termination && !tg.target_health_state[0].enable_unhealthy_connection_termination && tg.target_health_state[0].unhealthy_draining_interval == 0])
+    condition     = var.deregistration_delay == 0 && alltrue([for tg in concat([aws_lb_target_group.this], values(aws_lb_target_group.internal)) : tonumber(tg.deregistration_delay) == 0 && !tg.connection_termination && !tg.target_health_state[0].enable_unhealthy_connection_termination && tg.target_health_state[0].unhealthy_draining_interval == 0])
     error_message = "All shared-database target groups must default to zero deregistration and unhealthy draining delays with both connection-termination flags disabled."
   }
 }

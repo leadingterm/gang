@@ -175,18 +175,11 @@ mod tests {
     #[test]
     fn bootstrap_configuration_requires_generation_but_not_consumers() {
         let configuration = "[server]\nname = \"example\"\n\n";
-        let mut resources = vec![
-            resource(
-                "aws_ecr_repository",
-                "module.gang.module.controller.aws_ecr_repository.controller[0]",
-                &["create"],
-            ),
-            resource(
-                "aws_lb_target_group",
-                "module.gang.module.load_balancer[0].aws_lb_target_group.service[0]",
-                &["create"],
-            ),
-        ];
+        let mut resources = vec![resource(
+            "aws_ecr_repository",
+            "module.gang.module.controller.aws_ecr_repository.controller[0]",
+            &["create"],
+        )];
         assert!(matches!(
             plan(&resources).configuration(),
             Err(DeployError::ConfigurationMissing)

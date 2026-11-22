@@ -266,7 +266,8 @@ jobs:
       - name: Confirm convergence
         run: .gang/infra/scripts/reviewed-plan.sh converge
       - name: Verify server version and controller targets
-        timeout-minutes: 45
+        # The verifier owns the configured deadline; GitHub's job limit still applies.
+        timeout-minutes: 360
         env:
           GANG_WORKFLOW_REF: ${{ job.workflow_ref }}
         run: .gang/infra/scripts/verify-deployment.sh

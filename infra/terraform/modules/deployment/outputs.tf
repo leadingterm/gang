@@ -112,6 +112,11 @@ output "controller_capacity_asg_name" {
   value       = module.controller.capacity_asg_name
 }
 
+output "controller_stop_timeout_seconds" {
+  description = "Configured controller drain timeout in seconds."
+  value       = var.controller_stop_timeout_seconds
+}
+
 output "controller_repository_url" {
   description = "Private ECR repository URL for the controller image."
   value       = module.controller.repository_url

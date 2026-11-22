@@ -1,6 +1,6 @@
 ### Changed
 
-- Shared-database controllers run as ECS EC2 services with digest-pinned images, cooperative leader handoff and bounded SIGTERM drain. SQLite remains a standalone instance without HA.
+- Shared-database controllers run as host-networked ECS EC2 services with digest-pinned images, existing instance target groups, managed N+1 host capacity and bounded SIGTERM drain. SQLite remains a standalone instance without HA.
 
 ### Removed
 
@@ -8,4 +8,4 @@
 
 ### Upgrade notes
 
-- Set `controller_image_digest` to the release image digest and migrate existing shared-database ASG deployments in explicit stages: preserve the old controller and routing while creating the service and IP targets, hand off and drain, then remove the old resources. A one-step apply is not a safe migration. See the deployment contract in the specification.
+- Set `controller_image_digest` to the release image digest and migrate existing shared-database ASG deployments in explicit stages: verify an unhealthy ECS standby is prepared with a loopback PROXY v2 LOCAL-framed `/prepared` probe, dispatch a nonblocking stop of the old controller, verify the promoted task and drain, then remove the old resources. A legacy incumbent is not asked to yield automatically. If the reviewed task is not the healthy leader within 60 seconds of stop dispatch, the private caller must quiesce the ECS service, kill and restart the old unit, verify a fresh healthy old-instance leader, and fail the stage retaining the old resources without cleanup. This failure-only recovery can lose and retry old held operations; normal handover preserves them. Listeners do not switch. Local E2E exercises runtime handoff with local fixtures, not the real AWS adapter or private migration workflow. A one-step apply is not a safe migration; see the deployment contract in the specification.

@@ -28,7 +28,7 @@ use crate::settings::{DeploymentInputs, ReleaseInput, Settings};
 use crate::system::{Probe, Variant};
 use crate::upgrade_credentials::ColdHelpers;
 use crate::upgrade_evidence::BuildEvidence;
-use crate::upgrade_fixture::ReleaseFixture;
+use crate::upgrade_fixture::{HandoffProtocol, ReleaseFixture};
 use crate::upgrade_probe::{
     Availability, DirectTarget, probe_authentication, probe_capabilities, probe_refusal,
 };
@@ -195,9 +195,37 @@ struct DrainWitness {
     elapsed: Duration,
     old_leader_before: bool,
     old_leader_after: bool,
-    credentials: Option<HeldDrainWitness>,
+    evidence: Option<DrainEvidence>,
     release_started: Option<Duration>,
     retired: bool,
+}
+
+#[derive(Debug)]
+enum DrainEvidence {
+    Held(HeldDrainWitness),
+    DrainFirst(DrainFirstWitness),
+}
+
+#[derive(Debug)]
+struct DrainFirstWitness {
+    before: HeldState,
+    before_release: HeldState,
+    controller_pid: u32,
+    release: Duration,
+    old_exit: Duration,
+    promotion: Duration,
+    authenticated: Duration,
+}
+
+impl DrainFirstWitness {
+    fn valid(&self) -> bool {
+        self.before.valid()
+            && self.before_release.valid()
+            && self.controller_pid != 0
+            && self.release <= self.old_exit
+            && self.old_exit <= self.promotion
+            && self.promotion <= self.authenticated
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -259,12 +287,22 @@ impl HeldDrainWitness {
     }
 }
 
-fn drain_credentials_ok(drain: &DrainWitness, required: bool, gap_limit: Duration) -> bool {
-    if !required {
-        return true;
-    }
-    match (&drain.credentials, drain.release_started) {
-        (Some(witness), Some(stop)) => witness.valid(stop, gap_limit),
+fn drain_credentials_ok(
+    drain: &DrainWitness,
+    protocol: HandoffProtocol,
+    gap_limit: Duration,
+) -> bool {
+    match (&drain.evidence, drain.release_started, protocol) {
+        (
+            Some(DrainEvidence::Held(witness)),
+            Some(release),
+            HandoffProtocol::ReleaseBeforeDrain,
+        ) => witness.valid(release, gap_limit),
+        (
+            Some(DrainEvidence::DrainFirst(witness)),
+            Some(release),
+            HandoffProtocol::DrainBeforeRelease,
+        ) => witness.release == release && witness.valid(),
         _ => false,
     }
 }
@@ -281,6 +319,11 @@ struct Handoff<'a> {
 impl Handoff<'_> {
     fn observe_held(&self, cluster: &Cluster<'_>) -> Result<(DirectTarget, HeldState)> {
         let target = cluster.controller_public_target(0)?;
+        if !cluster.controller_targets_registered(0)? {
+            return Err(E2eError::system(
+                "original controller targets were deregistered during held handoff",
+            ));
+        }
         let (original_target, controller_pid, worker_pid, executable) = self
             .old_identity
             .as_ref()
@@ -323,7 +366,6 @@ fn remaining_budget(start: Instant, budget: Duration) -> Result<Duration> {
 
 fn held_drain(
     cluster: &Cluster<'_>,
-    releases: &Releases<'_>,
     monitor: &RunningMonitor<'_>,
     next: usize,
     handoff: &mut Handoff<'_>,
@@ -338,20 +380,15 @@ fn held_drain(
         E2eError::system("original held witness before replacement launch missing")
     })?;
     let started = handoff.applied.elapsed();
-    let refusal = if releases.mode == Refresh::ReleaseUpgrade {
-        None
-    } else {
-        let body =
-            ColdHelpers::proof_request(cluster.stack().gang_cli(), &handoff.client.endpoint)?;
-        let response = probe_refusal(
-            &handoff.client.endpoint,
-            &handoff.client.credentials,
-            target,
-            body,
-            remaining_budget(start, budget)?.min(settings.upgrade_probe_timeout),
-        )?;
-        Some((response.status, response.marker))
-    };
+    let body = ColdHelpers::proof_request(cluster.stack().gang_cli(), &handoff.client.endpoint)?;
+    let response = probe_refusal(
+        &handoff.client.endpoint,
+        &handoff.client.credentials,
+        target,
+        body,
+        remaining_budget(start, budget)?.min(settings.upgrade_probe_timeout),
+    )?;
+    let refusal = Some((response.status, response.marker));
     monitor.mint_pair()?;
     handoff
         .client
@@ -362,7 +399,7 @@ fn held_drain(
         finished: handoff.applied.elapsed(),
         deadline: start.duration_since(handoff.applied) + budget,
         refusal,
-        refusal_required: releases.mode != Refresh::ReleaseUpgrade,
+        refusal_required: true,
         controller_pid: cluster.controller_pid(0)?,
         before,
         after,
@@ -379,7 +416,7 @@ fn held_drain(
             elapsed: start.elapsed(),
             old_leader_before: false,
             old_leader_after: cluster.controller_is_leader(0)?,
-            credentials: Some(credentials),
+            evidence: Some(DrainEvidence::Held(credentials)),
             release_started: None,
             ..DrainWitness::default()
         },
@@ -439,13 +476,72 @@ fn confirm_promotion(
     }
 }
 
+enum Retirement {
+    Pending(Retiring),
+    Completed(std::process::ExitStatus),
+}
+
+fn drain_before_promotion<K: Fn(Option<&str>) -> Result<()>>(
+    cluster: &Cluster<'_>,
+    releases: &Releases<'_>,
+    context: &mut Handoff<'_>,
+    monitor: &RunningMonitor<'_>,
+    hold: &Hold<'_, K>,
+    next: usize,
+    retiring: &Retiring,
+) -> Result<(usize, Retirement, PromotionTiming, DrainWitness)> {
+    let (_, before_release) = context.observe_held(cluster)?;
+    let before = context.before_transition.ok_or_else(|| {
+        E2eError::system("original held witness before replacement launch missing")
+    })?;
+    let controller_pid = cluster.controller_pid(0)?;
+    context.client.assert_original_rc()?;
+    context.continuity_observed = true;
+    let release = context.applied.elapsed();
+    let start = Instant::now();
+    hold.release()?;
+    let status = cluster
+        .finish_retire_within(retiring, releases.candidate.controller.ecs_stop_timeout()?)?;
+    let old_exit = context.applied.elapsed();
+    let timing = confirm_promotion(cluster, next, context.client, start, None)?;
+    let startup = cluster.stack().settings().startup_timeout;
+    cluster.wait_for_controller_health_within(next, startup.saturating_sub(start.elapsed()))?;
+    let promotion = context.applied.elapsed();
+    monitor.mint_pair()?;
+    context.client.assert_warm_credentials(
+        cluster,
+        next,
+        startup.saturating_sub(start.elapsed()),
+    )?;
+    let authenticated = context.applied.elapsed();
+    let old_leader_after = cluster.controller_is_leader(0)?;
+    cluster.deregister_controller(0)?;
+    let witness = DrainWitness {
+        elapsed: start.elapsed(),
+        old_leader_before: true,
+        old_leader_after,
+        evidence: Some(DrainEvidence::DrainFirst(DrainFirstWitness {
+            before,
+            before_release,
+            controller_pid,
+            release,
+            old_exit,
+            promotion,
+            authenticated,
+        })),
+        release_started: Some(release),
+        retired: true,
+    };
+    Ok((next, Retirement::Completed(status), timing, witness))
+}
+
 fn handoff<K: Fn(Option<&str>) -> Result<()>>(
     cluster: &Cluster<'_>,
     releases: &Releases<'_>,
     context: &mut Handoff<'_>,
     monitor: &RunningMonitor<'_>,
     hold: &Hold<'_, K>,
-) -> Result<(usize, Option<Retiring>, PromotionTiming, DrainWitness)> {
+) -> Result<(usize, Retirement, PromotionTiming, DrainWitness)> {
     cluster.apply_release(&releases.candidate)?;
     if !cluster.controller_is_leader(0)? {
         return Err(E2eError::system(
@@ -466,16 +562,58 @@ fn handoff<K: Fn(Option<&str>) -> Result<()>>(
         next,
         startup.saturating_sub(startup_started.elapsed()),
     )?;
-    let (mut witness, timing) = held_drain(cluster, releases, monitor, next, context)?;
+    let mut retiring = if releases.mode == Refresh::ReleaseUpgrade {
+        cluster.wait_for_controller_prepared_within(
+            next,
+            startup.saturating_sub(startup_started.elapsed()),
+        )?;
+        context.observe_held(cluster)?;
+        if !cluster.controller_is_leader(0)?
+            || !cluster.controller_is_healthy(0)?
+            || cluster.controller_is_leader(next)?
+        {
+            return Err(E2eError::system(
+                "prepared candidate did not remain standby behind the original ready leader",
+            ));
+        }
+        Some(cluster.begin_retire(0)?)
+    } else {
+        None
+    };
+    if releases.mode == Refresh::ReleaseUpgrade
+        && releases.old_fixture.handoff_protocol == HandoffProtocol::DrainBeforeRelease
+    {
+        return drain_before_promotion(
+            cluster,
+            releases,
+            context,
+            monitor,
+            hold,
+            next,
+            retiring
+                .as_ref()
+                .ok_or_else(|| E2eError::system("missing retiring controller"))?,
+        );
+    }
+    let (mut witness, timing) = held_drain(cluster, monitor, next, context)?;
     witness.old_leader_before = true;
     witness.release_started = Some(context.applied.elapsed());
     context.observe_held(cluster)?;
     context.client.assert_original_rc()?;
     cluster.deregister_controller(0)?;
-    let retiring = Some(cluster.begin_retire(0)?);
+    if retiring.is_none() {
+        retiring = Some(cluster.begin_retire(0)?);
+    }
     context.continuity_observed = true;
     hold.release()?;
-    Ok((next, retiring, timing, witness))
+    Ok((
+        next,
+        Retirement::Pending(
+            retiring.ok_or_else(|| E2eError::system("missing retiring controller"))?,
+        ),
+        timing,
+        witness,
+    ))
 }
 
 enum MonitorCommand {
@@ -585,6 +723,7 @@ struct VerdictInputs<'a> {
     elapsed: Duration,
     rollout: &'a RolloutWitness,
     mode: Refresh,
+    protocol: HandoffProtocol,
 }
 
 fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
@@ -607,17 +746,28 @@ fn final_verdict(input: &VerdictInputs<'_>) -> Vec<Check> {
         && input.drain.retired
         && input.drain.old_leader_before
         && !input.drain.old_leader_after
-        && drain_credentials_ok(input.drain, true, input.gap_limit)
+        && drain_credentials_ok(input.drain, input.protocol, input.gap_limit)
         && input.timing.lease <= input.gap_limit
         && availability_ok(input.gap, input.gap_limit)
         && input.rollout.valid();
 
-    let drain_receipt = input.drain.credentials.as_ref().map_or_else(
-        || "original-process held drain witness absent".to_owned(),
-        HeldDrainWitness::receipt,
-    );
+    let drain_receipt = match &input.drain.evidence {
+        Some(DrainEvidence::Held(witness)) => witness.receipt(),
+        Some(DrainEvidence::DrainFirst(witness)) => format!(
+            "drain-before-release witness: held before launch/release={:?}/{:?}, original controllerPID={}, held release={:?}, old exit observed={:?}, successor healthy={:?}, post-drain authentication={:?}",
+            witness.before,
+            witness.before_release,
+            witness.controller_pid,
+            witness.release,
+            witness.old_exit,
+            witness.promotion,
+            witness.authenticated
+        ),
+        None => "handoff witness absent".to_owned(),
+    };
     let metrics = format!(
-        "ECS handover; successor healthy before held work release; drain elapsed={:?}, old leader before/after={}/{}, versions={:?}->{:?}, initial exit={:?} post exit={:?}, failed actions={}/{}, successful actions={}/{}, attempts={attempts}, reexecutions={}, workers={workers:?}, frozen in-flight={:?}, rpc calls={}/{}, rpc failures={}/{}, rpc retries={}/{}, execute/wait correlations={}/{}, warmcold_mints={}, raw probe failures={}, repeated raw probes after failures={}, bounded raw max gap={:?} (sampled, not zero-error client evidence), lease takeover={:?}, client promotion={:?}, old exit={}, final leader={}, total={:?}, {drain_receipt}, release apply offset={:?}, refresh={:?}, old_task_retired={}, rollout={:?}",
+        "ECS handover; protocol={:?}; drain elapsed={:?}, old leader before/after={}/{}, versions={:?}->{:?}, initial exit={:?} post exit={:?}, failed actions={}/{}, successful actions={}/{}, attempts={attempts}, reexecutions={}, workers={workers:?}, frozen in-flight={:?}, rpc calls={}/{}, rpc failures={}/{}, rpc retries={}/{}, execute/wait correlations={}/{}, warmcold_mints={}, raw probe failures={}, repeated raw probes after failures={}, bounded raw max gap={:?} (sampled, not zero-error client evidence), lease takeover={:?}, client promotion={:?}, old exit={}, final leader={}, total={:?}, {drain_receipt}, release apply offset={:?}, refresh={:?}, old_task_retired={}, rollout={:?}",
+        input.protocol,
         input.drain.elapsed,
         input.drain.old_leader_before,
         input.drain.old_leader_after,
@@ -1299,11 +1449,11 @@ impl Upgrade<'_> {
             Ok((next, retiring, timing, mut witness)) => {
                 continuity_observed = false;
                 let status = match retiring {
-                    Some(retiring) => self.cluster.finish_retire_within(
+                    Retirement::Pending(retiring) => self.cluster.finish_retire_within(
                         &retiring,
                         self.releases.candidate.controller.ecs_stop_timeout()?,
                     ),
-                    None => Err(E2eError::system("missing retiring controller")),
+                    Retirement::Completed(status) => Ok(status),
                 };
                 status.map(|status| {
                     witness.retired = true;
@@ -1601,6 +1751,11 @@ impl Upgrade<'_> {
         let leader = self.cluster.controller_is_leader(promotion.index)?;
         Ok(final_verdict(&VerdictInputs {
             mode: self.releases.mode,
+            protocol: if self.releases.mode == Refresh::ReleaseUpgrade {
+                self.releases.old_fixture.handoff_protocol
+            } else {
+                HandoffProtocol::ReleaseBeforeDrain
+            },
             initial_outcome: &initial.outcome,
             initial_evidence: &initial.evidence,
             initial_attempts: &initial.attempts,
@@ -1893,6 +2048,7 @@ mod tests {
                     client: Duration::ZERO,
                 },
                 mode: Refresh::Candidate,
+                protocol: HandoffProtocol::ReleaseBeforeDrain,
                 drain: &self.drain,
                 status: std::process::ExitStatus::from_raw(0),
                 leader: true,
@@ -1934,11 +2090,7 @@ mod tests {
         assert!(final_verdict(&input).iter().any(Check::is_failure));
         input.drain = &held_drain;
         let mut invalid_refusal = credential_drain();
-        invalid_refusal
-            .credentials
-            .as_mut()
-            .expect("held witness")
-            .refusal = Some((200, false));
+        held_evidence(&mut invalid_refusal).refusal = Some((200, false));
         input.drain = &invalid_refusal;
         assert!(final_verdict(&input).iter().any(Check::is_failure));
         input.drain = &held_drain;
@@ -2025,7 +2177,7 @@ mod tests {
             elapsed: Duration::from_secs(8),
             old_leader_before: true,
             retired: true,
-            credentials: Some(HeldDrainWitness {
+            evidence: Some(DrainEvidence::Held(HeldDrainWitness {
                 started: Duration::from_millis(100),
                 finished: Duration::from_millis(111),
                 deadline: Duration::from_millis(8090),
@@ -2035,9 +2187,71 @@ mod tests {
                 before: state,
                 after: state,
                 owner_rechecked: true,
-            }),
+            })),
             release_started: Some(Duration::from_secs(9)),
             ..DrainWitness::default()
+        }
+    }
+
+    fn held_evidence(drain: &mut DrainWitness) -> &mut HeldDrainWitness {
+        match drain.evidence.as_mut().expect("held witness") {
+            DrainEvidence::Held(witness) => witness,
+            DrainEvidence::DrainFirst(_) => panic!("expected held witness"),
+        }
+    }
+
+    fn drain_first() -> DrainWitness {
+        let state = HeldState {
+            build_unfinished: true,
+            hold_unreleased: true,
+            old_live: true,
+        };
+        DrainWitness {
+            old_leader_before: true,
+            retired: true,
+            release_started: Some(Duration::from_secs(1)),
+            evidence: Some(DrainEvidence::DrainFirst(DrainFirstWitness {
+                before: state,
+                before_release: state,
+                controller_pid: 42,
+                release: Duration::from_secs(1),
+                old_exit: Duration::from_secs(2),
+                promotion: Duration::from_secs(3),
+                authenticated: Duration::from_secs(4),
+            })),
+            ..DrainWitness::default()
+        }
+    }
+
+    #[test]
+    fn drain_first_requires_ordered_real_witness_and_matching_protocol() {
+        let fixture = VerdictFixture::new();
+        let mut input = fixture.inputs();
+        let drain = drain_first();
+        input.protocol = HandoffProtocol::DrainBeforeRelease;
+        input.drain = &drain;
+        assert!(final_verdict(&input).iter().all(Check::is_passed));
+        input.protocol = HandoffProtocol::ReleaseBeforeDrain;
+        assert!(final_verdict(&input).iter().any(Check::is_failure));
+        let mutations: [fn(&mut DrainFirstWitness); 6] = [
+            |w| w.before.old_live = false,
+            |w| w.before_release.hold_unreleased = false,
+            |w| w.controller_pid = 0,
+            |w| w.old_exit = Duration::ZERO,
+            |w| w.promotion = w.release,
+            |w| w.authenticated = w.old_exit,
+        ];
+        for mutate in mutations {
+            let mut drain = drain_first();
+            let Some(DrainEvidence::DrainFirst(witness)) = &mut drain.evidence else {
+                panic!("expected drain-first witness");
+            };
+            mutate(witness);
+            assert!(!drain_credentials_ok(
+                &drain,
+                HandoffProtocol::DrainBeforeRelease,
+                Duration::from_secs(4),
+            ));
         }
     }
 
@@ -2045,10 +2259,22 @@ mod tests {
     fn every_ordinary_plain_refresh_requires_a_prepared_drain_witness() {
         let mut drain = credential_drain();
         let gap = Duration::from_secs(4);
-        assert!(drain_credentials_ok(&drain, true, gap));
-        drain.credentials = None;
-        assert!(!drain_credentials_ok(&drain, true, gap));
-        assert!(drain_credentials_ok(&drain, false, gap));
+        assert!(drain_credentials_ok(
+            &drain,
+            HandoffProtocol::ReleaseBeforeDrain,
+            gap
+        ));
+        assert!(!drain_credentials_ok(
+            &drain,
+            HandoffProtocol::DrainBeforeRelease,
+            gap
+        ));
+        drain.evidence = None;
+        assert!(!drain_credentials_ok(
+            &drain,
+            HandoffProtocol::ReleaseBeforeDrain,
+            gap
+        ));
     }
 
     #[test]
@@ -2064,8 +2290,12 @@ mod tests {
         ];
         for mutate in mutations {
             let mut drain = credential_drain();
-            mutate(drain.credentials.as_mut().expect("credential fixture"));
-            assert!(!drain_credentials_ok(&drain, true, Duration::from_secs(4)));
+            mutate(held_evidence(&mut drain));
+            assert!(!drain_credentials_ok(
+                &drain,
+                HandoffProtocol::ReleaseBeforeDrain,
+                Duration::from_secs(4)
+            ));
         }
     }
 
@@ -2082,8 +2312,12 @@ mod tests {
         ];
         for mutate in mutations {
             let mut drain = credential_drain();
-            mutate(drain.credentials.as_mut().expect("held witness"));
-            assert!(!drain_credentials_ok(&drain, true, Duration::from_secs(4)));
+            mutate(held_evidence(&mut drain));
+            assert!(!drain_credentials_ok(
+                &drain,
+                HandoffProtocol::ReleaseBeforeDrain,
+                Duration::from_secs(4)
+            ));
         }
     }
 
@@ -2092,11 +2326,23 @@ mod tests {
         let mut drain = credential_drain();
         let gap = Duration::from_secs(4);
         drain.elapsed = Duration::ZERO;
-        assert!(drain_credentials_ok(&drain, true, gap));
+        assert!(drain_credentials_ok(
+            &drain,
+            HandoffProtocol::ReleaseBeforeDrain,
+            gap
+        ));
         drain.release_started = None;
-        assert!(!drain_credentials_ok(&drain, true, gap));
+        assert!(!drain_credentials_ok(
+            &drain,
+            HandoffProtocol::ReleaseBeforeDrain,
+            gap
+        ));
         drain.release_started = Some(Duration::from_millis(111));
-        assert!(!drain_credentials_ok(&drain, true, gap));
+        assert!(!drain_credentials_ok(
+            &drain,
+            HandoffProtocol::ReleaseBeforeDrain,
+            gap
+        ));
         assert!(remaining_budget(Instant::now(), Duration::ZERO).is_err());
     }
 }

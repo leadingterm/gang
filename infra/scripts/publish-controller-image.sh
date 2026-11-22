@@ -21,9 +21,14 @@ selection=$(jq -ce '
   elif ($tasks | length) != 1 or ($repos | length) != 1 then error("expected one controller task and repository")
   else
     ($repos[0].values.repository_url) as $repo |
-    ($tasks[0].values.container_definitions | fromjson | map(select(.name == "controller"))) as $containers |
-    if ($repo | type) != "string" or ($containers | length) != 1 then error("unknown controller repository or image")
-    else {repository:$repo, image:$containers[0].image} end
+    ($tasks[0].values.container_definitions) as $definitions |
+    if ($repo | type) != "string" then error("controller repository URL is unknown; first review and apply a targeted bootstrap of aws_ecr_repository.controller")
+    elif ($definitions | type) != "string" then error("controller task container definitions are unknown; create a new reviewed plan after bootstrapping aws_ecr_repository.controller")
+    else
+      ($definitions | fromjson | map(select(.name == "controller"))) as $containers |
+      if ($containers | length) != 1 then error("unknown controller repository or image")
+      else {repository:$repo, image:$containers[0].image} end
+    end
   end
 ' "$plan")
 if [[ $(jq -r '.skip // false' <<<"$selection") == true ]]; then

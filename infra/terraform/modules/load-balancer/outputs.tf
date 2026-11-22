@@ -34,17 +34,17 @@ output "security_group_id" {
 
 output "serve_target_group_arn" {
   description = "ARN of the public serve target group."
-  value       = var.shared_database ? aws_lb_target_group.service[0].arn : aws_lb_target_group.this[0].arn
+  value       = aws_lb_target_group.this.arn
 }
 
 output "internal_serve_target_group_arn" {
   description = "ARN of the internal serve target group, or null when disabled."
-  value       = var.shared_database ? aws_lb_target_group.service_internal["serve"].arn : null
+  value       = var.shared_database ? aws_lb_target_group.internal["serve"].arn : null
 }
 
 output "workers_target_group_arn" {
   description = "ARN of the internal worker target group, or null when disabled."
-  value       = var.shared_database ? aws_lb_target_group.service_internal["workers"].arn : null
+  value       = var.shared_database ? aws_lb_target_group.internal["workers"].arn : null
 }
 
 output "target_groups" {
@@ -52,9 +52,9 @@ output "target_groups" {
   # ECS requires each target group to be associated with a load balancer first.
   depends_on = [aws_lb_listener.this, aws_lb_listener.internal]
   value = var.shared_database ? {
-    serve          = { arn = aws_lb_target_group.service[0].arn, port = var.port }
-    internal_serve = { arn = aws_lb_target_group.service_internal["serve"].arn, port = var.port }
-    workers        = { arn = aws_lb_target_group.service_internal["workers"].arn, port = var.workers_port }
+    serve          = { arn = aws_lb_target_group.this.arn, port = var.port }
+    internal_serve = { arn = aws_lb_target_group.internal["serve"].arn, port = var.port }
+    workers        = { arn = aws_lb_target_group.internal["workers"].arn, port = var.workers_port }
   } : {}
 }
 
@@ -65,13 +65,13 @@ output "internal_dns_name" {
 
 output "health_port" {
   description = "Health listener port checked by the public serve target group."
-  value       = var.shared_database ? tonumber(aws_lb_target_group.service[0].health_check[0].port) : tonumber(aws_lb_target_group.this[0].health_check[0].port)
+  value       = tonumber(aws_lb_target_group.this.health_check[0].port)
 }
 
 output "proxy_protocol_trusted_cidrs" {
   description = "Exact public and internal NLB interface addresses trusted to send PROXY headers."
   # New controllers require the target groups' framing and health-path updates first.
-  depends_on = [aws_lb_target_group.service, aws_lb_target_group.service_internal]
+  depends_on = [aws_lb_target_group.this, aws_lb_target_group.internal]
 
   value = sort(distinct(flatten([
     for eni in concat(values(data.aws_network_interface.public), values(data.aws_network_interface.internal)) :

@@ -472,8 +472,8 @@ mod tests {
                 worker_timeout: Duration::from_secs(10),
             },
             ConfigError::StopTimeoutTooShort {
-                stop_timeout: Duration::from_secs(60),
-                attempt_budget: Duration::from_secs(60),
+                stop_timeout: Duration::from_mins(1),
+                attempt_budget: Duration::from_mins(1),
             },
             ConfigError::HandoverOutlastsCli {
                 window: Duration::from_secs(15),

@@ -38,11 +38,4 @@ if [ -n "${ECS_CONTAINER_METADATA_URI_V4-}" ]; then
     export GANG_CONTROLLER_IDENTITY GANG_CONTROLLER_LAUNCHED_AT
     unset metadata task_arn
 fi
-if [ ! -e /etc/gang/upstream-resolv.conf ]; then
-    cp /etc/resolv.conf /etc/gang/upstream-resolv.conf
-fi
-chmod 0644 /etc/gang/upstream-resolv.conf
-# Keep search domains and resolver options while directing all lookups through the cache.
-{ printf 'nameserver 127.0.0.1\n'; grep -E '^[[:space:]]*(search|domain|options)[[:space:]]' /etc/gang/upstream-resolv.conf || true; } > /etc/resolv.conf
-dnsmasq --listen-address=127.0.0.1 --bind-interfaces --resolv-file=/etc/gang/upstream-resolv.conf --user=gang-dns --group=gang-dns --pid-file=
 exec su-exec 65532:65532 /usr/local/bin/gang server --config /etc/gang/gang.toml

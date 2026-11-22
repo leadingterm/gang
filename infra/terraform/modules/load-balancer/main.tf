@@ -121,15 +121,23 @@ resource "aws_lb" "this" {
 }
 
 resource "aws_lb_target_group" "this" {
-  count = var.shared_database ? 0 : 1
+  name                   = var.name
+  port                   = var.port
+  protocol               = "TLS"
+  target_type            = "instance"
+  vpc_id                 = var.vpc_id
+  preserve_client_ip     = var.shared_database ? "false" : "true"
+  proxy_protocol_v2      = var.shared_database
+  deregistration_delay   = var.shared_database ? var.deregistration_delay : null
+  connection_termination = var.shared_database ? false : null
 
-  name               = var.name
-  port               = var.port
-  protocol           = "TLS"
-  target_type        = "instance"
-  vpc_id             = var.vpc_id
-  preserve_client_ip = "true"
-  proxy_protocol_v2  = false
+  dynamic "target_health_state" {
+    for_each = var.shared_database ? [1] : []
+    content {
+      enable_unhealthy_connection_termination = false
+      unhealthy_draining_interval             = 0
+    }
+  }
 
   # Readiness requires the controller to serve, hold the lease, and accept workers.
   # HTTPS health checks fail against Gang's TLS-1.3-only targets.
@@ -149,46 +157,11 @@ resource "aws_lb_target_group" "this" {
   })
 }
 
-resource "aws_lb_target_group" "service" {
-  count = var.shared_database ? 1 : 0
-
-  name                   = "${substr(var.name, 0, 29)}-ip"
-  port                   = var.port
-  protocol               = "TLS"
-  target_type            = "ip"
-  vpc_id                 = var.vpc_id
-  preserve_client_ip     = "false"
-  proxy_protocol_v2      = true
-  deregistration_delay   = var.deregistration_delay
-  connection_termination = false
-
-  target_health_state {
-    enable_unhealthy_connection_termination = false
-    unhealthy_draining_interval             = 0
-  }
-
-  health_check {
-    protocol            = "HTTP"
-    port                = var.health_port
-    path                = local.health.ready_path
-    matcher             = "200"
-    interval            = local.health.interval_seconds
-    timeout             = local.health.timeout_seconds
-    healthy_threshold   = local.health.threshold
-    unhealthy_threshold = local.health.threshold
-  }
-
-  lifecycle {
-    create_before_destroy = true
-  }
-
-  tags = merge(var.tags, { Name = var.name })
-}
 
 resource "aws_lb_target_group_attachment" "this" {
   count = var.shared_database ? 0 : 1
 
-  target_group_arn = aws_lb_target_group.this[0].arn
+  target_group_arn = aws_lb_target_group.this.arn
   target_id        = var.controller_instance_id
   port             = var.port
 }
@@ -206,7 +179,7 @@ resource "aws_lb_listener" "this" {
 
   default_action {
     type             = "forward"
-    target_group_arn = var.shared_database ? aws_lb_target_group.service[0].arn : aws_lb_target_group.this[0].arn
+    target_group_arn = aws_lb_target_group.this.arn
   }
 
   tags = merge(var.tags, {
@@ -264,10 +237,6 @@ resource "aws_route53_record" "controller" {
   }
 }
 
-moved {
-  from = aws_lb_target_group.this
-  to   = aws_lb_target_group.this[0]
-}
 
 moved {
   from = aws_lb_target_group_attachment.this
@@ -408,13 +377,13 @@ data "aws_network_interface" "internal" {
   }
 }
 
-resource "aws_lb_target_group" "service_internal" {
+resource "aws_lb_target_group" "internal" {
   for_each = local.internal_listeners
 
-  name                   = "${substr(var.name, 0, 19)}-i-${each.key}-ip"
+  name                   = "${substr(var.name, 0, 22)}-i-${each.key}"
   port                   = each.value
   protocol               = "TCP"
-  target_type            = "ip"
+  target_type            = "instance"
   vpc_id                 = var.vpc_id
   preserve_client_ip     = "false"
   proxy_protocol_v2      = true
@@ -437,10 +406,6 @@ resource "aws_lb_target_group" "service_internal" {
     unhealthy_threshold = local.health.threshold
   }
 
-  lifecycle {
-    create_before_destroy = true
-  }
-
   tags = merge(var.tags, { Name = "${var.name}-internal-${each.key}" })
 }
 
@@ -452,7 +417,7 @@ resource "aws_lb_listener" "internal" {
   protocol          = "TCP"
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.service_internal[each.key].arn
+    target_group_arn = aws_lb_target_group.internal[each.key].arn
   }
   tags = merge(var.tags, { Name = "${var.name}-internal-${each.key}" })
 }

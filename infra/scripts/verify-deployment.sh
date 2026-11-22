@@ -16,7 +16,12 @@ task_definition=$(jq -er 'if has("controller_task_definition_arn") then .control
 capacity_asg=$(jq -er 'if has("controller_capacity_asg_name") then .controller_capacity_asg_name // "" else error("missing controller capacity ASG") end' <<<"$gang")
 targets=$(jq -er '.controller_target_group_arns | select(type == "array" and all(.[]; type == "string" and length > 0)) | join("\n")' <<<"$gang")
 workers=$(jq -er '.asg_names | select(type == "array" and all(.[]; type == "string" and length > 0)) | join("\n")' <<<"$gang")
-deadline=$(($(date +%s) + 2400))
+wait_seconds=2400
+if [[ -n $service ]]; then
+  stop_timeout=$(jq -er '.controller_stop_timeout_seconds | select(type == "number" and . > 0 and floor == .)' <<<"$gang") || { echo '::error::invalid controller stop timeout' >&2; exit 1; }
+  if (( stop_timeout + 600 > wait_seconds )); then wait_seconds=$((stop_timeout + 600)); fi
+fi
+deadline=$(($(date +%s) + wait_seconds))
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
 
@@ -112,16 +117,60 @@ if [[ -n $service ]]; then
         fi
         printf '%s\n' "$task_description" >>"$dir/controller-tasks"
       done
-      if controller_ids=$(jq -sec --arg definition "$task_definition" --argjson count "$controller_count" --argjson arns "$(jq -Rsc 'split("\n") | map(select(length > 0)) | sort' <<<"$task_arns")" '
+      if container_instances=$(jq -ser --arg definition "$task_definition" --argjson count "$controller_count" --argjson arns "$(jq -Rsc 'split("\n") | map(select(length > 0)) | sort' <<<"$task_arns")" '
         select(all(.[]; (.failures | type == "array" and length == 0) and (.tasks | type == "array")))
         | [.[].tasks[]] | select(length == $count and ([.[].taskArn] | sort) == $arns)
-        | select(all(.[]; .lastStatus == "RUNNING" and .taskDefinitionArn == $definition))
-        | [.[].attachments[]? | select(.type == "ElasticNetworkInterface" and .status == "ATTACHED") | .details[]? | select(.name == "privateIPv4Address") | .value]
-        | select(length == $count and all(.[]; type == "string" and length > 0) and length == (unique | length)) | sort
-      ' "$dir/controller-tasks"); then break; fi
+        | select(all(.[]; .lastStatus == "RUNNING" and .taskDefinitionArn == $definition and
+            (.healthStatus == null or .healthStatus == "UNKNOWN" or .healthStatus == "HEALTHY")))
+        | [.[].containerInstanceArn]
+        | select(length == $count and all(.[]; type == "string" and length > 0) and length == (unique | length)) | sort | .[]
+      ' "$dir/controller-tasks"); then
+        instance_array=()
+        while IFS= read -r instance_arn; do instance_array+=("$instance_arn"); done <<<"$container_instances"
+        : >"$dir/controller-instances"
+        for ((offset = 0; offset < ${#instance_array[@]}; offset += 100)); do
+          if ! instance_description=$(aws_read "$deadline" --region "$region" ecs describe-container-instances --cluster "$cluster" --container-instances "${instance_array[@]:offset:100}" --output json); then
+            echo '::error::failed to describe controller ECS container instances' >&2; exit 1
+          fi
+          printf '%s\n' "$instance_description" >>"$dir/controller-instances"
+        done
+        if controller_ids=$(jq -sec --argjson count "$controller_count" --argjson arns "$(jq -Rsc 'split("\n") | map(select(length > 0)) | sort' <<<"$container_instances")" '
+          select(all(.[]; (.failures | type == "array" and length == 0) and (.containerInstances | type == "array")))
+          | [.[].containerInstances[]]
+          | select(length == $count and ([.[].containerInstanceArn] | sort) == $arns)
+          | [.[].ec2InstanceId]
+          | select(length == $count and all(.[]; type == "string" and test("^i-[A-Za-z0-9]+$")) and length == (unique | length)) | sort
+        ' "$dir/controller-instances"); then break; fi
+      fi
     fi
     if ! readiness_sleep "$deadline"; then
       echo '::error::controller ECS tasks did not reach current-revision readiness' >&2; exit 1
+    fi
+  done
+  while :; do
+    if ! capacity=$(aws_read "$deadline" --region "$region" autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$capacity_asg" --output json); then
+      echo '::error::failed to describe controller capacity Auto Scaling group' >&2; exit 1
+    fi
+    if jq -e --arg name "$capacity_asg" --argjson ids "$controller_ids" '
+      .AutoScalingGroups | select(type == "array" and length == 1)
+      | .[0] | select(.AutoScalingGroupName == $name)
+      | .LaunchTemplate as $template
+      | select(($template.LaunchTemplateId | type == "string" and length > 0) and
+          ($template.Version | type == "string" and test("^[1-9][0-9]*$")))
+      | .Instances | select(type == "array")
+      | select(all(.[]; (.InstanceId | type == "string" and test("^i-[A-Za-z0-9]+$")) and
+          (.LifecycleState | type == "string" and length > 0)))
+      | select(([.[].InstanceId] | length) == ([.[].InstanceId] | unique | length))
+      | . as $members
+      | select(all(.[]; if (.LifecycleState | startswith("Terminating")) then true else
+          .LaunchTemplate.LaunchTemplateId == $template.LaunchTemplateId and
+          .LaunchTemplate.Version == $template.Version end))
+      | all($ids[]; . as $id | any($members[]; .InstanceId == $id and
+          .LifecycleState == "InService" and .HealthStatus == "Healthy"))
+    ' <<<"$capacity" >/dev/null; then break; fi
+    if ! readiness_sleep "$deadline"; then
+      printf '%s\n' "$capacity" >&2
+      echo '::error::controller capacity did not reach current launch template readiness' >&2; exit 1
     fi
   done
 elif [[ -n $cluster || -n $task_definition || -n $capacity_asg ]]; then
@@ -130,16 +179,33 @@ elif [[ -n $targets ]]; then
   controller_ids=$(jq -ec '[.controller_instance_id | select(type == "string" and length > 0)] | select(length == 1)' <<<"$gang")
 fi
 
+if [[ -n $service && -n $targets ]]; then
+  jq -e 'length == 3 and length == (unique | length)' <<<"$(jq -Rsc 'split("\n") | map(select(length > 0))' <<<"$targets")" >/dev/null || { echo '::error::expected three distinct controller target groups' >&2; exit 1; }
+fi
+
 if [[ -n $targets ]]; then
+  target_index=0
   while IFS= read -r arn; do
+    port=443
+    if (( target_index == 2 )); then port=9090; fi
+    target_index=$((target_index + 1))
+    if ! group=$(aws_read "$deadline" --region "$region" elbv2 describe-target-groups --target-group-arns "$arn" --output json); then
+      echo "::error::failed to describe target group $arn" >&2; exit 1
+    fi
+    if ! jq -e --arg arn "$arn" --argjson port "$port" '
+      .TargetGroups | type == "array" and length == 1 and
+        (.[0] | .TargetGroupArn == $arn and .TargetType == "instance" and .Port == $port)
+    ' <<<"$group" >/dev/null; then
+      echo "::error::unexpected controller target group type or port in $arn" >&2; exit 1
+    fi
     while :; do
       if ! health=$(aws_read "$deadline" --region "$region" elbv2 describe-target-health --target-group-arn "$arn" --output json); then
         echo "::error::failed to describe target health in $arn" >&2; exit 1
       fi
-      if jq -e --argjson ids "$controller_ids" '
+      if jq -e --argjson ids "$controller_ids" --argjson port "$port" '
         .TargetHealthDescriptions | select(type == "array")
         | ([.[].Target.Id] | sort) == $ids
-          and all(.[]; .TargetHealth.State == "healthy")
+          and all(.[]; .Target.Port == $port and .TargetHealth.State == "healthy")
       ' <<<"$health" >/dev/null; then break; fi
       if ! readiness_sleep "$deadline"; then
         printf '%s\n' "$health" >&2

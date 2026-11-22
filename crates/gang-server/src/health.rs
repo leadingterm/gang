@@ -89,10 +89,14 @@ impl Readiness {
     }
 
     pub(crate) fn status(&self, path: &str) -> StatusCode {
-        if path != health_check().ready_path() {
+        let available = if path == health_check().ready_path() {
+            self.ready()
+        } else if path == "/prepared" {
+            self.0.serving.load(Ordering::Acquire)
+        } else {
             return StatusCode::NOT_FOUND;
-        }
-        if self.ready() {
+        };
+        if available {
             StatusCode::OK
         } else {
             StatusCode::SERVICE_UNAVAILABLE
@@ -265,6 +269,28 @@ mod tests {
         }
     }
 
+    struct ProbePeer<const LOOPBACK: bool>(MemoryListener);
+
+    impl<const LOOPBACK: bool> Listener for ProbePeer<LOOPBACK> {
+        type Io = DuplexStream;
+        type Addr = u32;
+
+        async fn accept(&mut self) -> io::Result<(Self::Io, Self::Addr)> {
+            self.0.accept().await
+        }
+
+        fn peer_ip(_: &u32) -> Option<std::net::IpAddr> {
+            Some(
+                if LOOPBACK {
+                    std::net::Ipv4Addr::LOCALHOST
+                } else {
+                    std::net::Ipv4Addr::new(10, 0, 1, 99)
+                }
+                .into(),
+            )
+        }
+    }
+
     fn assert_statuses(readiness: &Readiness, ready: StatusCode) {
         assert_eq!(readiness.status(health_check().ready_path()), ready);
         assert_eq!(readiness.status("/serve"), StatusCode::NOT_FOUND);
@@ -377,20 +403,67 @@ mod tests {
     #[tokio::test]
     async fn listener_serves_lifecycle_statuses() -> gang_testkit::TestResult {
         let (listener, dialer) = memory_listener();
-        let (fence, _keeper) = valid_fence();
-        let readiness = Readiness::default().with_fence(fence);
         let clock = crate::test_support_clock::start();
+        let (fence, keeper) = Fence::lease(clock.clone(), NonZeroDuration::from_secs(1));
+        keeper.extend_to(clock.monotonic() + Duration::from_secs(2));
+        let readiness = Readiness::default().with_fence(fence);
+        let server_readiness = readiness.clone();
+        let server_clock = Arc::clone(&clock);
+        let task = tokio::spawn(async move {
+            serve_health(listener, server_readiness, &*server_clock, limits(4)).await
+        });
+        assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
+        assert_eq!(
+            request(&dialer, "/prepared").await?,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        readiness.serve();
+        assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
+        assert_eq!(request(&dialer, "/prepared").await?, StatusCode::OK);
+        readiness.lead();
+        assert_http(&dialer, StatusCode::OK).await?;
+        assert_eq!(request(&dialer, "/prepared").await?, StatusCode::OK);
+        clock.advance(Duration::from_secs(3));
+        assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
+        assert_eq!(request(&dialer, "/prepared").await?, StatusCode::OK);
+        readiness.stop();
+        assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
+        assert_eq!(
+            request(&dialer, "/prepared").await?,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn never_ready_controller_cannot_report_prepared_or_ready() -> gang_testkit::TestResult {
+        let (listener, dialer) = memory_listener();
+        let clock = crate::test_support_clock::start();
+        let (fence, _keeper) = Fence::lease(clock.clone(), NonZeroDuration::from_secs(1));
+        let readiness = Readiness::default().with_fence(fence);
         let server_readiness = readiness.clone();
         let task = tokio::spawn(async move {
             serve_health(listener, server_readiness, &*clock, limits(4)).await
         });
         assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
-        readiness.serve();
-        assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
+        assert_eq!(
+            request(&dialer, "/prepared").await?,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         readiness.lead();
-        assert_http(&dialer, StatusCode::OK).await?;
-
-        readiness.stop();
+        assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
+        assert_eq!(
+            request(&dialer, "/prepared").await?,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        readiness.serve();
+        let (status, leading) = request_with_leading(dialer.dial(), "/prepared").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            leading.as_ref().and_then(|value| value.to_str().ok()),
+            Some("false")
+        );
         assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
         task.abort();
         Ok(())
@@ -458,17 +531,25 @@ mod tests {
         let task = tokio::spawn(async move {
             serve_health(Trusted(listener), server_readiness, &*clock, limits).await
         });
-        for (step, status) in [
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::OK,
+        for (step, (ready, prepared)) in [
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (StatusCode::SERVICE_UNAVAILABLE, StatusCode::OK),
+            (StatusCode::OK, StatusCode::OK),
         ]
         .into_iter()
         .enumerate()
         {
-            let mut io = dialer.dial();
-            io.write_all(b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0").await?;
-            assert_eq!(request_on(io, health_check().ready_path()).await?, status);
+            for (path, status) in [
+                (health_check().ready_path(), ready),
+                ("/prepared", prepared),
+            ] {
+                let mut io = dialer.dial();
+                io.write_all(b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0").await?;
+                assert_eq!(request_on(io, path).await?, status);
+            }
             if step == 0 {
                 readiness.serve();
             } else if step == 1 {
@@ -486,7 +567,7 @@ mod tests {
             StatusCode::OK
         );
         let mut io = dialer.dial();
-        io.write_all(b"GET / HTTP/1.1\r\n\r\n").await?;
+        io.write_all(b"GET /prepared HTTP/1.1\r\n\r\n").await?;
         let mut byte = [0; 1];
         assert_eq!(io.read(&mut byte).await?, 0);
         let mut invalid = dialer.dial();
@@ -495,6 +576,83 @@ mod tests {
             .await?;
         let mut byte = [0; 1];
         assert_eq!(invalid.read(&mut byte).await?, 0);
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loopback_health_requires_local_proxy_header() -> gang_testkit::TestResult {
+        let (listener, dialer) = memory_listener();
+        let clock = crate::test_support_clock::start();
+        let (fence, _keeper) = valid_fence();
+        let readiness = Readiness::default().with_fence(fence);
+        let server_readiness = readiness.clone();
+        let mut limits = limits(4);
+        limits.proxy_protocol = Some(Arc::new(gang_config::ProxyProtocolConfig {
+            trusted_cidrs: vec!["10.0.1.4/32".parse()?],
+            ..gang_config::ProxyProtocolConfig::default()
+        }));
+        let task = tokio::spawn(async move {
+            serve_health(
+                ProbePeer::<true>(listener),
+                server_readiness,
+                &*clock,
+                limits,
+            )
+            .await
+        });
+        readiness.serve();
+        for (path, expected) in [
+            ("/prepared", StatusCode::OK),
+            (health_check().ready_path(), StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let mut io = dialer.dial();
+            io.write_all(b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0").await?;
+            assert_eq!(request_on(io, path).await?, expected);
+        }
+        readiness.lead();
+        let mut io = dialer.dial();
+        io.write_all(b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0").await?;
+        assert_eq!(
+            request_on(io, health_check().ready_path()).await?,
+            StatusCode::OK
+        );
+
+        for bytes in [
+            &b"\r\n\r\n\0\r\nQUIT\n\x21\x11\0\x0c\xc0\0\x02\x01\xc0\0\x02\x02\0\x01\0\x02"[..],
+            &b"GET /prepared HTTP/1.1\r\n\r\n"[..],
+        ] {
+            let mut io = dialer.dial();
+            io.write_all(bytes).await?;
+            let mut byte = [0; 1];
+            assert_eq!(io.read(&mut byte).await?, 0);
+        }
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn untrusted_remote_health_rejects_local_proxy_header() -> gang_testkit::TestResult {
+        let (listener, dialer) = memory_listener();
+        let clock = crate::test_support_clock::start();
+        let mut limits = limits(4);
+        limits.proxy_protocol = Some(Arc::new(gang_config::ProxyProtocolConfig {
+            trusted_cidrs: vec!["10.0.1.4/32".parse()?],
+            ..gang_config::ProxyProtocolConfig::default()
+        }));
+        let task = tokio::spawn(async move {
+            serve_health(
+                ProbePeer::<false>(listener),
+                Readiness::default(),
+                &*clock,
+                limits,
+            )
+            .await
+        });
+        let mut io = dialer.dial();
+        io.write_all(b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0").await?;
+        let mut byte = [0; 1];
+        assert_eq!(io.read(&mut byte).await?, 0);
         task.abort();
         Ok(())
     }
@@ -642,9 +800,14 @@ mod tests {
         let exercise = async {
             snapshots.reached(1).await;
             assert_http(&dialer, StatusCode::OK).await?;
+            assert_eq!(request(&dialer, "/prepared").await?, StatusCode::OK);
             stop.send(()).expect("server is running");
             drains.reached(1).await;
             assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
+            assert_eq!(
+                request(&dialer, "/prepared").await?,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
             release.send(()).expect("controller is draining");
             handles.clock.advance(
                 crate::test_support::plain_settings()
@@ -702,6 +865,7 @@ mod tests {
         let exercise = async {
             readiness.await?;
             assert_http(&dialer, StatusCode::SERVICE_UNAVAILABLE).await?;
+            assert_eq!(request(&dialer, "/prepared").await?, StatusCode::OK);
             stop.send(()).expect("server is running");
             gang_testkit::TestResult::Ok(())
         };

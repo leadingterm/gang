@@ -189,13 +189,7 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
                 worker_timeout: server.worker_timeout.get(),
             });
         }
-        let attempt_budget = worker.attempt_budget(actions.timeout);
-        if attempt_budget >= server.stop_timeout.get() {
-            return Err(ConfigError::StopTimeoutTooShort {
-                stop_timeout: server.stop_timeout.get(),
-                attempt_budget,
-            });
-        }
+        Self::check_stop_timeout(&worker, &actions, &server)?;
         if let Some(name) = identity.providers.keys().find(|name| name.is_anonymous()) {
             return Err(ConfigError::ReservedProviderName(name.clone()));
         }
@@ -234,6 +228,21 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             sandbox,
             limits,
         })
+    }
+
+    fn check_stop_timeout(
+        worker: &WorkerConfig,
+        actions: &ActionsConfig,
+        server: &ServerConfig,
+    ) -> Result<(), ConfigError> {
+        let attempt_budget = worker.attempt_budget(actions.timeout);
+        if attempt_budget >= server.stop_timeout.get() {
+            return Err(ConfigError::StopTimeoutTooShort {
+                stop_timeout: server.stop_timeout.get(),
+                attempt_budget,
+            });
+        }
+        Ok(())
     }
 
     fn check_actions(fleets: &Fleets<P>, actions: &ActionsConfig) -> Result<(), ConfigError> {

@@ -405,7 +405,11 @@ async fn assert_completed_yield_waits_for_shutdown(with_attempt: bool) -> TestRe
     ));
     assert!(futures::poll!(first.as_mut()).is_pending());
     assert!(old_state.is_leading());
-    let original = old.scheduler.controller().await.ok_or("controller missing")?;
+    let original = old
+        .scheduler
+        .controller()
+        .await
+        .ok_or("controller missing")?;
     if with_attempt {
         seed_owned_attempt(&old)?;
     }
@@ -447,7 +451,10 @@ async fn assert_completed_yield_waits_for_shutdown(with_attempt: bool) -> TestRe
     second.await?;
     old.clock.advance(stop_timeout);
     assert!(futures::poll!(first.as_mut()).is_pending());
-    assert!(!old_state.is_leading(), "yield must never reacquire authority");
+    assert!(
+        !old_state.is_leading(),
+        "yield must never reacquire authority"
+    );
     assert_eq!(old.scheduler.controller_runs().get(), 1);
     stop_old
         .send(())

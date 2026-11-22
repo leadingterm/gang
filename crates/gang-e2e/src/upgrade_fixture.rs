@@ -7,8 +7,16 @@ use serde::Deserialize;
 
 use crate::errors::{E2eError, Result};
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HandoffProtocol {
+    DrainBeforeRelease,
+    ReleaseBeforeDrain,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReleaseFixture {
+    pub(crate) handoff_protocol: HandoffProtocol,
     pub(crate) gang_toml: String,
     pub(crate) local_config: String,
     pub(crate) public: FrontendPlan,
@@ -96,8 +104,8 @@ impl ControllerPlan {
             || self.instances != 1
             || self.min_healthy_percentage != 100
             || self.max_healthy_percentage != 200
-            || self.network_mode.as_deref() != Some("awsvpc")
-            || self.target_type.as_deref() != Some("ip")
+            || self.network_mode.as_deref() != Some("host")
+            || self.target_type.as_deref() != Some("instance")
             || self.circuit_breaker_enable != Some(true)
             || self.circuit_breaker_rollback != Some(true)
             || !image_valid
@@ -171,6 +179,7 @@ mod tests {
             "generations_retained": false
         });
         json!({
+            "handoff_protocol": "release_before_drain",
             "gang_toml": "rendered",
             "local_config": "local",
             "public": frontend,
@@ -186,6 +195,34 @@ mod tests {
                 "deregistration_delay_seconds": 300
             }
         })
+    }
+
+    #[test]
+    fn handoff_protocol_is_required_and_explicit() {
+        for (value, expected) in [
+            ("drain_before_release", HandoffProtocol::DrainBeforeRelease),
+            ("release_before_drain", HandoffProtocol::ReleaseBeforeDrain),
+        ] {
+            let mut input = fixture();
+            input["handoff_protocol"] = json!(value);
+            assert_eq!(
+                serde_json::from_value::<ReleaseFixture>(input)
+                    .expect("fixture")
+                    .handoff_protocol,
+                expected
+            );
+        }
+        let mut missing = fixture();
+        missing
+            .as_object_mut()
+            .expect("fixture")
+            .remove("handoff_protocol");
+        assert!(serde_json::from_value::<ReleaseFixture>(missing).is_err());
+        for value in [json!(null), json!("unknown")] {
+            let mut invalid = fixture();
+            invalid["handoff_protocol"] = value;
+            assert!(serde_json::from_value::<ReleaseFixture>(invalid).is_err());
+        }
     }
 
     #[test]
@@ -208,8 +245,8 @@ mod tests {
         value["controller"]["mode"] = json!("ecs");
         value["controller"]["stop_timeout_seconds"] = json!(2460);
         value["controller"]["image"] = json!(format!("example.com/gang@sha256:{}", "a".repeat(64)));
-        value["controller"]["network_mode"] = json!("awsvpc");
-        value["controller"]["target_type"] = json!("ip");
+        value["controller"]["network_mode"] = json!("host");
+        value["controller"]["target_type"] = json!("instance");
         value["controller"]["circuit_breaker_enable"] = json!(true);
         value["controller"]["circuit_breaker_rollback"] = json!(true);
         let parsed: ReleaseFixture = serde_json::from_value(value.clone()).expect("ECS fixture");
@@ -225,8 +262,8 @@ mod tests {
             ("mode", json!("asg")),
             ("stop_timeout_seconds", json!(0)),
             ("image", json!("example.com/gang:latest")),
-            ("network_mode", json!("bridge")),
-            ("target_type", json!("instance")),
+            ("network_mode", json!("awsvpc")),
+            ("target_type", json!("ip")),
             ("circuit_breaker_enable", json!(false)),
             ("circuit_breaker_rollback", json!(false)),
         ] {

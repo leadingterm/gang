@@ -111,15 +111,25 @@ fn held_attempts(journal: &Journal, run: &Run, attempts: &mut Attempts) -> Resul
         .count())
 }
 
-fn server_stop_timeout(config: &str) -> Result<Duration> {
+fn server_config(config: &str) -> Result<gang_config::ServerConfig> {
     let document: toml::Value = toml::from_str(config).map_err(crate::template::template_error)?;
-    let server: gang_config::ServerConfig = document
+    document
         .get("server")
         .cloned()
         .ok_or_else(|| E2eError::system("missing controller server configuration"))?
         .try_into()
-        .map_err(crate::template::template_error)?;
-    Ok(server.stop_timeout.get())
+        .map_err(crate::template::template_error)
+}
+
+fn idle_client_interval(limits: &gang_config::RateLimitConfig) -> Duration {
+    // All clients share a source address; reserve half the tighter sustained budget.
+    limits
+        .client
+        .refill_interval
+        .get()
+        .max(limits.global.refill_interval.get())
+        .saturating_mul(u32::try_from(IDLE_CLIENTS).expect("four idle clients fit in u32"))
+        .saturating_mul(2)
 }
 
 fn observe_stable_host_priority(cluster: &Cluster<'_>) -> Result<()> {
@@ -138,7 +148,8 @@ fn observe_stable_host_priority(cluster: &Cluster<'_>) -> Result<()> {
 fn idle_client_requests(
     cluster: &Cluster<'_>,
     stop: &AtomicBool,
-    ready: mpsc::Sender<()>,
+    ready: &mpsc::Sender<()>,
+    interval: Duration,
 ) -> Result<usize> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -171,6 +182,9 @@ fn idle_client_requests(
         if finishing {
             return Ok(completed);
         }
+        // Test-traffic pacing only, not a handover wait or retry. An unpark permit also
+        // makes a stop signalled before this park advance immediately to the final request.
+        std::thread::park_timeout(interval);
     }
 }
 
@@ -185,7 +199,9 @@ fn idle_replacement(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
     let original_pid = cluster.suppress_controller_restart(old)?;
     let config = fs::read_to_string(cluster.release_config_path(old)?)
         .map_err(E2eError::io("reading idle controller configuration"))?;
-    let stop_timeout = server_stop_timeout(&config)?;
+    let config = server_config(&config)?;
+    let stop_timeout = config.stop_timeout.get();
+    let interval = idle_client_interval(&config.rate_limit);
     let stop = AtomicBool::new(false);
     let completed = std::thread::scope(|scope| -> Result<usize> {
         let (ready, receivers) = mpsc::channel();
@@ -194,7 +210,7 @@ fn idle_replacement(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
                 let ready = ready.clone();
                 let stop = &stop;
                 scope.spawn(move || {
-                    let result = idle_client_requests(cluster, stop, ready);
+                    let result = idle_client_requests(cluster, stop, &ready, interval);
                     if result.is_err() {
                         stop.store(true, Ordering::Release);
                     }
@@ -227,6 +243,9 @@ fn idle_replacement(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
             Ok(())
         })();
         stop.store(true, Ordering::Release);
+        for client in &clients {
+            client.thread().unpark();
+        }
         let mut completed = 0;
         let mut client_error = None;
         for client in clients {
@@ -279,7 +298,7 @@ fn replace_controllers(
     let initial_leader = cluster.wait_for_leader()?;
     let config = fs::read_to_string(cluster.release_config_path(initial_leader)?)
         .map_err(E2eError::io("reading original controller configuration"))?;
-    let stop_timeout = server_stop_timeout(&config)?;
+    let stop_timeout = server_config(&config)?.stop_timeout.get();
     let original_holder = cluster.controller_identity(initial_leader)?;
     let original_attempts: BTreeMap<_, _> = attempts
         .iter()
@@ -410,17 +429,41 @@ mod tests {
 
     #[test]
     fn stop_budget_comes_from_rendered_server_configuration() {
-        let default = server_stop_timeout("[server]\ntransport = 'plaintext'\n")
-            .expect("default server configuration");
+        let default = server_config("[server]\ntransport = 'plaintext'\n")
+            .expect("default server configuration")
+            .stop_timeout
+            .get();
         let configured =
-            server_stop_timeout("[server]\ntransport = 'plaintext'\nstop_timeout = '43m'\n")
-                .expect("configured stop timeout");
+            server_config("[server]\ntransport = 'plaintext'\nstop_timeout = '43m'\n")
+                .expect("configured stop timeout")
+                .stop_timeout
+                .get();
         assert_eq!(configured, Duration::from_mins(43));
         assert_ne!(default, configured);
         assert!(
-            server_stop_timeout("[server]\ntransport = 'plaintext'\nstop_timeout = '0s'\n")
+            server_config("[server]\ntransport = 'plaintext'\nstop_timeout = '0s'\n")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn idle_client_cadence_reserves_half_of_both_installed_budgets() {
+        assert_eq!(
+            idle_client_interval(&gang_config::RateLimitConfig::default()),
+            Duration::from_secs(16),
+        );
+        for (client, global, expected) in [("3s", "1s", 24), ("1s", "5s", 40)] {
+            let configuration = format!(
+                "[server]\ntransport = 'plaintext'\n\
+                 [server.rate_limit.client]\nburst = 30\nrefill_interval = '{client}'\n\
+                 [server.rate_limit.global]\nburst = 500\nrefill_interval = '{global}'\n"
+            );
+            let config = server_config(&configuration).expect("installed rate limits");
+            assert_eq!(
+                idle_client_interval(&config.rate_limit),
+                Duration::from_secs(expected),
+            );
+        }
     }
 
     #[test]

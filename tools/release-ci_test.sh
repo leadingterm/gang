@@ -176,18 +176,11 @@ done
 mkdir -p "$scratch/bin" "$scratch/etc/gang"
 entrypoint=$(<"$script_dir/../infra/container/entrypoint.sh")
 gang_dir=/etc/gang
-resolv_conf=/etc/resolv.conf
 entrypoint=${entrypoint//"$gang_dir"/"$scratch/etc/gang"}
-entrypoint=${entrypoint//"$resolv_conf"/"$scratch/etc/resolv.conf"}
 printf '%s\n' "$entrypoint" >"$scratch/entrypoint.sh"
 cat >"$scratch/bin/chown" <<'EOF'
 #!/bin/sh
 exit 0
-EOF
-cat >"$scratch/bin/dnsmasq" <<'EOF'
-#!/bin/sh
-[ -z "${GANG_CONFIG+x}${GANG_SECRET_0+x}${GANG_SECRET_1+x}${GANG_SECRET_FILES+x}" ] || exit 1
-printf '%s\n' "$@" > "$TRACE_DNS"
 EOF
 cat >"$scratch/bin/su-exec" <<'EOF'
 #!/bin/sh
@@ -202,7 +195,7 @@ cat >"$scratch/bin/wget" <<'EOF'
 printf '%s' "$METADATA_RESPONSE"
 EOF
 chmod +x "$scratch/bin/"*
-export PATH="$scratch/bin:$PATH" TRACE_DNS="$scratch/dns" TRACE_EXEC="$scratch/exec" TRACE_IDENTITY="$scratch/identity" TRACE_LAUNCHED="$scratch/launched"
+export PATH="$scratch/bin:$PATH" TRACE_EXEC="$scratch/exec" TRACE_IDENTITY="$scratch/identity" TRACE_LAUNCHED="$scratch/launched"
 unset ECS_CONTAINER_METADATA_URI_V4 GANG_CONTROLLER_IDENTITY GANG_CONTROLLER_LAUNCHED_AT
 printf 'nameserver 10.0.0.2\nsearch internal\n' >"$scratch/etc/resolv.conf"
 export GANG_CONFIG=$'config contents\n' GANG_SECRET_FILES=$'0=database-password\n1=token' GANG_SECRET_0=$'password\n\n' GANG_SECRET_1='token value'
@@ -216,14 +209,9 @@ cmp "$scratch/expected-secret" "$scratch/etc/gang/secrets/database-password"
 [[ $(stat -c %a "$scratch/etc/gang/secrets/token") == 600 ]]
 [[ $(stat -c %a "$scratch/etc/gang") == 755 ]]
 [[ $(stat -c %a "$scratch/etc/gang/secrets") == 700 ]]
-[[ $(stat -c %a "$scratch/etc/gang/upstream-resolv.conf") == 644 ]]
-[[ $(<"$scratch/etc/gang/upstream-resolv.conf") == $'nameserver 10.0.0.2\nsearch internal' ]]
-[[ $(<"$scratch/etc/resolv.conf") == $'nameserver 127.0.0.1\nsearch internal' ]]
 [[ $(<"$TRACE_EXEC") == $'65532:65532\n/usr/local/bin/gang\nserver\n--config\n'"$scratch/etc/gang/gang.toml" ]]
-grep -Fx -- "--resolv-file=$scratch/etc/gang/upstream-resolv.conf" "$TRACE_DNS" >/dev/null
-grep -Fx -- '--user=gang-dns' "$TRACE_DNS" >/dev/null
-grep -Fx -- '--group=gang-dns' "$TRACE_DNS" >/dev/null
-grep -Fx -- '--pid-file=' "$TRACE_DNS" >/dev/null
+[[ $(<"$scratch/etc/resolv.conf") == $'nameserver 10.0.0.2\nsearch internal' ]]
+[[ ! -e "$scratch/etc/gang/upstream-resolv.conf" ]]
 ((cases += 1))
 for bad in '../escape' '.' 'bad/name' 'bad name'; do
   export GANG_SECRET_FILES="0=$bad"
@@ -241,15 +229,9 @@ expected_identity=${expected_identity%% *}
 sh "$scratch/entrypoint.sh"
 [[ $(<"$TRACE_IDENTITY") == "$expected_identity" ]]
 [[ $(<"$TRACE_LAUNCHED") == '2026-11-22T12:34:56.123Z' ]]
-chmod 0600 "$scratch/etc/gang/upstream-resolv.conf"
 sh "$scratch/entrypoint.sh"
 [[ $(<"$TRACE_IDENTITY") == "$expected_identity" ]]
 [[ $(<"$TRACE_LAUNCHED") == '2026-11-22T12:34:56.123Z' ]]
-[[ $(<"$scratch/etc/gang/upstream-resolv.conf") == $'nameserver 10.0.0.2\nsearch internal' ]]
-[[ $(stat -c %a "$scratch/etc/gang/upstream-resolv.conf") == 644 ]]
-[[ $(<"$scratch/etc/resolv.conf") == $'nameserver 127.0.0.1\nsearch internal' ]]
-grep -Fx -- '--user=gang-dns' "$TRACE_DNS" >/dev/null
-grep -Fx -- '--group=gang-dns' "$TRACE_DNS" >/dev/null
 ((cases += 1))
 responses=(
   '{}'

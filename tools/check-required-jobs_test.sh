@@ -247,7 +247,7 @@ expect_local_selections() {
     | split($total_expr) | join($total)
   ')
   cases=$((cases + 1))
-  if actual=$(bash "$local_gate/tools/gate.sh" --list-e2e 2>"$scratch/local-error"); then
+  if actual=$(env -u GANG_CONTROLLER_BINARY bash "$local_gate/tools/gate.sh" --list-e2e 2>"$scratch/local-error"); then
     if [[ $actual != "$expected" ]]; then fail "$description: local selections differ from CI"; fi
   else
     fail "$description: list failed: $(cat "$scratch/local-error")"
@@ -289,6 +289,35 @@ done
 cases=$((cases + 1))
 if [[ -e $local_gate/tools/lint-called ]]; then fail 'list and invalid arguments must not invoke lint'; fi
 
+# Normal mode rejects a missing or unreadable controller before invoking lint.
+cases=$((cases + 1))
+if env -u GANG_CONTROLLER_BINARY bash "$local_gate/tools/gate.sh" >"$scratch/output" 2>&1; then
+  fail 'normal local gate must reject an unset controller binary'
+elif ! grep -q 'GANG_CONTROLLER_BINARY' "$scratch/output"; then
+  fail 'missing controller binary must produce an actionable diagnostic'
+fi
+for binary in '' "$scratch/nonexistent-controller" "$scratch"; do
+  cases=$((cases + 1))
+  if GANG_CONTROLLER_BINARY="$binary" bash "$local_gate/tools/gate.sh" >"$scratch/output" 2>&1; then
+    fail "normal local gate must reject invalid controller binary: $binary"
+  elif ! grep -q 'GANG_CONTROLLER_BINARY' "$scratch/output"; then
+    fail 'invalid controller binary must produce an actionable diagnostic'
+  fi
+done
+touch "$scratch/unreadable-controller"
+chmod 000 "$scratch/unreadable-controller"
+if [[ ! -r $scratch/unreadable-controller ]]; then
+  cases=$((cases + 1))
+  if GANG_CONTROLLER_BINARY="$scratch/unreadable-controller" bash "$local_gate/tools/gate.sh" >"$scratch/output" 2>&1; then
+    fail 'normal local gate must reject an unreadable controller binary'
+  elif ! grep -q 'GANG_CONTROLLER_BINARY' "$scratch/output"; then
+    fail 'unreadable controller binary must produce an actionable diagnostic'
+  fi
+fi
+cases=$((cases + 1))
+if [[ -e $local_gate/tools/lint-called ]]; then fail 'invalid controller binary must not invoke lint'; fi
+touch "$scratch/controller"
+
 # Substitute only the heavyweight tools so the real normal-mode dispatch can run.
 cat >"$local_gate/tools/lint.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -322,7 +351,7 @@ shift 2
 EOF
 chmod +x "$local_gate/tools/lint.sh" "$local_gate/tools/ci-targets.sh" "$local_gate/tools/bazel" "$local_gate/tools/e2e-gate.sh"
 cases=$((cases + 1))
-if BAZEL="$local_gate/tools/bazel" bash "$local_gate/tools/gate.sh" >"$scratch/output" 2>&1; then
+if GANG_CONTROLLER_BINARY="$scratch/controller" BAZEL="$local_gate/tools/bazel" bash "$local_gate/tools/gate.sh" >"$scratch/output" 2>&1; then
   calls=$(cat "$local_gate/tools/e2e-calls")
   if [[ $calls != "$ci_selections" ]]; then
     fail 'normal local gate calls must match CI'

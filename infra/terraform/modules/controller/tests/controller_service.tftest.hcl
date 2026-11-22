@@ -15,7 +15,6 @@ mock_provider "aws" {
   mock_data "aws_ec2_instance_type" { defaults = { supported_architectures = ["arm64"], boot_modes = ["uefi"], burstable_performance_supported = true } }
   mock_data "aws_ami" { defaults = { id = "ami-0123456789abcdef0", root_device_name = "/dev/xvda" } }
   mock_data "aws_ssm_parameter" { defaults = { value = "ami-0123456789abcdef0" } }
-  mock_data "aws_security_group" { defaults = { vpc_id = "vpc-0123456789abcdef0" } }
 }
 
 variables {
@@ -43,8 +42,8 @@ variables {
 run "rolling_service_and_network" {
   command = plan
   assert {
-    condition     = aws_ecs_service.controller[0].deployment_minimum_healthy_percent == 100 && aws_ecs_service.controller[0].deployment_maximum_percent == 200 && aws_ecs_service.controller[0].deployment_circuit_breaker[0].enable && aws_ecs_service.controller[0].deployment_circuit_breaker[0].rollback && aws_ecs_service.controller[0].wait_for_steady_state
-    error_message = "Rolling deployment must preserve serving capacity and roll back failures."
+    condition     = aws_ecs_service.controller[0].deployment_minimum_healthy_percent == 100 && aws_ecs_service.controller[0].deployment_maximum_percent == 200 && aws_ecs_service.controller[0].deployment_circuit_breaker[0].enable && aws_ecs_service.controller[0].deployment_circuit_breaker[0].rollback && !aws_ecs_service.controller[0].wait_for_steady_state
+    error_message = "Rolling deployments must preserve capacity and roll back failures without blocking the external migration stop."
   }
   assert {
     condition     = aws_ecs_service.controller[0].health_check_grace_period_seconds == 300 && aws_ecs_service.controller[0].health_check_grace_period_seconds > jsondecode(file("${path.module}/../load-balancer/health-check.json")).interval_seconds * jsondecode(file("${path.module}/../load-balancer/health-check.json")).threshold
@@ -56,7 +55,7 @@ run "rolling_service_and_network" {
   }
   assert {
     condition     = aws_ecs_service.controller[0].timeouts.update == "3060s" && aws_ecs_service.controller[0].timeouts.delete == "3060s"
-    error_message = "Service wait and deletion timeouts must cover the configured stop budget and platform margin."
+    error_message = "Service operation timeouts must cover the configured stop budget and platform margin."
   }
   assert {
     condition     = aws_ecr_repository.controller[0].image_tag_mutability == "IMMUTABLE" && aws_ecr_repository.controller[0].encryption_configuration[0].encryption_type == "AES256" && aws_ecr_repository.controller[0].image_scanning_configuration[0].scan_on_push
@@ -67,29 +66,69 @@ run "rolling_service_and_network" {
     error_message = "The task must pull the pinned digest from the private repository."
   }
   assert {
-    condition     = aws_autoscaling_group.capacity[0].min_size == 1 && aws_autoscaling_group.capacity[0].max_size == 1 && aws_autoscaling_group.capacity[0].desired_capacity == 1 && aws_ecs_service.controller[0].desired_count == 1
-    error_message = "Capacity and service must run one controller."
+    condition     = aws_autoscaling_group.capacity[0].min_size == 1 && aws_autoscaling_group.capacity[0].max_size == 2 && aws_autoscaling_group.capacity[0].desired_capacity == 1 && aws_autoscaling_group.capacity[0].protect_from_scale_in && aws_ecs_service.controller[0].desired_count == 1
+    error_message = "Capacity must allow one protected replacement host for the single controller."
   }
   assert {
-    condition     = aws_ecs_task_definition.controller[0].network_mode == "awsvpc" && toset([for lb in aws_ecs_service.controller[0].load_balancer : "${lb.target_group_arn}:${lb.container_port}"]) == toset([for group in values(var.target_groups) : "${group.arn}:${group.port}"])
-    error_message = "Every IP target group must attach to its configured task port."
+    condition     = aws_autoscaling_group.capacity[0].launch_template[0].version == tostring(aws_launch_template.capacity[0].latest_version) && aws_autoscaling_group.capacity[0].instance_refresh[0].strategy == "Rolling" && aws_autoscaling_group.capacity[0].instance_refresh[0].preferences[0].min_healthy_percentage == 100 && aws_autoscaling_group.capacity[0].instance_refresh[0].preferences[0].max_healthy_percentage == 200 && aws_autoscaling_group.capacity[0].instance_refresh[0].preferences[0].scale_in_protected_instances == "Refresh" && aws_autoscaling_group.capacity[0].instance_refresh[0].preferences[0].skip_matching
+    error_message = "Launch template changes must refresh protected hosts with replacement capacity and skip matching instances."
   }
   assert {
-    condition     = toset([for p in jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].portMappings : p.containerPort]) == toset([443, 8080, 9090]) && jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].stopTimeout == 2460
-    error_message = "Tasks must expose service and health ports and honor the configured stop budget."
+    condition     = aws_ecs_capacity_provider.controller[0].auto_scaling_group_provider[0].managed_termination_protection == "ENABLED" && aws_ecs_capacity_provider.controller[0].auto_scaling_group_provider[0].managed_draining == "ENABLED" && aws_ecs_capacity_provider.controller[0].auto_scaling_group_provider[0].managed_scaling[0].status == "ENABLED" && aws_ecs_capacity_provider.controller[0].auto_scaling_group_provider[0].managed_scaling[0].target_capacity == 100 && aws_ecs_capacity_provider.controller[0].auto_scaling_group_provider[0].managed_scaling[0].minimum_scaling_step_size == 1 && aws_ecs_capacity_provider.controller[0].auto_scaling_group_provider[0].managed_scaling[0].maximum_scaling_step_size == 1
+    error_message = "ECS must manage one-host scaling steps and protect and drain task hosts."
+  }
+  assert {
+    condition     = aws_ecs_task_definition.controller[0].network_mode == "host" && length(aws_ecs_service.controller[0].network_configuration) == 0 && toset([for lb in aws_ecs_service.controller[0].load_balancer : "${lb.target_group_arn}:${lb.container_port}"]) == toset([for group in values(var.target_groups) : "${group.arn}:${group.port}"])
+    error_message = "Host-mode tasks must attach each existing instance target group to its configured port."
+  }
+  assert {
+    condition     = toset([for p in jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].portMappings : p.containerPort]) == toset([443, 8080, 9090]) && alltrue([for p in jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].portMappings : p.containerPort == p.hostPort && p.protocol == "tcp"]) && jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].stopTimeout == 2460
+    error_message = "Tasks must reserve fixed host ports and honor the configured stop budget."
   }
   assert {
     condition     = !contains(keys(jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0]), "healthCheck")
     error_message = "Readiness must be checked through the NLB, not an untrusted loopback probe."
   }
   assert {
-    condition     = strcontains(base64decode(aws_launch_template.capacity[0].user_data), "ECS_CONTAINER_STOP_TIMEOUT=2460s") && strcontains(base64decode(aws_launch_template.capacity[0].user_data), "ECS_RESERVED_MEMORY=512") && aws_launch_template.capacity[0].metadata_options[0].http_tokens == "required" && length(aws_security_group.capacity[0].ingress) == 0
-    error_message = "Capacity hosts must reserve memory, honor stop budget, require IMDSv2 and expose no application ingress."
+    condition     = strcontains(base64decode(aws_launch_template.capacity[0].user_data), "ECS_CONTAINER_STOP_TIMEOUT=2460s") && strcontains(base64decode(aws_launch_template.capacity[0].user_data), "ECS_RESERVED_MEMORY=512") && strcontains(base64decode(aws_launch_template.capacity[0].user_data), "ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST=true") && aws_launch_template.capacity[0].metadata_options[0].http_tokens == "required" && toset(aws_launch_template.capacity[0].vpc_security_group_ids) == toset([var.security_group_id])
+    error_message = "Capacity hosts must use the controller security group, reserve memory, honor the stop budget and require IMDSv2."
+  }
+  assert {
+    condition     = strcontains(file("${path.module}/ecs.tf"), "ignore_changes = [desired_capacity]") && !strcontains(file("${path.module}/ecs.tf"), "target_group_arns")
+    error_message = "ECS owns capacity desired count and only task hosts may register in target groups."
+  }
+  assert {
+    condition     = alltrue([for source in fileset(path.module, "*.tf") : !strcontains(file("${path.module}/${source}"), "resource \"aws_iam_service_linked_role\"") && !strcontains(file("${path.module}/${source}"), "data \"aws_iam_role\"")])
+    error_message = "The ECS service-linked role must remain an unmanaged prerequisite."
   }
 }
 
 run "secrets_and_roles" {
-  command = plan
+  command = apply
+  assert {
+    condition     = aws_iam_role_policy.ecs_host[0].role == aws_iam_role.ecs_host[0].id && aws_iam_role_policy.execution[0].role == aws_iam_role.execution[0].id && aws_ecs_task_definition.controller[0].task_role_arn == module.instance_role.role_arn
+    error_message = "Inline host and execution permissions must remain separate from the task application role."
+  }
+  assert {
+    condition     = aws_iam_role_policy_attachments_exclusive.ecs_host[0].role_name == aws_iam_role.ecs_host[0].name && length(aws_iam_role_policy_attachments_exclusive.ecs_host[0].policy_arns) == 0 && aws_iam_role_policy_attachments_exclusive.execution[0].role_name == aws_iam_role.execution[0].name && length(aws_iam_role_policy_attachments_exclusive.execution[0].policy_arns) == 0
+    error_message = "Neither host nor execution role may retain managed-policy attachments."
+  }
+  assert {
+    condition     = [for e in jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].environment : e.value if e.name == "AWS_EC2_METADATA_DISABLED"] == ["true"]
+    error_message = "The application SDK must not fall back to host instance credentials."
+  }
+  assert {
+    condition     = length([for s in data.aws_iam_policy_document.ecs_host.statement : s if s.sid == "SsmCore" && contains(s.actions, "ssm:UpdateInstanceInformation") && contains(s.actions, "ssmmessages:OpenControlChannel") && !anytrue([for a in s.actions : startswith(a, "ssm:GetParameter")])]) == 1 && length([for s in data.aws_iam_policy_document.ecs_host.statement : s if s.sid == "EcsAgent" && contains(s.actions, "ecs:RegisterContainerInstance") && !contains(s.actions, "ecs:CreateCluster")]) == 1
+    error_message = "Host permissions must support SSM and ECS registration without parameter reads or cluster creation."
+  }
+  assert {
+    condition     = length([for s in data.aws_iam_policy_document.ecs_host.statement : s if s.sid == "TagEcsRegistration" && contains(s.actions, "ecs:TagResource") && anytrue([for c in s.condition : c.variable == "ecs:CreateAction" && contains(c.values, "RegisterContainerInstance")])]) == 1 && length([for s in data.aws_iam_policy_document.ecs_host.statement : s if s.sid == "ListEcsTags" && contains(s.actions, "ecs:ListTagsForResource") && length(s.resources) == 2]) == 1
+    error_message = "ECS registration tagging and tag reads must use scoped permissions."
+  }
+  assert {
+    condition     = length([for s in data.aws_iam_policy_document.execution[0].statement : s if s.sid == "PullControllerImage" && s.resources == toset([aws_ecr_repository.controller[0].arn]) && contains(s.actions, "ecr:BatchGetImage")]) == 1 && length([for s in data.aws_iam_policy_document.execution[0].statement : s if s.sid == "WriteControllerLogs" && s.resources == toset(["${aws_cloudwatch_log_group.controller[0].arn}:*"]) && contains(s.actions, "logs:PutLogEvents")]) == 1
+    error_message = "Execution permissions must scope image pulls and log writes to the controller resources."
+  }
   assert {
     condition     = toset([for s in data.aws_iam_policy_document.execution_secrets.statement : s.resources if s.sid == "ReadParameters"][0]) == toset(concat(var.config_parameter_arns, local.secret_parameter_arns)) && contains([for s in data.aws_iam_policy_document.execution_secrets.statement : s.sid], "DecryptSecrets")
     error_message = "Execution role must read only configured parameters and decrypt the supplied key."
@@ -99,8 +138,8 @@ run "secrets_and_roles" {
     error_message = "Secret filenames and injected values must share deterministic order."
   }
   assert {
-    condition     = one(jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].systemControls).namespace == "net.ipv4.ip_unprivileged_port_start" && one(jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].systemControls).value == "0"
-    error_message = "The unprivileged controller must be able to bind port 443 in its task namespace."
+    condition     = !contains(keys(jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0]), "systemControls") && toset(jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].dnsServers) == toset(["127.0.0.1"])
+    error_message = "Host-mode tasks must use host DNS and must not set network namespace sysctls."
   }
   assert {
     condition     = length([for s in data.aws_iam_policy_document.this.statement : s if s.sid == "ControlFleetGroups" && length(s.resources) == 1 && endswith(one(s.resources), ":autoScalingGroupName/gang-worker")]) == 1 && alltrue([for s in data.aws_iam_policy_document.this.statement : !contains(["ControllerLifecycle", "DescribeControllerLifecycleHooks", "RegisterControllerTarget", "DescribeControllerTargetHealth"], s.sid)])

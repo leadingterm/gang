@@ -45,9 +45,6 @@ mock_provider "aws" {
   mock_data "aws_ssm_parameter" {
     defaults = { value = "ami-0123456789abcdef0" }
   }
-  mock_data "aws_security_group" {
-    defaults = { vpc_id = "vpc-0123456789abcdef0" }
-  }
   mock_data "aws_iam_policy_document" {
     defaults = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
   }

@@ -253,6 +253,10 @@ run "dynamodb_group_shape" {
     condition     = length(module.load_balancer[0].target_groups) == 3 && module.load_balancer[0].target_groups["serve"].port == module.network.public_port && module.load_balancer[0].target_groups["internal_serve"].port == module.network.public_port && module.load_balancer[0].target_groups["workers"].port == module.network.worker_port && length(output.controller_target_group_arns) == 3
     error_message = "All three load balancer targets must reach the correct ECS container ports."
   }
+  assert {
+    condition     = module.load_balancer[0].target_groups["serve"].arn == module.load_balancer[0].serve_target_group_arn && module.load_balancer[0].target_groups["internal_serve"].arn == module.load_balancer[0].internal_serve_target_group_arn && module.load_balancer[0].target_groups["workers"].arn == module.load_balancer[0].workers_target_group_arn
+    error_message = "The controller must use the existing listener target groups, not migration target groups."
+  }
 
   assert {
     condition     = strcontains(output.gang_toml, "stop_timeout = \"2460s\"") && !contains(keys(output.images), "controller") && alltrue([for fleet in var.fleets : contains(keys(output.images), fleet.name)])

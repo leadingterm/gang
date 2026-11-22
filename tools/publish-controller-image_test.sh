@@ -78,6 +78,7 @@ run_case() {
   cp "$scratch/plan.json" "$RUNNER_TEMP/infra-plan.json"
   if [[ $CASE == sqlite ]]; then printf '%s\n' '{"planned_values":{"root_module":{"resources":[]}}}' >"$RUNNER_TEMP/infra-plan.json"; fi
   if [[ $CASE == bootstrap ]]; then jq 'del(.planned_values.root_module.child_modules[0].resources[1])' "$scratch/plan.json" >"$RUNNER_TEMP/infra-plan.json"; fi
+  if [[ $CASE == initial_plan ]]; then jq '(.planned_values.root_module.child_modules[0].resources[0].values.repository_url, .planned_values.root_module.child_modules[0].resources[1].values.container_definitions) = null' "$scratch/plan.json" >"$RUNNER_TEMP/infra-plan.json"; fi
   if bash "$root/infra/scripts/publish-controller-image.sh" >"$scratch/output" 2>&1; then
     [[ $CASE == success || $CASE == existing || $CASE == sqlite || $CASE == bootstrap ]] || { echo "$CASE unexpectedly succeeded" >&2; exit 1; }
   else
@@ -90,9 +91,12 @@ run_case() {
     existing)
       grep -q 'ecr describe-images' "$CALLS"
       ! grep -q '^skopeo ' "$CALLS" ;;
+    initial_plan)
+      grep -Fq 'controller repository URL is unknown; first review and apply a targeted bootstrap of aws_ecr_repository.controller' "$scratch/output"
+      [[ ! -s $CALLS ]] ;;
     sqlite | bootstrap) [[ ! -s $CALLS ]] ;;
     failed_push) grep -q '^skopeo --policy .* copy ' "$CALLS"; [[ $(grep -c 'describe-images' "$CALLS") == 1 ]] ;;
     *) ! grep -q '^skopeo --policy .* copy ' "$CALLS" ;;
   esac
 }
-for case_name in success existing aws_error tamper tamper_manifest mismatch missing_repo failed_push missing_manifest sqlite bootstrap; do run_case "$case_name"; done
+for case_name in success existing aws_error tamper tamper_manifest mismatch missing_repo failed_push missing_manifest sqlite bootstrap initial_plan; do run_case "$case_name"; done

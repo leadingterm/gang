@@ -1088,7 +1088,9 @@ fn stop_timeout_must_exceed_the_complete_attempt_budget() -> Result<(), Box<dyn 
                 "{error}"
             );
             let message = error.to_string();
-            let fix = error.fix().ok_or("stop timeout error has no operator fix")?;
+            let fix = error
+                .fix()
+                .ok_or("stop timeout error has no operator fix")?;
             for key in [
                 "server.stop_timeout",
                 "actions.timeout",

@@ -57,11 +57,12 @@ struct LeadershipHealth {
     leading: bool,
 }
 
-async fn probe_leadership(
+async fn probe_health(
     address: SocketAddr,
     policy: &Policy,
+    path: &str,
     timeout: Duration,
-) -> Option<LeadershipHealth> {
+) -> Option<(StatusCode, bool)> {
     tokio::time::timeout(policy.timeout.min(timeout), async {
         let mut stream = TcpStream::connect(address).await.ok()?;
         if policy.proxy_protocol_v2 {
@@ -76,23 +77,33 @@ async fn probe_leadership(
                 .ok()?;
         let mut connections = JoinSet::new();
         connections.spawn(connection);
-        let request = Request::get(policy.path.as_str())
+        let request = Request::get(path)
             .header(hyper::header::HOST, address.to_string())
             .body(Body::empty())
             .ok()?;
         let response = sender.send_request(request).await.ok()?;
         let values = response.headers().get_all(LEADING_HEADER);
         let mut values = values.iter();
-        let leading = response.status() == StatusCode::OK
-            && values
-                .next()
-                .is_some_and(|value| value.as_bytes() == b"true")
+        let leading = values
+            .next()
+            .is_some_and(|value| value.as_bytes() == b"true")
             && values.next().is_none();
-        Some(LeadershipHealth { leading })
+        Some((response.status(), leading))
     })
     .await
     .ok()
     .flatten()
+}
+
+async fn probe_leadership(
+    address: SocketAddr,
+    policy: &Policy,
+    timeout: Duration,
+) -> Option<LeadershipHealth> {
+    let (status, leading) = probe_health(address, policy, &policy.path, timeout).await?;
+    Some(LeadershipHealth {
+        leading: status == StatusCode::OK && leading,
+    })
 }
 
 fn observed_leaders(observations: &[Option<LeadershipHealth>]) -> impl Iterator<Item = usize> + '_ {
@@ -547,6 +558,55 @@ impl<'a> Cluster<'a> {
         Ok(())
     }
 
+    /// Waits for the same candidate process to report completed preparation.
+    pub(crate) fn wait_for_controller_prepared_within(
+        &self,
+        index: usize,
+        timeout: Duration,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let pid = self.controller_pid(index)?;
+        let (address, policy) = {
+            let controllers = self.controllers.lock();
+            let controller = controllers
+                .get(index)
+                .ok_or_else(|| E2eError::system("unknown controller"))?;
+            (controller.health, Arc::clone(&controller.health_policy))
+        };
+        loop {
+            if self.controller_pid(index)? != pid {
+                return Err(E2eError::system(
+                    "candidate controller process changed during preparation",
+                ));
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(E2eError::timeout(
+                    format!("controller {index} preparation"),
+                    timeout,
+                ));
+            }
+            let response =
+                self.runtime
+                    .block_on(probe_health(address, &policy, "/prepared", remaining));
+            if self.controller_pid(index)? != pid {
+                return Err(E2eError::system(
+                    "candidate controller process changed during preparation",
+                ));
+            }
+            if started.elapsed() >= timeout {
+                return Err(E2eError::timeout(
+                    format!("controller {index} preparation"),
+                    timeout,
+                ));
+            }
+            if response.is_some_and(|(status, _)| status == StatusCode::OK) {
+                return Ok(());
+            }
+            std::thread::sleep(LEASE_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
+        }
+    }
+
     pub(crate) fn deregister_controller(&self, index: usize) -> Result<()> {
         let controllers = self.controllers.lock();
         let controller = controllers
@@ -703,7 +763,9 @@ impl<'a> Cluster<'a> {
         // Cooperative yield keeps refusal listeners alive until actual shutdown. Exercise the
         // host's Restart=always policy with SIGTERM, without disabling its supervisor.
         if self.controller_pid(old)? != original_pid {
-            return Err(E2eError::system("outgoing controller changed before SIGTERM"));
+            return Err(E2eError::system(
+                "outgoing controller changed before SIGTERM",
+            ));
         }
         self.signal(old, Signal::TERM, false)?;
         let (pid, _) = {
@@ -1322,7 +1384,7 @@ impl<'a> Cluster<'a> {
             &policy,
             self.stack.settings().handshake_timeout,
         ));
-        if !health.is_some_and(|health| !health.leading) {
+        if health.is_none_or(|health| health.leading) {
             return Err(E2eError::system(format!(
                 "original outgoing controller health did not answer nonleading: {health:?}"
             )));
@@ -1644,6 +1706,17 @@ impl<'a> Cluster<'a> {
             address: controller.public,
             proxy_protocol_v2: controller.public_proxy_protocol_v2,
         })
+    }
+
+    pub(crate) fn controller_targets_registered(&self, index: usize) -> Result<bool> {
+        let controllers = self.controllers.lock();
+        let controller = controllers
+            .get(index)
+            .ok_or_else(|| E2eError::system("unknown controller"))?;
+        Ok(self.balancer.registered(Frontend::Serve, controller.public)
+            && self
+                .balancer
+                .registered(Frontend::Workers, controller.worker))
     }
 
     /// Stops routing new public connections to a controller, preserving existing streams.
@@ -2657,6 +2730,32 @@ mod tests {
         );
         served?;
         assert!(health.ok_or("missing health response")?.leading);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepared_probe_uses_explicit_path_and_local_proxy_framing() -> TestResult {
+        let listener = TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let address = listener.local_addr()?;
+        let mut policy = leadership_policy("/ready");
+        policy.proxy_protocol_v2 = true;
+        for (response, status) in [
+            (
+                &b"HTTP/1.1 503 Unavailable\r\ncontent-length: 0\r\n\r\n"[..],
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"[..],
+                hyper::StatusCode::OK,
+            ),
+        ] {
+            let (health, served) = tokio::join!(
+                super::probe_health(address, &policy, "/prepared", DEADLINE),
+                answer_health(&listener, "/prepared", response, true),
+            );
+            served?;
+            assert_eq!(health, Some((status, false)));
+        }
         Ok(())
     }
 
