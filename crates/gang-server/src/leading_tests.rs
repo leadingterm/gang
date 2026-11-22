@@ -161,7 +161,7 @@ async fn only_prepared_successor_requests_handoff_and_becomes_ready() -> TestRes
         .with_health(Some(health));
     let old_state = first.readiness();
     let new_state = second.readiness();
-    let (_stop_old, stopped_old) = oneshot::channel::<()>();
+    let (stop_old, stopped_old) = oneshot::channel::<()>();
     let (stop_new, stopped_new) = oneshot::channel::<()>();
     let mut first = Box::pin(first.run(
         async {
@@ -196,11 +196,14 @@ async fn only_prepared_successor_requests_handoff_and_becomes_ready() -> TestRes
     assert!(futures::poll!(second.as_mut()).is_pending());
     assert!(!new_state.ready());
     old.clock.advance(interval);
-    first.await?;
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(!old_state.is_leading());
     old.clock.advance(interval);
     assert!(futures::poll!(second.as_mut()).is_pending());
     assert!(new_state.is_leading());
     assert!(new_state.ready());
+    stop_old.send(()).map_err(|()| "original stopped early")?;
+    first.await?;
     stop_new.send(()).map_err(|()| "successor stopped early")?;
     second.await?;
     Ok(())
@@ -363,6 +366,97 @@ async fn health_status(
     drop(sender);
     driver.await??;
     Ok(status)
+}
+
+#[tokio::test]
+async fn idle_yield_keeps_refusal_listeners_until_shutdown() -> TestResult {
+    assert_completed_yield_waits_for_shutdown(false).await
+}
+
+#[tokio::test]
+async fn fast_drain_yield_keeps_refusal_listeners_until_shutdown() -> TestResult {
+    assert_completed_yield_waits_for_shutdown(true).await
+}
+
+async fn assert_completed_yield_waits_for_shutdown(with_attempt: bool) -> TestResult {
+    let (first, dials, old) = plain_parts();
+    let mut connections = old.scheduler.connections();
+    let (mut second, _, _) = plain_parts();
+    second.repository = first.repository.clone();
+    second.clock = first.clock.clone();
+    second.controller = ControllerId::new("successor");
+    let settings = plain_settings();
+    let interval = settings.leadership.renew_interval.get();
+    let stop_timeout = settings.stop_timeout.get();
+    let (health, health_dial) = crate::test_support_memory::memory_listener();
+    let first = Server::prepare(first, settings.clone())
+        .await?
+        .with_health(Some(health));
+    let old_state = first.readiness();
+    let second = Server::prepare(second, settings).await?;
+    let new_state = second.readiness();
+    let (stop_old, stopped_old) = oneshot::channel::<()>();
+    let (stop_new, stopped_new) = oneshot::channel::<()>();
+    let mut first = Box::pin(first.run(
+        async {
+            let _ = stopped_old.await;
+        },
+        ControllerReady::channel().0,
+    ));
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(old_state.is_leading());
+    let original = old.scheduler.controller().await.ok_or("controller missing")?;
+    if with_attempt {
+        seed_owned_attempt(&old)?;
+    }
+    let mut second = Box::pin(second.run(
+        async {
+            let _ = stopped_new.await;
+        },
+        ControllerReady::channel().0,
+    ));
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    old.clock.advance(interval);
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    assert!(new_state.is_leading());
+    if with_attempt {
+        assert_original_drain(&original, &old).await?;
+        old.scheduler.set_snapshot(SchedulerSnapshot::default());
+        old.clock.advance(interval);
+        assert!(futures::poll!(first.as_mut()).is_pending());
+    }
+    assert!(!old_state.ready());
+    assert!(!old_state.is_leading());
+    assert_eq!(old.scheduler.drains().get(), 1);
+    assert_gates(&original, false).await;
+    let _public = dials.public.dial();
+    let _worker = dials.worker.dial();
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    let public = connections.try_recv()?;
+    let worker = connections.try_recv()?;
+    assert!(matches!(
+        (public.side, worker.side),
+        (Side::Public, Side::Worker) | (Side::Worker, Side::Public)
+    ));
+    tokio::select! {
+        status = health_status(&health_dial) => assert_eq!(status?, http::StatusCode::SERVICE_UNAVAILABLE),
+        result = &mut first => return Err(format!("yield closed listeners before shutdown: {result:?}").into()),
+    }
+    stop_new.send(()).map_err(|()| "successor stopped early")?;
+    second.await?;
+    old.clock.advance(stop_timeout);
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(!old_state.is_leading(), "yield must never reacquire authority");
+    assert_eq!(old.scheduler.controller_runs().get(), 1);
+    stop_old
+        .send(())
+        .map_err(|()| "original stopped before shutdown")?;
+    assert!(matches!(
+        futures::poll!(first.as_mut()),
+        std::task::Poll::Ready(Ok(()))
+    ));
+    Ok(())
 }
 
 #[tokio::test]

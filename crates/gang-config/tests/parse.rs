@@ -1027,6 +1027,83 @@ fn worker_connect_timeout_must_be_below_twice_worker_timeout() {
 }
 
 #[test]
+fn stop_timeout_must_exceed_the_complete_attempt_budget() -> Result<(), Box<dyn Error>> {
+    use gang_types::Fix as _;
+
+    for (actions, worker, attempt_seconds, stop_seconds) in [
+        ("", "", 2400, 2399),
+        ("", "", 2400, 2400),
+        ("", "", 2400, 2401),
+        (
+            "[actions]\ntimeout = \"31s\"\n",
+            "[worker]\ndownload_timeout = \"12s\"\nupload_timeout = \"17s\"\n",
+            60,
+            59,
+        ),
+        (
+            "[actions]\ntimeout = \"31s\"\n",
+            "[worker]\ndownload_timeout = \"12s\"\nupload_timeout = \"17s\"\n",
+            60,
+            60,
+        ),
+        (
+            "[actions]\ntimeout = \"31s\"\n",
+            "[worker]\ndownload_timeout = \"12s\"\nupload_timeout = \"17s\"\n",
+            60,
+            61,
+        ),
+    ] {
+        let server = format!("{SERVER}\nstop_timeout = \"{stop_seconds}s\"\n");
+        let text = Sections {
+            actions,
+            worker,
+            server: server.leak(),
+            ..Sections::VALID
+        }
+        .text();
+        for result in [
+            Document::<Plugins>::parse(&text)?.resolve(),
+            text.parse::<GangConfig<Plugins>>(),
+        ] {
+            if stop_seconds > attempt_seconds {
+                let config = result?;
+                assert_eq!(
+                    config.worker.attempt_budget(config.actions.timeout),
+                    Duration::from_secs(attempt_seconds)
+                );
+                assert_eq!(
+                    config.server.stop_timeout.get(),
+                    Duration::from_secs(stop_seconds)
+                );
+                continue;
+            }
+            let error = result.expect_err("stop timeout leaves no attempt drain margin");
+            assert!(
+                matches!(
+                    &error,
+                    ConfigError::StopTimeoutTooShort { stop_timeout, attempt_budget }
+                        if *stop_timeout == Duration::from_secs(stop_seconds)
+                            && *attempt_budget == Duration::from_secs(attempt_seconds)
+                ),
+                "{error}"
+            );
+            let message = error.to_string();
+            let fix = error.fix().ok_or("stop timeout error has no operator fix")?;
+            for key in [
+                "server.stop_timeout",
+                "actions.timeout",
+                "worker.download_timeout",
+                "worker.upload_timeout",
+            ] {
+                assert!(message.contains(key), "{message}");
+                assert!(fix.contains(key), "{fix}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn planned_handover_must_precede_legacy_cli_last_attempt() {
     for (call, valid) in [("1059ms", true), ("1060ms", false)] {
         let server = format!("{SERVER}\n[server.leadership]\ncall_timeout = \"{call}\"\n");

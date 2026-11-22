@@ -239,7 +239,13 @@ async fn the_lease_is_renewed_while_the_term_baseline_is_taken() -> TestResult {
     parts.controller = ControllerId::new("baseline-successor");
     let old = Server::prepare(old_parts, plain_settings()).await?;
     let old_ready = old.readiness();
-    let mut old = pin!(old.run(pending(), ControllerReady::channel().0));
+    let (stop_old, stopped_old) = tokio::sync::oneshot::channel::<()>();
+    let mut old = pin!(old.run(
+        async {
+            let _ = stopped_old.await;
+        },
+        ControllerReady::channel().0,
+    ));
     assert!(futures::poll!(old.as_mut()).is_pending());
     let renew_interval = settings.leadership.renew_interval.get();
     settings.poll_interval = NonZeroDuration::from_mins(1);
@@ -295,13 +301,16 @@ async fn the_lease_is_renewed_while_the_term_baseline_is_taken() -> TestResult {
         StatusCode::SERVICE_UNAVAILABLE
     );
     handles.clock.advance(renew_interval);
-    old.await?;
+    assert!(futures::poll!(old.as_mut()).is_pending());
+    assert!(!old_ready.is_leading());
     assert!(futures::poll!(run.as_mut()).is_pending());
     assert_eq!(
         follower_status(&controller).await,
         StatusCode::OK,
         "requests become available after the term starts"
     );
+    stop_old.send(()).map_err(|()| "original stopped early")?;
+    old.await?;
     Ok(())
 }
 

@@ -397,10 +397,10 @@ run "renders_configured_controller_drain_timeout" {
     database                        = { engine = "dynamodb" }
     hostname                        = "gang.example.com"
     load_balancer                   = {}
-    controller_stop_timeout_seconds = 1800
+    controller_stop_timeout_seconds = 3600
   }
   assert {
-    condition     = strcontains(output.gang_toml, "stop_timeout = \"1800s\"")
+    condition     = strcontains(output.gang_toml, "stop_timeout = \"3600s\"")
     error_message = "The configured stop timeout must reach the controller configuration."
   }
 }

@@ -189,6 +189,13 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
                 worker_timeout: server.worker_timeout.get(),
             });
         }
+        let attempt_budget = worker.attempt_budget(actions.timeout);
+        if attempt_budget >= server.stop_timeout.get() {
+            return Err(ConfigError::StopTimeoutTooShort {
+                stop_timeout: server.stop_timeout.get(),
+                attempt_budget,
+            });
+        }
         if let Some(name) = identity.providers.keys().find(|name| name.is_anonymous()) {
             return Err(ConfigError::ReservedProviderName(name.clone()));
         }

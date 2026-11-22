@@ -71,7 +71,8 @@ in
           wants = ["network-online.target"];
           serviceConfig.ExecStart = pkgs.writeShellScript "dns-fixture" ''
             exec ${pkgs.dnsmasq}/bin/dnsmasq --keep-in-foreground --pid-file= --no-resolv --no-hosts \
-              --interface=eth1 --bind-interfaces --local-ttl=300 --address=/cached.cache.test/192.0.2.80
+              --interface=eth1 --bind-interfaces --local-ttl=300 \
+              --address=/cached.cache.test/192.0.2.80 --address=/restarted.cache.test/192.0.2.81
           '';
         };
       };
@@ -102,24 +103,44 @@ in
       image = client.succeed("podman images -q | sort -u").strip()
       assert image
       client.succeed(f"podman run -d --name controller -p 127.0.0.1:8080:8080 --dns 192.168.77.1 --env \"GANG_CONFIG=$(cat ${config})\" --env GANG_SECRET_FILES=0=test-secret --env GANG_SECRET_0=secret-value {image}")
-      try:
-          client.wait_until_succeeds("curl -fsS http://127.0.0.1:8080/ready", timeout=timedelta(seconds=60))
-      except Exception:
-          print(client.execute("podman logs --tail 100 controller"))
-          print(client.execute("podman inspect --format '{{json .State}}' controller"))
-          raise
-      client.succeed("podman exec controller grep -Eq '^Uid:[[:space:]]+65532[[:space:]]+65532' /proc/1/status")
-      client.succeed("podman exec controller sh -c 'test $(stat -c %u:%g:%a /etc/gang/gang.toml) = 65532:65532:600 && test $(stat -c %u:%g:%a /etc/gang/secrets/test-secret) = 65532:65532:600'")
-      # Host root can inspect the dropped-UID process without adding container capabilities.
-      controller_pid = int(client.succeed("podman inspect --format '{{.State.Pid}}' controller"))
-      assert controller_pid > 0
-      environment = client.succeed(f"cat /proc/{controller_pid}/environ | tr '\\000' '\\n'")
-      assert "GANG_CONFIG=" not in environment and "GANG_SECRET" not in environment
-      client.succeed("podman exec controller nslookup -type=A cached.cache.test 127.0.0.1 | grep -q 192.0.2.80")
+      def stop_controller():
+          client.succeed("podman kill --signal TERM controller")
+          client.wait_until_succeeds("test $(podman inspect -f '{{.State.Running}}' controller) = false", timeout=timedelta(seconds=60))
+          client.succeed("test $(podman inspect -f '{{.State.ExitCode}}' controller) = 0")
+
+      original_upstream = None
+      for restart in (False, True):
+          if restart:
+              stop_controller()
+              client.succeed("podman start controller")
+          try:
+              client.wait_until_succeeds("curl -fsS http://127.0.0.1:8080/ready", timeout=timedelta(seconds=60))
+          except Exception:
+              print(client.execute("podman logs --tail 100 controller"))
+              print(client.execute("podman inspect --format '{{json .State}}' controller"))
+              raise
+          client.succeed("podman exec controller grep -Eq '^Uid:[[:space:]]+65532[[:space:]]+65532' /proc/1/status")
+          client.succeed("podman exec controller sh -c 'test $(stat -c %u:%g:%a /etc/gang/gang.toml) = 65532:65532:600 && test $(stat -c %u:%g:%a /etc/gang/secrets/test-secret) = 65532:65532:600 && test $(stat -c %u:%g:%a /etc/gang/secrets) = 65532:65532:700'")
+          client.succeed("podman exec controller sh -c 'pid=$(pidof dnsmasq); test -n \"$pid\" && grep -Eq \"^Uid:[[:space:]]+65533[[:space:]]+65533[[:space:]]+65533[[:space:]]+65533$\" /proc/$pid/status && grep -Eq \"^Gid:[[:space:]]+65533[[:space:]]+65533[[:space:]]+65533[[:space:]]+65533$\" /proc/$pid/status'")
+          client.succeed("podman exec --user 65533:65533 controller sh -c 'test ! -r /etc/gang/gang.toml && test ! -r /etc/gang/secrets && test ! -x /etc/gang/secrets && test ! -r /etc/gang/secrets/test-secret'")
+          # Host root can inspect the dropped-UID process without adding container capabilities.
+          controller_pid = int(client.succeed("podman inspect --format '{{.State.Pid}}' controller"))
+          assert controller_pid > 0
+          environment = client.succeed(f"cat /proc/{controller_pid}/environ | tr '\\000' '\\n'")
+          assert "GANG_CONFIG=" not in environment and "GANG_SECRET" not in environment
+          saved_upstream = client.succeed("podman exec controller cat /etc/gang/upstream-resolv.conf")
+          assert "nameserver 192.168.77.1" in saved_upstream
+          if restart:
+              assert saved_upstream == original_upstream
+              # This name was never queried before restart, so only the live upstream can answer.
+              client.succeed("podman exec controller nslookup -type=A restarted.cache.test 127.0.0.1 | grep -q 192.0.2.81")
+          else:
+              original_upstream = saved_upstream
+          client.succeed("podman exec controller sh -c 'test $(stat -c %a /etc/gang/upstream-resolv.conf) = 644'")
+          client.succeed("podman exec controller nslookup -type=A cached.cache.test 127.0.0.1 | grep -q 192.0.2.80")
       upstream.succeed("systemctl stop dns-fixture.service")
       client.succeed("podman exec controller nslookup -type=A cached.cache.test 127.0.0.1 | grep -q 192.0.2.80")
-      client.succeed("podman kill --signal TERM controller")
-      client.wait_until_succeeds("test $(podman inspect -f '{{.State.Running}}' controller) = false", timeout=timedelta(seconds=60))
-      client.succeed("test $(podman inspect -f '{{.State.ExitCode}}' controller) = 0")
+      client.succeed("podman exec controller nslookup -type=A restarted.cache.test 127.0.0.1 | grep -q 192.0.2.81")
+      stop_controller()
     '';
   }

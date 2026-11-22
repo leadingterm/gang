@@ -26,8 +26,8 @@
     ln -s ${runtime.cacert}/etc/ssl/certs/ca-bundle.crt $out/etc/ssl/certs/ca-certificates.crt
     mkdir -p $out/etc/gang
     install -m 0644 ${../nixos/rds-ca-bundle.pem} $out/etc/gang/rds-ca-bundle.pem
-    printf 'root:x:0:0:root:/root:/bin/sh\nnobody:x:65532:65532:nobody:/:/bin/sh\n' > $out/etc/passwd
-    printf 'root:x:0:\nnobody:x:65532:\n' > $out/etc/group
+    printf 'root:x:0:0:root:/root:/bin/sh\nnobody:x:65532:65532:nobody:/:/bin/sh\ngang-dns:x:65533:65533:DNS cache:/:/bin/false\n' > $out/etc/passwd
+    printf 'root:x:0:\nnobody:x:65532:\ngang-dns:x:65533:\n' > $out/etc/group
   '';
   dockerImage = pkgs.dockerTools.buildLayeredImage {
     name = "gang-controller";
@@ -106,6 +106,12 @@ in {
         entry = image_file("usr/local/bin/gang-entrypoint")
         with open(sys.argv[3], "rb") as expected:
             assert entry == expected.read()
+        passwd = image_file("etc/passwd").decode().splitlines()
+        group = image_file("etc/group").decode().splitlines()
+        assert "nobody:x:65532:65532:nobody:/:/bin/sh" in passwd
+        assert "gang-dns:x:65533:65533:DNS cache:/:/bin/false" in passwd
+        assert "nobody:x:65532:" in group
+        assert "gang-dns:x:65533:" in group
         binary_link = members["usr/local/bin/gang"][0]
         assert binary_link.issym()
         binary = image_file("usr/local/bin/gang")

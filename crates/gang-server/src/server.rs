@@ -848,7 +848,7 @@ async fn drain_original<D: Deployment>(
     }
 }
 
-/// Drives the original engine through authority transfer and completion of its admitted work.
+/// Drains the original engine, retaining refusal listeners until actual shutdown after a yield.
 async fn drive_original<D: Deployment>(
     context: &LeadContext<'_, D>,
     spec: &ControllerSpec<'_>,
@@ -871,7 +871,7 @@ async fn drive_original<D: Deployment>(
     ));
     let mut outgoing = None;
     let result = {
-        let leader = run_leader(context, prepared, ready, shutdown, &mut outgoing);
+        let leader = run_leader(context, prepared, ready, shutdown.clone(), &mut outgoing);
         tokio::pin!(leader);
         tokio::select! {
             biased;
@@ -891,8 +891,22 @@ async fn drive_original<D: Deployment>(
         tokio::pin!(drain);
         tokio::select! {
             result = &mut controller => return result.map_err(ServerError::Controller).and(Err(ServerError::ControllerEnded)),
+            error = listener_stopped("public", &mut ends.public) => return Err(error),
+            error = listener_stopped("worker", &mut ends.worker) => return Err(error),
             result = &mut drain => result?,
             never = &mut background => match never {},
+        }
+        if result.is_ok() {
+            // A cooperative yield releases authority, not the process or its load-balancer
+            // connections. Keep serving explicit refusals even when no original work remains.
+            tokio::select! {
+                biased;
+                result = &mut controller => return result.map_err(ServerError::Controller).and(Err(ServerError::ControllerEnded)),
+                error = listener_stopped("public", &mut ends.public) => return Err(error),
+                error = listener_stopped("worker", &mut ends.worker) => return Err(error),
+                () = shutdown => {}
+                never = &mut background => match never {},
+            }
         }
         let _ = stop_sender.send(());
         tokio::select! {
@@ -1084,6 +1098,8 @@ impl<D: Deployment> Server<D> {
     /// the returned future stops every connection and task the server started.
     /// `ready` is signalled once the embedded controller is built and serves; a run that fails
     /// first drops it unsent.
+    /// After a cooperative yield, the original controller drains its admitted work and remains
+    /// nonleading with live refusal and health listeners until `shutdown` completes.
     ///
     /// Under plaintext, and for every surface whose authentication plugin presents
     /// [`Scheme::None`], a warning is logged once at start.
@@ -1657,14 +1673,14 @@ mod tests {
         let original = super::Server::prepare(original, settings.clone()).await?;
         let successor = super::Server::prepare(successor, settings.clone()).await?;
         let successor_ready = successor.readiness.clone();
-        let (_stop_old, stopped_old) = super::stop_channel();
+        let (stop_old, stopped_old) = super::stop_channel();
         let (stop_new, stopped_new) = super::stop_channel();
         let mut first = Box::pin(original.run(stopped_old, ControllerReady::channel().0));
         assert!(futures::poll!(first.as_mut()).is_pending());
         let mut second = Box::pin(successor.run(stopped_new, ControllerReady::channel().0));
         assert!(futures::poll!(second.as_mut()).is_pending());
         old.clock.advance(interval);
-        first.await?;
+        assert!(futures::poll!(first.as_mut()).is_pending());
         assert!(futures::poll!(second.as_mut()).is_pending());
         assert!(successor_ready.is_leading());
 
@@ -1683,6 +1699,8 @@ mod tests {
         assert!(futures::poll!(restarted.as_mut()).is_pending());
         assert!(futures::poll!(second.as_mut()).is_pending());
         assert!(successor_ready.is_leading());
+        stop_old.send(()).map_err(|()| "original stopped early")?;
+        first.await?;
         stop_restart
             .send(())
             .map_err(|()| "restart stopped early")?;
@@ -1775,10 +1793,12 @@ mod tests {
             .await?;
         assert_eq!(restored, expected);
         old.clock.advance(renew);
-        first.await?;
-        drop(stop_old);
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(!old_state.is_leading());
         assert!(futures::poll!(second.as_mut()).is_pending());
         assert!(new_state.is_leading());
+        stop_old.send(()).map_err(|()| "original stopped early")?;
+        first.await?;
         stop_new.send(()).map_err(|()| "successor stopped early")?;
         second.await?;
         Ok(())

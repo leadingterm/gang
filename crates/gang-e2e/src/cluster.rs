@@ -700,6 +700,12 @@ impl<'a> Cluster<'a> {
         successor: usize,
         original_pid: u32,
     ) -> Result<()> {
+        // Cooperative yield keeps refusal listeners alive until actual shutdown. Exercise the
+        // host's Restart=always policy with SIGTERM, without disabling its supervisor.
+        if self.controller_pid(old)? != original_pid {
+            return Err(E2eError::system("outgoing controller changed before SIGTERM"));
+        }
+        self.signal(old, Signal::TERM, false)?;
         let (pid, _) = {
             let controllers = self.controllers.lock();
             let child = controllers
@@ -1279,6 +1285,49 @@ impl<'a> Cluster<'a> {
             return Err(E2eError::system("controller has exited"));
         }
         Ok(child.pid())
+    }
+
+    /// Disables automatic replacement without signalling or relinquishing the original child.
+    pub(crate) fn suppress_controller_restart(&self, index: usize) -> Result<u32> {
+        let mut controllers = self.controllers.lock();
+        let child = controllers
+            .get_mut(index)
+            .and_then(|controller| controller.child.as_mut())
+            .ok_or_else(|| E2eError::system("controller is not running"))?;
+        child.suppress_restart();
+        if child.has_exited()? {
+            return Err(E2eError::system(
+                "controller exited before restart suppression",
+            ));
+        }
+        Ok(child.pid())
+    }
+
+    /// Requires a response from the original process's health listener after it yields.
+    pub(crate) fn observe_yielded_controller(&self, index: usize, pid: u32) -> Result<()> {
+        if self.controller_pid(index)? != pid {
+            return Err(E2eError::system(
+                "outgoing controller PID changed before SIGTERM",
+            ));
+        }
+        let (address, policy) = {
+            let controllers = self.controllers.lock();
+            let controller = controllers
+                .get(index)
+                .ok_or_else(|| E2eError::system("unknown controller"))?;
+            (controller.health, Arc::clone(&controller.health_policy))
+        };
+        let health = self.runtime.block_on(probe_leadership(
+            address,
+            &policy,
+            self.stack.settings().handshake_timeout,
+        ));
+        if !health.is_some_and(|health| !health.leading) {
+            return Err(E2eError::system(format!(
+                "original outgoing controller health did not answer nonleading: {health:?}"
+            )));
+        }
+        Ok(())
     }
 
     /// Reboots the pinned process from fetched bytes, without re-rendering or changing topology.

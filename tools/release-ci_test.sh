@@ -221,6 +221,8 @@ cmp "$scratch/expected-secret" "$scratch/etc/gang/secrets/database-password"
 [[ $(<"$scratch/etc/resolv.conf") == $'nameserver 127.0.0.1\nsearch internal' ]]
 [[ $(<"$TRACE_EXEC") == $'65532:65532\n/usr/local/bin/gang\nserver\n--config\n'"$scratch/etc/gang/gang.toml" ]]
 grep -Fx -- "--resolv-file=$scratch/etc/gang/upstream-resolv.conf" "$TRACE_DNS" >/dev/null
+grep -Fx -- '--user=gang-dns' "$TRACE_DNS" >/dev/null
+grep -Fx -- '--group=gang-dns' "$TRACE_DNS" >/dev/null
 grep -Fx -- '--pid-file=' "$TRACE_DNS" >/dev/null
 ((cases += 1))
 for bad in '../escape' '.' 'bad/name' 'bad name'; do
@@ -239,9 +241,15 @@ expected_identity=${expected_identity%% *}
 sh "$scratch/entrypoint.sh"
 [[ $(<"$TRACE_IDENTITY") == "$expected_identity" ]]
 [[ $(<"$TRACE_LAUNCHED") == '2026-11-22T12:34:56.123Z' ]]
+chmod 0600 "$scratch/etc/gang/upstream-resolv.conf"
 sh "$scratch/entrypoint.sh"
 [[ $(<"$TRACE_IDENTITY") == "$expected_identity" ]]
 [[ $(<"$TRACE_LAUNCHED") == '2026-11-22T12:34:56.123Z' ]]
+[[ $(<"$scratch/etc/gang/upstream-resolv.conf") == $'nameserver 10.0.0.2\nsearch internal' ]]
+[[ $(stat -c %a "$scratch/etc/gang/upstream-resolv.conf") == 644 ]]
+[[ $(<"$scratch/etc/resolv.conf") == $'nameserver 127.0.0.1\nsearch internal' ]]
+grep -Fx -- '--user=gang-dns' "$TRACE_DNS" >/dev/null
+grep -Fx -- '--group=gang-dns' "$TRACE_DNS" >/dev/null
 ((cases += 1))
 responses=(
   '{}'
