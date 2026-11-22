@@ -224,6 +224,9 @@ const FleetRow = ({ f, ordinal, events, census, known, recent }: { f: Fleet; ord
     f.instances.pending > 0 && f.instances.inService === 0
       ? events.findLast((e) => e.fleet === f.name && "scaledOut" in e)
       : undefined;
+  const warning = f.launchFailure ? undefined : events.findLast(
+    (e) => e.fleet === f.name && "aws" in e && e.aws.event.kind.type === "capacityUnavailable",
+  );
   const samples: readonly (FleetInstanceSample | undefined)[] = recentSlots(recent).map((sample) => sample?.fleets?.find((fleet) => fleet.name === f.name));
   const fields = [
     { name: "pending", label: "Pending", value: (sample: FleetInstanceSample) => sample.instances.pending },
@@ -236,9 +239,6 @@ const FleetRow = ({ f, ordinal, events, census, known, recent }: { f: Fleet; ord
   const series = fields.map((field) => ({ ...field, values: samples.map((sample) => sample ? field.value(sample) : null) }));
   const latest = samples.at(-1);
   const historyLabel = `Instance history for ${f.name}; latest sample: ${latest ? fields.map((field) => `${field.label} ${field.value(latest)}`).join(", ") : "not recorded"}`;
-  const warning = f.launchFailure ? undefined : events.findLast(
-    (e) => e.fleet === f.name && "aws" in e && e.aws.event.kind.type === "capacityUnavailable",
-  );
   return (
     <li class={idle ? "fleet is-idle" : "fleet"}>
       <div class="fleet__id">

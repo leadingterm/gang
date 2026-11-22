@@ -197,8 +197,8 @@ impl Fleets {
         let mut observation = self.observation.lock().await;
         *observation = None;
         let names = GroupNames::of(fleet);
-        let mut output = self.describe_groups(names.iter()).await?;
-        match FleetGroups::read(&mut output, &names)? {
+        let output = self.describe_groups(names.iter()).await?;
+        match FleetGroups::read(&output, &names)? {
             FleetGroups::Plain(group) => {
                 if group.reported() < desired {
                     self.set_capacity(held, &group, desired).await?;
@@ -249,8 +249,8 @@ impl Fleets {
         let mut observation = self.observation.lock().await;
         *observation = None;
         let names = GroupNames::of(fleet);
-        let mut output = self.describe_groups(names.iter()).await?;
-        let groups = FleetGroups::read(&mut output, &names)?;
+        let output = self.describe_groups(names.iter()).await?;
+        let groups = FleetGroups::read(&output, &names)?;
         let Some((group, member)) = groups
             .groups()
             .find_map(|group| group.member(instance).map(|member| (group, member)))
@@ -284,7 +284,7 @@ impl Fleets {
     async fn release(
         &self,
         held: &Held,
-        group: &Group,
+        group: &Group<'_>,
         member: &Member,
         instance: &InstanceId,
     ) -> Result<(), AwsError> {
@@ -301,7 +301,12 @@ impl Fleets {
 
     /// Raises the physical limit when necessary before writing desired capacity. The logical
     /// fleet bound is enforced by the reconciler, not by this retained ASG limit.
-    async fn set_capacity(&self, held: &Held, group: &Group, desired: u32) -> Result<(), AwsError> {
+    async fn set_capacity(
+        &self,
+        held: &Held,
+        group: &Group<'_>,
+        desired: u32,
+    ) -> Result<(), AwsError> {
         let wanted = i32::try_from(desired).map_err(|_| AwsError::Config {
             field: "desired",
             reason: "exceeds the largest capacity an auto scaling group accepts".to_owned(),
@@ -356,7 +361,7 @@ impl Fleets {
     /// Spot is down only when recent activity proves growth blocked and no instance is launching.
     async fn spot_down(
         &self,
-        spot: &Group,
+        spot: &Group<'_>,
         policy: SpotFallback,
     ) -> Result<Option<LaunchFailure>, AwsError> {
         if spot.launching() {
@@ -369,7 +374,7 @@ impl Fleets {
     /// Assesses bounded, newest-first launch activity since the applicable history boundary.
     async fn launch_assessment(
         &self,
-        group: &Group,
+        group: &Group<'_>,
         since: Timestamp,
     ) -> Result<Option<LaunchFailure>, AwsError> {
         let limit = usize::try_from(self.events.activity_limit()).unwrap_or(usize::MAX);
@@ -428,7 +433,7 @@ impl Fleets {
 
     async fn latest_launch_failure(
         &self,
-        group: &Group,
+        group: &Group<'_>,
     ) -> Result<Option<LaunchFailure>, AwsError> {
         if group.launching() {
             return Ok(None);
@@ -564,19 +569,19 @@ impl<'a> GroupNames<'a> {
     }
 }
 
-/// The groups of a fleet, read from one `DescribeAutoScalingGroups` response.
-enum FleetGroups {
+/// Fleet operational state with candidate metadata borrowed from one immutable AWS response.
+enum FleetGroups<'snapshot> {
     /// A fleet that is its one group.
-    Plain(Group),
+    Plain(Group<'snapshot>),
     /// A spot fleet with its on-demand twin; both protect new instances from scale-in.
     Fallback {
-        spot: Group,
-        twin: Group,
+        spot: Group<'snapshot>,
+        twin: Group<'snapshot>,
         policy: SpotFallback,
     },
 }
 
-impl FleetGroups {
+impl<'snapshot> FleetGroups<'snapshot> {
     /// Reads a fleet's groups from `output`.
     ///
     /// An opted-in fleet needs both groups to protect new instances from scale-in: the twin's warm
@@ -587,7 +592,7 @@ impl FleetGroups {
     /// Returns the errors of [`Group::read`], and [`AwsError::Config`] naming a group that does not
     /// protect new instances from scale-in.
     fn read(
-        output: &mut DescribeAutoScalingGroupsOutput,
+        output: &'snapshot DescribeAutoScalingGroupsOutput,
         names: &GroupNames<'_>,
     ) -> Result<Self, AwsError> {
         let spot = Group::read(output, names.primary)?;
@@ -614,7 +619,7 @@ impl FleetGroups {
     }
 
     /// The spot group, or the fleet's one group.
-    fn spot(&self) -> &Group {
+    fn spot(&self) -> &Group<'snapshot> {
         match self {
             Self::Plain(group) => group,
             Self::Fallback { spot, .. } => spot,
@@ -622,7 +627,7 @@ impl FleetGroups {
     }
 
     /// The fleet's groups: spot first, then the on-demand twin.
-    fn groups(&self) -> impl Iterator<Item = &Group> {
+    fn groups(&self) -> impl Iterator<Item = &Group<'snapshot>> {
         let twin = match self {
             Self::Plain(_) => None,
             Self::Fallback { twin, .. } => Some(twin),
@@ -1197,11 +1202,11 @@ mod tests {
         for age in 1..=100 {
             zoned_activity(&harness, age, "us-east-1b", UNFULFILLABLE);
         }
-        let mut output = harness
+        let output = harness
             .fleets
             .describe_groups(std::iter::once(FLEET))
             .await?;
-        let group = Group::read(&mut output, FLEET)?;
+        let group = Group::read(&output, FLEET)?;
         let since = harness.clock.wall() - Duration::from_mins(5);
         assert!(
             harness

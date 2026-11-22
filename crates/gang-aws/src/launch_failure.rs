@@ -20,7 +20,7 @@ pub(crate) enum Assessment<'a> {
 /// A block requires complete history, since an older launch may still be in flight.
 pub(crate) fn assess<'a>(
     activities: &'a [Activity],
-    candidates: Option<&crate::group::LaunchCandidates>,
+    candidates: Option<&crate::group::LaunchCandidates<'_>>,
     history_complete: bool,
 ) -> Assessment<'a> {
     if has_launch_in_flight(activities) {
@@ -170,7 +170,7 @@ fn tokens(message: &str) -> impl Iterator<Item = &str> {
 
 fn classify_attempt<'a>(
     activity: &'a Activity,
-    candidates: &crate::group::LaunchCandidates,
+    candidates: &crate::group::LaunchCandidates<'_>,
 ) -> Option<Attempt<'a>> {
     let message = activity.status_message()?;
     // AWS documents these status messages without error codes:
@@ -316,7 +316,7 @@ mod tests {
         )
     }
 
-    fn candidates(single: bool) -> LaunchCandidates {
+    fn candidate_snapshot(single: bool) -> DescribeAutoScalingGroupsOutput {
         let mut template = LaunchTemplate::builder().overrides(
             LaunchTemplateOverrides::builder()
                 .instance_type("c7g.large")
@@ -332,6 +332,7 @@ mod tests {
         let mut group = AutoScalingGroup::builder()
             .auto_scaling_group_name("workers")
             .desired_capacity(1)
+            .max_size(1000)
             .availability_zones("us-east-1a");
         if !single {
             group = group.availability_zones("us-east-1b");
@@ -343,10 +344,13 @@ mod tests {
                     .build(),
             )
             .build();
-        let mut output = DescribeAutoScalingGroupsOutput::builder()
+        DescribeAutoScalingGroupsOutput::builder()
             .auto_scaling_groups(group)
-            .build();
-        Group::read(&mut output, "workers")
+            .build()
+    }
+
+    fn candidates(output: &DescribeAutoScalingGroupsOutput) -> LaunchCandidates<'_> {
+        Group::read(output, "workers")
             .expect("fixture has a valid group")
             .launch_candidates
             .expect("fixture has explicit candidates")
@@ -367,7 +371,8 @@ mod tests {
 
     #[test]
     fn documented_uncoded_spot_stockouts_require_every_zone() {
-        let candidates = candidates(false);
+        let output = candidate_snapshot(false);
+        let candidates = candidates(&output);
         let reason = "There is no Spot capacity available that matches your request. Launching EC2 instance failed.";
         let a = with_details(reason, r#"{"Availability Zone":"us-east-1a"}"#);
         let b = with_details(reason, r#"{"Availability Zone":"us-east-1b"}"#);
@@ -405,7 +410,8 @@ mod tests {
 
     #[test]
     fn documented_type_specific_failures_only_cover_the_reported_pair() {
-        let candidates = candidates(false);
+        let output = candidate_snapshot(false);
+        let candidates = candidates(&output);
         let reason = "We currently do not have sufficient c7g.large capacity in the Availability Zone you requested. Launching EC2 instance failed.";
         let first = with_details(reason, r#"{"Availability Zone":"us-east-1a"}"#);
         let remaining = [
@@ -471,7 +477,8 @@ mod tests {
 
     #[test]
     fn requested_zone_takes_precedence_over_capacity_suggestions() {
-        let candidates = candidates(false);
+        let output = candidate_snapshot(false);
+        let candidates = candidates(&output);
         let foreign = "We currently do not have sufficient c7g.large capacity in the Availability Zone you requested (us-east-1z). You can currently get c7g.large capacity by choosing us-east-1a.";
         let current = "We currently do not have sufficient c7g.large capacity in the Availability Zone you requested (us-east-1a). You can currently get c7g.large capacity by choosing us-east-1z.";
         let remaining = [
@@ -522,7 +529,8 @@ mod tests {
 
     #[test]
     fn documented_unsupported_type_and_zone_require_exact_current_pair() {
-        let candidates = candidates(false);
+        let output = candidate_snapshot(false);
+        let candidates = candidates(&output);
         let reason = "Your requested instance type (c7g.large) is not supported in your requested Availability Zone (us-east-1a).";
         let remaining = [
             failed("InvalidFleetConfiguration m7g.large us-east-1a"),
@@ -564,7 +572,8 @@ mod tests {
 
     #[test]
     fn single_candidate_requires_current_attributed_evidence() {
-        let candidates = candidates(true);
+        let output = candidate_snapshot(true);
+        let candidates = candidates(&output);
         for failure in [
             with_details(
                 "InsufficientInstanceCapacity",
@@ -600,7 +609,8 @@ mod tests {
 
     #[test]
     fn coverage_uses_newest_contributing_message_and_respects_history() {
-        let candidates = candidates(false);
+        let output = candidate_snapshot(false);
+        let candidates = candidates(&output);
         let reason = "InsufficientInstanceCapacity us-east-1a; exact reason.";
         let failures = [
             failed("InsufficientInstanceCapacity us-east-1z"),
@@ -636,7 +646,8 @@ mod tests {
 
     #[test]
     fn structured_details_support_empty_and_escaped_fields() {
-        let candidates = candidates(true);
+        let output = candidate_snapshot(true);
+        let candidates = candidates(&output);
         let fallback = "InvalidFleetConfiguration c7g.large us-east-1a";
         let empty = with_details(fallback, r#"{"Availability Zone":"","Instance Type":"  "}"#);
         assert_eq!(
@@ -663,7 +674,8 @@ mod tests {
 
     #[test]
     fn exact_pair_coverage_and_ambiguity() {
-        let candidates = candidates(false);
+        let output = candidate_snapshot(false);
+        let candidates = candidates(&output);
         let failures = [
             failed("InvalidFleetConfiguration c7g.large us-east-1a"),
             failed("InvalidFleetConfiguration m7g.large us-east-1a"),
@@ -693,7 +705,8 @@ mod tests {
 
     #[test]
     fn progress_boundaries_and_in_flight_launches() {
-        let candidates = candidates(false);
+        let output = candidate_snapshot(false);
+        let candidates = candidates(&output);
         let a = || failed("InsufficientInstanceCapacity us-east-1a");
         let b = || failed("InsufficientInstanceCapacity us-east-1b");
         for status in ["Successful", "Cancelled"] {
