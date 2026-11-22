@@ -123,6 +123,10 @@ gh() {
       if [[ $CASE == invalid_runs ]]; then printf '{"workflow_runs":null}\n'; return; fi
       if [[ $CASE == malformed_json ]]; then printf '{\n'; return; fi
       local event=push run_sha=$SHA branch=main head_repo=",\"head_repository\":{\"full_name\":\"$GH_REPO\"}"
+      if [[ $CASE == queue* ]]; then event=merge_group; branch=gh-readonly-queue/main/pr-1; fi
+      if [[ $CASE == queue_wrong_branch ]]; then branch=gh-readonly-queue/other/pr-1; fi
+      if [[ $CASE == queue_wrong_sha ]]; then run_sha=$OTHER_SHA; fi
+      if [[ $CASE == queue_wrong_repo ]]; then head_repo=',"head_repository":{"full_name":"fork/gang"}'; fi
       if [[ $CASE == ci_dispatch ]]; then event=workflow_dispatch; fi
       if [[ $CASE == same_repo_pr ]]; then event=pull_request; fi
       if [[ $CASE == fork_pr ]]; then event=pull_request; head_repo=',"head_repository":{"full_name":"fork/gang"}'; fi
@@ -182,7 +186,7 @@ gh() {
 }
 export -f gh
 cases=0
-for scenario in direct:101 release_dispatch:101 newer_tag_push:101 pr_merged:101 pr_overall_failure:101 pr_missing_required:fail pr_failed_required:fail pr_duplicate_required:fail pr_missing_validation:fail pr_failed_validation:fail pr_missing_artifact:fail pr_expired_artifact:fail changed_tree:fail fork_pr:fail unmerged_pr:fail wrong_merge:fail wrong_base:fail invalid_pr:fail pr_wrong_event:fail pr_wrong_repo:fail pr_wrong_sha:fail compare_failure:fail not_main:fail invalid_compare:fail tree_api_failure:fail invalid_tree:fail prs_api_failure:fail invalid_prs:fail same_repo_pr:fail ci_dispatch:fail wrong_sha:fail wrong_branch:fail wrong_repo:fail missing_repo:fail null_repo:fail api_failure:fail invalid_runs:fail malformed_json:fail failed_required:fail pending_required:fail missing_required:fail duplicate_required:fail missing_validation:fail failed_validation:fail cancelled_validation:fail skipped_validation:fail latest_validation_failure:fail jobs_api_failure:fail invalid_jobs:fail malformed_job:fail missing_artifact:fail expired_artifact:fail artifact_api_failure:fail invalid_artifacts:fail malformed_artifact:fail no_darwin:101 expired_darwin:101 latest:202 fallback_required:101 fallback_validation:101 fallback_artifact:101 fallback_api_failure:fail; do
+for scenario in direct:101 release_dispatch:101 newer_tag_push:101 queue:101 queue_wrong_branch:fail queue_wrong_sha:fail queue_wrong_repo:fail pr_merged:101 pr_overall_failure:101 pr_missing_required:fail pr_failed_required:fail pr_duplicate_required:fail pr_missing_validation:fail pr_failed_validation:fail pr_missing_artifact:fail pr_expired_artifact:fail changed_tree:fail fork_pr:fail unmerged_pr:fail wrong_merge:fail wrong_base:fail invalid_pr:fail pr_wrong_event:fail pr_wrong_repo:fail pr_wrong_sha:fail compare_failure:fail not_main:fail invalid_compare:fail tree_api_failure:fail invalid_tree:fail prs_api_failure:fail invalid_prs:fail same_repo_pr:fail ci_dispatch:fail wrong_sha:fail wrong_branch:fail wrong_repo:fail missing_repo:fail null_repo:fail api_failure:fail invalid_runs:fail malformed_json:fail failed_required:fail pending_required:fail missing_required:fail duplicate_required:fail missing_validation:fail failed_validation:fail cancelled_validation:fail skipped_validation:fail latest_validation_failure:fail jobs_api_failure:fail invalid_jobs:fail malformed_job:fail missing_artifact:fail expired_artifact:fail artifact_api_failure:fail invalid_artifacts:fail malformed_artifact:fail no_darwin:101 expired_darwin:101 latest:202 fallback_required:101 fallback_validation:101 fallback_artifact:101 fallback_api_failure:fail; do
   export CASE=${scenario%:*} EVENT=push
   expected=${scenario#*:}
   if [[ $CASE == release_dispatch ]]; then EVENT=workflow_dispatch; fi

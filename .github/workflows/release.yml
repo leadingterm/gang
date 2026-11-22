@@ -79,7 +79,9 @@ jobs:
                 then error("invalid runs")
                 else [.[].workflow_runs[] | select(.head_sha == $head and
                   .head_repository.full_name == $repo and .status == "completed" and
-                  (if $kind == "push" then .event == "push" and .head_branch == "main"
+                  (if $kind == "push" then
+                    (.event == "push" and .head_branch == "main") or
+                    (.event == "merge_group" and (.head_branch | startswith("gh-readonly-queue/main/")))
                    else .event == "pull_request" end))]
                   | sort_by(.created_at) | reverse | .[].id end')"
             if [[ -n "$runs" ]]; then
