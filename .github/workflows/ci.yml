@@ -169,6 +169,17 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/e2e"
           cp $(bazel cquery --output=files //crates/gang-e2e:bundle) "$RUNNER_TEMP/e2e/"
+          files=$(jq -er '
+            if .v035 == {"binary":"gang-v035","fixture":"deployment-v035.json"} then
+              [.previous.binary, .previous.fixture, .v035.binary, .v035.fixture, .candidate_fixture] |
+              if all(.[]; if type == "string" then test("^[A-Za-z0-9][A-Za-z0-9._-]*$") else false end)
+              then .[] else error("invalid upgrade bundle manifest") end
+            else error("invalid v035 upgrade pair") end
+          ' "$RUNNER_TEMP/e2e/upgrade-inputs.json")
+          readarray -t files <<< "$files"
+          for file in "${files[@]}"; do
+            test -f "$RUNNER_TEMP/e2e/$file"
+          done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-harness-x86_64
@@ -259,9 +270,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/e2e"
           cp $(bazel cquery --output=files //crates/gang-e2e:bundle) "$RUNNER_TEMP/e2e/"
           files=$(jq -er '
-            [.previous.binary, .previous.fixture, .candidate_fixture] |
-            if all(.[]; if type == "string" then test("^[A-Za-z0-9][A-Za-z0-9._-]*$") else false end)
-            then .[] else error("invalid upgrade bundle manifest") end
+            if .v035 == {"binary":"gang-v035","fixture":"deployment-v035.json"} then
+              [.previous.binary, .previous.fixture, .v035.binary, .v035.fixture, .candidate_fixture] |
+              if all(.[]; if type == "string" then test("^[A-Za-z0-9][A-Za-z0-9._-]*$") else false end)
+              then .[] else error("invalid upgrade bundle manifest") end
+            else error("invalid v035 upgrade pair") end
           ' "$RUNNER_TEMP/e2e/upgrade-inputs.json")
           readarray -t files <<< "$files"
           for file in "${files[@]}"; do
@@ -337,9 +350,23 @@ jobs:
         with:
           args: --gate 2 --additions --shard ${{ matrix.shard }}/${{ strategy.job-total }}
 
+  e2e-v035-upgrade:
+    needs: [linux-x86_64-bundle]
+    if: github.event_name == 'merge_group'
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/run-e2e
+        with:
+          args: --gate 2 --scenario rolling-upgrade --previous-gang ${{ runner.temp }}/e2e/gang-v035 --previous-fixture ${{ runner.temp }}/e2e/deployment-v035.json
+
   release-validation:
     # macOS remains advisory and is not a release prerequisite.
-    needs: [nativelink-memory-tests, nix-vm, lint-checks, linux-x86_64-shards, linux-x86_64-bundle, linux-arm64-bundle, linux-arm64-checks, cross-build, e2e-gate-1-shards, e2e-gate-2-shards]
+    needs: [nativelink-memory-tests, nix-vm, lint-checks, linux-x86_64-shards, linux-x86_64-bundle, linux-arm64-bundle, linux-arm64-checks, cross-build, e2e-gate-1-shards, e2e-gate-2-shards, e2e-v035-upgrade]
     if: always() && github.event_name == 'merge_group'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 5
@@ -350,7 +377,7 @@ jobs:
           NEEDS_RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
           read -r -a results <<< "$NEEDS_RESULTS"
-          test "${#results[@]}" -eq 10
+          test "${#results[@]}" -eq 11
           for result in "${results[@]}"; do
             test "$result" = success
           done

@@ -34,7 +34,7 @@ jq -en --slurpfile ci "$scratch/ci.json" --slurpfile pr "$scratch/pr.json" '
   def no_continue:
     require((."continue-on-error" == null or ."continue-on-error" == false) and .permissions == null
       and all(.steps[]?; ."continue-on-error" == null or ."continue-on-error" == false); "critical work must not continue on error or override permissions");
-  ["nativelink-memory-tests", "nix-vm", "lint-checks", "linux-x86_64-shards", "linux-x86_64-bundle", "linux-arm64-bundle", "linux-arm64-checks", "cross-build", "e2e-gate-1-shards", "e2e-gate-2-shards"] as $critical
+  ["nativelink-memory-tests", "nix-vm", "lint-checks", "linux-x86_64-shards", "linux-x86_64-bundle", "linux-arm64-bundle", "linux-arm64-checks", "cross-build", "e2e-gate-1-shards", "e2e-gate-2-shards", "e2e-v035-upgrade"] as $critical
   | $ci[0] as $c | $pr[0] as $p
   | $c | require((.on | keys) == ["merge_group"] and .on.merge_group.types == ["checks_requested"]; "CI must trigger only for requested merge groups")
   | require(.permissions == {"contents":"read"}; "CI permissions must be read-only")
@@ -46,9 +46,9 @@ jq -en --slurpfile ci "$scratch/ci.json" --slurpfile pr "$scratch/pr.json" '
       | require([.steps[]? | select((.uses // "") | startswith("actions/checkout@")) | checkout] | length == 1; "critical job must check out the queue SHA")
       | require(all(.steps[]?; .if == null or (.uses == "./.github/actions/save-bazel-cache" and .if == "always() && job.status == '\''success'\''") or (.with.name == "bazel-metrics-x86-bundle" and .if == "always()")); "critical steps must not skip")
       | no_continue)
-  | reduce ($critical - ["linux-arm64-checks", "e2e-gate-1-shards", "e2e-gate-2-shards"])[] as $id (.; $jobs[$id] | require(deps == []; "unexpected dependency for " + $id))
+  | reduce ($critical - ["linux-arm64-checks", "e2e-gate-1-shards", "e2e-gate-2-shards", "e2e-v035-upgrade"])[] as $id (.; $jobs[$id] | require(deps == []; "unexpected dependency for " + $id))
   | $jobs["linux-arm64-checks"] | require(deps == ["linux-arm64-bundle"]; "ARM checks must depend on the ARM bundle")
-  | reduce ["nativelink-memory-tests", "nix-vm", "lint-checks", "linux-x86_64-shards", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-2-shards"][] as $id (.;
+  | reduce ["nativelink-memory-tests", "nix-vm", "lint-checks", "linux-x86_64-shards", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-2-shards", "e2e-v035-upgrade"][] as $id (.;
       $jobs[$id] | require((."runs-on" | strings | contains("linux-x64") and contains("ubuntu-24.04")); "x86 job must use x86 runners"))
   | $jobs["nativelink-memory-tests"] | require([.steps[]? | select(.name == "Run NativeLink memory tests" and (.run | contains("cargo test -p nativelink-scheduler") and contains("cargo test -p nativelink-worker") and contains("cargo test -p nativelink-service")))] | length == 1; "NativeLink memory tests must run")
   | $jobs["nix-vm"] | require([.steps[]? | select(.run == "tools/lint.sh --nix-vm")] | length == 1; "Nix VM checks must run")
@@ -58,19 +58,22 @@ jq -en --slurpfile ci "$scratch/ci.json" --slurpfile pr "$scratch/pr.json" '
   | $jobs["linux-x86_64-shards"] | require([.steps[]? | select(.name == "Test" and (.run | contains("bazel test") and contains("--target_pattern_file=\"$RUNNER_TEMP/targets\"")))] | length == 1; "x86 shard tests must execute selected targets")
   | $jobs["release-validation"]
   | require(.steps[0].env.NEEDS_RESULTS == "${{ join(needs.*.result, '\'' '\'') }}"; "release validation must receive every dependency result")
-  | require(deps == ($critical | sort); "release validation must directly depend on all ten critical jobs")
+  | require(deps == ($critical | sort); "release validation must directly depend on all eleven critical jobs")
   | require(scope == "always() && github.event_name == '\''merge_group'\''"; "release validation must always run on merge groups")
   | no_continue
   | require((.steps | length) == 1 and .steps[0].if == null and .steps[0].shell == "bash" and (.steps[0].run | type) == "string"; "release validation must have one unconditional Bash result-checking step")
   | $jobs.readiness | readiness("release-validation"; "always() && github.event_name == '\''merge_group'\''") | no_continue
   | $jobs.macos | require(scope == "github.event_name == '\''merge_group'\'' && !github.event.repository.private"; "macOS must remain advisory and queue-only")
   | [$jobs[].steps[]? | select((.uses // "") | startswith("actions/checkout@")) | checkout] | . as $checkouts
-  | require(($checkouts | length) >= 10; "full jobs require checkouts")
+  | require(($checkouts | length) >= 11; "full jobs require checkouts")
   | reduce ["e2e-gate-1-shards", "e2e-gate-2-shards"][] as $id (.;
       $jobs[$id] | require(deps == ["linux-x86_64-bundle"]; "E2E must depend on the x86 bundle")
       | require(.strategy.matrix == {"shard":[1,2,3,4,5,6,7,8]}; "E2E must run all eight shards")
       | (if $id == "e2e-gate-1-shards" then "--gate 1" else "--gate 2 --additions" end) as $selection
       | require([.steps[]? | select(.uses == "./.github/actions/run-e2e") | .with.args] == [$selection + " --shard ${{ matrix.shard }}/${{ strategy.job-total }}"]; "incorrect E2E selection"))
+  | $jobs["e2e-v035-upgrade"]
+  | require(deps == ["linux-x86_64-bundle"] and .strategy == null; "v035 upgrade must depend on the x86 bundle without a matrix")
+  | require([.steps[]? | select(.uses == "./.github/actions/run-e2e") | .with.args] == ["--gate 2 --scenario rolling-upgrade --previous-gang ${{ runner.temp }}/e2e/gang-v035 --previous-fixture ${{ runner.temp }}/e2e/deployment-v035.json"]; "v035 upgrade must run the rolling scenario with the published pair")
   | $jobs["linux-x86_64-shards"]
   | require(.strategy.matrix == {"shard":[1,2,3,4]}; "x86 must run four shards")
   | require([.steps[]? | select(.uses == "./.github/actions/save-bazel-cache") | select(.with.mode == "export" and .with.shard == "x86-${{ matrix.shard }}")] | length == 1; "x86 shards must export working sets")
@@ -103,14 +106,14 @@ jq -en --slurpfile ci "$scratch/ci.json" --slurpfile pr "$scratch/pr.json" '
 ' >/dev/null
 # Exercise the workflow's actual release result check, not a copy of its logic.
 jq -r '.jobs["release-validation"].steps[0].run' "$scratch/ci.json" >"$scratch/release.sh"
-good="success success success success success success success success success success"
+good="success success success success success success success success success success success"
 if ! NEEDS_RESULTS="$good" bash --noprofile --norc -e -u -o pipefail "$scratch/release.sh"; then
   echo "release validation rejects successful jobs" >&2
   exit 1
 fi
-for ((i = 0; i < 10; i++)); do
+for ((i = 0; i < 11; i++)); do
   for bad in failure cancelled skipped missing; do
-    results=(success success success success success success success success success success)
+    results=(success success success success success success success success success success success)
     if [[ $bad == missing ]]; then
       unset 'results[i]'
     else

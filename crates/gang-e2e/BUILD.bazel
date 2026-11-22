@@ -23,6 +23,22 @@ alias(
 )
 
 alias(
+    name = "v035_gang",
+    actual = select({
+        "//bazel/platforms:linux_x86_64": "@gang_v035_linux_x86_64//file:gang",
+        "//bazel/platforms:linux_arm64": "@gang_v035_linux_arm64//file:gang",
+    }),
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+upgrade_fixture(
+    name = "v035_fixture",
+    srcs = ["@gang_v035_source//:sources"],
+    source_root = "@gang_v035_source//:Cargo.toml",
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+alias(
     name = "previous_gang",
     actual = select({
         "//bazel/platforms:linux_x86_64": "@gang_v037_linux_x86_64//file:gang",
@@ -165,6 +181,8 @@ e2e_bundle(
     postgres = "//crates/gang-testkit:postgresql_archive",
     previous_fixture = ":previous_fixture",
     previous_gang = ":previous_gang",
+    v035_fixture = ":v035_fixture",
+    v035_gang = ":v035_gang",
     target_compatible_with = ["@platforms//os:linux"],
 )
 

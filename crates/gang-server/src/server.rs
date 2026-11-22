@@ -284,8 +284,8 @@ async fn run_leader<D: Deployment>(
     let state = tokio::select! {
         biased;
         () = shutdown.clone() => return Ok(()),
-        result = report_prepared(context.provisioner, &*context.core.host.clock,
-            context.sidecar_retry_interval.get()) => result.map_err(ServerError::PreparedMilestone)?,
+        state = report_prepared(context.provisioner, &*context.core.host.clock,
+            context.sidecar_retry_interval.get()) => state,
     };
     if state == ControllerHostState::Retiring {
         return Ok(());
@@ -613,23 +613,22 @@ async fn report_prepared<H: ControllerHostPort, C: Clock>(
     host: &H,
     clock: &C,
     interval: Duration,
-) -> Result<ControllerHostState, PortError> {
+) -> ControllerHostState {
     loop {
         let attempt = async {
             let state = host.state().await?;
             if state == ControllerHostState::Retiring {
-                return Ok(state);
+                return Ok::<_, PortError>(state);
             }
             host.reached(HostMilestone::Prepared).await?;
             Ok(ControllerHostState::Active)
         }
         .await;
         match attempt {
-            Ok(state) => return Ok(state),
-            Err(error @ PortError::Unavailable(_)) => {
+            Ok(state) => return state,
+            Err(error) => {
                 tracing::warn!(%error, "cannot prepare controller host; retrying before takeover");
             }
-            Err(error) => return Err(error),
         }
         clock.sleep(interval).await;
     }
@@ -639,23 +638,23 @@ async fn report_serving<H: ControllerHostPort, C: Clock>(
     host: &H,
     clock: &C,
     interval: Duration,
-    bound: Duration,
-) -> Result<(), PortError> {
-    clock
-        .timeout(bound, async {
-            loop {
-                match host.reached(HostMilestone::Serving).await {
-                    Ok(()) => return Ok(()),
-                    Err(error @ PortError::Unavailable(_)) => {
-                        tracing::warn!(%error, "failed to report serving milestone; retrying");
-                    }
-                    Err(error) => return Err(error),
-                }
-                clock.sleep(interval).await;
+    host_call_timeout: Duration,
+) -> Infallible {
+    loop {
+        match clock
+            .timeout(host_call_timeout, host.reached(HostMilestone::Serving))
+            .await
+        {
+            Ok(Ok(())) => std::future::pending().await,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "failed to report serving milestone; retrying");
             }
-        })
-        .await
-        .map_err(PortError::unavailable)?
+            Err(error) => {
+                tracing::warn!(%error, "timed out reporting serving milestone; retrying");
+            }
+        }
+        clock.sleep(interval).await;
+    }
 }
 
 /// Starts the term and runs the leader's work after taking the cache baseline.
@@ -673,17 +672,6 @@ async fn lead_work<D: Deployment>(
         .timeout(
             promotion_deadline.saturating_duration_since(context.core.host.clock.monotonic()),
             async {
-                if context
-                    .provisioner
-                    .state()
-                    .await
-                    .map_err(ServerError::HostIdentity)?
-                    == ControllerHostState::Retiring
-                {
-                    return Err(ServerError::HostIdentity(PortError::unavailable(
-                        "controller host is retiring",
-                    )));
-                }
                 synchronize_revocations(context.core, context.revoked_certificates)
                     .await
                     .map_err(ServerError::Revocations)?;
@@ -692,15 +680,6 @@ async fn lead_work<D: Deployment>(
                 }
                 context.leading.set(context.core.host.clock.wall());
                 context.readiness.lead();
-                report_serving(
-                    context.provisioner,
-                    &*context.core.host.clock,
-                    context.sidecar_retry_interval.get(),
-                    promotion_deadline
-                        .saturating_duration_since(context.core.host.clock.monotonic()),
-                )
-                .await
-                .map_err(ServerError::ServingMilestone)?;
                 Ok::<_, ServerError>(())
             },
         )
@@ -733,6 +712,12 @@ async fn lead_work<D: Deployment>(
     tokio::select! {
         biased;
         () = stop => Ok(()),
+        never = report_serving(
+            context.provisioner,
+            &**clock,
+            context.sidecar_retry_interval.get(),
+            context.leadership.host_call_timeout(),
+        ) => match never {},
         never = sidecar => match never {},
         never = control.run() => match never {},
         never = dashboard_tasks(context) => match never {},
@@ -1626,6 +1611,331 @@ mod tests {
 
     use super::{UnauthenticatedListeners, unauthenticated_listeners};
     use crate::endpoint::EndpointRole;
+
+    // The account budget is shared by the simulated v0.3.5 read workload and
+    // the candidate's lifecycle calls, not partitioned by controller host.
+    #[derive(Default)]
+    struct AccountBudget {
+        second: u64,
+        used: u32,
+        next_candidate: Option<gang_clock::Tick>,
+        old_requests: u64,
+        candidate_requests: u64,
+        throttled: u32,
+        prepared_attempts: u32,
+        prepared_backend_failures: u32,
+        prepared_transient_failures: u32,
+        serving_attempts: u32,
+        serving_completed: bool,
+        prepared: bool,
+        hold_serving: bool,
+        transient_serving: bool,
+        fail_serving: bool,
+    }
+
+    #[derive(Clone)]
+    struct AccountHost {
+        inner: gang_testkit::FakeProvisioner,
+        clock: Arc<gang_clock::TestClock>,
+        account: Arc<parking_lot::Mutex<AccountBudget>>,
+    }
+
+    impl AccountHost {
+        async fn request(&self) -> Result<(), gang_spi::PortError> {
+            use gang_clock::Clock;
+            let now = self.clock.monotonic();
+            let due = {
+                let mut account = self.account.lock();
+                let due = account.next_candidate.unwrap_or(now).max(now);
+                account.next_candidate = Some(due + std::time::Duration::from_millis(500));
+                due
+            };
+            self.clock.sleep_until(due).await;
+            let second = self.clock.monotonic().elapsed().as_secs();
+            let mut account = self.account.lock();
+            if account.second != second {
+                account.second = second;
+                account.used = 0;
+            }
+            account.candidate_requests += 1;
+            if account.used >= 4 {
+                account.throttled += 1;
+                return Err(gang_spi::PortError::unavailable("account throttled"));
+            }
+            account.used += 1;
+            Ok(())
+        }
+    }
+
+    impl gang_spi::ControllerHostPort for AccountHost {
+        async fn state(&self) -> Result<gang_spi::ControllerHostState, gang_spi::PortError> {
+            self.request().await?;
+            gang_spi::ControllerHostPort::state(&self.inner).await
+        }
+        async fn drain_limit(&self) -> Result<Option<std::time::Duration>, gang_spi::PortError> {
+            gang_spi::ControllerHostPort::drain_limit(&self.inner).await
+        }
+        async fn heartbeat(&self) -> Result<(), gang_spi::PortError> {
+            gang_spi::ControllerHostPort::heartbeat(&self.inner).await
+        }
+        async fn incarnation(&self) -> Result<gang_spi::ControllerHostIdentity, gang_spi::PortError> {
+            gang_spi::ControllerHostPort::incarnation(&self.inner).await
+        }
+        async fn retiring(&self) -> Result<(), gang_spi::PortError> {
+            gang_spi::ControllerHostPort::retiring(&self.inner).await
+        }
+        async fn reached(&self, milestone: gang_spi::HostMilestone) -> Result<(), gang_spi::PortError> {
+            if matches!(milestone, gang_spi::HostMilestone::Prepared | gang_spi::HostMilestone::Serving) {
+                if milestone == gang_spi::HostMilestone::Serving {
+                    let hold = {
+                        let mut account = self.account.lock();
+                        account.serving_attempts += 1;
+                        account.hold_serving
+                    };
+                    if hold {
+                        return std::future::pending().await;
+                    }
+                }
+                self.request().await?;
+                if milestone == gang_spi::HostMilestone::Prepared {
+                    let mut account = self.account.lock();
+                    account.prepared_attempts += 1;
+                    if account.prepared_backend_failures > 0 {
+                        account.prepared_backend_failures -= 1;
+                        return Err(gang_spi::PortError::backend("prepared backend failure"));
+                    }
+                    if account.prepared_transient_failures > 0 {
+                        account.prepared_transient_failures -= 1;
+                        return Err(gang_spi::PortError::unavailable("prepared throttled"));
+                    }
+                }
+                if milestone == gang_spi::HostMilestone::Serving
+                    && self.account.lock().transient_serving
+                {
+                    return Err(gang_spi::PortError::unavailable("lifecycle throttled"));
+                }
+                if milestone == gang_spi::HostMilestone::Serving
+                    && self.account.lock().fail_serving
+                {
+                    return Err(gang_spi::PortError::backend("lifecycle failure"));
+                }
+            }
+            gang_spi::ControllerHostPort::reached(&self.inner, milestone).await?;
+            let mut account = self.account.lock();
+            if milestone == gang_spi::HostMilestone::Prepared {
+                account.prepared = true;
+            } else if milestone == gang_spi::HostMilestone::Serving {
+                account.serving_completed = true;
+            }
+            Ok(())
+        }
+    }
+
+    impl gang_spi::ProvisionerPort for AccountHost {
+        type FleetOptions = gang_testkit::Opaque;
+        async fn supply(&self, fleet: gang_types::Fleet<'_, Self::FleetOptions>, into: &mut gang_spi::FleetSupply) -> Result<(), gang_spi::PortError> {
+            gang_spi::ProvisionerPort::supply(&self.inner, fleet, into).await
+        }
+        async fn converge(&self, held: &gang_spi::Held, fleet: gang_types::Fleet<'_, Self::FleetOptions>) -> Result<(), gang_spi::PortError> {
+            gang_spi::ProvisionerPort::converge(&self.inner, held, fleet).await
+        }
+        async fn set_desired_capacity(&self, held: &gang_spi::Held, fleet: gang_types::Fleet<'_, Self::FleetOptions>, desired: u32) -> Result<(), gang_spi::PortError> {
+            gang_spi::ProvisionerPort::set_desired_capacity(&self.inner, held, fleet, desired).await
+        }
+        async fn terminate(&self, held: &gang_spi::Held, fleet: gang_types::Fleet<'_, Self::FleetOptions>, instance: &gang_types::InstanceId, mode: gang_spi::TerminationMode) -> Result<(), gang_spi::PortError> {
+            gang_spi::ProvisionerPort::terminate(&self.inner, held, fleet, instance, mode).await
+        }
+        fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
+            gang_spi::ProvisionerPort::worker_lifetime(&self.inner)
+        }
+    }
+
+    struct AccountDeployment;
+    impl crate::deployment::Stack for AccountDeployment {
+        type Signer = <crate::test_support_deployment::PlainDeployment as crate::deployment::Stack>::Signer;
+        type Clock = gang_clock::TestClock;
+        type Repository = <crate::test_support_deployment::PlainDeployment as crate::deployment::Stack>::Repository;
+        type Identity = <crate::test_support_deployment::PlainDeployment as crate::deployment::Stack>::Identity;
+        type Clients = <crate::test_support_deployment::PlainDeployment as crate::deployment::Stack>::Clients;
+        type Workers = <crate::test_support_deployment::PlainDeployment as crate::deployment::Stack>::Workers;
+    }
+    impl crate::deployment::Deployment for AccountDeployment {
+        type Provisioner = AccountHost;
+        type Cache = <crate::test_support_deployment::PlainDeployment as crate::deployment::Deployment>::Cache;
+        type Scheduler = <crate::test_support_deployment::PlainDeployment as crate::deployment::Deployment>::Scheduler;
+        type Listener = <crate::test_support_deployment::PlainDeployment as crate::deployment::Deployment>::Listener;
+        type Plugins = <crate::test_support_deployment::PlainDeployment as crate::deployment::Deployment>::Plugins;
+    }
+
+    fn account_parts(
+        parts: crate::deployment::Parts<crate::test_support_deployment::PlainDeployment>,
+        account: Arc<parking_lot::Mutex<AccountBudget>>,
+    ) -> crate::deployment::Parts<AccountDeployment> {
+        crate::deployment::Parts {
+            provisioner: AccountHost { inner: parts.provisioner, clock: parts.clock.clone(), account },
+            fleets: parts.fleets,
+            cache: parts.cache,
+            signer: parts.signer,
+            scheduler: parts.scheduler,
+            repository: parts.repository,
+            providers: parts.providers,
+            clock: parts.clock,
+            listeners: parts.listeners,
+            controller: parts.controller,
+            clients: parts.clients,
+            workers: parts.workers,
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_account_throttle_preserves_handover_and_serving() -> gang_testkit::TestResult {
+        use gang_clock::Clock;
+        use gang_spi::{ControllerHostIdentity, ControllerId, ControllerReady};
+        use std::time::Duration;
+
+            let (mut old_parts, _, old) = crate::test_support::plain_parts();
+            let (mut new_parts, _, replacement) = crate::test_support::plain_parts();
+            old_parts.provisioner = old_parts.provisioner.with_host_identity(
+                ControllerHostIdentity::Launched {
+                    at: old.clock.wall(),
+                    instance: gang_types::InstanceId::try_new("old-account-host")?,
+                },
+            );
+            new_parts.provisioner = new_parts.provisioner.with_host_identity(
+                ControllerHostIdentity::Launched {
+                    at: old.clock.wall() + Duration::from_secs(1),
+                    instance: gang_types::InstanceId::try_new("new-account-host")?,
+                },
+            );
+            new_parts.repository = old_parts.repository.clone();
+            new_parts.clock = old_parts.clock.clone();
+            new_parts.controller = ControllerId::new("account-successor");
+            let settings = crate::test_support::plain_settings();
+            let renew = settings.leadership.renew_interval.get();
+            let bound = gang_types::handover::handover_window(
+                renew,
+                settings.leadership.call_timeout.get(),
+            );
+            let account = Arc::new(parking_lot::Mutex::new(AccountBudget::default()));
+            let new_parts = account_parts(new_parts, account.clone());
+            let old_server = super::Server::prepare(old_parts, settings.clone()).await?;
+            let new_server = super::Server::prepare(new_parts, settings).await?;
+            let old_ready = old_server.readiness.clone();
+            let new_ready = new_server.readiness.clone();
+            let release_drain = old.scheduler.hold_drain();
+            let (old_stop, old_stopped) = super::stop_channel();
+            let (new_stop, new_stopped) = super::stop_channel();
+            let mut first = Box::pin(old_server.run(old_stopped, ControllerReady::channel().0));
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            assert!(old_ready.ready());
+            let old_snapshots = old.scheduler.snapshots().get();
+            let mut second = Box::pin(new_server.run(new_stopped, ControllerReady::channel().0));
+
+            // Model v0.3.5's unpaced DescribeAutoScalingGroups/Activities reads.
+            let steps = bound.as_secs() + 4;
+            for _ in 0..steps {
+                let mut budget = account.lock();
+                budget.second = old.clock.monotonic().elapsed().as_secs();
+                budget.used = 4;
+                budget.old_requests += 4;
+                drop(budget);
+                assert!(futures::poll!(first.as_mut()).is_pending());
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                assert!(old_ready.ready());
+                assert!(!new_ready.ready());
+                assert_eq!(old.scheduler.drains().get(), 0);
+                old.clock.advance(Duration::from_secs(1));
+            }
+            assert!(old.scheduler.snapshots().get() > old_snapshots);
+            {
+                let budget = account.lock();
+                assert_eq!(budget.old_requests, steps * 4);
+                assert!(budget.candidate_requests > 0);
+                assert!(budget.throttled > 0);
+            }
+            {
+                let mut budget = account.lock();
+                budget.prepared_backend_failures = 1;
+                budget.prepared_transient_failures = 1;
+            }
+            for _ in 0..20 {
+                old.clock.advance(Duration::from_secs(1));
+                assert!(futures::poll!(first.as_mut()).is_pending());
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                assert!(old_ready.ready());
+                assert!(!new_ready.ready());
+                assert_eq!(old.scheduler.drains().get(), 0);
+                let budget = account.lock();
+                if budget.prepared_attempts >= 2 {
+                    break;
+                }
+            }
+            assert_eq!(account.lock().prepared_attempts, 2);
+
+
+            account.lock().hold_serving = true;
+            for _ in 0..40 {
+                old.clock.advance(Duration::from_secs(1));
+                assert!(futures::poll!(first.as_mut()).is_pending());
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                if new_ready.ready() {
+                    break;
+                }
+            }
+            assert!(new_ready.ready(), "candidate must eventually take over");
+            assert!(account.lock().prepared);
+            assert_eq!(account.lock().serving_attempts, 1);
+            let snapshots = replacement.scheduler.snapshots().get();
+            for _ in 0..11 {
+                old.clock.advance(Duration::from_secs(1));
+                assert!(futures::poll!(first.as_mut()).is_pending());
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                assert!(new_ready.ready());
+            }
+            assert!(replacement.scheduler.snapshots().get() > snapshots);
+            assert!(account.lock().serving_attempts >= 2);
+            {
+                let mut budget = account.lock();
+                budget.hold_serving = false;
+                budget.transient_serving = true;
+            }
+            for _ in 0..12 {
+                old.clock.advance(Duration::from_secs(1));
+                assert!(futures::poll!(first.as_mut()).is_pending());
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                assert!(new_ready.ready());
+            }
+            let attempts = {
+                let mut budget = account.lock();
+                assert!(budget.serving_attempts >= 3, "timed out attempts must retry");
+                budget.transient_serving = false;
+                budget.fail_serving = true;
+                budget.serving_attempts
+            };
+            for _ in 0..3 {
+                old.clock.advance(Duration::from_secs(1));
+                assert!(futures::poll!(first.as_mut()).is_pending());
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                assert!(new_ready.ready());
+            }
+            assert!(account.lock().serving_attempts > attempts);
+            account.lock().fail_serving = false;
+            for _ in 0..5 {
+                old.clock.advance(Duration::from_secs(1));
+                assert!(futures::poll!(first.as_mut()).is_pending());
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                if account.lock().serving_completed {
+                    break;
+                }
+            }
+            assert!(account.lock().serving_completed);
+            new_stop.send(()).map_err(|()| "new server stopped early")?;
+            second.await?;
+            release_drain.send(()).map_err(|()| "old drain ended early")?;
+            old_stop.send(()).map_err(|()| "old server stopped early")?;
+            first.await?;
+        Ok(())
+    }
 
     fn passive_candidate(holder: &gang_spi::ControllerId) -> gang_spi::LeaseCandidate {
         gang_spi::LeaseCandidate {

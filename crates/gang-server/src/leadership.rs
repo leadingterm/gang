@@ -105,6 +105,10 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
         self.config.call_timeout.get()
     }
 
+    pub(crate) fn host_call_timeout(&self) -> Duration {
+        self.config.host_call_timeout.get()
+    }
+
     pub(crate) fn protection_ttl(&self) -> Duration {
         self.config.ttl.get()
     }
@@ -152,6 +156,27 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
     ) -> Result<Option<Lease>, PortError> {
         let mut reachable_since = None;
         loop {
+            match self
+                .clock
+                .timeout(self.host_call_timeout(), host.state())
+                .await
+            {
+                Ok(Ok(ControllerHostState::Active)) => {}
+                Ok(Ok(ControllerHostState::Retiring)) => return Ok(None),
+                Ok(Err(error @ PortError::Unavailable(_))) => {
+                    reachable_since = None;
+                    tracing::warn!(%error, "cannot read controller host state");
+                    self.clock.sleep(self.renew_interval()).await;
+                    continue;
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(error) => {
+                    reachable_since = None;
+                    tracing::warn!(%error, "timed out reading controller host state");
+                    self.clock.sleep(self.renew_interval()).await;
+                    continue;
+                }
+            }
             let started = self.clock.monotonic();
             let wall = self.clock.wall();
             let stale_before = if reachable_since.is_some_and(|since| {
@@ -161,47 +186,33 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
             } else {
                 ONLY_RELEASED
             };
-            let mut host_failed = false;
-            let mut checking_host = true;
             let attempt = self
                 .clock
-                .timeout(self.call_timeout(), async {
-                    let state = host.state().await.inspect_err(|_| {
-                        host_failed = true;
-                    })?;
-                    checking_host = false;
-                    if state == ControllerHostState::Retiring {
-                        return Ok(None);
-                    }
-                    self.lease
-                        .acquire(
-                            candidate,
-                            wall,
-                            stale_before,
-                            wall + self.config.ttl.get(),
-                            Takeover::Request,
-                        )
-                        .await
-                        .map(Some)
-                })
+                .timeout(
+                    self.call_timeout(),
+                    self.lease.acquire(
+                        candidate,
+                        wall,
+                        stale_before,
+                        wall + self.config.ttl.get(),
+                        Takeover::Request,
+                    ),
+                )
                 .await;
             match attempt {
-                Ok(Ok(None)) => return Ok(None),
-                Ok(Ok(Some(Acquisition::Acquired(lease)))) => {
+                Ok(Ok(Acquisition::Acquired(lease))) => {
                     self.confirm(started);
                     return Ok(Some(lease));
                 }
-                Ok(Ok(Some(
+                Ok(Ok(
                     Acquisition::Contending(_) | Acquisition::Held(_) | Acquisition::Reserved,
-                ))) => {
+                )) => {
                     reachable_since.get_or_insert_with(|| self.clock.monotonic());
                 }
-                Ok(Err(error)) if host_failed => return Err(error),
                 Ok(Err(error)) => {
                     reachable_since = None;
                     tracing::warn!(%error, "cannot acquire the leader lease");
                 }
-                Err(error) if checking_host => return Err(PortError::unavailable(error)),
                 Err(error) => {
                     reachable_since = None;
                     tracing::warn!(%error, "timed out acquiring the leader lease");

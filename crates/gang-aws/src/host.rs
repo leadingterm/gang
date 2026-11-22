@@ -502,7 +502,7 @@ mod tests {
 
     use super::*;
     use crate::config::AwsConfig;
-    use crate::fake_aws::{FakeAws, FakeFailure, FakeGroup};
+    use crate::fake_aws::{AccountQuota, FakeAws, FakeFailure, FakeGroup};
     use crate::plugin::Runtime;
 
     const GROUP: &str = "controllers";
@@ -583,6 +583,165 @@ mod tests {
                 ("terminate".to_owned(), TERMINATE_TRANSITION.to_owned()),
             ],
         );
+    }
+
+    async fn wait_for_requests(fake: &FakeAws, operation: &str, count: usize) {
+        let started = fake.state().request_started.clone();
+        loop {
+            let notified = started.notified();
+            if request_count(fake, operation) >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn request_count(fake: &FakeAws, operation: &str) -> usize {
+        fake.state()
+            .requests
+            .iter()
+            .filter(|request| request.operation == operation)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn account_contention_and_bounded_serving_recover_without_duplicate_completion()
+    -> TestResult {
+        let fake = FakeAws::start().await?;
+        let clock = Arc::new(TestClock::default());
+        seed(&fake);
+        let config: AwsConfig = serde_json::from_value(
+            json!({"region":"us-east-1", "scratch_mount_point":"/mnt/scratch"}),
+        )?;
+        let sdk = fake.sdk_config().await;
+        let runtime = Runtime::from_sdk(
+            &sdk,
+            fake.imds_client()?,
+            &config,
+            clock.clone(),
+            &Arc::new(crate::events::Managed::default()),
+        );
+        let mut aws = Aws::with_runtime(config, runtime);
+        aws.clock = clock.clone();
+        let aws = Arc::new(aws);
+
+        // Prepared runs before promotion, using the same manually driven pacing clock.
+        let prepared = {
+            let aws = aws.clone();
+            tokio::spawn(async move { Box::pin(aws.reached(HostMilestone::Prepared)).await })
+        };
+        wait_for_requests(&fake, "DescribeAutoScalingGroups", 1).await;
+        clock.advance(Duration::from_millis(500));
+        prepared.await??;
+
+        // Four old, unpaced starts per second exhaust the shared account window.
+        fake.state().account_quota =
+            Some(AccountQuota::new(clock.clone(), 4, Duration::from_secs(1)));
+        let old = aws_sdk_autoscaling::Client::new(&fake.sdk_config().await);
+        let other_session = aws_sdk_autoscaling::Client::new(&fake.sdk_config().await);
+        for index in 0..4 {
+            if index % 2 == 0 {
+                old.describe_auto_scaling_groups().send().await?;
+            } else {
+                old.describe_scaling_activities().send().await?;
+            }
+            if index != 3 {
+                clock.advance(Duration::from_millis(250));
+            }
+        }
+        assert!(
+            other_session
+                .describe_scaling_activities()
+                .send()
+                .await
+                .is_err()
+        );
+        assert!(matches!(aws.state().await, Err(PortError::Unavailable(_))));
+        assert_eq!(fake.state().throttled.len(), 2);
+        clock.advance(Duration::from_millis(500));
+
+        // The old promotion path did a state read followed by Serving: four serial ASG
+        // calls at 2/s cannot complete inside its one-second deadline.
+        let groups = request_count(&fake, "DescribeAutoScalingGroups");
+        let hooks = request_count(&fake, DESCRIBE_HOOKS);
+        let deadline = clock.monotonic() + Duration::from_secs(1);
+        let short = {
+            let aws = aws.clone();
+            let clock = clock.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = clock.sleep_until(deadline) => None,
+                    result = async {
+                        aws.state().await?;
+                        Box::pin(aws.reached(HostMilestone::Serving)).await
+                    } => Some(result),
+                }
+            })
+        };
+        wait_for_requests(&fake, "DescribeAutoScalingGroups", groups + 1).await;
+        clock.advance(Duration::from_millis(500));
+        wait_for_requests(&fake, DESCRIBE_HOOKS, hooks + 1).await;
+        clock.advance(Duration::from_millis(500));
+        assert!(short.await?.is_none());
+        assert!(fake.state().lifecycle_completions.is_empty());
+
+        // A longer attempt can reach completion; lose that response after the effect.
+        fake.state().hold_response = Some(COMPLETE_ACTION);
+        let held = fake.state().response_held.clone();
+        let release = fake.state().release_response.clone();
+        let hooks = request_count(&fake, DESCRIBE_HOOKS);
+        let groups = request_count(&fake, "DescribeAutoScalingGroups");
+        let deadline = clock.monotonic() + Duration::from_secs(4);
+        let long = {
+            let aws = aws.clone();
+            let clock = clock.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = clock.sleep_until(deadline) => None,
+                    result = async {
+                        aws.state().await?;
+                        Box::pin(aws.reached(HostMilestone::Serving)).await
+                    } => Some(result),
+                }
+            })
+        };
+        wait_for_requests(&fake, "DescribeAutoScalingGroups", groups + 1).await;
+        clock.advance(Duration::from_millis(500));
+        wait_for_requests(&fake, DESCRIBE_HOOKS, hooks + 1).await;
+        clock.advance(Duration::from_millis(500));
+        wait_for_requests(&fake, "DescribeAutoScalingGroups", groups + 2).await;
+        clock.advance(Duration::from_millis(500));
+        held.notified().await;
+        assert_eq!(fake.state().lifecycle_completions.len(), 1);
+        clock.advance(Duration::from_millis(2500));
+        assert!(long.await?.is_none());
+        release.notify_one();
+
+        // The next bounded attempt observes Pending:Proceed and does not repeat the effect.
+        let hooks = request_count(&fake, DESCRIBE_HOOKS);
+        let deadline = clock.monotonic() + Duration::from_secs(4);
+        let retry = {
+            let aws = aws.clone();
+            let clock = clock.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = clock.sleep_until(deadline) => None,
+                    result = Box::pin(aws.reached(HostMilestone::Serving)) => Some(result),
+                }
+            })
+        };
+        wait_for_requests(&fake, DESCRIBE_HOOKS, hooks + 1).await;
+        clock.advance(Duration::from_millis(500));
+        retry.await?.ok_or("retry timed out")??;
+        assert_eq!(
+            fake.state().lifecycle_completions,
+            vec![(GROUP.into(), "launch".into(), INSTANCE.into())]
+        );
+        assert_eq!(request_count(&fake, COMPLETE_ACTION), 1);
+        Ok(())
     }
 
     #[tokio::test]

@@ -19,12 +19,15 @@ def _e2e_bundle_impl(ctx):
         (ctx.file.loaded_probe, ctx.outputs.out_loaded_probe),
         (ctx.file.previous_gang, ctx.outputs.out_previous_gang),
         (ctx.file.previous_fixture, ctx.outputs.out_previous_fixture),
+        (ctx.file.v035_gang, ctx.outputs.out_v035_gang),
+        (ctx.file.v035_fixture, ctx.outputs.out_v035_fixture),
         (ctx.file.candidate_fixture, ctx.outputs.out_candidate_fixture),
     ]
     for source, output in copies:
         _copy(ctx, source, output)
     ctx.actions.write(ctx.outputs.manifest, json.encode({
         "previous": {"binary": ctx.outputs.out_previous_gang.basename, "fixture": ctx.outputs.out_previous_fixture.basename},
+        "v035": {"binary": ctx.outputs.out_v035_gang.basename, "fixture": ctx.outputs.out_v035_fixture.basename},
         "candidate_fixture": ctx.outputs.out_candidate_fixture.basename,
     }))
     return [DefaultInfo(files = depset([output for _, output in copies] + [ctx.outputs.manifest]))]
@@ -41,6 +44,8 @@ e2e_bundle = rule(
             "loaded_probe",
             "previous_gang",
             "previous_fixture",
+            "v035_gang",
+            "v035_fixture",
             "candidate_fixture",
         ]
     },
@@ -52,6 +57,8 @@ e2e_bundle = rule(
         "out_loaded_probe": "%{name}/loaded_probe",
         "out_previous_gang": "%{name}/gang-previous",
         "out_previous_fixture": "%{name}/deployment-previous.json",
+        "out_v035_gang": "%{name}/gang-v035",
+        "out_v035_fixture": "%{name}/deployment-v035.json",
         "out_candidate_fixture": "%{name}/deployment-candidate.json",
         "manifest": "%{name}/upgrade-inputs.json",
     },

@@ -4,6 +4,12 @@ This file is the historical archive. New release notes come from [change fragmen
 
 ## 0.3.8 — 2026-11-22
 
+### Fixed
+
+- Prepare controllers and preflight host state before takeover, with a separate 10-second host-call timeout; transient preflight failures retry passively without consuming the lease deadline.
+- Retry launch lifecycle notification in bounded attempts after promotion without interrupting healthy serving, control or lease renewal.
+- Fail deployment verification and cancel the instance refresh once if the incoming controller is not serving within 10 minutes.
+
 ## 0.3.6 — 2026-11-22
 
 ### Added

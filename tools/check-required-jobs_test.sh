@@ -35,7 +35,7 @@ reset_fixtures() {
 }
 
 expect success 'current workflow graph' "$guard" "$workflow" "$pr_workflow"
-critical=(nativelink-memory-tests nix-vm lint-checks linux-x86_64-shards linux-x86_64-bundle linux-arm64-bundle linux-arm64-checks cross-build e2e-gate-1-shards e2e-gate-2-shards)
+critical=(nativelink-memory-tests nix-vm lint-checks linux-x86_64-shards linux-x86_64-bundle linux-arm64-bundle linux-arm64-checks cross-build e2e-gate-1-shards e2e-gate-2-shards e2e-v035-upgrade)
 for job in "${critical[@]}"; do
   reset_fixtures
   job="$job" yq -i 'del(.jobs.release-validation.needs[] | select(. == strenv(job)))' "$fixture"
@@ -115,7 +115,7 @@ expect failure 'release gate cannot be a green stub' "$guard" "$fixture" "$pr_fi
 reset_fixtures
 yq -i '.jobs.release-validation.needs += ["macos"]' "$fixture"
 expect failure 'advisory macOS cannot join release gate' "$guard" "$fixture" "$pr_fixture"
-for job in linux-arm64-checks e2e-gate-1-shards e2e-gate-2-shards; do
+for job in linux-arm64-checks e2e-gate-1-shards e2e-gate-2-shards e2e-v035-upgrade; do
   reset_fixtures
   job="$job" yq -i '.jobs[strenv(job)].needs = []' "$fixture"
   expect failure "$job requires its bundle" "$guard" "$fixture" "$pr_fixture"
@@ -149,6 +149,22 @@ for job in e2e-gate-1-shards e2e-gate-2-shards; do
   job="$job" yq -i '(.jobs[strenv(job)].steps[] | select(.uses == "./.github/actions/run-e2e") | .with.args) = "--gate 1"' "$fixture"
   expect failure "$job uses the real shard selection" "$guard" "$fixture" "$pr_fixture"
 done
+reset_fixtures
+yq -i 'del(.jobs.e2e-v035-upgrade)' "$fixture"
+expect failure 'v035 upgrade job is required' "$guard" "$fixture" "$pr_fixture"
+for mutation in \
+  '--gate 2 --scenario rolling-upgrade' \
+  '--gate 1 --scenario rolling-upgrade --previous-gang ${{ runner.temp }}/e2e/gang-v035 --previous-fixture ${{ runner.temp }}/e2e/deployment-v035.json' \
+  '--gate 2 --scenario config-refetch-restart --previous-gang ${{ runner.temp }}/e2e/gang-v035 --previous-fixture ${{ runner.temp }}/e2e/deployment-v035.json' \
+  '--gate 2 --scenario rolling-upgrade --previous-gang ${{ runner.temp }}/e2e/gang-previous --previous-fixture ${{ runner.temp }}/e2e/deployment-v035.json' \
+  '--gate 2 --scenario rolling-upgrade --previous-gang ${{ runner.temp }}/e2e/gang-v035 --previous-fixture ${{ runner.temp }}/e2e/deployment-previous.json'; do
+  reset_fixtures
+  mutation="$mutation" yq -i '(.jobs.e2e-v035-upgrade.steps[] | select(.uses == "./.github/actions/run-e2e") | .with.args) = strenv(mutation)' "$fixture"
+  expect failure 'v035 upgrade requires the exact scenario and published pair' "$guard" "$fixture" "$pr_fixture"
+done
+reset_fixtures
+yq -i '.jobs.e2e-v035-upgrade.runs-on = "ubuntu-24.04-arm"' "$fixture"
+expect failure 'v035 upgrade requires x86 runners' "$guard" "$fixture" "$pr_fixture"
 reset_fixtures
 yq -i '(.jobs.lint-checks.steps[] | select(.run == "tools/lint.sh --portable") | .run) = "true"' "$fixture"
 expect failure 'queue lint executes portable lint' "$guard" "$fixture" "$pr_fixture"
@@ -189,11 +205,11 @@ expect failure 'preflight cannot override permissions' "$guard" "$fixture" "$pr_
 
 # Execute the actual release result body for every failing or missing dependency.
 yq -o=json '.jobs.release-validation.steps[0].run' "$workflow" | jq -r . >"$scratch/release.sh"
-results=(success success success success success success success success success success)
+results=(success success success success success success success success success success success)
 expect success 'release gate accepts all success' env NEEDS_RESULTS="${results[*]}" bash --noprofile --norc -e -u -o pipefail "$scratch/release.sh"
-for ((i = 0; i < 10; i++)); do
+for ((i = 0; i < 11; i++)); do
   for value in failure cancelled skipped missing; do
-    results=(success success success success success success success success success success)
+    results=(success success success success success success success success success success success)
     if [[ $value == missing ]]; then unset 'results[i]'; else results[i]=$value; fi
     expect failure "release gate rejects $value at $i" env NEEDS_RESULTS="${results[*]}" bash --noprofile --norc -e -u -o pipefail "$scratch/release.sh"
   done

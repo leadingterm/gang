@@ -79,6 +79,24 @@ devshell_import_tools(
 
 # Released Linux binaries and source trees used by the mixed-version upgrade gate.
 http_file(
+    name = "gang_v035_linux_x86_64",
+    dev_dependency = True,
+    downloaded_file_path = "gang",
+    executable = True,
+    sha256 = "b98066c3975154e6596601f3e3a042d3ebc29d35995e11ddf9fc3774bc3bb2e1",
+    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.5/gang-x86_64-unknown-linux-musl"],
+)
+
+http_file(
+    name = "gang_v035_linux_arm64",
+    dev_dependency = True,
+    downloaded_file_path = "gang",
+    executable = True,
+    sha256 = "f80bd035e46d1a8d7922b80f717b7f8f42a71dbaf29f1a068a7b09bd505c60d6",
+    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.5/gang-aarch64-unknown-linux-musl"],
+)
+
+http_file(
     name = "gang_v037_linux_x86_64",
     dev_dependency = True,
     downloaded_file_path = "gang",
@@ -107,6 +125,17 @@ filegroup(
 """
 
 UPGRADE_SOURCE_PATCH = "find infra configs -type f \\( -name BUILD -o -name BUILD.bazel \\) -delete"
+
+http_archive(
+    name = "gang_v035_source",
+    build_file_content = UPGRADE_SOURCE_BUILD,
+    dev_dependency = True,
+    patch_cmds = [UPGRADE_SOURCE_PATCH],
+    sha256 = "ca92feffbca1ba24adcf6867afa29e7f90a05b7e0cce0d0f7fdde6bf0579fe70",
+    strip_prefix = "gang-0.3.5",
+    type = "tar.gz",
+    urls = ["https://codeload.github.com/leadingterm/gang/tar.gz/refs/tags/v0.3.5"],
+)
 
 http_archive(
     name = "gang_v037_source",
