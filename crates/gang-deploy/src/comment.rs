@@ -27,14 +27,24 @@ pub struct PlanComment<'a> {
     source: CommentSource<'a>,
     /// The plan; `None` when the plan did not complete.
     plan: Option<&'a Plan>,
+    /// Exact Auto Scaling group addresses allowed to be destroyed.
+    allow_asg_destroy: &'a [String],
 }
 
 impl<'a> PlanComment<'a> {
     /// The comment for `plan` of the tree `source` names; `plan` is `None` when planning did not
-    /// complete.
+    /// complete. `allow_asg_destroy` uses the same exact-address exceptions as the policy.
     #[must_use]
-    pub const fn new(source: CommentSource<'a>, plan: Option<&'a Plan>) -> Self {
-        Self { source, plan }
+    pub const fn new(
+        source: CommentSource<'a>,
+        plan: Option<&'a Plan>,
+        allow_asg_destroy: &'a [String],
+    ) -> Self {
+        Self {
+            source,
+            plan,
+            allow_asg_destroy,
+        }
     }
 }
 
@@ -53,7 +63,7 @@ impl fmt::Display for PlanComment<'_> {
             return writeln!(f, "**Plan did not complete.** See the workflow run logs.");
         };
 
-        let protected = plan.protected_changes();
+        let protected = plan.protected_changes(self.allow_asg_destroy);
         if !protected.is_empty() {
             writeln!(
                 f,
@@ -79,6 +89,25 @@ impl fmt::Display for PlanComment<'_> {
             writeln!(f)?;
         } else {
             writeln!(f, "No changes.")?;
+            writeln!(f)?;
+        }
+
+        let mut allowed = plan
+            .resource_changes()
+            .iter()
+            .filter(|resource| resource.is_allowed_asg_destroy(self.allow_asg_destroy))
+            .peekable();
+        if allowed.peek().is_some() {
+            writeln!(f, "Explicitly allowed Auto Scaling group destructions:")?;
+            writeln!(f)?;
+            for resource in allowed {
+                writeln!(
+                    f,
+                    "- `{}` (aws_autoscaling_group: {})",
+                    resource.address,
+                    resource.change.actions.join(",")
+                )?;
+            }
             writeln!(f)?;
         }
 
@@ -132,7 +161,7 @@ mod tests {
     }
 
     fn render(plan: &Plan) -> String {
-        PlanComment::new(CommentSource::Tree(&tree()), Some(plan)).to_string()
+        PlanComment::new(CommentSource::Tree(&tree()), Some(plan), &[]).to_string()
     }
 
     fn eip_delete() -> Value {
@@ -179,7 +208,7 @@ mod tests {
     #[test]
     fn render_comment_reports_an_incomplete_plan_without_a_manifest_line() {
         let manifest = manifest();
-        let body = PlanComment::new(CommentSource::Manifest(&manifest), None).to_string();
+        let body = PlanComment::new(CommentSource::Manifest(&manifest), None, &[]).to_string();
         assert!(body.ends_with("\n\n**Plan did not complete.** See the workflow run logs.\n"));
         assert!(!body.contains(MANIFEST_LINE_PREFIX));
     }
@@ -247,7 +276,7 @@ mod tests {
     fn render_comment_takes_the_tree_from_the_manifest_when_present() {
         let manifest = manifest();
         let body =
-            PlanComment::new(CommentSource::Manifest(&manifest), Some(&plan(&[]))).to_string();
+            PlanComment::new(CommentSource::Manifest(&manifest), Some(&plan(&[])), &[]).to_string();
         assert!(body.contains(&format!("Tree: `{TREE}`")));
         assert!(!body.contains(HEAD_TREE));
     }
@@ -256,12 +285,42 @@ mod tests {
     fn render_comment_ends_the_body_with_the_manifest_line() {
         let manifest = manifest();
         let body =
-            PlanComment::new(CommentSource::Manifest(&manifest), Some(&plan(&[]))).to_string();
+            PlanComment::new(CommentSource::Manifest(&manifest), Some(&plan(&[])), &[]).to_string();
         assert!(body.ends_with(&format!("\n\n{}\n", manifest.comment_line())));
         assert_eq!(
             crate::manifest::Manifest::from_comment(&body).unwrap(),
             manifest
         );
+    }
+
+    #[test]
+    fn asg_exceptions_are_visible_without_hiding_blocked_resources() {
+        let first = "module.gang.aws_autoscaling_group.controller[0]";
+        let second = "module.gang.aws_autoscaling_group.worker[\"arm spot\"]";
+        let allowed = [first.to_owned()];
+        for changes in [
+            vec![resource("aws_autoscaling_group", first, &["delete"])],
+            vec![
+                resource("aws_autoscaling_group", first, &["create", "delete"]),
+                resource("aws_autoscaling_group", second, &["delete", "create"]),
+                resource("aws_dynamodb_table", first, &["delete"]),
+            ],
+        ] {
+            let plan = plan(&changes);
+            let body =
+                PlanComment::new(CommentSource::Tree(&tree()), Some(&plan), &allowed).to_string();
+            assert_eq!(body.contains("**Blocked:"), plan.is_blocked(&allowed));
+            let (verdict, exceptions) = body
+                .split_once("Explicitly allowed Auto Scaling group destructions:")
+                .expect("visible exceptions");
+            assert!(!verdict.contains(&format!("`{first}` (aws_autoscaling_group")));
+            assert!(exceptions.contains(&format!("`{first}` (aws_autoscaling_group:")));
+            assert!(!exceptions.split("| Action").next().unwrap().contains(second));
+            if changes.len() > 1 {
+                assert!(verdict.contains(second));
+                assert!(verdict.contains("aws_dynamodb_table: delete"));
+            }
+        }
     }
 
     /// The comments the shell `render_comment` printed for real plans of the tree `HEAD_TREE`.

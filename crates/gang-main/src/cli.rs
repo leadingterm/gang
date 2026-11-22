@@ -881,7 +881,7 @@ fn image(text: &str) -> std::result::Result<(Architecture, ImageSha256), String>
 pub enum DeployCommand {
     /// Print `has_changes=` and `blocked=` for a `tofu show -json` plan; exit 3 when it is blocked.
     #[command(after_help = DEPLOY_POLICY_EXAMPLES)]
-    Policy,
+    Policy(PolicyArgs),
     /// Print the exact planned immutable configuration bytes from plan JSON on standard input.
     #[command(after_help = DEPLOY_CONFIGURATION_EXAMPLES)]
     Configuration,
@@ -924,7 +924,7 @@ impl DeployCommand {
     /// The name an error of this command is reported under.
     pub(crate) fn subject(&self) -> &'static str {
         match self {
-            Self::Policy => "gang deploy policy",
+            Self::Policy(_) => "gang deploy policy",
             Self::Configuration => "gang deploy configuration",
             Self::StoreRequest(_) => "gang deploy store-request",
             Self::Manifest(_) => "gang deploy manifest",
@@ -996,14 +996,22 @@ pub struct ManifestArgs {
     pub plan_version: PlanVersion,
 }
 
+/// Arguments of `gang deploy policy`.
+#[derive(Debug, Clone, Args)]
+pub struct PolicyArgs {
+    /// Allow destruction of this exact Auto Scaling group address; repeat for each exception.
+    #[arg(long, value_name = "ADDRESS")]
+    pub allow_asg_destroy: Vec<String>,
+}
+
 /// Arguments of `gang deploy comment`: where the planned tree comes from, exactly one of
 /// `--tree` and `--manifest`.
 #[derive(Debug, Clone)]
 pub enum CommentArgs {
     /// `--tree`: the tree of the checked-out commit, when no plan was stored.
-    Tree(Sha),
+    Tree(Sha, Vec<String>),
     /// `--manifest`: the manifest of the stored plan.
-    Manifest(PathBuf),
+    Manifest(PathBuf, Vec<String>),
 }
 
 const COMMENT_TREE: &str = "tree";
@@ -1011,7 +1019,7 @@ const COMMENT_MANIFEST: &str = "manifest";
 
 impl Args for CommentArgs {
     fn augment_args(cmd: clap::Command) -> clap::Command {
-        cmd.arg(
+        PolicyArgs::augment_args(cmd).arg(
             Arg::new(COMMENT_TREE)
                 .long("tree")
                 .value_name("SHA")
@@ -1040,10 +1048,16 @@ impl Args for CommentArgs {
 
 impl FromArgMatches for CommentArgs {
     fn from_arg_matches(matches: &ArgMatches) -> std::result::Result<Self, clap::Error> {
+        let allow_asg_destroy = matches
+            .get_many::<String>("allow_asg_destroy")
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
         if let Some(tree) = matches.get_one::<Sha>(COMMENT_TREE) {
-            Ok(Self::Tree(tree.clone()))
+            Ok(Self::Tree(tree.clone(), allow_asg_destroy))
         } else if let Some(manifest) = matches.get_one::<PathBuf>(COMMENT_MANIFEST) {
-            Ok(Self::Manifest(manifest.clone()))
+            Ok(Self::Manifest(manifest.clone(), allow_asg_destroy))
         } else {
             Err(clap::Error::new(
                 clap::error::ErrorKind::MissingRequiredArgument,
@@ -1978,12 +1992,38 @@ mod tests {
     fn deploy_policy_takes_no_arguments() {
         assert!(matches!(
             command(&["gang", "deploy", "policy"]),
-            Command::Deploy(DeployCommand::Policy)
+            Command::Deploy(DeployCommand::Policy(args)) if args.allow_asg_destroy.is_empty()
         ));
         assert_eq!(
             rejection(&["gang", "deploy", "policy", "plan.json"]),
             ErrorKind::UnknownArgument
         );
+    }
+
+    #[test]
+    fn deploy_policy_and_comment_preserve_repeated_exact_asg_addresses() {
+        let addresses = [
+            "module.gang.aws_autoscaling_group.worker[\"arm spot\"]",
+            "module.nested.aws_autoscaling_group.controller[0]",
+        ];
+        for prefix in [
+            vec!["gang", "deploy", "policy"],
+            vec!["gang", "deploy", "comment", "--tree", SHA],
+            vec!["gang", "deploy", "comment", "--manifest", "plan manifest.json"],
+        ] {
+            let mut args = prefix;
+            for address in addresses {
+                args.extend(["--allow-asg-destroy", address]);
+            }
+            let parsed = match command(&args) {
+                Command::Deploy(DeployCommand::Policy(args)) => args.allow_asg_destroy,
+                Command::Deploy(DeployCommand::Comment(
+                    CommentArgs::Tree(_, addresses) | CommentArgs::Manifest(_, addresses),
+                )) => addresses,
+                other => panic!("unexpected command: {other:?}"),
+            };
+            assert_eq!(parsed, addresses);
+        }
     }
 
     #[test]
@@ -2069,12 +2109,13 @@ mod tests {
     fn deploy_comment_takes_exactly_one_tree_source() {
         assert!(matches!(
             command(&["gang", "deploy", "comment", "--tree", SHA]),
-            Command::Deploy(DeployCommand::Comment(CommentArgs::Tree(_)))
+            Command::Deploy(DeployCommand::Comment(CommentArgs::Tree(_, addresses)))
+                if addresses.is_empty()
         ));
         assert!(matches!(
             command(&["gang", "deploy", "comment", "--manifest", "manifest.json"]),
-            Command::Deploy(DeployCommand::Comment(CommentArgs::Manifest(path)))
-                if path == Path::new("manifest.json")
+            Command::Deploy(DeployCommand::Comment(CommentArgs::Manifest(path, addresses)))
+                if path == Path::new("manifest.json") && addresses.is_empty()
         ));
         assert_eq!(
             rejection(&["gang", "deploy", "comment"]),

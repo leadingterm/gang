@@ -8,6 +8,21 @@ sh_test(
 )
 
 sh_test(
+    name = "reviewed-plan_test",
+    size = "small",
+    timeout = "short",
+    srcs = ["reviewed-plan_test.sh"],
+    data = [
+        "reviewed-plan.sh",
+        "@import_test_tools//:jq",
+    ],
+    env = {
+        "REVIEWED_PLAN": "$(rootpath reviewed-plan.sh)",
+        "REVIEWED_JQ": "$(rootpath @import_test_tools//:jq)",
+    },
+)
+
+sh_test(
     name = "publish-amis_test",
     size = "small",
     timeout = "short",

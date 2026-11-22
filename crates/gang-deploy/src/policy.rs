@@ -3,11 +3,11 @@
 use std::fmt;
 
 use crate::errors::{DeployError, Result};
-use crate::plan::{Action, Actions, Plan};
+use crate::plan::{Action, Actions, Plan, ResourceChange};
 
-/// Resource types whose deletion or replacement blocks a merge: they hold state that cannot be
-/// recreated (keys, data, addresses, federation).
-pub const PROTECTED_TYPES: [&str; 7] = [
+/// Resource types whose deletion or replacement blocks a merge: they hold state or running
+/// capacity. Only Auto Scaling groups support an exact-address exception.
+pub const PROTECTED_TYPES: [&str; 8] = [
     "aws_kms_key",
     "aws_s3_bucket",
     "aws_dynamodb_table",
@@ -15,6 +15,7 @@ pub const PROTECTED_TYPES: [&str; 7] = [
     "aws_ebs_volume",
     "aws_eip",
     "aws_iam_outbound_web_identity_federation",
+    "aws_autoscaling_group",
 ];
 
 /// Address of the immutable configuration generation below a deployment module.
@@ -81,8 +82,11 @@ impl Plan {
     }
 
     /// The protected resource deletions or replacements, in plan order.
+    ///
+    /// `allow_asg_destroy` exempts only Auto Scaling groups with an exactly matching address.
+    /// An empty slice grants no exceptions.
     #[must_use]
-    pub fn protected_changes(&self) -> Vec<ProtectedChange<'_>> {
+    pub fn protected_changes(&self, allow_asg_destroy: &[String]) -> Vec<ProtectedChange<'_>> {
         self.resource_changes()
             .iter()
             .filter(|resource| {
@@ -90,6 +94,7 @@ impl Plan {
                     && (PROTECTED_TYPES.contains(&resource.resource_type.as_str())
                         || (resource.resource_type == "aws_ssm_parameter"
                             && is_module_resource(&resource.address, CONFIG_GENERATION_PARAMETER)))
+                    && !resource.is_allowed_asg_destroy(allow_asg_destroy)
             })
             .map(|resource| ProtectedChange {
                 address: &resource.address,
@@ -99,10 +104,20 @@ impl Plan {
             .collect()
     }
 
-    /// Reports whether the plan must not merge: it deletes or replaces a protected resource.
+    /// Reports whether the plan must not merge after exact-address Auto Scaling group exceptions.
     #[must_use]
-    pub fn is_blocked(&self) -> bool {
-        !self.protected_changes().is_empty()
+    pub fn is_blocked(&self, allow_asg_destroy: &[String]) -> bool {
+        !self.protected_changes(allow_asg_destroy).is_empty()
+    }
+}
+
+impl ResourceChange {
+    /// Whether this destructive Auto Scaling group change has an exact-address exception.
+    pub(crate) fn is_allowed_asg_destroy(&self, allow_asg_destroy: &[String]) -> bool {
+        self.resource_type == "aws_autoscaling_group"
+            && self.change.actions.contains(&Action::Delete)
+            && !self.address.is_empty()
+            && allow_asg_destroy.contains(&self.address)
     }
 }
 
@@ -242,8 +257,8 @@ mod tests {
 
     #[test]
     fn creating_an_aws_kms_key_passes() {
-        assert!(!plan(&[resource("aws_kms_key", "aws_kms_key.state", &["create"])]).is_blocked());
-        assert!(!fixture("created").is_blocked());
+        assert!(!plan(&[resource("aws_kms_key", "aws_kms_key.state", &["create"])]).is_blocked(&[]));
+        assert!(!fixture("created").is_blocked(&[]));
     }
 
     #[test]
@@ -256,7 +271,7 @@ mod tests {
             ] {
                 let address = format!("{resource_type}.example");
                 let plan = plan(&[resource(resource_type, &address, actions)]);
-                let protected = plan.protected_changes();
+                let protected = plan.protected_changes(&[]);
                 assert_eq!(protected.len(), 1, "{resource_type} {actions:?}");
                 assert_eq!(
                     protected[0].to_string(),
@@ -275,7 +290,7 @@ mod tests {
             &["create", "delete"],
         ] {
             let plan = plan(&[resource("aws_ssm_parameter", address, actions)]);
-            let protected = plan.protected_changes();
+            let protected = plan.protected_changes(&[]);
             assert_eq!(protected.len(), 1, "{address} {actions:?}");
             assert_eq!(
                 protected[0].to_string(),
@@ -290,7 +305,7 @@ mod tests {
             &["forget", "create"],
         ] {
             assert!(
-                !plan(&[resource("aws_ssm_parameter", address, actions)]).is_blocked(),
+                !plan(&[resource("aws_ssm_parameter", address, actions)]).is_blocked(&[]),
                 "{address} {actions:?}"
             );
         }
@@ -308,7 +323,7 @@ mod tests {
             "module..aws_ssm_parameter.config_generation",
         ] {
             assert!(
-                !plan(&[resource("aws_ssm_parameter", address, &["delete"])]).is_blocked(),
+                !plan(&[resource("aws_ssm_parameter", address, &["delete"])]).is_blocked(&[]),
                 "{address}"
             );
         }
@@ -318,7 +333,7 @@ mod tests {
                 "module.gang.aws_ssm_parameter.config_generation",
                 &["delete"],
             )])
-            .is_blocked()
+            .is_blocked(&[])
         );
     }
 
@@ -329,7 +344,7 @@ mod tests {
             "aws_dynamodb_table.state",
             &["delete"],
         )]);
-        assert!(plan.is_blocked());
+        assert!(plan.is_blocked(&[]));
     }
 
     #[test]
@@ -339,7 +354,7 @@ mod tests {
             "aws_db_instance.postgres",
             &["delete"],
         )]);
-        assert!(plan.is_blocked());
+        assert!(plan.is_blocked(&[]));
     }
 
     #[test]
@@ -349,32 +364,85 @@ mod tests {
             "aws_db_parameter_group.postgres",
             &["delete", "create"],
         )]);
-        assert!(!plan.is_blocked());
+        assert!(!plan.is_blocked(&[]));
     }
 
     #[test]
     fn deleting_an_aws_instance_is_allowed() {
         let plan = plan(&[resource("aws_instance", "aws_instance.worker", &["delete"])]);
-        assert!(!plan.is_blocked());
+        assert!(!plan.is_blocked(&[]));
         assert!(plan.has_changes());
     }
 
     #[test]
     fn a_no_op_plan_passes() {
-        assert!(!plan(&[resource("aws_kms_key", "aws_kms_key.state", &["no-op"])]).is_blocked());
-        assert!(!fixture("no-op").is_blocked());
+        assert!(!plan(&[resource("aws_kms_key", "aws_kms_key.state", &["no-op"])]).is_blocked(&[]));
+        assert!(!fixture("no-op").is_blocked(&[]));
     }
 
     #[test]
     fn a_real_plan_lists_each_protected_change_in_plan_order() {
         let plan = fixture("blocked");
-        let protected: Vec<String> = plan
-            .protected_changes()
+        let protected: Vec<String> = plan.protected_changes(&[])
             .iter()
             .map(ToString::to_string)
             .collect();
         assert_eq!(protected, BLOCKED_PROTECTED_CHANGES);
-        assert!(plan.is_blocked());
+        assert!(plan.is_blocked(&[]));
+    }
+
+    #[test]
+    fn every_asg_address_and_destructive_order_requires_an_exact_exception() {
+        for address in [
+            "module.gang.module.controller.aws_autoscaling_group.this[0]",
+            "module.gang.module.worker.aws_autoscaling_group.fleet[\"arm spot\"]",
+            "module.other.module.nested.aws_autoscaling_group.other",
+            "aws_autoscaling_group.unrelated",
+        ] {
+            for actions in [
+                &["delete"][..],
+                &["delete", "create"],
+                &["create", "delete"],
+            ] {
+                let plan = plan(&[resource("aws_autoscaling_group", address, actions)]);
+                assert!(plan.is_blocked(&[]), "{address} {actions:?}");
+                assert!(!plan.is_blocked(&[address.to_owned()]));
+                for wrong in ["", "*", "module.gang", "aws_autoscaling_group.*"] {
+                    assert!(plan.is_blocked(&[wrong.to_owned()]), "{wrong}");
+                }
+                assert!(plan.is_blocked(&[format!("{address}_other")]));
+                assert!(plan.is_blocked(&[address[..address.len() - 1].to_owned()]));
+            }
+            for actions in [&["create"][..], &["update"], &["no-op"]] {
+                assert!(!plan(&[resource("aws_autoscaling_group", address, actions)])
+                    .is_blocked(&[]));
+            }
+        }
+    }
+
+    #[test]
+    fn asg_exceptions_are_individual_and_never_exempt_other_protected_types() {
+        let first = "aws_autoscaling_group.first";
+        let second = "aws_autoscaling_group.second";
+        let subject = plan(&[
+            resource("aws_autoscaling_group", first, &["delete"]),
+            resource("aws_autoscaling_group", second, &["create", "delete"]),
+        ]);
+        let allowed = [first.to_owned()];
+        let blocked = subject.protected_changes(&allowed);
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].address, second);
+        assert!(subject.is_blocked(&allowed));
+        assert!(!subject.is_blocked(&[first.to_owned(), second.to_owned()]));
+        for resource_type in PROTECTED_TYPES {
+            if resource_type != "aws_autoscaling_group" {
+                let plan = plan(&[resource(resource_type, first, &["delete"])]);
+                assert!(plan.is_blocked(&allowed), "{resource_type}");
+            }
+        }
+        let generation = "module.gang.aws_ssm_parameter.config_generation";
+        assert!(plan(&[resource("aws_ssm_parameter", generation, &["delete"])])
+            .is_blocked(&[generation.to_owned()]));
     }
 
     /// The protected changes of the `blocked` fixture, as the shell's `protected_changes` jq
