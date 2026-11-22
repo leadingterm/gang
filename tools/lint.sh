@@ -7,6 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 portable() {
+  export PYTHONDONTWRITEBYTECODE=1
   "${BAZEL:-bazel}" run --config=local -c opt --remote_executor= --remote_cache= //:gazelle.check
   tools/check-required-jobs_test.sh
   tools/check-opentofu-tests.sh

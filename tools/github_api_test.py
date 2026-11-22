@@ -6,8 +6,9 @@ import warnings
 from email.message import Message
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
+from urllib.request import Request
 
-from github_api import GitHubApi, GitHubApiError
+from github_api import GitHubApi, GitHubApiError, _SameOriginRedirect
 
 
 class Response:
@@ -157,6 +158,27 @@ class GitHubApiTest(unittest.TestCase):
         api, opener = self.api(Response(b'[]', link='<https://enterprise.example/other>; rel="next"'), api_url='https://enterprise.example/api/v3')
         with self.assertRaises(GitHubApiError):
             list(api.pages('/repos'))
+        self.assertEqual(len(opener.requests), 1)
+
+    def test_redirect_validates_api_base_and_closes_rejected_response(self):
+        api, _ = self.api(api_url='https://enterprise.example/api/v3')
+        handler = _SameOriginRedirect(api._trusted_url)
+        request = Request('https://enterprise.example/api/v3/repos', headers={'Authorization': 'Bearer secret-token'})
+        headers = Message()
+        with io.BytesIO() as stream:
+            redirected = handler.redirect_request(request, stream, 302, 'Found', headers, 'https://enterprise.example/api/v3/other')
+            self.assertEqual(redirected.full_url, 'https://enterprise.example/api/v3/other')
+        for url in ('https://enterprise.example/other', 'https://evil.example/api/v3/other',
+                    'https://enterprise.example/api/v3/%2e%2e/other'):
+            with self.subTest(url=url):
+                stream = io.BytesIO()
+                with self.assertRaises(GitHubApiError):
+                    handler.redirect_request(request, stream, 302, 'Found', headers, url)
+                self.assertTrue(stream.closed)
+
+    def test_pagination_ignores_empty_relation(self):
+        api, opener = self.api(Response(b'[]', link='<https://api.github.com/items?page=2>; rel=""'))
+        self.assertEqual(list(api.pages('/items')), [[]])
         self.assertEqual(len(opener.requests), 1)
 
     def test_malformed_and_ambiguous_links_fail_closed(self):

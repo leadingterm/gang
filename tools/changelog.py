@@ -177,19 +177,22 @@ def render(repo: Path, ref: str, tag: str) -> tuple[str, str]:
     return combined + archive[archive_start:], current
 
 
-def check(repo: Path, ref: str) -> None:
+def check(repo: Path, ref: str | None) -> None:
     full_history(repo)
-    commit = resolve(repo, ref)
-    directory = repo / "changes"
-    files: dict[str, bytes] = {}
-    if directory.exists():
-        for path in sorted(directory.rglob("*")):
-            if path.is_dir() and not path.is_symlink():
-                continue
-            name = path.relative_to(repo).as_posix()
-            if not re.fullmatch(r"changes/[^/]+\.md", name) or path.is_symlink():
-                raise ChangelogError(f"invalid fragment path: {name}")
-            files[name] = path.read_bytes()
+    commit = resolve(repo, "HEAD" if ref is None else ref)
+    if ref is not None:
+        files = snapshot(repo, commit)
+    else:
+        directory = repo / "changes"
+        files: dict[str, bytes] = {}
+        if directory.exists():
+            for path in sorted(directory.rglob("*")):
+                if path.is_dir() and not path.is_symlink():
+                    continue
+                name = path.relative_to(repo).as_posix()
+                if not re.fullmatch(r"changes/[^/]+\.md", name) or path.is_symlink():
+                    raise ChangelogError(f"invalid fragment path: {name}")
+                files[name] = path.read_bytes()
     validate(files)
     tags = ancestors(repo, commit)
     if tags:
@@ -214,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     commands = parser.add_subparsers(dest="command", required=True)
     check_parser = commands.add_parser("check")
-    check_parser.add_argument("--ref", default="HEAD")
+    check_parser.add_argument("--ref")
     render_parser = commands.add_parser("render")
     render_parser.add_argument("--ref", required=True)
     render_parser.add_argument("--tag", required=True)

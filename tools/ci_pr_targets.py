@@ -44,7 +44,8 @@ def ordinary_doc(path: str) -> bool:
 def graph_input(path: str) -> bool:
     name = path.rsplit("/", 1)[-1]
     return (
-        name in {"BUILD", "BUILD.bazel", "WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel", "MODULE.bazel.lock", "Cargo.toml", "Cargo.lock", "Cargo.Bazel.lock", "flake.nix", "flake.lock", ".bazelrc", ".bazelversion", "rust-toolchain", "rust-toolchain.toml"}
+        path in {"ui/package.json", "ui/pnpm-lock.yaml"}
+        or name in {"BUILD", "BUILD.bazel", "WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel", "MODULE.bazel.lock", "Cargo.toml", "Cargo.lock", "Cargo.Bazel.lock", "flake.nix", "flake.lock", ".bazelrc", ".bazelversion", "rust-toolchain", "rust-toolchain.toml"}
         or name.endswith((".bzl", ".bazelrc"))
         or "toolchain" in name.lower()
         or name.startswith("Cargo.")
@@ -52,6 +53,8 @@ def graph_input(path: str) -> bool:
 
 
 def select(base: str, head: str) -> dict[str, list[str]]:
+    if base.startswith("-") or head.startswith("-"):
+        raise ValueError("Git refs must not start with '-'")
     diff = subprocess.run(
         ["git", "diff", "--no-renames", "--name-only", "-z", base, head, "--"],
         check=True, stdout=subprocess.PIPE,

@@ -55,7 +55,7 @@ producers cannot pass.
 
 On every push to `main`, a trusted-main conflict diagnostic uses `git
 merge-tree` against every open PR, including drafts and PRs with other base
-branches. It adds `bot:needs-rebase` and a comment with escaped conflicting
+branches. It adds `needs-rebase` and a comment with escaped conflicting
 paths when needed, and clears the report when clean. It never checks out or
 executes PR code and is not a waiver of the queue gates.
 

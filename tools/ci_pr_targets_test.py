@@ -15,16 +15,18 @@ SELECTOR = Path(__file__).with_name("ci_pr_targets.py").resolve()
 
 
 class SelectorTest(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
+        self = cls
         git_environment = patch.dict(os.environ, {
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_COUNT": "0",
         })
         git_environment.start()
-        self.addCleanup(git_environment.stop)
+        self.addClassCleanup(git_environment.stop)
         self.temp = tempfile.TemporaryDirectory(prefix="gang-pr-targets-")
-        self.addCleanup(self.temp.cleanup)
+        self.addClassCleanup(self.temp.cleanup)
         temporary = Path(self.temp.name)
         self.root = temporary / "workspace"
         self.root.mkdir()
@@ -45,7 +47,7 @@ class SelectorTest(unittest.TestCase):
         self.put(".bazelversion", (SELECTOR.parent.parent / ".bazelversion").read_text(encoding="utf-8"))
         self.put(".bazelrc", "common --incompatible_autoload_externally=\n")
         self.put("MODULE.bazel", 'module(name = "fixture")\n')
-        self.addCleanup(self.shutdown_bazel)
+        self.addClassCleanup(self.shutdown_bazel)
         self.put("defs.bzl", '''def _impl(ctx):
     executable = ctx.actions.declare_file(ctx.label.name + ".sh")
     ctx.actions.write(executable, "#!/bin/sh\\nexit 0\\n", is_executable = True)
@@ -75,6 +77,9 @@ fixture_test(name = "other_clippy_test")
         self.put("other/data.rs", "other\n")
         self.put("other/src/README.rs", "source\n")
         self.put("other/src/README.md", "data\n")
+        self.put("ui/BUILD.bazel", 'exports_files(["package.json", "pnpm-lock.yaml"])\n')
+        self.put("ui/package.json", "{}\n")
+        self.put("ui/pnpm-lock.yaml", "lockfileVersion: '9.0'\n")
         self.put("docs/guide.md", "guide\n")
         self.put("docs/API.md", "api\n")
         self.put("docs/nested/API.md", "ordinary documentation\n")
@@ -84,38 +89,50 @@ fixture_test(name = "other_clippy_test")
         self.git("commit", "-qm", "baseline")
         self.base = self.git("rev-parse", "HEAD").strip()
 
-    def put(self, name, content):
-        path = self.root / name
+    def setUp(self):
+        self.git("checkout", "-q", "-b", f"case-{self._testMethodName}", self.base)
+
+    def tearDown(self):
+        self.git("add", "-A")
+        self.git("commit", "--allow-empty", "-qm", "fixture cleanup")
+        self.git("checkout", "-q", "--detach", self.base)
+
+    @classmethod
+    def put(cls, name, content):
+        path = cls.root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
-    def git(self, *args):
-        return subprocess.run(["git", *args], cwd=self.root, check=True,
+    @classmethod
+    def git(cls, *args):
+        return subprocess.run(["git", *args], cwd=cls.root, check=True,
                               stdout=subprocess.PIPE, text=True).stdout
 
-    def fixture_environment(self):
+    @classmethod
+    def fixture_environment(cls):
         return {
             **os.environ,
-            "BAZEL": str(self.wrapper),
-            "CI_PR_FIXTURE_BAZEL": self.bazel,
-            "CI_PR_FIXTURE_OUTPUT": str(self.output_base),
+            "BAZEL": str(cls.wrapper),
+            "CI_PR_FIXTURE_BAZEL": cls.bazel,
+            "CI_PR_FIXTURE_OUTPUT": str(cls.output_base),
         }
 
-    def shutdown_bazel(self):
+    @classmethod
+    def shutdown_bazel(cls):
         subprocess.run(
-            [str(self.wrapper), "shutdown"], cwd=self.root,
-            env=self.fixture_environment(), check=True, timeout=60,
+            [str(cls.wrapper), "shutdown"], cwd=cls.root,
+            env=cls.fixture_environment(), check=True, timeout=60,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
 
-    def select(self, env=None, base=None):
+    def select(self, env=None, base=None, head="HEAD"):
         self.git("add", "-A")
         self.git("commit", "--allow-empty", "-qm", "change")
         selector_env = self.fixture_environment()
         if env is not None:
             selector_env.update(env)
         result = subprocess.run(
-            [sys.executable, str(SELECTOR), base or self.base, "HEAD"],
+            [sys.executable, str(SELECTOR), base or self.base, head],
             cwd=self.root, env=selector_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         return result
@@ -177,6 +194,14 @@ fixture_test(name = "other_clippy_test")
         self.put("MODULE.bazel", 'module(name = "fixture", version = "1")\n')
         self.assert_all_units(self.manifest())
 
+    def test_ui_package_manifest_selects_all_units(self):
+        self.put("ui/package.json", '{"name": "fixture"}\n')
+        self.assert_all_units(self.manifest())
+
+    def test_ui_lockfile_selects_all_units(self):
+        self.put("ui/pnpm-lock.yaml", "lockfileVersion: '9.0'\nimporters: {}\n")
+        self.assert_all_units(self.manifest())
+
     def test_unknown_file_selects_all_units(self):
         self.put("app/unowned.rs", "unknown\n")
         self.assert_all_units(self.manifest())
@@ -191,6 +216,16 @@ fixture_test(name = "other_clippy_test")
 
     def test_invalid_git_ref_fails_closed(self):
         result = self.select(base="not-a-real-ref")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_option_shaped_base_fails_closed(self):
+        result = self.select(base="--name-only")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_option_shaped_head_fails_closed(self):
+        result = self.select(head="--name-only")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
 

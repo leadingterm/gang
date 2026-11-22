@@ -8,6 +8,10 @@ permissions:
   contents: read
   actions: read
 
+concurrency:
+  group: cache-promotion-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   promote:
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}

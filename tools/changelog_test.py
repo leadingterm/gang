@@ -146,6 +146,17 @@ class ChangelogTest(unittest.TestCase):
         (self.repo / "changes/released.md").unlink()
         self.assertEqual(self.call("check"), 1)
 
+    def test_explicit_ref_checks_its_snapshot_not_the_worktree(self):
+        self.put("changes/a.md", "### Added\n- Valid.\n")
+        self.commit("valid")
+        self.put("changes/a.md", "### Unknown\n- Invalid.\n")
+        self.assertEqual(self.call("check", "--ref", "HEAD"), 0)
+        self.assertEqual(self.call("check"), 1)
+        self.commit("invalid")
+        self.put("changes/a.md", "### Added\n- Repaired.\n")
+        self.assertEqual(self.call("check"), 0)
+        self.assertEqual(self.call("check", "--ref", "HEAD"), 1)
+
     def test_malformed_fragments(self):
         for body in ("", "### Added\n", "### Unknown\n- Item\n", "### Added\n- One\n### Added\n- Two\n", "### Added\n- \n", "- no heading\n", "### Fixed\nparagraph\n", "### Fixed\n- yes\n## Bad\n"):
             with self.subTest(body=body):

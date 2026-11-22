@@ -7,7 +7,7 @@ import os
 import re
 from collections.abc import Iterator
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
@@ -32,12 +32,15 @@ def _reject_constant(value: str) -> None:
 
 
 class _SameOriginRedirect(HTTPRedirectHandler):
-    def __init__(self, origin: tuple[str, str, int]) -> None:
-        self.origin = origin
+    def __init__(self, validate_url) -> None:
+        self._validate_url = validate_url
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if _origin(newurl) != self.origin:
-            raise GitHubApiError("cross-origin GitHub API redirect rejected")
+        try:
+            self._validate_url(newurl)
+        except GitHubApiError:
+            fp.close()
+            raise
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -67,7 +70,7 @@ class GitHubApi:
         self._base = api_url.rstrip("/")
         self._base_path = parts.path.rstrip("/")
         self._timeout = timeout_seconds
-        self._opener = opener if opener is not None else build_opener(_SameOriginRedirect(self._origin))
+        self._opener = opener if opener is not None else build_opener(_SameOriginRedirect(self._trusted_url))
 
     @classmethod
     def from_env(cls) -> GitHubApi:
@@ -84,6 +87,9 @@ class GitHubApi:
 
     def _trusted_url(self, url: str) -> str:
         parts = urlsplit(url)
+        path = unquote(parts.path)
+        if "\\" in path or any(part in (".", "..") for part in path.split("/")) or any(ord(c) < 32 or ord(c) == 127 for c in path):
+            raise GitHubApiError("untrusted GitHub API URL")
         if _origin(url) != self._origin or parts.fragment or (self._base_path and not (parts.path == self._base_path or parts.path.startswith(self._base_path + "/"))):
             raise GitHubApiError("untrusted GitHub API pagination link")
         return url
@@ -143,7 +149,7 @@ class GitHubApi:
                     raise GitHubApiError("invalid GitHub API pagination link")
                 for parameter in match.group(2).split(";"):
                     rel = re.fullmatch(r'\s*rel\s*=\s*(?:"([^"]*)"|([^\s]+))\s*', parameter, re.IGNORECASE)
-                    if rel and "next" in (rel.group(1) or rel.group(2)).split():
+                    if rel and "next" in (rel.group(1) or rel.group(2) or "").split():
                         if next_url is not None:
                             raise GitHubApiError("ambiguous GitHub API pagination link")
                         next_url = urljoin(url, match.group(1))

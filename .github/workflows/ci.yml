@@ -99,7 +99,8 @@ jobs:
           cache-job: linux-x86_64
           restore-only: 'true'
       - name: Lint
-        timeout-minutes: 3
+        # Portable lint includes the real Git/Bazel selector regression fixtures.
+        timeout-minutes: 5
         run: tools/lint.sh --portable
       - name: Export the Bazel working set
         uses: ./.github/actions/save-bazel-cache

@@ -40,6 +40,16 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Validate release changelog
+        if: ${{ github.event_name == 'push' }}
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+          TAG: ${{ github.ref_name }}
+          CHANGELOG: ${{ runner.temp }}/validated-changelog.md
+          SECTION: ${{ runner.temp }}/validated-section.md
+        run: |
+          python3 tools/changelog.py --repo . render --ref "$RELEASE_COMMIT" \
+            --tag "$TAG" --output "$CHANGELOG" --section-output "$SECTION"
       - name: Find the CI run to release
         id: ci
         env:

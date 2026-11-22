@@ -51,6 +51,8 @@ translate() {
 promotion="$script_dir/../.github/workflows/cache-promotion.yml"
 yq -o=json '.' "$promotion" | jq -e '
   .on.push.branches == ["main"] and
+  .concurrency.group == "cache-promotion-${{ github.ref }}" and
+  .concurrency["cancel-in-progress"] == true and
   .permissions.contents == "read" and .permissions.actions == "read" and
   ([.jobs.promote.steps[] | select(.uses == "./.github/actions/setup-nix") |
     .with["cache-save"]] == ["true"]) and
