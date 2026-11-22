@@ -44,6 +44,7 @@ CREATE TABLE leases (
     name        text PRIMARY KEY,
     holder      text,
     epoch       bigint NOT NULL,
+    safe_yield_epoch bigint,
     expires_at  timestamptz NOT NULL,
     record_sequence bigint NOT NULL DEFAULT 0,
     holder_priority text,
@@ -114,6 +115,11 @@ pub(crate) async fn initialize(
             }
             .into());
         }
+        // Version 4 remains readable by older controllers; their writes leave this
+        // capability marker absent or bound to a previous epoch.
+        transaction
+            .batch_execute("ALTER TABLE leases ADD COLUMN IF NOT EXISTS safe_yield_epoch bigint")
+            .await?;
     } else {
         let row = transaction.query_typed_one(
             "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relnamespace = current_schema()::regnamespace AND relkind IN ('r', 'p', 'v', 'm', 'S', 'f') AND relname <> 'schema_version')",

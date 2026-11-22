@@ -9,20 +9,18 @@ use std::time::Duration;
 
 use gang_clock::TestClock;
 use gang_spi::{
-    ControllerHostIdentity, ControllerHostPort, ControllerHostState, FleetSupply, Held,
-    HostMilestone, InstanceIdentity, LaunchFailure, MountedScratchVolume, NodeLifecyclePort,
-    PortError, PreemptionNotice, ProvisionerPort, ScratchVolumePort, ServerEndpoints, Sidecar,
-    TerminationMode, WorkloadCredentialPort,
+    ControllerHostIdentity, ControllerIdentityPort, FleetSupply, Held, InstanceIdentity,
+    LaunchFailure, MountedScratchVolume, NodeLifecyclePort, PortError, PreemptionNotice,
+    ProvisionerPort, ScratchVolumePort, ServerEndpoints, Sidecar, TerminationMode,
+    WorkloadCredentialPort,
 };
 use gang_types::{
     Bytes, Fleet, FleetName, InstanceId, InstanceLifecycle, Isa, NameError, Proof, WorkerLifetime,
 };
 use parking_lot::Mutex;
-use tokio::sync::{oneshot, watch};
 
 use crate::{CallCount, Opaque};
 
-/// Each new fake represents a different host; cloning never allocates a new ordinal.
 static NEXT_HOST: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
@@ -73,13 +71,10 @@ struct State {
     converge_hook: Option<ConvergeHook>,
     desired: Vec<(FleetName, u32)>,
     terminations: Vec<(InstanceId, TerminationMode)>,
-    milestones: Vec<HostMilestone>,
-    prepared_hold: Option<oneshot::Receiver<()>>,
-    serving_hold: Option<oneshot::Receiver<()>>,
     failures: Failures,
     advance_on_supply: Option<(Arc<TestClock>, Duration)>,
     identity: Option<InstanceIdentity>,
-    host_identity: Result<ControllerHostIdentity, NameError>,
+    controller_identity: Result<ControllerHostIdentity, NameError>,
     lifetime: WorkerLifetime,
     notice: Option<PreemptionNotice>,
     volume: PathBuf,
@@ -99,16 +94,12 @@ struct State {
 /// leaves them untouched.
 ///
 /// The default has no node identity; configure one with [`Self::set_identity`] or [`Self::new`].
-/// Every new fake has a unique persistent controller host identity, retained by clones.
 #[derive(Clone)]
 pub struct FakeProvisioner {
     state: Arc<Mutex<State>>,
-    retirement: watch::Sender<bool>,
     credential_requests: CallCount,
     parked_polls: CallCount,
     attach_requests: CallCount,
-    prepared_attempts: CallCount,
-    serving_attempts: CallCount,
 }
 
 impl Default for FakeProvisioner {
@@ -150,13 +141,10 @@ impl FakeProvisioner {
                 converge_hook: None,
                 desired: Vec::new(),
                 terminations: Vec::new(),
-                milestones: Vec::new(),
-                prepared_hold: None,
-                serving_hold: None,
                 failures: Failures::default(),
                 advance_on_supply: None,
                 identity,
-                host_identity: InstanceId::try_new(format!(
+                controller_identity: InstanceId::try_new(format!(
                     "fake-host-{}",
                     NEXT_HOST.fetch_add(1, Ordering::Relaxed)
                 ))
@@ -171,19 +159,16 @@ impl FakeProvisioner {
                 parked_checks: Script::default(),
                 attach: Script::default(),
             })),
-            retirement: watch::channel(false).0,
             credential_requests: CallCount::new(),
             parked_polls: CallCount::new(),
             attach_requests: CallCount::new(),
-            prepared_attempts: CallCount::new(),
-            serving_attempts: CallCount::new(),
         }
     }
 
-    /// Assigns the immutable host identity used by controller restart and launch-order tests.
+    /// Sets the stable controller incarnation shared by clones of this fake.
     #[must_use]
     pub fn with_host_identity(self, identity: ControllerHostIdentity) -> Self {
-        self.state.lock().host_identity = Ok(identity);
+        self.state.lock().controller_identity = Ok(identity);
         self
     }
 
@@ -244,43 +229,6 @@ impl FakeProvisioner {
     #[must_use]
     pub fn termination_calls(&self) -> Vec<(InstanceId, TerminationMode)> {
         self.state.lock().terminations.clone()
-    }
-    /// Returns all host milestones reported, in order.
-    #[must_use]
-    pub fn milestones(&self) -> Vec<HostMilestone> {
-        self.state.lock().milestones.clone()
-    }
-    /// Holds the next prepared milestone until the returned sender is completed or dropped.
-    #[must_use]
-    pub fn hold_prepared(&self) -> oneshot::Sender<()> {
-        let (release, hold) = oneshot::channel();
-        self.state.lock().prepared_hold = Some(hold);
-        release
-    }
-
-    /// Returns the number of prepared milestone attempts started.
-    #[must_use]
-    pub fn prepared_attempts(&self) -> CallCount {
-        self.prepared_attempts.clone()
-    }
-
-    /// Holds the next serving milestone until the returned sender is completed or dropped.
-    #[must_use]
-    pub fn hold_serving(&self) -> oneshot::Sender<()> {
-        let (release, hold) = oneshot::channel();
-        self.state.lock().serving_hold = Some(hold);
-        release
-    }
-
-    /// Returns the number of serving milestone attempts started.
-    #[must_use]
-    pub fn serving_attempts(&self) -> CallCount {
-        self.serving_attempts.clone()
-    }
-
-    /// Retires the host, releasing all current and future retirement waiters.
-    pub fn retire(&self) {
-        self.retirement.send_replace(true);
     }
     /// Enables or disables supply failures.
     pub fn fail_supply(&self, fail: bool) {
@@ -505,57 +453,13 @@ impl ProvisionerPort for FakeProvisioner {
     }
 }
 
-impl ControllerHostPort for FakeProvisioner {
-    async fn state(&self) -> Result<ControllerHostState, PortError> {
-        Ok(if *self.retirement.borrow() {
-            ControllerHostState::Retiring
-        } else {
-            ControllerHostState::Active
-        })
-    }
-
-    async fn drain_limit(&self) -> Result<Option<Duration>, PortError> {
-        Ok(None)
-    }
-
-    async fn heartbeat(&self) -> Result<(), PortError> {
-        Ok(())
-    }
-
+impl ControllerIdentityPort for FakeProvisioner {
     async fn incarnation(&self) -> Result<ControllerHostIdentity, PortError> {
         self.state
             .lock()
-            .host_identity
+            .controller_identity
             .clone()
             .map_err(PortError::backend)
-    }
-
-    async fn retiring(&self) -> Result<(), PortError> {
-        let mut retirement = self.retirement.subscribe();
-        retirement
-            .wait_for(|retired| *retired)
-            .await
-            .map_err(|_| PortError::unavailable("host retirement channel closed"))?;
-        Ok(())
-    }
-
-    async fn reached(&self, milestone: HostMilestone) -> Result<(), PortError> {
-        if milestone == HostMilestone::Prepared {
-            let hold = self.state.lock().prepared_hold.take();
-            self.prepared_attempts.bump();
-            if let Some(hold) = hold {
-                let _ = hold.await;
-            }
-        }
-        if milestone == HostMilestone::Serving {
-            let hold = self.state.lock().serving_hold.take();
-            self.serving_attempts.bump();
-            if let Some(hold) = hold {
-                let _ = hold.await;
-            }
-        }
-        self.state.lock().milestones.push(milestone);
-        Ok(())
     }
 }
 
@@ -619,32 +523,16 @@ mod tests {
     use gang_types::{InstanceLifecycle, Resources};
 
     #[tokio::test]
-    async fn new_hosts_are_distinct_and_clones_keep_the_same_identity() -> crate::TestResult {
+    async fn controller_incarnations_are_unique_and_stable_across_clones() -> crate::TestResult {
         let first = FakeProvisioner::default();
         let clone = first.clone();
         let second = FakeProvisioner::default();
         let identity = first.incarnation().await?;
-        assert!(matches!(identity, ControllerHostIdentity::Persistent(_)));
-        assert_eq!(identity, clone.incarnation().await?);
-        assert_ne!(identity, second.incarnation().await?);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn explicit_host_identity_survives_cloning_without_affecting_milestones()
-    -> crate::TestResult {
-        let identity = ControllerHostIdentity::Launched {
-            at: Timestamp::from_unix_millis(42),
-            instance: InstanceId::try_new("i-controller")?,
-        };
-        let host = FakeProvisioner::default().with_host_identity(identity.clone());
-        let clone = host.clone();
-        assert_eq!(host.incarnation().await?, identity);
         assert_eq!(clone.incarnation().await?, identity);
-        clone.reached(HostMilestone::Serving).await?;
-        assert_eq!(host.milestones(), vec![HostMilestone::Serving]);
-        host.retire();
-        clone.retiring().await?;
+        assert_ne!(second.incarnation().await?, identity);
+        let explicit = ControllerHostIdentity::Persistent(InstanceId::try_new("controller")?);
+        let configured = second.with_host_identity(explicit.clone());
+        assert_eq!(configured.clone().incarnation().await?, explicit);
         Ok(())
     }
 
@@ -736,57 +624,6 @@ mod tests {
         assert!(fake.desired_requests().is_empty());
         assert!(fake.terminations().is_empty());
         assert!(fake.converge_requests().is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn prepared_hold_records_only_after_release() -> crate::TestResult {
-        let fake = FakeProvisioner::default();
-        let release = fake.hold_prepared();
-        let worker = fake.clone();
-        let run = tokio::spawn(async move { worker.reached(HostMilestone::Prepared).await });
-        fake.prepared_attempts().reached(1).await;
-        assert!(fake.milestones().is_empty());
-        assert!(!run.is_finished());
-        release.send(()).map_err(|()| "prepared hold disappeared")?;
-        run.await??;
-        assert_eq!(fake.milestones(), vec![HostMilestone::Prepared]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn records_host_milestones_in_order() -> crate::TestResult {
-        let fake = FakeProvisioner::default();
-        let shared = fake.clone();
-        assert!(fake.milestones().is_empty());
-        fake.reached(HostMilestone::Prepared).await?;
-        fake.reached(HostMilestone::Serving).await?;
-        shared.reached(HostMilestone::HandedOff).await?;
-        fake.reached(HostMilestone::Serving).await?;
-        assert_eq!(
-            shared.milestones(),
-            vec![
-                HostMilestone::Prepared,
-                HostMilestone::Serving,
-                HostMilestone::HandedOff,
-                HostMilestone::Serving,
-            ]
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn retirement_releases_all_current_and_future_waiters() -> crate::TestResult {
-        let fake = FakeProvisioner::default();
-        let shared = fake.clone();
-        let mut first = Box::pin(fake.retiring());
-        let mut second = Box::pin(shared.retiring());
-        assert!(futures::poll!(first.as_mut()).is_pending());
-        assert!(futures::poll!(second.as_mut()).is_pending());
-        shared.retire();
-        first.await?;
-        second.await?;
-        fake.retiring().await?;
         Ok(())
     }
 

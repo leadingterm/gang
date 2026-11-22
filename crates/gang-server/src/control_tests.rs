@@ -422,17 +422,13 @@ async fn mid_pass_lapse_forgets_unapplied_termination() -> TestResult {
         gang_config::LeadershipConfig::default(),
     );
     let mut lease = leader
-        .acquire(
-            &gang_spi::LeaseCandidate {
-                holder: id.clone(),
-                priority: gang_spi::CandidatePriority::registered(
-                    gang_spi::CandidateGeneration::default(),
-                ),
-            },
-            &fleet.inner,
-        )
-        .await?
-        .ok_or("active test host acquires the lease")?;
+        .acquire(&gang_spi::LeaseCandidate {
+            holder: id.clone(),
+            priority: gang_spi::CandidatePriority::registered(
+                gang_spi::CandidateGeneration::default(),
+            ),
+        })
+        .await?;
     let hold = leader.hold(&mut lease);
     futures::pin_mut!(hold);
     assert!(poll!(hold.as_mut()).is_pending());
@@ -583,17 +579,13 @@ async fn lapsed_leader_does_not_record_worker_registration() -> TestResult {
     control.pass().await;
     assert!(repository.scaling_events().is_empty());
     let _lease = leader
-        .acquire(
-            &gang_spi::LeaseCandidate {
-                holder: id.clone(),
-                priority: gang_spi::CandidatePriority::registered(
-                    gang_spi::CandidateGeneration::default(),
-                ),
-            },
-            &fleet,
-        )
-        .await?
-        .ok_or("active test host acquires the lease")?;
+        .acquire(&gang_spi::LeaseCandidate {
+            holder: id.clone(),
+            priority: gang_spi::CandidatePriority::registered(
+                gang_spi::CandidateGeneration::default(),
+            ),
+        })
+        .await?;
     control.pass().await;
     assert_eq!(repository.scaling_events().len(), 1);
     Ok(())
@@ -920,17 +912,13 @@ async fn exit_survives_leadership_lapse() -> TestResult {
         gang_config::LeadershipConfig::default(),
     );
     let mut lease = leader
-        .acquire(
-            &gang_spi::LeaseCandidate {
-                holder: id.clone(),
-                priority: gang_spi::CandidatePriority::registered(
-                    gang_spi::CandidateGeneration::default(),
-                ),
-            },
-            &fleet,
-        )
-        .await?
-        .ok_or("active test host acquires the lease")?;
+        .acquire(&gang_spi::LeaseCandidate {
+            holder: id.clone(),
+            priority: gang_spi::CandidatePriority::registered(
+                gang_spi::CandidateGeneration::default(),
+            ),
+        })
+        .await?;
     let hold = leader.hold(&mut lease);
     futures::pin_mut!(hold);
     assert!(poll!(hold.as_mut()).is_pending());

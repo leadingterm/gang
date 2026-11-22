@@ -508,7 +508,7 @@ impl ControllerHost {
         state.child.has_exited()
     }
 
-    /// Suppresses restart before explicit stop or a fault aimed at the original process.
+    /// Suppresses restart without signalling, reaping, or relinquishing the tracked child.
     pub(crate) fn suppress_restart(&mut self) {
         self.state.lock().enabled = false;
         self.changed.notify_all();
@@ -1105,6 +1105,53 @@ mod tests {
                 host.wait_within(Duration::ZERO, "original evidence")?,
                 original
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn suppressing_host_restart_keeps_original_alive_and_tracks_its_later_exit()
+    -> gang_testkit::TestResult {
+        for code in [0_u8, 17] {
+            let root = tempfile::tempdir()?;
+            let path = root.path().join("control.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path)?;
+            let log = root.path().join("log");
+            let mut command = helper("host");
+            command.env("GANG_E2E_HOST_SOCKET", &path);
+            let mut child = Supervised::spawn(&mut command, &log)?;
+            let identity = host_ready(&mut child, &log, 0, Duration::from_secs(30))?;
+            let original_pid = child.pid();
+            let mut host = ControllerHost::start(
+                child,
+                Arc::clone(&identity),
+                command,
+                log,
+                Duration::from_secs(30),
+                host_ready,
+            )?;
+            // The child connected before announcing ready. Its controlled exit is impossible
+            // until this parent writes, so suppression's no-signal property is deterministic.
+            let (mut control, _) = listener.accept()?;
+            host.suppress_restart();
+            assert_eq!(host.pid(), original_pid);
+            assert_eq!(host.identity(), identity);
+            assert!(!host.has_exited()?);
+            assert!(host.state.lock().original_status.is_none());
+            std::io::Write::write_all(&mut control, &[code])?;
+            let status = host.wait_stopped(Duration::from_secs(30))?;
+            assert_eq!(status.code(), Some(i32::from(code)));
+            assert_eq!(host.pid(), original_pid);
+            assert!(host.monitor.is_none());
+            assert_eq!(
+                host.wait_within(Duration::ZERO, "original controlled exit")?,
+                status
+            );
+            listener.set_nonblocking(true)?;
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
         }
         Ok(())
     }

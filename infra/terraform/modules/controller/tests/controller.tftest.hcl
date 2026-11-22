@@ -575,17 +575,12 @@ run "rejects_instance_type_without_uefi" {
   expect_failures = [aws_instance.this[0]]
 }
 
-run "instance_shape_has_no_group_permissions" {
+run "instance_shape_has_no_service_resources" {
   command = plan
 
   assert {
-    condition     = length(aws_launch_template.controller) == 0 && length(aws_autoscaling_group.controller) == 0 && output.autoscaling_group_name == null && !anytrue([for s in data.aws_iam_policy_document.this.statement : contains(["ControllerLifecycle", "Database"], s.sid)])
-    error_message = "The instance shape must not create a group or grant group and database permissions."
-  }
-
-  assert {
-    condition     = length(aws_autoscaling_lifecycle_hook.controller_launch) == 0 && length(aws_autoscaling_lifecycle_hook.controller_terminate) == 0
-    error_message = "The SQLite instance shape must not create controller lifecycle hooks."
+    condition     = length(aws_launch_template.capacity) == 0 && length(aws_autoscaling_group.capacity) == 0 && output.service_name == null && !anytrue([for s in data.aws_iam_policy_document.this.statement : s.sid == "Database"])
+    error_message = "The SQLite instance must not create service resources or grant database permissions."
   }
 }
 
@@ -625,21 +620,6 @@ run "instance_requires_eip" {
   expect_failures = [var.eip_allocation_id]
 }
 
-run "group_uses_ec2_health_for_refresh" {
-  command = plan
-  variables {
-    shape              = "group"
-    controller_count   = 2
-    subnet_ids         = ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1"]
-    target_group_arns  = ["arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/serve/0123456789abcdef"]
-    config_digest      = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    dynamodb_table_arn = "arn:aws:dynamodb:eu-north-1:000000000000:table/gang"
-  }
-  assert {
-    condition     = aws_autoscaling_group.controller[0].health_check_type == "EC2"
-    error_message = "Standby controllers must not fail ASG health during refresh."
-  }
-}
 run "aws_events_queue_permissions" {
   command = plan
 

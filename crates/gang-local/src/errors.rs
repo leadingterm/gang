@@ -29,7 +29,7 @@ pub enum LocalError {
         /// The key file that failed to decode or encode.
         path: PathBuf,
     },
-    /// A persisted controller host identity is not a 128-bit lowercase hexadecimal id.
+    /// A persisted controller identity is not a 128-bit lowercase hexadecimal id.
     #[error("invalid controller host identity file {}", .path.display())]
     #[failure(backend)]
     HostIdentity {

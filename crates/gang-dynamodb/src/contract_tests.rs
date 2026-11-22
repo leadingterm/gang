@@ -39,7 +39,7 @@ impl Clock for AdvancingClock {
     }
 }
 
-async fn setup() -> Result<(DynamoDb, FakeDynamoDb), Box<dyn std::error::Error>> {
+pub(super) async fn setup() -> Result<(DynamoDb, FakeDynamoDb), Box<dyn std::error::Error>> {
     let fake = FakeDynamoDb::start().await?;
     let endpoint = fake.endpoint();
     let client = aws_sdk_dynamodb::Client::from_conf(
@@ -521,16 +521,131 @@ async fn legacy_take_invalidates_priority_binding() -> TestResult {
     let stored = database
         .get("lease", "leader")
         .await?
-        .ok_or("requested lease missing")?;
+        .ok_or("legacy lease missing")?;
     assert_eq!(
-        crate::items::string(&stored, "successor_priority")?,
-        candidate.priority.as_str()
+        crate::items::number(&stored, "safe_yield_epoch")?,
+        old.epoch.get()
     );
-    assert!(!stored.contains_key("successor_generation"));
+    assert!(!stored.contains_key("successor_holder"));
     assert!(matches!(
         database.renew(&legacy, now, Timestamp::from_unix_millis(150)).await?,
-        Renewal::YieldRequested(updated) if updated.expires_at == Timestamp::from_unix_millis(150)
+        Renewal::Renewed(updated) if updated.expires_at == Timestamp::from_unix_millis(150)
     ));
+    Ok(())
+}
+
+async fn set_safe_yield_marker(
+    database: &DynamoDb,
+    marker: Option<&aws_sdk_dynamodb::types::AttributeValue>,
+) -> TestResult {
+    let mut item = database
+        .get("lease", "leader")
+        .await?
+        .ok_or("lease missing")?;
+    if let Some(value) = marker {
+        item.insert("safe_yield_epoch".into(), value.clone());
+    } else {
+        item.remove("safe_yield_epoch");
+    }
+    database
+        .client()
+        .await
+        .put_item()
+        .table_name(database.table())
+        .set_item(Some(item))
+        .send()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unsupported_safe_yield_requires_release_or_expiry_before_handoff() -> TestResult {
+    for marker in [
+        None,
+        Some(crate::items::s("not-a-number")),
+        Some(crate::items::n(0)),
+    ] {
+        let (database, _fake) = setup().await?;
+        let mut candidates = Vec::new();
+        for name in ["owner", "replacement", "next"] {
+            candidates.push(
+                database
+                    .register_candidate(
+                        &ControllerId::new(name),
+                        &ControllerHostIdentity::Persistent(InstanceId::try_new(name)?),
+                    )
+                    .await?,
+            );
+        }
+        let now = Timestamp::from_unix_millis(1);
+        let expiry = Timestamp::from_unix_millis(100);
+        let Acquisition::Acquired(owner) = database
+            .acquire(&candidates[0], now, now, expiry, Takeover::Observe)
+            .await?
+        else {
+            return Err("owner did not acquire lease".into());
+        };
+        set_safe_yield_marker(&database, marker.as_ref()).await?;
+        assert!(matches!(
+            database
+                .acquire(&candidates[1], now, now, expiry, Takeover::Request)
+                .await?,
+            Acquisition::Contending(_)
+        ));
+        let stored = database
+            .get("lease", "leader")
+            .await?
+            .ok_or("lease missing")?;
+        assert!(!stored.contains_key("successor_holder"));
+        assert!(matches!(
+            database.renew(&owner, now, expiry).await?,
+            Renewal::Renewed(_)
+        ));
+
+        let acquire_at = if marker == Some(crate::items::n(0)) {
+            Timestamp::from_unix_millis(101)
+        } else {
+            database.release(&owner).await?;
+            now
+        };
+        let new_expiry = Timestamp::from_unix_millis(200);
+        let Acquisition::Acquired(replacement) = database
+            .acquire(
+                &candidates[1],
+                acquire_at,
+                acquire_at,
+                new_expiry,
+                Takeover::Observe,
+            )
+            .await?
+        else {
+            return Err("replacement did not acquire released or stale lease".into());
+        };
+        let stored = database
+            .get("lease", "leader")
+            .await?
+            .ok_or("lease missing")?;
+        assert_eq!(
+            crate::items::number(&stored, "safe_yield_epoch")?,
+            replacement.epoch.get()
+        );
+        assert!(matches!(
+            database
+                .acquire(
+                    &candidates[2],
+                    acquire_at,
+                    acquire_at,
+                    new_expiry,
+                    Takeover::Request
+                )
+                .await?,
+            Acquisition::Contending(_)
+        ));
+        assert!(matches!(
+            database.renew(&replacement, acquire_at, new_expiry).await?,
+            Renewal::YieldRequested(_)
+        ));
+    }
     Ok(())
 }
 

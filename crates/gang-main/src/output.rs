@@ -524,7 +524,10 @@ impl Output {
     pub(crate) fn failure(&self, subject: &str, error: &MainError) -> ExitCode {
         let record = failure_record(subject, error, error.fix().map(Cow::into_owned));
         self.emit_err(&record.rows(self.shared.err.width));
-        ExitCode::FAILURE
+        match error {
+            MainError::Server(gang_server::ServerError::ShutdownTimedOut(_)) => ExitCode::from(4),
+            _ => ExitCode::FAILURE,
+        }
     }
 
     /// Whether stderr is colored: what logging passes to its ANSI switch.
@@ -897,6 +900,35 @@ mod behavior {
         let text = stderr.text();
         assert!(text.trim_start().starts_with("fail"), "{text:?}");
         assert!(text.contains("gang server"), "{text:?}");
+    }
+
+    #[test]
+    fn shutdown_timeout_returns_exit_code_four_and_a_fail_record() {
+        let (out, stdout, stderr) = Output::captured();
+        let error = MainError::Server(gang_server::ServerError::ShutdownTimedOut(
+            gang_clock::Elapsed,
+        ));
+        assert_eq!(out.failure("gang server", &error), ExitCode::from(4));
+        assert_eq!(stdout.text(), "");
+        assert_eq!(
+            stderr.text(),
+            "  fail  gang server: graceful shutdown timed out\n\
+             \x20       ↳ deadline elapsed\n"
+        );
+    }
+
+    #[test]
+    fn other_server_timeout_returns_exit_code_one() {
+        let (out, _, stderr) = Output::captured();
+        let error = MainError::Server(gang_server::ServerError::HandoffTimedOut(
+            gang_clock::Elapsed,
+        ));
+        assert_eq!(out.failure("gang server", &error), ExitCode::FAILURE);
+        assert_eq!(
+            stderr.text(),
+            "  fail  gang server: the controller handoff phase timed out\n\
+             \x20       ↳ deadline elapsed\n"
+        );
     }
 
     #[test]

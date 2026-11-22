@@ -109,10 +109,12 @@ const DEFAULT_HEALTH_MAX_HEADER_SIZE: Bytes = Bytes::kib(8);
 const DEFAULT_LEADERSHIP_TTL: NonZeroDuration = NonZeroDuration::from_secs(10);
 /// Default allowance for clock skew between controllers.
 const DEFAULT_LEADERSHIP_CLOCK_SKEW: Duration = Duration::from_secs(2);
-/// Default time allowed for a controller host operation.
-const DEFAULT_LEADERSHIP_HOST_CALL_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(10);
+/// Default time allowed for a controller incarnation lookup.
+const DEFAULT_LEADERSHIP_INCARNATION_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(10);
 /// Default interval between revocation refreshes.
 const DEFAULT_REVOCATION_REFRESH_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(5);
+/// Default maximum graceful shutdown duration.
+const DEFAULT_STOP_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(2460);
 
 /// Default time a worker may be silent before the scheduler drops it: 10 seconds.
 pub const DEFAULT_WORKER_TIMEOUT: WholeSeconds = WholeSeconds::from_units(10);
@@ -127,8 +129,8 @@ pub struct LeadershipConfig {
     pub renew_interval: NonZeroDuration,
     /// Minimum validity required before a provisioner mutation. Defaults to one second.
     pub call_timeout: NonZeroDuration,
-    /// Timeout for host operations, independent of lease timing. Defaults to ten seconds.
-    pub host_call_timeout: NonZeroDuration,
+    /// Timeout for incarnation lookup, independent of lease timing. Defaults to ten seconds.
+    pub incarnation_timeout: NonZeroDuration,
     /// Allowance for clock skew. Defaults to two seconds.
     #[serde(with = "gang_types::duration")]
     pub clock_skew: Duration,
@@ -144,7 +146,7 @@ impl Default for LeadershipConfig {
             call_timeout: NonZeroDuration::from_secs(
                 gang_types::handover::DEFAULT_CALL_TIMEOUT.as_secs(),
             ),
-            host_call_timeout: DEFAULT_LEADERSHIP_HOST_CALL_TIMEOUT,
+            incarnation_timeout: DEFAULT_LEADERSHIP_INCARNATION_TIMEOUT,
             clock_skew: DEFAULT_LEADERSHIP_CLOCK_SKEW,
         }
     }
@@ -205,6 +207,8 @@ pub struct ServerConfig {
     pub proxy_protocol: Option<ProxyProtocolConfig>,
     /// Controller leadership timing. Defaults to the values on [`LeadershipConfig`].
     pub leadership: LeadershipConfig,
+    /// Maximum graceful shutdown duration. Defaults to 41 minutes.
+    pub stop_timeout: NonZeroDuration,
     /// Interval between revocation refreshes. Defaults to five seconds.
     pub revocation_refresh_interval: NonZeroDuration,
     /// How many health listener connections may be open at once; further connections wait in the
@@ -247,6 +251,7 @@ struct RawServer {
     rate_limit: RateLimitConfig,
     proxy_protocol: Option<ProxyProtocolConfig>,
     leadership: LeadershipConfig,
+    stop_timeout: NonZeroDuration,
     revocation_refresh_interval: NonZeroDuration,
     health_max_connections: NonZeroUsize,
     health_max_header_size: Bytes,
@@ -277,6 +282,7 @@ impl Default for RawServer {
             rate_limit: RateLimitConfig::default(),
             proxy_protocol: None,
             leadership: LeadershipConfig::default(),
+            stop_timeout: DEFAULT_STOP_TIMEOUT,
             revocation_refresh_interval: DEFAULT_REVOCATION_REFRESH_INTERVAL,
             health_max_connections: DEFAULT_HEALTH_MAX_CONNECTIONS,
             health_max_header_size: DEFAULT_HEALTH_MAX_HEADER_SIZE,
@@ -335,6 +341,7 @@ impl TryFrom<RawServer> for ServerConfig {
             rate_limit: raw.rate_limit,
             proxy_protocol: raw.proxy_protocol,
             leadership: raw.leadership,
+            stop_timeout: raw.stop_timeout,
             revocation_refresh_interval: raw.revocation_refresh_interval,
             health_max_connections: raw.health_max_connections,
             health_max_header_size: raw.health_max_header_size,
@@ -371,6 +378,7 @@ impl From<ServerConfig> for RawServer {
             rate_limit: config.rate_limit,
             proxy_protocol: config.proxy_protocol,
             leadership: config.leadership,
+            stop_timeout: config.stop_timeout,
             revocation_refresh_interval: config.revocation_refresh_interval,
             health_max_connections: config.health_max_connections,
             health_max_header_size: config.health_max_header_size,
@@ -384,6 +392,29 @@ impl From<ServerConfig> for RawServer {
 #[cfg(test)]
 mod tests {
     use super::{EndpointTrust, ServerConfig};
+
+    #[test]
+    fn stop_timeout_defaults_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let default: ServerConfig = toml::from_str("transport = 'plaintext'")?;
+        assert_eq!(
+            default.stop_timeout,
+            gang_types::NonZeroDuration::from_secs(2460)
+        );
+        let configured: ServerConfig =
+            toml::from_str("transport = 'plaintext'\nstop_timeout = '43m'")?;
+        assert_eq!(
+            configured.stop_timeout,
+            gang_types::NonZeroDuration::from_secs(2580)
+        );
+        assert_eq!(
+            toml::from_str::<ServerConfig>(&toml::to_string(&configured)?)?,
+            configured
+        );
+        assert!(
+            toml::from_str::<ServerConfig>("transport = 'plaintext'\nstop_timeout = '0s'").is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn connection_settings_round_trip() -> Result<(), Box<dyn std::error::Error>> {
@@ -402,17 +433,17 @@ mod tests {
     }
 
     #[test]
-    fn leadership_host_timeout_defaults_and_round_trips() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn leadership_incarnation_timeout_defaults_and_round_trips()
+    -> Result<(), Box<dyn std::error::Error>> {
         let default: ServerConfig = toml::from_str("transport = 'plaintext'")?;
         assert_eq!(
-            default.leadership.host_call_timeout.get(),
+            default.leadership.incarnation_timeout.get(),
             std::time::Duration::from_secs(10)
         );
         let config: ServerConfig =
-            toml::from_str("transport = 'plaintext'\n[leadership]\nhost_call_timeout = '25s'")?;
+            toml::from_str("transport = 'plaintext'\n[leadership]\nincarnation_timeout = '25s'")?;
         assert_eq!(
-            config.leadership.host_call_timeout.get(),
+            config.leadership.incarnation_timeout.get(),
             std::time::Duration::from_secs(25)
         );
         assert_eq!(
@@ -421,7 +452,7 @@ mod tests {
         );
         assert!(
             toml::from_str::<ServerConfig>(
-                "transport = 'plaintext'\n[leadership]\nhost_call_timeout = '0s'"
+                "transport = 'plaintext'\n[leadership]\nincarnation_timeout = '0s'"
             )
             .is_err()
         );

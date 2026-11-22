@@ -1524,6 +1524,21 @@ run "sqlite_instance_shape" {
     condition     = output.controller_config_digest == null
     error_message = "SQLite must not pass a group configuration digest to its controller."
   }
+  assert {
+    condition     = output.controller_count == 1 && output.controller_service_name == null && output.controller_cluster_name == null && output.controller_task_definition_arn == null && output.controller_capacity_asg_name == null && contains(keys(output.images), "controller") && strcontains(output.gang_toml, "stop_timeout = \"2460s\"")
+    error_message = "SQLite must retain its controller AMI and standalone shape and render the default drain timeout."
+  }
+}
+
+run "sqlite_renders_custom_stop_timeout" {
+  command = plan
+  variables {
+    controller_stop_timeout_seconds = 3600
+  }
+  assert {
+    condition     = strcontains(output.gang_toml, "stop_timeout = \"3600s\"")
+    error_message = "A SQLite controller must receive its configured drain timeout."
+  }
 }
 
 run "rejects_unknown_database_engine" {
@@ -1538,7 +1553,7 @@ run "rejects_multiple_sqlite_controllers" {
     controller_count = 2
     nat_mode         = "per_az"
   }
-  expect_failures = [var.database]
+  expect_failures = [var.controller_count]
 }
 
 # Correctness: Defaults resolve each used architecture from this module's release.

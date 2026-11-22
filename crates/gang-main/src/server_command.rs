@@ -16,9 +16,7 @@ use gang_server::{
     DeviceSettings, HandshakeSettings, Listeners, LoginSettings, Parts, Provider, Providers,
     PublicEndpoint, RequestLimits, Server, ServerSettings, TlsSettings, TransportSettings,
 };
-use gang_spi::{
-    ControllerHostPort, ControllerId, ControllerReady, LoginClient, PluginContext, PortError,
-};
+use gang_spi::{ControllerId, ControllerReady, LoginClient, PluginContext};
 use gang_types::announcement::{Announcement, ListenerRole};
 use gang_types::{Isa, NonZeroDuration, ProviderName, Url};
 use tokio::net::TcpListener;
@@ -176,13 +174,6 @@ async fn serve_prepared(
     let (clients, workers) = build_authentication(authentication, &context)?;
     let providers = identity_providers(identity, &context)?;
     let attempt_budget = worker.attempt_budget(actions.timeout);
-    if let Some(limit) = fleet.drain_limit().await.map_err(MainError::Scheduler)?
-        && attempt_budget > limit
-    {
-        return Err(MainError::Scheduler(PortError::config(format!(
-            "configured whole-attempt budget {attempt_budget:?} exceeds the controller lifecycle hook limit {limit:?}"
-        ))));
-    }
     let clock = Arc::new(SystemClock::new());
 
     let settings = server_settings(
@@ -353,6 +344,7 @@ fn server_settings(source: SettingsSource, server: ServerConfig) -> Result<Serve
         principal_seen_interval: server.principal_seen_interval,
         leadership: server.leadership,
         attempt_budget: source.attempt_budget,
+        stop_timeout: server.stop_timeout,
         revocation_refresh_interval: server.revocation_refresh_interval,
         max_tracked_principals: server.max_tracked_principals,
         accept_error_backoff: server.accept_error_backoff,

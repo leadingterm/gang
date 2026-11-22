@@ -1,4 +1,31 @@
+override_data {
+  target = module.controller.data.aws_ec2_instance_type.this
+  values = { supported_architectures = ["arm64"], boot_modes = ["uefi"], burstable_performance_supported = true }
+}
+
 mock_provider "aws" {
+  mock_data "aws_ssm_parameter" {
+    defaults = { value = "ami-0123456789abcdef0" }
+  }
+  mock_data "aws_security_group" {
+    defaults = { vpc_id = "vpc-0123456789abcdef0" }
+  }
+  mock_resource "aws_iam_role" {
+    defaults = { arn = "arn:aws:iam::000000000000:role/gang-ecs-execution" }
+  }
+  mock_resource "aws_autoscaling_group" {
+    defaults = { arn = "arn:aws:autoscaling:eu-north-1:000000000000:autoScalingGroup:00000000-0000-0000-0000-000000000000:autoScalingGroupName/gang-ecs-capacity" }
+  }
+  mock_resource "aws_ecs_cluster" {
+    defaults = { arn = "arn:aws:ecs:eu-north-1:000000000000:cluster/gang-controller" }
+  }
+  mock_resource "aws_ecs_task_definition" {
+    defaults = { arn = "arn:aws:ecs:eu-north-1:000000000000:task-definition/gang-controller:1" }
+  }
+  mock_resource "aws_ecr_repository" {
+    defaults = { arn = "arn:aws:ecr:eu-north-1:000000000000:repository/gang-controller", repository_url = "000000000000.dkr.ecr.eu-north-1.amazonaws.com/gang-controller" }
+  }
+
   mock_data "aws_ami" {
     defaults = { root_device_name = "/dev/xvda" }
   }
@@ -221,18 +248,18 @@ override_data {
 }
 
 variables {
-  client_token_providers   = ["google", "github-actions"]
-  region                   = "eu-north-1"
-  cidr_block               = "10.20.0.0/16"
-  cache_bucket_name        = "example-gang-cache"
-  controller_instance_type = "c7i.large"
-  default_isa              = "x86-64"
-  trust_domain             = "example.com"
-  database                 = { engine = "dynamodb" }
-  hostname                 = "gang.example.com"
-  load_balancer            = {}
-  network                  = { availability_zone_count = 2 }
-  tags                     = { Environment = "test" }
+  client_token_providers  = ["google", "github-actions"]
+  region                  = "eu-north-1"
+  cidr_block              = "10.20.0.0/16"
+  cache_bucket_name       = "example-gang-cache"
+  default_isa             = "x86-64"
+  trust_domain            = "example.com"
+  database                = { engine = "dynamodb" }
+  controller_image_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  hostname                = "gang.example.com"
+  load_balancer           = {}
+  network                 = { availability_zone_count = 2 }
+  tags                    = { Environment = "test" }
   fleets = [
     {
       name               = "gang-worker-x86-64"
@@ -353,6 +380,10 @@ run "applyB" {
   assert {
     condition     = local.config_parameter_arns == ["arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml/generations/*"]
     error_message = "The previous pinned selector must remain covered by the generation IAM grant."
+  }
+  assert {
+    condition     = output.controller_config_digest == sha256(output.gang_toml)
+    error_message = "The task configuration digest must cover the current rendered configuration."
   }
 }
 

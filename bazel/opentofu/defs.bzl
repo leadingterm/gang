@@ -35,6 +35,7 @@ def _upgrade_fixture_impl(ctx):
     args.add("--tofu", runtime.tf.path)
     args.add("--provider-mirror", runtime.mirror.path)
     args.add("--output", output.path)
+    args.add("--handoff-protocol", ctx.attr.handoff_protocol)
     ctx.actions.run(
         executable = ctx.executable._runner,
         arguments = [args],
@@ -48,6 +49,10 @@ def _upgrade_fixture_impl(ctx):
 upgrade_fixture = rule(
     implementation = _upgrade_fixture_impl,
     attrs = {
+        "handoff_protocol": attr.string(
+            mandatory = True,
+            values = ["drain_before_release", "release_before_drain"],
+        ),
         "source_root": attr.label(mandatory = True, allow_single_file = True),
         "srcs": attr.label_list(allow_files = True),
         "test_file": attr.label(

@@ -7,8 +7,8 @@ use std::time::Duration;
 use gang_clock::{Clock, Tick, Timestamp};
 use gang_config::LeadershipConfig;
 use gang_spi::{
-    Acquisition, ControllerHostIdentity, ControllerHostPort, ControllerHostState, ControllerId,
-    Fence, Keeper, LeaderLeasePort, Lease, LeaseCandidate, PortError, Renewal, Takeover,
+    Acquisition, ControllerHostIdentity, ControllerId, Fence, Keeper, LeaderLeasePort, Lease,
+    LeaseCandidate, PortError, Renewal, Takeover,
 };
 
 /// The `stale_before` under which no lease counts as stale, so only a released lease is free.
@@ -105,8 +105,8 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
         self.config.call_timeout.get()
     }
 
-    pub(crate) fn host_call_timeout(&self) -> Duration {
-        self.config.host_call_timeout.get()
+    pub(crate) fn incarnation_timeout(&self) -> Duration {
+        self.config.incarnation_timeout.get()
     }
 
     pub(crate) fn protection_ttl(&self) -> Duration {
@@ -149,39 +149,7 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
     /// `ttl`: a leader that could not renew while the database was down renews within
     /// `renew_interval` of it answering again, so it keeps its lease instead of losing it to
     /// whichever controller reaches the database first. Until then only a released lease is free.
-    pub(crate) async fn acquire(
-        &self,
-        candidate: &LeaseCandidate,
-        host: &impl ControllerHostPort,
-    ) -> Result<Option<Lease>, PortError> {
-        loop {
-            match self
-                .clock
-                .timeout(self.host_call_timeout(), host.state())
-                .await
-            {
-                Ok(Ok(ControllerHostState::Active)) => break,
-                Ok(Ok(ControllerHostState::Retiring)) => return Ok(None),
-                Ok(Err(error @ PortError::Unavailable(_))) => {
-                    tracing::warn!(%error, "cannot read controller host state");
-                    self.clock.sleep(self.renew_interval()).await;
-                }
-                Ok(Err(error)) => return Err(error),
-                Err(error) => {
-                    tracing::warn!(%error, "timed out reading controller host state");
-                    self.clock.sleep(self.renew_interval()).await;
-                }
-            }
-        }
-        tokio::select! {
-            biased;
-            retired = host.retiring() => retired.map(|()| None),
-            acquired = self.acquire_prepared(candidate) => acquired.map(Some),
-        }
-    }
-
-    /// Contends using only database calls after the host has passed preflight.
-    async fn acquire_prepared(&self, candidate: &LeaseCandidate) -> Result<Lease, PortError> {
+    pub(crate) async fn acquire(&self, candidate: &LeaseCandidate) -> Result<Lease, PortError> {
         let mut reachable_since = None;
         loop {
             let started = self.clock.monotonic();
@@ -231,10 +199,9 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
         }
     }
 
-    /// Renews `lease` every `renew_interval` and returns once it is lost. A failed or timed-out
-    /// renewal is retried, but once validity lapses `/ready` returns 503 and fleet mutations are
-    /// fenced until renewal succeeds. Promoted public and worker admission remains enabled
-    /// until confirmed handoff; existing execution and result streams are not readmitted.
+    /// Renews `lease` every `renew_interval` and returns once it is lost. Failed renewals
+    /// are retried; fleet mutations are fenced once validity lapses until renewal succeeds.
+    /// Promoted admission remains enabled until confirmed handoff.
     pub(crate) async fn hold(&self, lease: &mut Lease) -> LeaseEnd {
         loop {
             self.clock.sleep(self.config.renew_interval.get()).await;

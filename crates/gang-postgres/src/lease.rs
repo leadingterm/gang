@@ -126,11 +126,12 @@ impl LeaderLeasePort for Postgres {
                 &[(&LEASE, Type::TEXT), (&expires_at, Type::TIMESTAMPTZ)],
             ).await?;
             let row = client.query_typed_one(
-                "SELECT holder, epoch, expires_at, holder_priority, holder_priority_epoch, pending_holder, pending_priority, pending_epoch, pending_expires_at FROM leases WHERE name = $1 FOR UPDATE",
+                "SELECT holder, epoch, safe_yield_epoch, expires_at, holder_priority, holder_priority_epoch, pending_holder, pending_priority, pending_epoch, pending_expires_at FROM leases WHERE name = $1 FOR UPDATE",
                 &[(&LEASE, Type::TEXT)],
             ).await?;
             let holder: Option<String> = get(&row, "holder")?;
             let epoch: i64 = get(&row, "epoch")?;
+            let safe_yield_epoch: Option<i64> = get(&row, "safe_yield_epoch")?;
             let epoch_unsigned = unsigned("epoch", epoch)?;
             let expiry: time::OffsetDateTime = get(&row, "expires_at")?;
             let binding: i64 = get(&row, "holder_priority_epoch")?;
@@ -160,12 +161,12 @@ impl LeaderLeasePort for Postgres {
                 let next = epoch_unsigned.checked_add(1).ok_or(PostgresError::Range { column: "epoch", value: epoch_unsigned })?;
                 let next = signed("epoch", next)?;
                 let acquired = client.query_typed_one(
-                    "UPDATE leases SET holder = $2, epoch = $3, expires_at = $4, record_sequence = 0, holder_priority = $5, holder_priority_epoch = $3, pending_holder = NULL, pending_priority = NULL, pending_epoch = NULL, pending_expires_at = NULL WHERE name = $1 RETURNING holder, epoch, expires_at",
+                    "UPDATE leases SET holder = $2, epoch = $3, safe_yield_epoch = $3, expires_at = $4, record_sequence = 0, holder_priority = $5, holder_priority_epoch = $3, pending_holder = NULL, pending_priority = NULL, pending_epoch = NULL, pending_expires_at = NULL WHERE name = $1 RETURNING holder, epoch, expires_at",
                     &[(&LEASE, Type::TEXT), (&candidate.holder.as_str(), Type::TEXT), (&next, Type::INT8), (&expires_at, Type::TIMESTAMPTZ), (&candidate.priority.as_str(), Type::TEXT)],
                 ).await?;
                 return Ok(Acquisition::Acquired(decode_lease(&acquired, get(&acquired, "holder")?)?));
             }
-            if takeover == Takeover::Request && newer && may_replace {
+            if takeover == Takeover::Request && safe_yield_epoch == Some(epoch) && newer && may_replace {
                 client.execute_typed(
                     "UPDATE leases SET pending_holder = $2, pending_priority = $3, pending_epoch = $4, pending_expires_at = $5 WHERE name = $1",
                     &[(&LEASE, Type::TEXT), (&candidate.holder.as_str(), Type::TEXT), (&candidate.priority.as_str(), Type::TEXT), (&epoch, Type::INT8), (&expires_at, Type::TIMESTAMPTZ)],

@@ -47,6 +47,17 @@ output "workers_target_group_arn" {
   value       = var.shared_database ? aws_lb_target_group.internal["workers"].arn : null
 }
 
+output "target_groups" {
+  description = "Listener-associated target groups and container ports for the shared-database controller service."
+  # ECS requires each target group to be associated with a load balancer first.
+  depends_on = [aws_lb_listener.this, aws_lb_listener.internal]
+  value = var.shared_database ? {
+    serve          = { arn = aws_lb_target_group.this.arn, port = var.port }
+    internal_serve = { arn = aws_lb_target_group.internal["serve"].arn, port = var.port }
+    workers        = { arn = aws_lb_target_group.internal["workers"].arn, port = var.workers_port }
+  } : {}
+}
+
 output "internal_dns_name" {
   description = "DNS name of the internal load balancer, or null when disabled."
   value       = one(aws_lb.internal[*].dns_name)

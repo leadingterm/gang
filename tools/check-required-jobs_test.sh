@@ -115,11 +115,17 @@ expect failure 'release gate cannot be a green stub' "$guard" "$fixture" "$pr_fi
 reset_fixtures
 yq -i '.jobs.release-validation.needs += ["macos"]' "$fixture"
 expect failure 'advisory macOS cannot join release gate' "$guard" "$fixture" "$pr_fixture"
-for job in linux-arm64-checks e2e-gate-1-shards e2e-gate-2-shards e2e-v035-upgrade; do
+for job in nix-vm linux-arm64-checks e2e-gate-1-shards e2e-gate-2-shards e2e-v035-upgrade; do
   reset_fixtures
   job="$job" yq -i '.jobs[strenv(job)].needs = []' "$fixture"
   expect failure "$job requires its bundle" "$guard" "$fixture" "$pr_fixture"
 done
+reset_fixtures
+yq -i '.jobs.nix-vm.needs = ["linux-x86_64-bundle"]' "$fixture"
+expect failure 'nix-vm requires the ARM bundle, not the x86 bundle' "$guard" "$fixture" "$pr_fixture"
+reset_fixtures
+yq -i '.jobs.nix-vm.needs += ["linux-x86_64-bundle"]' "$fixture"
+expect failure 'nix-vm cannot add another dependency' "$guard" "$fixture" "$pr_fixture"
 for job in nativelink-memory-tests nix-vm cross-build linux-arm64-checks linux-x86_64-shards; do
   reset_fixtures
   job="$job" yq -i '(.jobs[strenv(job)].steps[] | select(.name == "Run NativeLink memory tests" or .name == "Run NixOS VM checks" or .name == "Cross-build gang" or .name == "Test") | .run) = "true"' "$fixture"
@@ -241,7 +247,7 @@ expect_local_selections() {
     | split($total_expr) | join($total)
   ')
   cases=$((cases + 1))
-  if actual=$(bash "$local_gate/tools/gate.sh" --list-e2e 2>"$scratch/local-error"); then
+  if actual=$(env -u GANG_CONTROLLER_BINARY bash "$local_gate/tools/gate.sh" --list-e2e 2>"$scratch/local-error"); then
     if [[ $actual != "$expected" ]]; then fail "$description: local selections differ from CI"; fi
   else
     fail "$description: list failed: $(cat "$scratch/local-error")"
@@ -283,6 +289,35 @@ done
 cases=$((cases + 1))
 if [[ -e $local_gate/tools/lint-called ]]; then fail 'list and invalid arguments must not invoke lint'; fi
 
+# Normal mode rejects a missing or unreadable controller before invoking lint.
+cases=$((cases + 1))
+if env -u GANG_CONTROLLER_BINARY bash "$local_gate/tools/gate.sh" >"$scratch/output" 2>&1; then
+  fail 'normal local gate must reject an unset controller binary'
+elif ! grep -q 'GANG_CONTROLLER_BINARY' "$scratch/output"; then
+  fail 'missing controller binary must produce an actionable diagnostic'
+fi
+for binary in '' "$scratch/nonexistent-controller" "$scratch"; do
+  cases=$((cases + 1))
+  if GANG_CONTROLLER_BINARY="$binary" bash "$local_gate/tools/gate.sh" >"$scratch/output" 2>&1; then
+    fail "normal local gate must reject invalid controller binary: $binary"
+  elif ! grep -q 'GANG_CONTROLLER_BINARY' "$scratch/output"; then
+    fail 'invalid controller binary must produce an actionable diagnostic'
+  fi
+done
+touch "$scratch/unreadable-controller"
+chmod 000 "$scratch/unreadable-controller"
+if [[ ! -r $scratch/unreadable-controller ]]; then
+  cases=$((cases + 1))
+  if GANG_CONTROLLER_BINARY="$scratch/unreadable-controller" bash "$local_gate/tools/gate.sh" >"$scratch/output" 2>&1; then
+    fail 'normal local gate must reject an unreadable controller binary'
+  elif ! grep -q 'GANG_CONTROLLER_BINARY' "$scratch/output"; then
+    fail 'unreadable controller binary must produce an actionable diagnostic'
+  fi
+fi
+cases=$((cases + 1))
+if [[ -e $local_gate/tools/lint-called ]]; then fail 'invalid controller binary must not invoke lint'; fi
+touch "$scratch/controller"
+
 # Substitute only the heavyweight tools so the real normal-mode dispatch can run.
 cat >"$local_gate/tools/lint.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -316,7 +351,7 @@ shift 2
 EOF
 chmod +x "$local_gate/tools/lint.sh" "$local_gate/tools/ci-targets.sh" "$local_gate/tools/bazel" "$local_gate/tools/e2e-gate.sh"
 cases=$((cases + 1))
-if BAZEL="$local_gate/tools/bazel" bash "$local_gate/tools/gate.sh" >"$scratch/output" 2>&1; then
+if GANG_CONTROLLER_BINARY="$scratch/controller" BAZEL="$local_gate/tools/bazel" bash "$local_gate/tools/gate.sh" >"$scratch/output" 2>&1; then
   calls=$(cat "$local_gate/tools/e2e-calls")
   if [[ $calls != "$ci_selections" ]]; then
     fail 'normal local gate calls must match CI'

@@ -34,6 +34,7 @@ alias(
 upgrade_fixture(
     name = "v035_fixture",
     srcs = ["@gang_v035_source//:sources"],
+    handoff_protocol = "drain_before_release",
     source_root = "@gang_v035_source//:Cargo.toml",
     target_compatible_with = ["@platforms//os:linux"],
 )
@@ -41,22 +42,23 @@ upgrade_fixture(
 alias(
     name = "previous_gang",
     actual = select({
-        "//bazel/platforms:linux_x86_64": "@gang_v037_linux_x86_64//file:gang",
-        "//bazel/platforms:linux_arm64": "@gang_v037_linux_arm64//file:gang",
+        "//bazel/platforms:linux_x86_64": "@gang_v038_linux_x86_64//file:gang",
+        "//bazel/platforms:linux_arm64": "@gang_v038_linux_arm64//file:gang",
     }),
     target_compatible_with = ["@platforms//os:linux"],
 )
 
 upgrade_fixture(
-    name = "v037_fixture",
-    srcs = ["@gang_v037_source//:sources"],
-    source_root = "@gang_v037_source//:Cargo.toml",
+    name = "v038_fixture",
+    srcs = ["@gang_v038_source//:sources"],
+    handoff_protocol = "release_before_drain",
+    source_root = "@gang_v038_source//:Cargo.toml",
     target_compatible_with = ["@platforms//os:linux"],
 )
 
 alias(
     name = "previous_fixture",
-    actual = ":v037_fixture",
+    actual = ":v038_fixture",
     target_compatible_with = ["@platforms//os:linux"],
 )
 
@@ -73,6 +75,7 @@ upgrade_fixture(
         "//infra/terraform/modules/storage:sources",
         "//infra/terraform/modules/worker-fleet:sources",
     ],
+    handoff_protocol = "release_before_drain",
     source_root = "//:Cargo.toml",
     target_compatible_with = ["@platforms//os:linux"],
 )

@@ -13,19 +13,18 @@ use gang_spi::{
     CacheStorePort, CandidateGeneration, CandidatePriority, Capabilities, CertStatus,
     CertificateIssue, CertificateSignerPort, CertificateTarget, ClientCertificates,
     ControllerConnections, ControllerDrain, ControllerEndpoints, ControllerHostIdentity,
-    ControllerHostPort, ControllerHostState, ControllerId, ControllerReady, ControllerSpec,
-    CredentialLifecyclePort, Evidence, ExpiringRecordPort, FleetInstance, FleetOptions,
-    FleetSupply, Held, HostMilestone, Insert, InstanceIdentity, IssuedCertRecord,
-    IssuedCertificate, IssuedToken, LeaderLeasePort, LearnedHistory, Lease, LeaseCandidate,
-    LeaseEpoch, ListingLimits, LoginChallenge, LoginClient, LoginGrant, LoginPort, LoginRequest,
-    LoginSupport, MeasuredUsage, MountedScratchVolume, NodeLifecyclePort, Plugin, PluginContext,
-    PortError, PreemptionNotice, PrincipalRecord, ProofVerifierPort, ProvisionerPort, QueuedDemand,
-    Record, RecordBatchSeq, RecordChange, RecordId, RecordKey, RecordKind, RecordVersion,
-    RecordedScalingEvent, Rejection, Remove, RenderedStoreSpec, Renewal, Replace, RequestGate,
-    RevocationEpoch, SandboxPrograms, SandboxedAction, ScalingAuditEvent, ScalingEventSeq,
-    SchedulerPort, SchedulerSnapshot, Scheme, ScratchVolumePort, SignatureAlgorithm,
-    StateRepositoryPort, StoreAccess, Subject, Takeover, TokenIssue, WorkerSpec, WorkerTls,
-    WorkloadCredentialPort, validate_record_changes,
+    ControllerId, ControllerIdentityPort, ControllerReady, ControllerSpec, CredentialLifecyclePort,
+    Evidence, ExpiringRecordPort, FleetInstance, FleetOptions, FleetSupply, Held, Insert,
+    InstanceIdentity, IssuedCertRecord, IssuedCertificate, IssuedToken, LeaderLeasePort,
+    LearnedHistory, Lease, LeaseCandidate, LeaseEpoch, ListingLimits, LoginChallenge, LoginClient,
+    LoginGrant, LoginPort, LoginRequest, LoginSupport, MeasuredUsage, MountedScratchVolume,
+    NodeLifecyclePort, Plugin, PluginContext, PortError, PreemptionNotice, PrincipalRecord,
+    ProofVerifierPort, ProvisionerPort, QueuedDemand, Record, RecordBatchSeq, RecordChange,
+    RecordId, RecordKey, RecordKind, RecordVersion, RecordedScalingEvent, Rejection, Remove,
+    RenderedStoreSpec, Renewal, Replace, RequestGate, RevocationEpoch, SandboxPrograms,
+    SandboxedAction, ScalingAuditEvent, ScalingEventSeq, SchedulerPort, SchedulerSnapshot, Scheme,
+    ScratchVolumePort, SignatureAlgorithm, StateRepositoryPort, StoreAccess, Subject, Takeover,
+    TokenIssue, WorkerSpec, WorkerTls, WorkloadCredentialPort, validate_record_changes,
 };
 use gang_types::{
     ActionResources, AuthenticationSettings, Bytes, CertSerial, Fleet, FleetName, FleetSet,
@@ -270,29 +269,9 @@ macro_rules! provisioner_plugin {
             }
         }
 
-        impl ControllerHostPort for $plugin {
-            async fn state(&self) -> Result<ControllerHostState, PortError> {
-                Ok(ControllerHostState::Active)
-            }
-
-            async fn drain_limit(&self) -> Result<Option<std::time::Duration>, PortError> {
-                Ok(None)
-            }
-
-            async fn heartbeat(&self) -> Result<(), PortError> {
-                Ok(())
-            }
-
+        impl ControllerIdentityPort for $plugin {
             async fn incarnation(&self) -> Result<ControllerHostIdentity, PortError> {
                 Ok(ControllerHostIdentity::Persistent(instance(self.number)?))
-            }
-
-            async fn retiring(&self) -> Result<(), PortError> {
-                std::future::pending().await
-            }
-
-            async fn reached(&self, _milestone: HostMilestone) -> Result<(), PortError> {
-                Ok(())
             }
         }
 

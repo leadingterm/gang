@@ -6,61 +6,85 @@ variable "name" {
 }
 
 variable "shape" {
-  description = "Controller resource shape: instance for SQLite or group for shared state."
+  description = "Controller resource shape: instance for SQLite or service for shared state."
   type        = string
   default     = "instance"
   nullable    = false
 
   validation {
-    condition     = contains(["instance", "group"], var.shape)
-    error_message = "shape must be instance or group."
+    condition     = contains(["instance", "service"], var.shape)
+    error_message = "shape must be instance or service."
   }
 }
 
 variable "controller_count" {
-  description = "Desired number of controllers in the group."
+  description = "Desired number of controllers; the service currently requires one."
   type        = number
   default     = 1
   nullable    = false
 
   validation {
-    condition     = var.controller_count >= 1 && floor(var.controller_count) == var.controller_count
-    error_message = "controller_count must be a positive integer."
+    condition     = var.controller_count >= 1 && floor(var.controller_count) == var.controller_count && (var.shape != "service" || var.controller_count == 1)
+    error_message = "controller_count must be a positive integer and exactly one for the service shape."
   }
 }
 
 variable "subnet_ids" {
-  description = "Private subnet IDs for the controller group; required for the group shape."
+  description = "Private subnet IDs for the controller service."
   type        = list(string)
   default     = []
   nullable    = false
-
   validation {
-    condition     = var.shape != "group" || (length(var.subnet_ids) > 0 && alltrue([for id in var.subnet_ids : length(trimspace(id)) > 0]))
-    error_message = "subnet_ids must contain nonempty subnet IDs for the group shape."
+    condition     = var.shape != "service" || (length(var.subnet_ids) > 0 && alltrue([for id in var.subnet_ids : length(trimspace(id)) > 0]))
+    error_message = "subnet_ids must contain nonempty subnet IDs for the service shape."
   }
 }
 
-variable "target_group_arns" {
-  description = "Load balancer target group ARNs attached to the controller group."
-  type        = list(string)
-  default     = []
+variable "target_groups" {
+  description = "Target groups and container ports attached to the controller service."
+  type        = map(object({ arn = string, port = number }))
+  default     = {}
   nullable    = false
-
   validation {
-    condition     = var.shape != "group" || (length(var.target_group_arns) > 0 && alltrue([for arn in var.target_group_arns : length(trimspace(arn)) > 0]))
-    error_message = "target_group_arns must contain nonempty target group ARNs for the group shape."
+    condition     = var.shape != "service" || (length(var.target_groups) > 0 && alltrue([for group in values(var.target_groups) : length(trimspace(group.arn)) > 0 && group.port >= 1 && group.port <= 65535]))
+    error_message = "target_groups must contain valid ARNs and ports for the service shape."
   }
 }
 
 variable "config_digest" {
-  description = "SHA-256 digest of rendered gang.toml, required for group instance refresh on configuration changes."
+  description = "SHA-256 digest of rendered gang.toml, required for the service."
   type        = string
   default     = null
-
   validation {
-    condition     = var.shape != "group" || can(regex("^[0-9a-f]{64}$", var.config_digest))
-    error_message = "config_digest must be a lowercase SHA-256 hex digest for the group shape."
+    condition     = var.shape != "service" || can(regex("^[0-9a-f]{64}$", var.config_digest))
+    error_message = "config_digest must be a lowercase SHA-256 hex digest for the service shape."
+  }
+}
+
+variable "controller_image_digest" {
+  description = "SHA-256 digest of the controller image in the private repository."
+  type        = string
+  default     = null
+  validation {
+    condition     = var.shape != "service" || can(regex("^sha256:[0-9a-f]{64}$", var.controller_image_digest))
+    error_message = "controller_image_digest must be a lowercase SHA-256 digest prefixed with sha256:."
+  }
+}
+
+variable "ecs_ami_id" {
+  description = "Optional ECS-optimized AL2023 ARM64 AMI override."
+  type        = string
+  default     = null
+}
+
+variable "stop_timeout_seconds" {
+  description = "Maximum controller shutdown duration in seconds."
+  type        = number
+  default     = 2460
+  nullable    = false
+  validation {
+    condition     = var.stop_timeout_seconds > 0 && floor(var.stop_timeout_seconds) == var.stop_timeout_seconds
+    error_message = "stop_timeout_seconds must be a positive integer."
   }
 }
 
@@ -100,14 +124,19 @@ variable "iam_permissions_boundary_arn" {
 }
 
 variable "ami_id" {
-  description = "AMI ID for the controller instance. Changing it replaces the instance."
+  description = "AMI ID for the SQLite controller instance."
   type        = string
-  nullable    = false
+  default     = null
+  validation {
+    condition     = var.shape != "instance" || try(length(trimspace(var.ami_id)) > 0, false)
+    error_message = "ami_id is required for the instance shape."
+  }
 }
 
 variable "instance_type" {
   description = "EC2 instance type of the controller."
   type        = string
+  default     = "t4g.large"
   nullable    = false
 }
 

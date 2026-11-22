@@ -143,23 +143,41 @@
           // lib.optionalAttrs (file == "action-network.nix") {
             gang = gangPackage pkgs "${gang-binaries}/${system}/gang";
             helper = "${gang-binaries}/${system}/action_network";
+          }
+          // lib.optionalAttrs (file == "controller-container.nix") {
+            controllerImage = self.packages.${system}.controller-oci;
           })))
-      tests);
+      tests
+      // {
+        controller-oci =
+          (import ./infra/container/image.nix {
+            inherit pkgs;
+            gang = gangPackage pkgs "${gang-binaries}/aarch64-linux/gang";
+          }).check;
+      });
 
     packages =
       forLinuxSystems (system: let
         pkgs = pkgsFor system;
-      in {
-        # Bazel is the only builder of gang (statically linked, dashboard embedded): the images carry exactly the binary it built, taken unchanged from the gang-binaries input.
-        gang = gangPackage pkgs "${gang-binaries}/${system}/gang";
-        action-rootfs = import ./infra/nixos/action-rootfs {inherit pkgs;};
-        action-rootfs-e2e = self.packages.${system}.action-rootfs;
-        image = self.lib.image {
-          inherit system;
-          binary = "${gang-binaries}/${system}/gang";
-        };
-        darwin-check = darwinCheck pkgs;
-      })
+      in
+        {
+          # Bazel is the only builder of gang (statically linked, dashboard embedded): the images carry exactly the binary it built, taken unchanged from the gang-binaries input.
+          gang = gangPackage pkgs "${gang-binaries}/${system}/gang";
+          action-rootfs = import ./infra/nixos/action-rootfs {inherit pkgs;};
+          action-rootfs-e2e = self.packages.${system}.action-rootfs;
+          image = self.lib.image {
+            inherit system;
+            binary = "${gang-binaries}/${system}/gang";
+          };
+          darwin-check = darwinCheck pkgs;
+        }
+        // lib.optionalAttrs (system == "x86_64-linux") {
+          controller-oci =
+            (import ./infra/container/image.nix {
+              inherit pkgs;
+              gang = gangPackage pkgs "${gang-binaries}/aarch64-linux/gang";
+            }).image;
+        })
       // {
         aarch64-darwin.darwin-check = darwinCheck (pkgsFor "aarch64-darwin");
       };
@@ -230,7 +248,7 @@
         ln -s ${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf $out/share/fonts/DejaVuSans.ttf
         ln -s ${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf $out/share/fonts/DejaVuSansMono.ttf
       '';
-      deployTools = [pkgs.awscli2 pkgs.coreutils pkgs.curl pkgs.gh pkgs.git pkgs.jq pkgs.openssl opentofu];
+      deployTools = [pkgs.awscli2 pkgs.coreutils pkgs.curl pkgs.gh pkgs.git pkgs.jq pkgs.openssl pkgs.skopeo opentofu];
     in {
       default = pkgs.mkShell ({
           GANG_BAZELRC = "${bazelrc}";

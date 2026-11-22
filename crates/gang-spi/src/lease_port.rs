@@ -26,14 +26,20 @@ pub trait LeaderLeasePort: Send + Sync {
     ) -> Result<LeaseCandidate, PortError>;
 
     /// Takes a never-held or released lease, or one expiring strictly before `stale_before`.
-    /// Acquisition increments the epoch and clears any request. Concurrent attempts have at
-    /// most one winner; no request steals a live lease or otherwise changes its authority.
+    /// Acquisition increments the epoch and clears any request. Adapters that support
+    /// cooperative handoff atomically advertise safe yielding for the newly acquired epoch.
+    /// Concurrent attempts have at most one winner; no request steals a live lease or otherwise
+    /// changes its authority.
     ///
     /// [`Takeover::Observe`] never publishes or refreshes a request. [`Takeover::Request`]
-    /// may request that a distinct, lower-priority holder yield, including when its lease has
-    /// wall-expired but is not yet stale. The request targets the current epoch, expires at
-    /// `expires_at`, and retains the highest fresh candidate priority; the same candidate can
-    /// refresh it. Freshness requires the target epoch to match and expiry to be later than `now`.
+    /// may request that a distinct, lower-priority holder yield only if its durable safe-yield
+    /// advertisement matches the current lease epoch, including when its lease has wall-expired
+    /// but is not yet stale. An absent, malformed, or stale advertisement is unsupported:
+    /// legacy holders remain undisturbed until release or stale acquisition. The holder, epoch,
+    /// advertisement, and request update must be checked atomically.
+    /// The request targets the current epoch, expires at `expires_at`, and retains the highest
+    /// fresh candidate priority; the same candidate can refresh it. Freshness requires the
+    /// target epoch to match and expiry to be later than `now`.
     ///
     /// A fresh request reserves a free or stale lease for its matching holder and priority.
     /// Other candidates receive [`Acquisition::Reserved`], unless a higher-priority request
@@ -126,7 +132,7 @@ pub struct LeaseCandidate {
 pub enum Takeover {
     /// Observe without publishing a request.
     Observe,
-    /// Request handoff when eligible.
+    /// Request handoff when eligible and the holder advertises safe yielding for its epoch.
     Request,
 }
 
@@ -148,7 +154,7 @@ pub enum Acquisition {
     Acquired(Lease),
     /// Another controller holds this lease, live at `stale_before`.
     Held(Lease),
-    /// A live, distinct lower-ranked holder can be asked to yield.
+    /// A live, distinct lower-ranked holder is contended, whether or not it supports yielding.
     Contending(Lease),
     /// A fresh request reserves a free or stale lease for another candidate.
     Reserved,

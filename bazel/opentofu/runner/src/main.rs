@@ -28,15 +28,16 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     if !args.is_empty() {
-        if args.len() != 11
+        if args.len() != 13
             || args[0] != "--upgrade-fixture"
             || args[1] != "--source-root"
             || args[3] != "--test-file"
             || args[5] != "--tofu"
             || args[7] != "--provider-mirror"
             || args[9] != "--output"
+            || args[11] != "--handoff-protocol"
         {
-            return Err("expected --upgrade-fixture --source-root ROOT --test-file FILE --tofu TF --provider-mirror MIRROR --output OUT".into());
+            return Err("expected --upgrade-fixture --source-root ROOT --test-file FILE --tofu TF --provider-mirror MIRROR --output OUT --handoff-protocol PROTOCOL".into());
         }
         return opentofu_runner::upgrade_fixture(
             args[2].as_os_str().as_ref(),
@@ -44,6 +45,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             args[6].as_os_str().as_ref(),
             args[8].as_os_str().as_ref(),
             args[10].as_os_str().as_ref(),
+            args[12].to_str().ok_or("handoff protocol must be UTF-8")?,
         );
     }
     let cwd = env::current_dir()?;

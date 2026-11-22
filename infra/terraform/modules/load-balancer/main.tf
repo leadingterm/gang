@@ -121,14 +121,11 @@ resource "aws_lb" "this" {
 }
 
 resource "aws_lb_target_group" "this" {
-  name        = var.name
-  port        = var.port
-  protocol    = "TLS"
-  target_type = "instance"
-  vpc_id      = var.vpc_id
-
-  # PROXY preserves effective client identity while disabling source preservation
-  # avoids NLB target connection tuple collisions.
+  name                   = var.name
+  port                   = var.port
+  protocol               = "TLS"
+  target_type            = "instance"
+  vpc_id                 = var.vpc_id
   preserve_client_ip     = var.shared_database ? "false" : "true"
   proxy_protocol_v2      = var.shared_database
   deregistration_delay   = var.shared_database ? var.deregistration_delay : null
@@ -159,6 +156,7 @@ resource "aws_lb_target_group" "this" {
     Name = var.name
   })
 }
+
 
 resource "aws_lb_target_group_attachment" "this" {
   count = var.shared_database ? 0 : 1
@@ -238,6 +236,7 @@ resource "aws_route53_record" "controller" {
     }
   }
 }
+
 
 moved {
   from = aws_lb_target_group_attachment.this
