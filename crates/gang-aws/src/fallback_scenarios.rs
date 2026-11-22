@@ -710,7 +710,8 @@ async fn first_failure_withdraws_spot_then_raises_on_demand() -> TestResult {
     assert_eq!(into.desired, 10);
     assert_eq!(
         harness.requests("DescribeScalingActivities") - activities_before,
-        3
+        1,
+        "only the unmet twin needs a bounded launch assessment"
     );
     Ok(())
 }
