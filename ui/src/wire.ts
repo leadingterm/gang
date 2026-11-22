@@ -580,6 +580,10 @@ desired: number,
  */
 launchFailure?: LaunchFailure, 
 /**
+ * The latest failed launch while the fleet is below its desired capacity.
+ */
+launchWarning?: LaunchWarning, 
+/**
  * Instances by lifecycle.
  */
 instances: InstanceCounts, 
@@ -721,6 +725,16 @@ export type LaunchFailure = {
  * The provider's failure message, verbatim.
  */
 reason: string, };
+
+export type LaunchWarning = { 
+/**
+ * The provider's failure message, verbatim.
+ */
+reason: string, 
+/**
+ * The time the provider observed the failure.
+ */
+at: Timestamp, };
 
 export type Lifecycle = "PENDING" | "IN_SERVICE" | "TERMINATING";
 

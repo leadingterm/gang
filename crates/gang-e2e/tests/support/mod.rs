@@ -1209,6 +1209,7 @@ impl Simulation {
             },
             desired: count,
             launch_failure: None,
+            launch_warning: None,
             instances: InstanceCounts {
                 pending: 0,
                 in_service: count,

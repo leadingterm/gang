@@ -178,6 +178,79 @@ const probe = async (ready, pageName) => {
     if (violations.length < 50) violations.push(message);
   };
   if (["overview-instances", "workers-instances"].includes(pageName) && /\/\s*0(?:\D|$)/.test(document.body.innerText)) add("rendered page contains a /0 denominator");
+  if (pageName === "workers-instances") {
+    const rect = (element) => element?.getBoundingClientRect();
+    const fleets = [...document.querySelectorAll(".wgroup")];
+    const histories = [...document.querySelectorAll(".fleet__history")];
+    if (fleets.length < 2 || histories.length !== fleets.length) add(`expected one history per fleet, got ${histories.length} histories for ${fleets.length} fleets`);
+    if (![...document.querySelectorAll('svg[aria-label^="Instance history for "]')].some((svg) => svg.getAttribute("aria-label").includes("fleets/gpu"))) add("zero-worker fleet is missing its history chart");
+    const ids = [...document.querySelectorAll("svg pattern[id]")].map((pattern) => pattern.id);
+    if (new Set(ids).size !== ids.length) add("duplicate SVG hatch IDs");
+    for (const [index, fleet] of fleets.entries()) {
+      const history = fleet.querySelector(".fleet__history");
+      const svg = history?.querySelector("svg");
+      const legend = history?.querySelector('[aria-label="Instance history legend"]');
+      const historyBox = rect(history), svgBox = rect(svg), legendBox = rect(legend);
+      if (!historyBox || !svgBox || !legendBox || svgBox.width <= EPS || svgBox.height <= EPS || legendBox.width <= EPS || legendBox.height <= EPS) {
+        add(`fleet ${index}: chart or legend is missing or invisible`);
+        continue;
+      }
+      const labels = [...legend.children].map((item) => item.textContent.trim());
+      for (const label of ["Pending", "In service", "Terminating", "Warm", "Desired", "Max"]) {
+        if (!labels.includes(label)) add(`fleet ${index}: missing ${label} legend item`);
+      }
+      const tokenProbe = document.createElement("span");
+      legend.append(tokenProbe);
+      const tokenColor = (token) => {
+        tokenProbe.style.color = `var(${token})`;
+        return getComputedStyle(tokenProbe).color;
+      };
+      const muted = tokenColor("--color-muted");
+      for (const [name, label, token] of [
+        ["pending", "Pending", "--color-amber"],
+        ["inService", "In service", "--color-accent"],
+        ["terminating", "Terminating", "--color-bark"],
+        ["warm", "Warm", "--color-accent-deep"],
+        ["desired", "Desired", "--color-ink-2"],
+        ["max", "Max", "--color-muted"],
+      ]) {
+        const item = [...legend.children].find((child) => child.textContent.trim() === label);
+        const swatch = item?.querySelector(".fleet__history-swatch");
+        if (!item || item.className !== "legend__item" || getComputedStyle(item).color !== muted) add(`fleet ${index}: ${label} legend text does not inherit muted color`);
+        if (!swatch || !swatch.classList.contains(`spark__series--${name}`)) {
+          add(`fleet ${index}: missing ${name} swatch`);
+          continue;
+        }
+        const style = getComputedStyle(swatch);
+        const reference = ["desired", "max"].includes(name);
+        if (style.color !== tokenColor(token) || style.borderBlockStartColor !== tokenColor(token)) add(`fleet ${index}: ${name} swatch does not use ${token}`);
+        if (style.borderBlockStartStyle !== (reference ? "dashed" : "solid") || parseFloat(style.borderBlockStartWidth) <= 0 || swatch.getBoundingClientRect().width <= EPS) add(`fleet ${index}: ${name} swatch has incorrect or invisible border`);
+        if (swatch.classList.contains("spark__series--reference") !== reference) add(`fleet ${index}: incorrect reference class for ${name} swatch`);
+      }
+      tokenProbe.remove();
+      if (legend.querySelectorAll(".fleet__history-swatch").length !== 6) add(`fleet ${index}: expected exactly six legend swatches`);
+      for (const [name, node] of [["chart", svg], ["legend", legend], ...[...legend.children].map((item) => ["legend item", item])]) {
+        const box = rect(node);
+        const style = getComputedStyle(node);
+        if (!box || box.width <= EPS || box.height <= EPS || style.display === "none" || style.visibility === "hidden" ||
+            box.left < historyBox.left - EPS || box.right > historyBox.right + EPS ||
+            box.top < historyBox.top - EPS || box.bottom > historyBox.bottom + EPS) add(`fleet ${index}: ${name} is invisible or overflows history`);
+      }
+      for (const name of ["pending", "inService", "terminating", "warm", "desired", "max"]) {
+        const paths = svg.querySelectorAll(`path[data-series="${name}"]`);
+        if (paths.length !== 1) add(`fleet ${index}: expected one ${name} path, got ${paths.length}`);
+        else {
+          const reference = paths[0].classList.contains("spark__run--reference");
+          if (reference !== ["desired", "max"].includes(name)) add(`fleet ${index}: incorrect reference class for ${name}`);
+          const pathStyle = getComputedStyle(paths[0]);
+          if (reference && (pathStyle.strokeDasharray === "none" || parseFloat(pathStyle.strokeWidth) <= 0)) add(`fleet ${index}: ${name} reference line is not visibly dashed`);
+          if (!(paths[0].getAttribute("d") ?? "").trim()) add(`fleet ${index}: ${name} path is empty`);
+          if (index === 0 && name === "pending" && (paths[0].getAttribute("d")?.match(/M/g) ?? []).length !== 2) add("fleet 0: missing-entry gap or scheduler-independent sample not preserved");
+        }
+      }
+      if (svg.querySelectorAll("path[data-series]").length !== 6) add(`fleet ${index}: expected exactly six series paths`);
+    }
+  }
   for (const [index, family] of families.entries()) {
     if (!loadedFonts[index].length || !document.fonts.check(`16px "${family}"`, sample)) add(`font ${family} is not loaded`);
   }
@@ -629,6 +702,11 @@ test("dashboard layouts", { timeout: 240000 }, async () => {
           })()`, returnByValue: true });
           const screenshot = await page.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, clip: main.result.value });
           writeFileSync(join(process.env.TEST_UNDECLARED_OUTPUTS_DIR, `${screen.name}-${width}.png`), Buffer.from(screenshot.data, "base64"));
+          if (["overview-instances", "workers-instances"].includes(screen.name) && [390, 1516].includes(width)) {
+            const full = await page.send("Runtime.evaluate", { expression: `({ x: 0, y: 0, width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight, scale: 1 })`, returnByValue: true });
+            const shot = await page.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, clip: full.result.value });
+            writeFileSync(join(process.env.TEST_UNDECLARED_OUTPUTS_DIR, `${screen.name}-${width}-full.png`), Buffer.from(shot.data, "base64"));
+          }
         }
       }
       if (new Set(widths.map((value) => value.split(" ").at(-1))).size > 1) violations.push(`gutter@${width}: the content width differs between pages: ${widths.join(", ")}`);

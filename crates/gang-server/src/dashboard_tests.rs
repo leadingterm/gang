@@ -349,6 +349,174 @@ async fn server_info_never_contains_the_dashboard_client_secret() {
     .await;
 }
 
+async fn warning_api_fixture() -> (
+    crate::api::Api<crate::test_support_deployment::TlsDeployment>,
+    crate::hub::StateHub,
+) {
+    use std::sync::Arc;
+
+    use crate::api::{Api, ApiParts};
+    use crate::authorizer::Authorizer;
+    use crate::rate_limit::RateLimiter;
+    use crate::revocation::Revocations;
+    use crate::test_support::{Harness, HarnessOptions, role_for};
+    use gang_config::EndpointTrust;
+    use gang_spi::Scheme;
+    use gang_tls::RevocationSet;
+    use gang_types::PermissionSet;
+
+    let harness = Harness::token(HarnessOptions::default());
+    let settings = tls_settings();
+    let dashboard = Dashboard::start(
+        DashboardConfig::default(),
+        "test".to_owned(),
+        Duration::from_secs(1),
+        0,
+        &*harness.clock,
+        &harness.core.host.repository,
+    )
+    .await
+    .expect("dashboard starts");
+    let hub = dashboard.api().hub;
+    let info = crate::info::wire_server(
+        &harness.core.host.endpoint,
+        settings.default_isa,
+        EndpointTrust::System,
+        None,
+        Scheme::Token,
+        &harness.core.host.providers,
+    )
+    .expect("server info");
+    let api = Api::new(ApiParts {
+        readiness: crate::health::Readiness::for_test(),
+        core: Arc::clone(&harness.core),
+        revocations: Revocations::new(
+            Arc::clone(&harness.core),
+            RevocationSet::from_serials(Vec::new()),
+            crate::health::Readiness::for_test(),
+        ),
+        info,
+        authorizer: Authorizer::new(vec![role_for("reader", PermissionSet::all(), ALICE)]),
+        limits: settings.limits,
+        dashboard: Some(dashboard.api()),
+        builds: crate::builds::BuildsCell::new(&gang_config::BuildsConfig::default()),
+        limiter: Arc::new(RateLimiter::new(
+            &settings.rate_limit,
+            Arc::clone(&harness.clock),
+        )),
+        login_provider: None,
+        device: None,
+    });
+    (api, hub)
+}
+
+async fn warning_api_get(
+    api: &crate::api::Api<crate::test_support_deployment::TlsDeployment>,
+    path: &str,
+) -> http::Response<ApiResponseBody> {
+    use gang_spi::{ApiService, Authenticated};
+    use std::sync::Arc;
+
+    let mut request = api_request("GET", path, None, None);
+    request
+        .extensions_mut()
+        .insert(crate::gate::Caller::Authenticated(Authenticated {
+            identity: Arc::new(crate::test_support::identity(ALICE)),
+            valid_until: None,
+        }));
+    let response = api.call(request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+}
+
+fn raw_sse_payload(text: &str) -> serde_json::Value {
+    let data = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("SSE frame has data");
+    serde_json::from_str(data).expect("SSE data is JSON")
+}
+
+#[tokio::test]
+async fn state_and_watch_preserve_and_clear_launch_warning() {
+    use gang_wire::{AwsEvent, AwsEventKind, Event, EventChange, Fleet, LaunchWarning};
+
+    let (api, hub) = warning_api_fixture().await;
+    let response = warning_api_get(&api, WATCH_STATE.template).await;
+    let mut stream = response.into_body();
+    let initial = next_text(&mut stream).await.expect("initial snapshot");
+    assert_eq!(sse_event(&initial), "snapshot");
+
+    let at = Timestamp::from_unix_millis(1_000);
+    let reason = "insufficient capacity";
+    let failure = Event {
+        name: "events/aws-failure".to_owned(),
+        create_time: at,
+        fleet: "fleets/example-fleet".to_owned(),
+        cause: None,
+        change: EventChange::Aws {
+            event: AwsEvent {
+                id: "failure".to_owned(),
+                at,
+                kind: AwsEventKind::CapacityUnavailable {
+                    reason: reason.to_owned(),
+                },
+            },
+        },
+    };
+    hub.publish(|cur, prev, seq, _| {
+        cur.clone_from(prev);
+        cur.seq = seq;
+        cur.fleets = vec![Fleet {
+            name: "fleets/example-fleet".to_owned(),
+            launch_warning: Some(LaunchWarning {
+                reason: reason.to_owned(),
+                at,
+            }),
+            ..Fleet::default()
+        }];
+        cur.status_events = vec![failure.clone()];
+    });
+    let delta = next_text(&mut stream).await.expect("warning delta");
+    assert_eq!(sse_event(&delta), "delta");
+    let expected = serde_json::json!({"reason": reason, "at": "1970-01-01T00:00:01.000Z"});
+    let delta = raw_sse_payload(&delta);
+    assert_eq!(delta["fleets"]["upsert"][0]["launchWarning"], expected);
+    assert_eq!(
+        delta["statusEvents"][0],
+        serde_json::to_value(&failure).expect("event JSON")
+    );
+
+    let response = warning_api_get(&api, GET_STATE.template).await;
+    let json: serde_json::Value = read(response).await.json();
+    assert_eq!(json["fleets"][0]["launchWarning"], expected);
+    assert_eq!(
+        json["statusEvents"][0],
+        serde_json::to_value(&failure).expect("event JSON")
+    );
+    let response = warning_api_get(&api, WATCH_STATE.template).await;
+    let mut viewer = response.into_body();
+    let snapshot = next_text(&mut viewer).await.expect("warning snapshot");
+    assert_eq!(sse_event(&snapshot), "snapshot");
+    let snapshot = raw_sse_payload(&snapshot);
+    assert_eq!(snapshot["fleets"][0]["launchWarning"], expected);
+    assert_eq!(snapshot["statusEvents"][0], json["statusEvents"][0]);
+
+    hub.publish(|cur, prev, seq, _| {
+        cur.clone_from(prev);
+        cur.seq = seq;
+        cur.fleets[0].launch_warning = None;
+    });
+    let delta = next_text(&mut viewer).await.expect("cleared warning delta");
+    assert_eq!(sse_event(&delta), "delta");
+    let delta = raw_sse_payload(&delta);
+    assert!(delta["fleets"]["upsert"][0].get("launchWarning").is_none());
+    let response = warning_api_get(&api, GET_STATE.template).await;
+    let cleared: serde_json::Value = read(response).await.json();
+    assert!(cleared["fleets"][0].get("launchWarning").is_none());
+    assert_eq!(cleared["statusEvents"][0], json["statusEvents"][0]);
+}
+
 fn assert_fleet_sample_shape(fleet: &serde_json::Value) {
     assert_eq!(fleet["name"], "fleets/example-fleet");
     assert_eq!(fleet["max"], 4);

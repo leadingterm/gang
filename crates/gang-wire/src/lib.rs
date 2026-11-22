@@ -82,8 +82,8 @@ pub use session::{
 pub use state::{
     Actions, BucketUsage, Cache, CacheReads, CacheStore, Connections, Demand, Fleet,
     FleetInstanceSample, FleetWorkerCache, InfrastructurePhase, InfrastructureReason,
-    InfrastructureStatus, Instance, InstanceCounts, InstanceSize, LaunchFailure, Lifecycle, Named,
-    Pass, PassState, Phase, PhaseSpan, Policy, Queue, QueuedAction, Recent, Reservation,
-    RunningAction, Sample, SkipReason, State, StoreUsage, Truncated, Worker, WorkerCache,
-    WorkerCounts,
+    InfrastructureStatus, Instance, InstanceCounts, InstanceSize, LaunchFailure, LaunchWarning,
+    Lifecycle, Named, Pass, PassState, Phase, PhaseSpan, Policy, Queue, QueuedAction, Recent,
+    Reservation, RunningAction, Sample, SkipReason, State, StoreUsage, Truncated, Worker,
+    WorkerCache, WorkerCounts,
 };

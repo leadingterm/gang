@@ -4136,6 +4136,110 @@ async fn observed_publisher<F: ProvisionerPort<FleetOptions = Opaque>>(
     Ok(publisher)
 }
 
+async fn assert_launch_warning_survives_observations(replacement: bool) -> TestResult {
+    use gang_spi::{InfrastructureEvent, InfrastructureEventKind};
+
+    let clock = clock_at(1_000_000);
+    let fleets = fleets();
+    let fleet = EventProvisioner::default();
+    let scheduler = FakeScheduler::new()?;
+    let repository = FakeRepository::default();
+    let hub = hub();
+    let mut supply = supply_with("local-1", clock.wall(), 2);
+    supply.events.push(InfrastructureEvent {
+        id: "capacity-1".into(),
+        at: clock.wall(),
+        kind: InfrastructureEventKind::CapacityUnavailable {
+            reason: "capacity unavailable".into(),
+        },
+    });
+    fleet.inner.set_supply(&fleet_name(), supply.clone());
+    let mut observer = observed_publisher(&hub, &fleets, &fleet, &scheduler, clock.wall()).await?;
+    let dashboard = gang_config::DashboardConfig::default();
+    let mut control = ControlLoop::new(
+        &fleets,
+        crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
+        Arc::new(gang_config::ScalingConfig::default()),
+        source_profiles(),
+        gang_types::nonzero_u32(2),
+        &crate::control::ControlPorts {
+            provisioner: &fleet,
+            scheduler: &scheduler,
+            repository: &repository,
+            clock: &clock,
+        },
+        gang_testkit::fence::valid_fence(),
+    )
+    .with_publisher(observer.clone());
+    control.pass().await;
+    let warning = served(&hub).fleets[0]
+        .launch_warning
+        .clone()
+        .expect("the control pass publishes the canonical failure");
+    assert_eq!(warning.reason, "capacity unavailable");
+    assert_eq!(warning.at, clock.wall());
+
+    // The independent publisher has no canonical snapshot; identical observations must not
+    // remove the warning or emit a fleet upsert solely because of it.
+    supply.events.clear();
+    fleet.inner.set_supply(&fleet_name(), supply.clone());
+    for _ in 0..2 {
+        let before = served(&hub);
+        clock.advance(Duration::from_secs(1));
+        publish_observation(&mut observer, &fleets, &fleet, &scheduler, clock.wall()).await?;
+        let after = served(&hub);
+        assert_eq!(after.fleets[0].launch_warning.as_ref(), Some(&warning));
+        assert!(
+            gang_state::diff(&before, &after)
+                .and_then(|delta| delta.fleets)
+                .is_none_or(|fleets| fleets.upsert.is_empty())
+        );
+    }
+
+    supply.instances.push(in_service("local-2"));
+    fleet.inner.set_supply(&fleet_name(), supply.clone());
+    publish_observation(&mut observer, &fleets, &fleet, &scheduler, clock.wall()).await?;
+    assert!(served(&hub).fleets[0].launch_warning.is_none());
+
+    // A later shortage must still see the cached failure without another control pass.
+    supply.instances.pop();
+    fleet.inner.set_supply(&fleet_name(), supply.clone());
+    publish_observation(&mut observer, &fleets, &fleet, &scheduler, clock.wall()).await?;
+    assert_eq!(
+        served(&hub).fleets[0].launch_warning.as_ref(),
+        Some(&warning)
+    );
+
+    clock.advance(Duration::from_secs(1));
+    let instance = instance_id("local-2");
+    supply.events.push(InfrastructureEvent {
+        id: "success-1".into(),
+        at: clock.wall(),
+        kind: if replacement {
+            InfrastructureEventKind::ReplacementLaunched {
+                instance,
+                replacing: Some(instance_id("local-1")),
+            }
+        } else {
+            InfrastructureEventKind::InstanceLaunched { instance }
+        },
+    });
+    fleet.inner.set_supply(&fleet_name(), supply.clone());
+    control.pass().await;
+    assert!(served(&hub).fleets[0].launch_warning.is_none());
+    supply.events.clear();
+    fleet.inner.set_supply(&fleet_name(), supply);
+    publish_observation(&mut observer, &fleets, &fleet, &scheduler, clock.wall()).await?;
+    assert!(served(&hub).fleets[0].launch_warning.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn independent_observations_preserve_latest_canonical_launch_outcome() -> TestResult {
+    assert_launch_warning_survives_observations(false).await?;
+    assert_launch_warning_survives_observations(true).await
+}
+
 fn assert_replacement_visible(hub: &StateHub) {
     let state = served(hub);
     assert_eq!(state.status_events.len(), 1);

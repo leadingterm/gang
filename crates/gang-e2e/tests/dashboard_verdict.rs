@@ -53,6 +53,7 @@ fn fleet(in_service: u32) -> Fleet {
         },
         desired: in_service,
         launch_failure: None,
+        launch_warning: None,
         instances: InstanceCounts {
             pending: 0,
             in_service,

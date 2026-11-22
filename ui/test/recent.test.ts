@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { applyRecent, bytesSeries, cacheWindow, donePerMinute, doneSeries, evictedSeries, passBars, queuedSeries, runningSeries, schedulerCurrent, schedulerKnown, slots, transferred, unrecordedSlots } from "../src/recent.ts";
+import { applyRecent, bytesSeries, cacheWindow, donePerMinute, doneSeries, evictedSeries, inServiceSeries, passBars, queuedSeries, runningSeries, schedulerCurrent, schedulerKnown, slots, transferred, unrecordedSlots } from "../src/recent.ts";
 import type { Recent, Sample } from "../src/wire.ts";
 import { iso, load, snapshotOf } from "./sse.ts";
 
@@ -111,6 +111,25 @@ test("live scheduler gauges retain known zero and leave unknown current observat
   assert.deepEqual(queuedSeries(r, 4), [0, null, 4]);
   assert.deepEqual(runningSeries(r, null), [0, null, null]);
   assert.deepEqual(queuedSeries(r, null), [0, null, null]);
+});
+
+test("in-service history sums every fleet including the current bucket without inventing zeroes", () => {
+  const fleet = snapshotOf(load("live")).fleets[0];
+  if (!fleet) throw new Error("the live recording has a fleet");
+  const a = { ...fleet, name: "fleets/a" };
+  const b = { ...fleet, name: "fleets/b" };
+  const observed = (name: string, inService: number) => ({
+    name, instances: { pending: 0, inService, terminating: 0, warm: 0 }, desired: 0, max: 10,
+  });
+  const r = recent([
+    { ...sample(0), fleets: [observed(a.name, 2), observed(b.name, 3)] },
+    { ...sample(1), fleets: [observed(a.name, 0), observed(b.name, 0)] },
+    { ...sample(2), fleets: [observed(a.name, 4)] },
+    sample(3),
+    { ...sample(4), schedulerKnown: false, fleets: [observed(a.name, 6), observed(b.name, 7)] },
+  ], "60s");
+  assert.deepEqual(inServiceSeries(r, [a, b]), [null, 5, 0, null, null, 13]);
+  assert.deepEqual(inServiceSeries(r, []), [null, null, null, null, null, null]);
 });
 
 test("slots mark leading steps before the first sample as unrecorded", () => {

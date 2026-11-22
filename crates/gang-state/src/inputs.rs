@@ -82,7 +82,8 @@ pub struct Inputs<'a> {
     pub actions: Option<&'a ActionsSample>,
     /// The newest scaling events, oldest first.
     pub events: &'a [gang_wire::Event],
-    /// All live infrastructure observations from the operational record store.
+    /// The complete live operational record snapshot for control or skipped passes.
+    /// Independent observations do not carry a snapshot and leave this empty.
     pub infrastructure: &'a [gang_spi::FleetInfrastructureEvent],
     /// The builds the recorder holds.
     pub builds: &'a gang_insight::Builds,

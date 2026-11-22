@@ -411,7 +411,7 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .fleet {
   display: grid;
   grid-template-columns: minmax(var(--size-fleet-id), 1fr) minmax(0, 1.6fr) auto;
-  grid-template-areas: "id gauge nums" "history history history";
+  grid-template-areas: "id gauge nums";
   align-items: center;
   gap: var(--space-sm) var(--space-xl);
   padding-block: var(--space-md);
@@ -460,7 +460,7 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .fleet__nums > div { display: flex; flex-direction: column-reverse; align-items: flex-end; min-width: var(--fleet-count-width); }
 .fleet__nums dt { color: var(--color-muted); font-size: var(--text-xs); }
 .fleet__nums dd { font-family: var(--font-mono); font-size: var(--text-2xl); line-height: 1.1; }
-.fleet__history { grid-area: history; min-width: 0; }
+.fleet__history { grid-column: 1 / -1; min-width: 0; }
 .fleet__history-swatch { width: var(--chart-swatch-width); border-block-start: 2px solid currentColor; }
 .spark__series--reference.fleet__history-swatch { border-block-start-style: dashed; }
 
@@ -1059,7 +1059,7 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .ann__long { display: none; }
   .ann__short { display: inline; }
   .ann__short:empty { display: none; }
-  .fleet { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "id nums" "gauge gauge" "history history"; }
+  .fleet { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "id nums" "gauge gauge"; }
   .wgrid { grid-template-columns: minmax(var(--size-worker-id-compact), 1fr) max-content var(--size-worker-slots) minmax(0, 1.4fr); }
   .builds-table thead { display: block; position: absolute; width: var(--size-pixel); height: var(--size-pixel); overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .table.builds-table { display: block; }
@@ -1098,7 +1098,7 @@ time { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .main { padding-block: var(--space-lg) var(--space-2xl); }
   .readout__big { font-size: var(--text-2xl); }
   .readout__of { font-size: var(--text-sm); }
-  .fleet { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "id id" "gauge nums" "history history"; }
+  .fleet { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "id id" "gauge nums"; }
   .fleet { gap: var(--space-xs) var(--space-md); }
   .fleet__nums { gap: var(--space-md); }
   .fleet__nums > div { min-width: var(--size-fleet-mobile-value); }
