@@ -1,14 +1,15 @@
 //! Fits learned reservations to a fleet that accepted the original client request.
 //! Positive memory and disk reservations are raised to their configured minima; zero stays zero.
-//! Original admission floors remain immutable. Desired memory is captured before static clamps;
-//! ordinary CPU fitting finishes before `NativeLink` performs authoritative physical-memory fitting.
+//! Client minimums and trusted historical peaks remain hard floors; fleets below them are
+//! excluded before fitting. Desired memory is captured before static clamps; ordinary CPU
+//! fitting finishes before `NativeLink` performs authoritative physical-memory fitting.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use gang_config::{DiskMinReservation, MinReservation};
 use gang_types::{Bytes, FleetCatalog, property};
-use nativelink_error::{Error, make_input_err};
+use nativelink_error::{Code, Error, make_err};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, RootMetricsComponent,
 };
@@ -61,6 +62,7 @@ impl FittedActions {
         &self,
         operation: &OperationId,
         fleets: &FleetCatalog,
+        trusted_minimum_kb: Option<u64>,
     ) -> Result<AdmittedAction, Error> {
         let mut admission = self
             .admitted
@@ -69,8 +71,8 @@ impl FittedActions {
                 fleets: fleets.accepting(|_| None),
                 minimum_kb: None,
             });
-        // Observations can shrink a fleet between admission and historical learning.
-        // The explicit client floor is immutable, not another learned value to clamp.
+        // Both the client floor and a measured historical peak are hard constraints.
+        admission.minimum_kb = admission.minimum_kb.max(trusted_minimum_kb);
         if let Some(minimum) = admission.minimum_kb {
             for index in admission.fleets {
                 if fleets
@@ -83,8 +85,9 @@ impl FittedActions {
                 }
             }
             if admission.fleets.is_empty() {
-                return Err(make_input_err!(
-                    "no fleet accepts original memory floor {minimum} KiB"
+                return Err(make_err!(
+                    Code::FailedPrecondition,
+                    "no admitted fleet can satisfy memory floor {minimum} KiB"
                 ));
             }
         }
@@ -123,10 +126,14 @@ impl ClientStateManager for FittedActions {
         mut action_info: Arc<ActionInfo>,
     ) -> Result<Box<dyn ActionStateResult>, Error> {
         let fleets = self.fleets.current()?;
+        let trusted_minimum_kb = action_info
+            .memory_reservation
+            .as_ref()
+            .and_then(|reservation| reservation.minimum_kb);
         let AdmittedAction {
             fleets: admitted,
             minimum_kb,
-        } = self.current_admission(&operation, &fleets)?;
+        } = self.current_admission(&operation, &fleets, trusted_minimum_kb)?;
         for (key, min_kb) in [
             (property::MEMORY_KB, self.min_reservation.as_units()),
             (property::DISK_KB, self.disk_min_reservation.as_units()),
@@ -199,7 +206,7 @@ impl ClientStateManager for FittedActions {
         let cpu_before_memory_fit = cpu_reservation(&action_info);
         // Keep ordinary CPU learning/fitting, but let NativeLink alone promote CPU when
         // fitted memory fills the observed physical worker (including exact equality).
-        // Gang owns this metadata; never borrow client-shaped metadata as original intent.
+        // Preserve only the trusted floor from historical learning; recompute the rest.
         let info = Arc::make_mut(&mut action_info);
         info.pre_fit_reservation = Some(pre_fit_reservation);
         info.memory_reservation = Some(MemoryReservation {

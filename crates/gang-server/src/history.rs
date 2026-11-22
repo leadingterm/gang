@@ -257,7 +257,7 @@ impl LearnedHistoryStore {
                         if let Some(records) = into.as_mut() {
                             records.push(LearnedHistory {
                                 key,
-                                body,
+                                body: body.into(),
                                 expires_at: head.expires_at,
                             });
                         }
@@ -726,7 +726,7 @@ mod tests {
                 kind: RecordKind::ResourceHistory,
                 id: RecordId::new([id; 32]),
             },
-            body: vec![id; size],
+            body: vec![id; size].into(),
             expires_at: expiry,
         }
     }
@@ -774,13 +774,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded, vec![record.clone()]);
-        record.body[0] = 42;
+        std::sync::Arc::make_mut(&mut record.body)[0] = 42;
         successor
             .flush(&repository, &lease, time(30), &[record.clone()])
             .await
             .unwrap();
         assert_eq!(repository.stored_records(), 3);
-        record.body.truncate(10);
+        record.body = record.body[..10].into();
         successor
             .flush(&repository, &lease, time(40), &[record.clone()])
             .await
@@ -862,7 +862,7 @@ mod tests {
                 .await,
             Err(HistoryError::Storage(_))
         ));
-        record.body[0] = 99;
+        std::sync::Arc::make_mut(&mut record.body)[0] = 99;
         store
             .flush(&failing, &lease, time(20), &[record.clone()])
             .await
@@ -979,9 +979,9 @@ mod tests {
             .await
             .unwrap();
         // Import may migrate representation without adding any actual observations.
-        prepared[0].body[1] = 77;
+        std::sync::Arc::make_mut(&mut prepared[0].body)[1] = 77;
         candidate.prepared(&prepared);
-        old_records[0].body[0] = 42;
+        std::sync::Arc::make_mut(&mut old_records[0].body)[0] = 42;
         old_records.pop();
         old_records.push(entry(3, 410 * 1024, time(50_000)));
         old.flush(&repository, &old_lease, time(30), &old_records)
@@ -1025,7 +1025,7 @@ mod tests {
         );
         // Actual new candidate learning may replace its key, but not delete unknown old keys.
         prepared.truncate(1);
-        prepared[0].body[0] = 91;
+        std::sync::Arc::make_mut(&mut prepared[0].body)[0] = 91;
         prepared[0].expires_at = time(60_000);
         candidate
             .flush(&repository, &lease, time(70), &prepared)

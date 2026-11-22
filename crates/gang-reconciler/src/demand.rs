@@ -31,7 +31,9 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU32;
+#[cfg(test)]
+use std::num::NonZeroU64;
 
 use gang_config::FleetPolicy;
 use gang_types::{ActionResources, Bytes, FleetSet, SaturatingInto, property::MILLICORES_PER_CORE};
@@ -98,8 +100,18 @@ impl Demand {
     /// plays no part: the pass raises the need to the minimum in force.
     #[must_use]
     pub fn instances(&self, policy: &FleetPolicy, cpu_oversubscription: NonZeroU32) -> u32 {
+        self.instances_with_credit(policy, cpu_oversubscription, [0; 3])
+    }
+
+    /// Counts nominal instances after observed deviations of usable resources.
+    pub(crate) fn instances_with_credit(
+        &self,
+        policy: &FleetPolicy,
+        cpu_oversubscription: NonZeroU32,
+        credit: [i128; 3],
+    ) -> u32 {
         let need: u32 = self
-            .uncapped_need(policy, cpu_oversubscription)
+            .uncapped_need_with_credit(policy, cpu_oversubscription, credit)
             .saturating_into();
         need.min(policy.instances.max().get())
     }
@@ -113,19 +125,45 @@ impl Demand {
     }
 
     fn uncapped_need(&self, policy: &FleetPolicy, cpu_oversubscription: NonZeroU32) -> u64 {
-        let cpu_capacity = u64::from(policy.vcpus_per_instance.get())
+        self.uncapped_need_with_credit(policy, cpu_oversubscription, [0; 3])
+    }
+
+    fn uncapped_need_with_credit(
+        &self,
+        policy: &FleetPolicy,
+        cpu_oversubscription: NonZeroU32,
+        credit: [i128; 3],
+    ) -> u64 {
+        let cpu = u64::from(policy.vcpus_per_instance.get())
             .saturating_mul(MILLICORES_PER_CORE)
             .saturating_mul(u64::from(cpu_oversubscription.get()));
-        let cpu_need = self.millicores.div_ceil(cpu_capacity);
-        let by_memory = div_ceil(self.memory, policy.memory_per_instance.as_nonzero_u64());
-        let by_disk = div_ceil(self.disk, policy.disk_per_instance.as_nonzero_u64());
-        cpu_need
-            .max(by_memory)
-            .max(by_disk)
-            .max(u64::from(self.actions > 0))
+        let totals = [self.millicores, self.memory, self.disk];
+        let capacities = [
+            cpu,
+            policy.memory_per_instance.get().get(),
+            policy.disk_per_instance.get().get(),
+        ];
+        let mut need = u64::from(self.actions > 0);
+        if totals == [0; 3] {
+            return need;
+        }
+        for ((total, capacity), adjustment) in totals.into_iter().zip(capacities).zip(credit) {
+            if total == 0 {
+                continue;
+            }
+            let adjusted = i128::from(total)
+                .saturating_sub(adjustment)
+                .max(0)
+                .cast_unsigned();
+            let dimension =
+                u64::try_from(adjusted.div_ceil(u128::from(capacity))).unwrap_or(u64::MAX);
+            need = need.max(dimension);
+        }
+        need
     }
 }
 
+#[cfg(test)]
 fn div_ceil(total: u64, per: NonZeroU64) -> u64 {
     total / per + u64::from(total % per != 0)
 }
@@ -141,11 +179,24 @@ fn div_ceil(total: u64, per: NonZeroU64) -> u64 {
 /// The limit is capped by the policy maximum. It returns `None` for an index that names no
 /// fleet, and the walk stops at the first such index. `place` charges nothing: the caller adds
 /// the action to the demand of the chosen fleet.
+#[cfg(test)]
 pub(crate) fn place<'a>(
     candidates: FleetSet,
     resources: ActionResources,
     cpu_oversubscription: NonZeroU32,
     fleets: impl Fn(usize) -> Option<(&'a FleetPolicy, Demand, u32)>,
+) -> Option<usize> {
+    place_with_credit(candidates, resources, cpu_oversubscription, fleets, |_| {
+        [0; 3]
+    })
+}
+
+pub(crate) fn place_with_credit<'a>(
+    candidates: FleetSet,
+    resources: ActionResources,
+    cpu_oversubscription: NonZeroU32,
+    fleets: impl Fn(usize) -> Option<(&'a FleetPolicy, Demand, u32)>,
+    credit: impl Fn(usize) -> [i128; 3],
 ) -> Option<usize> {
     let mut last = None;
     for index in candidates {
@@ -154,7 +205,7 @@ pub(crate) fn place<'a>(
         };
         let mut trial = demand;
         trial.add_queued(resources);
-        if trial.uncapped_need(policy, cpu_oversubscription)
+        if trial.uncapped_need_with_credit(policy, cpu_oversubscription, credit(index))
             <= u64::from(limit.min(policy.instances.max().get()))
         {
             return Some(index);
@@ -198,6 +249,57 @@ mod tests {
         assert_eq!(div_ceil(7, three), 3);
         assert_eq!(div_ceil(u64::MAX, NonZeroU64::MIN), u64::MAX);
         assert_eq!(div_ceil(u64::MAX, three), u64::MAX / 3);
+    }
+
+    #[test]
+    fn credit_rounds_exactly_and_preserves_empty_floor() -> TestResult<()> {
+        let mut policy = policy()?;
+        let nominal = 67_645_734_912;
+        policy.memory_per_instance = NonZeroBytes::new(Bytes::new(nominal)).unwrap();
+        let mut demand = Demand::default();
+        let observed = 131_558_744_064_u64;
+        demand.add_queued(ActionResources {
+            memory: Bytes::new(observed),
+            ..ActionResources::default()
+        });
+        let credit = [0, i128::from(observed - nominal), 0];
+        assert_eq!(
+            demand.instances_with_credit(&policy, nonzero_u32(1), credit),
+            1
+        );
+        demand.add_running_resources(ActionResources {
+            memory: Bytes::new(1),
+            ..ActionResources::default()
+        });
+        assert_eq!(
+            demand.instances_with_credit(&policy, nonzero_u32(1), credit),
+            2
+        );
+        let empty = Demand::default();
+        assert_eq!(
+            empty.instances_with_credit(&policy, nonzero_u32(1), [-100; 3]),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn absent_dimensions_do_not_turn_negative_credit_into_demand() -> TestResult<()> {
+        let policy = policy()?;
+        for dimension in 0..3 {
+            let mut resources = ActionResources::default();
+            match dimension {
+                0 => resources.cpu_millicores = 1,
+                1 => resources.memory = Bytes::new(1),
+                _ => resources.disk = Bytes::new(1),
+            }
+            let mut demand = Demand::default();
+            demand.add_queued(resources);
+            let mut credit = [i128::MIN / 2; 3];
+            credit[dimension] = 0;
+            assert_eq!(demand.instances_with_credit(&policy, nonzero_u32(1), credit), 1);
+        }
+        Ok(())
     }
 
     fn policy() -> TestResult<FleetPolicy> {

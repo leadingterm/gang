@@ -11,10 +11,10 @@ use gang_spi::{
     ActionLimitsPort, CacheStorePort, ClientTls, NodeLifecyclePort, PortError, ProvisionerPort,
     SchedulerPort, ScratchVolumePort, WorkerSpec, WorkerTls, WorkloadCredentialPort,
 };
-use gang_types::ActionEnvironment;
+use gang_types::{ActionEnvironment, Resources};
 
 use crate::credentials::Enroller;
-use crate::deployment::{WorkerDeployment, WorkerParts, WorkerSettings};
+use crate::deployment::{PhysicalResources, WorkerDeployment, WorkerParts, WorkerSettings};
 use crate::errors::WorkerError;
 use crate::layout::{IdentityFiles, Layout};
 use crate::programs::resolve_program;
@@ -33,6 +33,9 @@ use crate::transport::{ServerCaSource, Transport};
 /// A parked node (see [`NodeLifecyclePort::parked`]) waits and does nothing: nothing is read,
 /// mounted, fetched, enrolled or registered until the provisioner stops parking it. `shutdown` still
 /// ends the wait.
+///
+/// `physical_resources` measures the host once after it starts serving, before preparing
+/// capacity and enrolling; it supplies physical facts, not operator configuration.
 ///
 /// # Errors
 ///
@@ -57,6 +60,7 @@ pub async fn run<D: WorkerDeployment, P: PluginSet>(
     settings: WorkerSettings<P>,
     build_limits: impl FnOnce(P::Limits) -> Result<D::Limits, PortError>,
     build_sandbox: impl FnOnce(P::SandboxKey, &mut P::Sandbox) -> Result<ActionEnvironment, PortError>,
+    physical_resources: impl FnOnce() -> Result<PhysicalResources, PortError>,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), WorkerError> {
     let WorkerParts {
@@ -73,8 +77,15 @@ pub async fn run<D: WorkerDeployment, P: PluginSet>(
         () = requested(shutdown.as_mut()) => return Ok(()),
         () = wait_until_serving(&provisioner, &clock, interval) => {}
     }
-    let (plan, _limits) =
-        describe::<D, P>(&provisioner, &cache, settings, build_limits, build_sandbox).await?;
+    let (plan, _limits) = describe::<D, P>(
+        &provisioner,
+        &cache,
+        settings,
+        build_limits,
+        build_sandbox,
+        physical_resources,
+    )
+    .await?;
     let mut generation = tokio::select! {
         biased;
         () = requested(shutdown.as_mut()) => return Ok(()),
@@ -185,9 +196,9 @@ struct Plan {
 ///
 /// The fast CAS is sized from the free space at mount plus what the worker's own fast CAS
 /// directory already holds, because that content is reclaimable. A restart therefore keeps the
-/// budget of a cold start instead of shrinking it by the cache it inherited.
-/// A scratch volume that leaves the actions less than the fleet's `disk_per_instance` stops
-/// the worker before it enrolls.
+/// budget of a cold start instead of shrinking it by the cache it inherited. The remainder is
+/// the measured disk pool for actions. A scratch volume that leaves the actions less than the
+/// fleet's `disk_per_instance` stops the worker before it enrolls.
 ///
 /// The limits are returned so the caller keeps them alive for the whole run.
 async fn describe<D: WorkerDeployment, P: PluginSet>(
@@ -196,6 +207,7 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
     settings: WorkerSettings<P>,
     build_limits: impl FnOnce(P::Limits) -> Result<D::Limits, PortError>,
     build_sandbox: impl FnOnce(P::SandboxKey, &mut P::Sandbox) -> Result<ActionEnvironment, PortError>,
+    physical_resources: impl FnOnce() -> Result<PhysicalResources, PortError>,
 ) -> Result<(Plan, Option<D::Limits>), WorkerError> {
     let WorkerSettings {
         fleets,
@@ -252,8 +264,9 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         .to_toml()
         .map_err(|error| WorkerError::Config(error.to_string()))?;
     layout.prepare(&text, &executable)?;
+    let physical = physical_resources()?;
     let volume = provisioner.mount(&identity.instance).await?;
-    let fast_cas_budget = fast_cas_budget(
+    let (fast_cas_budget, disk) = fast_cas_budget(
         &layout,
         &worker,
         volume.capacity,
@@ -262,11 +275,20 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
     )?;
     let limits = file.limits.map(build_limits).transpose()?;
     let reserve = actions.memory.reserve.get();
-    let (memory_pool, capacity) =
-        prepare_memory_pool(limits.as_ref(), reserve, actions.memory.min_reservation).await?;
+    let (memory_pool, capacity) = prepare_memory_pool(
+        limits.as_ref(),
+        physical.memory,
+        reserve,
+        actions.memory.min_reservation,
+    )
+    .await?;
     let mut properties = fleet.properties.clone();
     properties.set_action_environment(&environment);
-    properties.set_memory_capacity(capacity);
+    properties.set_capacity(Resources {
+        vcpus: physical.vcpus.get(),
+        memory: capacity.get(),
+        disk,
+    });
     let action_store = cache.action_store(&actions.environment)?;
     let spec = WorkerSpec {
         actions,
@@ -342,7 +364,7 @@ fn fast_cas_budget(
     capacity: gang_types::Bytes,
     fleet: &gang_types::FleetName,
     declared: gang_types::Bytes,
-) -> Result<gang_types::Bytes, WorkerError> {
+) -> Result<(gang_types::Bytes, gang_types::Bytes), WorkerError> {
     let cached = gang_os::fs::usage(&layout.fast_cas_directory())?;
     let scratch = capacity.saturating_add(cached);
     let budget = worker.fast_cas_percent.of_bytes(scratch);
@@ -354,11 +376,12 @@ fn fast_cas_budget(
             measured,
         });
     }
-    Ok(budget)
+    Ok((budget, measured))
 }
 
 async fn prepare_memory_pool<L: ActionLimitsPort>(
     limits: Option<&L>,
+    physical: gang_types::Bytes,
     reserve: gang_types::Bytes,
     minimum: gang_config::MinReservation,
 ) -> Result<(Option<gang_spi::ActionMemoryPool>, gang_types::NonZeroBytes), WorkerError> {
@@ -369,7 +392,6 @@ async fn prepare_memory_pool<L: ActionLimitsPort>(
     let capacity = if let Some(pool) = &memory_pool {
         pool.capacity
     } else {
-        let physical = gang_os::physical_memory().map_err(PortError::backend)?;
         gang_types::NonZeroBytes::new(physical.saturating_sub(reserve))
             .ok_or(WorkerError::MemoryReserveExhausted { physical, reserve })?
     };

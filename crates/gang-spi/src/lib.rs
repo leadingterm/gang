@@ -116,7 +116,7 @@ pub use scheduler_port::{
     Accepted, ActionInfo, ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService,
     BoxedConnection, ClientTls, Connection, ControllerConnections, ControllerDrain,
     ControllerEndpoints, ControllerReady, ControllerSpec, DrainingWorker, EngineStore,
-    ExecutingDemand, FleetMemoryCapacity, GateDecision, InstanceCordon, LeaderUnavailable,
+    ExecutingDemand, FleetResourceCapacity, GateDecision, InstanceCordon, LeaderUnavailable,
     LearnedHistory, Listening, ListingLimits, QueuedActionView, QueuedDemand, RequestGate,
     RequestScope, RunningActionView, SchedulerPort, SchedulerSnapshot, StoreAccess, StoreKind,
     WorkerCacheStats, WorkerSpec, WorkerState, WorkerTls, full_body,

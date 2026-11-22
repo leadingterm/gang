@@ -233,6 +233,8 @@ gang_types::string_enum! {
         /// Previous-release, candidate-to-candidate and configuration-only ordinary refreshes
         /// while work is held.
         RollingUpgrade = "rolling-upgrade",
+        /// A fresh published v0.3.8 reader restores its history after candidate flushes.
+        HistoryRollback = "history-rollback",
         /// Published old controllers and workers refetch preserved configuration after publication.
         ConfigRefetchRestart = "config-refetch-restart",
         /// Revocations propagate between controllers.
@@ -317,6 +319,7 @@ impl Scenario {
             Self::RollingDeploy | Self::BurstFromZero => 62,
             // All three held-build placements use the existing 62-second refresh weight.
             Self::RollingUpgrade => 3 * 62,
+            Self::HistoryRollback => 180,
             Self::FollowerBuilds => 66,
             Self::LoginAcross => 15,
             Self::ScheduledMinimum => 5,
@@ -383,6 +386,7 @@ impl Scenario {
             | Self::ControllerLoss
             | Self::RollingDeploy
             | Self::RollingUpgrade
+            | Self::HistoryRollback
             | Self::ConfigRefetchRestart
             | Self::CrossRevocation
             | Self::LeaderFailover
@@ -469,6 +473,7 @@ impl Scenario {
             Self::InputRoot => input_root_checks(ctx),
             Self::Restart => restart_checks(ctx),
             Self::RollingUpgrade => upgrade_checks(ctx),
+            Self::HistoryRollback => history_rollback_checks(ctx),
             Self::ConfigRefetchRestart => config_restart_checks(ctx),
             Self::ControllerLoss
             | Self::RollingDeploy
@@ -594,6 +599,20 @@ fn upgrade_checks(ctx: &RunContext<'_>) -> Vec<Check> {
             "mixed-version held probes require Linux",
         )]
     }
+}
+
+fn history_rollback_checks(ctx: &RunContext<'_>) -> Vec<Check> {
+    let scenario = Scenario::HistoryRollback;
+    if !cfg!(target_os = "linux") {
+        return vec![Check::skipped(
+            scenario.as_str(),
+            "published history rollback reader requires Linux",
+        )];
+    }
+    attempt(scenario, || {
+        let variant = required_cluster_variant(scenario, &ctx.baseline)?;
+        crate::history_rollback::history_rollback(ctx.inputs, &variant, ctx.issuer)
+    })
 }
 
 fn config_restart_checks(ctx: &RunContext<'_>) -> Vec<Check> {
@@ -935,6 +954,7 @@ fn cluster_variant(scenario: Scenario, baseline: &Variant) -> Option<Variant> {
         Scenario::ControllerLoss
         | Scenario::RollingDeploy
         | Scenario::RollingUpgrade
+        | Scenario::HistoryRollback
         | Scenario::ConfigRefetchRestart
         | Scenario::FollowerBuilds => Variant::baseline(Sandbox::Noop),
         Scenario::LeaderFailover => Variant {
@@ -1799,6 +1819,7 @@ mod tests {
     fn upgrades_are_gate_two_only_and_selectable_by_name() {
         for (name, scenario) in [
             ("rolling-upgrade", Scenario::RollingUpgrade),
+            ("history-rollback", Scenario::HistoryRollback),
             ("config-refetch-restart", Scenario::ConfigRefetchRestart),
         ] {
             assert_eq!(name.parse::<Scenario>().ok(), Some(scenario));

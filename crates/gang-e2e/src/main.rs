@@ -202,7 +202,7 @@ impl Cli {
             || !scenarios.iter().any(|scenario| {
                 matches!(
                     scenario,
-                    Scenario::RollingUpgrade | Scenario::ConfigRefetchRestart
+                    Scenario::RollingUpgrade | Scenario::HistoryRollback | Scenario::ConfigRefetchRestart
                 )
             })
         {

@@ -1,8 +1,8 @@
-//! Cached fleet properties lowered by observed physical worker capacities.
+//! Cached fleet properties updated from observed physical worker capacities.
 
 use std::sync::Arc;
 
-use gang_types::{Bytes, FleetCatalog, NonZeroBytes, property};
+use gang_types::{Bytes, FleetCatalog, NonZeroBytes, Resources, property};
 use nativelink_error::{Code, Error, make_err};
 use nativelink_scheduler::worker_scheduler::ResourceCapacitySnapshot;
 use parking_lot::RwLock;
@@ -26,6 +26,10 @@ impl RuntimeCatalog {
             cache: RwLock::new((None, Arc::clone(&estimates))),
             estimates,
         }
+    }
+
+    pub(crate) fn estimates(&self) -> &FleetCatalog {
+        &self.estimates
     }
 
     pub(crate) fn current(&self) -> Result<Arc<FleetCatalog>, Error> {
@@ -56,50 +60,68 @@ impl RuntimeCatalog {
         }
 
         let mut fleets = self.estimates.fleets().to_vec();
-        for row in source.capacities.iter() {
-            let Some(name) = row.exact.get(property::FLEET) else {
-                continue;
-            };
-            let Some(fleet) = fleets.iter_mut().find(|fleet| fleet.name() == name) else {
-                continue;
-            };
-            let observed = row
-                .minimum
-                .get(property::MEMORY_KB)
-                .copied()
-                .ok_or_else(|| {
-                    make_err!(
-                        Code::Internal,
-                        "missing physical memory capacity for fleet {name}"
-                    )
-                })?;
-            // Validate the provider value itself, even if our existing minimum is lower.
-            observed
-                .checked_mul(1024)
-                .and_then(|bytes| NonZeroBytes::new(Bytes::new(bytes)))
-                .ok_or_else(|| {
-                    make_err!(
-                        Code::Internal,
-                        "invalid physical memory capacity for fleet {name}: {observed} KiB"
-                    )
-                })?;
-            let previous = fleet.capacity(property::MEMORY_KB).ok_or_else(|| {
-                make_err!(
-                    Code::Internal,
-                    "missing cached physical memory capacity for fleet {name}"
-                )
-            })?;
-            let bytes = previous
-                .min(observed)
-                .checked_mul(1024)
-                .and_then(|bytes| NonZeroBytes::new(Bytes::new(bytes)))
-                .ok_or_else(|| {
-                    make_err!(
-                        Code::Internal,
-                        "invalid cached physical memory capacity for fleet {name}"
-                    )
-                })?;
-            fleet.set_memory_capacity(bytes);
+        for fleet in &mut fleets {
+            let mut minimum: Option<Resources> = None;
+            for row in source.capacities.iter().filter(|row| {
+                row.exact
+                    .get(property::FLEET)
+                    .is_some_and(|name| fleet.name() == name)
+                    && row
+                        .exact
+                        .iter()
+                        .all(|(key, value)| fleet.get(key) == Some(value.as_str()))
+            }) {
+                let read = |key| {
+                    row.physical_capacity(key).ok_or_else(|| {
+                        make_err!(
+                            Code::Internal,
+                            "missing {key} capacity for fleet {}",
+                            fleet.name()
+                        )
+                    })
+                };
+                let cpu = read(property::CPU_MILLICORES)?;
+                let bytes = |key| {
+                    read(key)?
+                        .checked_mul(1024)
+                        .and_then(|value| NonZeroBytes::new(Bytes::new(value)))
+                        .map(NonZeroBytes::get)
+                        .ok_or_else(|| {
+                            make_err!(
+                                Code::Internal,
+                                "invalid physical {key} capacity for fleet {}",
+                                fleet.name()
+                            )
+                        })
+                };
+                let vcpus = u32::try_from(cpu / 1000)
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        make_err!(
+                            Code::Internal,
+                            "invalid physical CPU capacity for fleet {}: {cpu}",
+                            fleet.name()
+                        )
+                    })?;
+                let memory = bytes(property::MEMORY_KB)?;
+                let disk = bytes(property::DISK_KB)?;
+                minimum = Some(match minimum {
+                    Some(previous) => Resources {
+                        vcpus: previous.vcpus.min(vcpus),
+                        memory: previous.memory.min(memory),
+                        disk: previous.disk.min(disk),
+                    },
+                    None => Resources {
+                        vcpus,
+                        memory,
+                        disk,
+                    },
+                });
+            }
+            if let Some(resources) = minimum {
+                fleet.set_capacity(resources);
+            }
         }
         let catalog = FleetCatalog::try_new(fleets)
             .map_err(|error| make_err!(Code::Internal, "rebuilding fleet catalog: {error}"))?;
@@ -145,6 +167,14 @@ mod tests {
             .insert(property::FLEET.to_owned(), name.to_owned());
         row.minimum
             .insert(property::MEMORY_KB.to_owned(), memory_kb);
+        row.minimum
+            .insert(property::CPU_MILLICORES.to_owned(), 32_000);
+        row.pool_multipliers.insert(
+            property::CPU_MILLICORES.to_owned(),
+            std::num::NonZeroU64::new(2).unwrap(),
+        );
+        row.minimum
+            .insert(property::DISK_KB.to_owned(), 100 * 1024 * 1024);
         row
     }
 
@@ -168,7 +198,35 @@ mod tests {
     }
 
     #[test]
-    fn current_observations_restore_bounded_estimate_and_reuse_catalog() {
+    fn catalog_uses_row_physical_capacity_not_aggregate_or_action_ceiling() {
+        let mut observed = row("alpha", 80 * 1024 * 1024);
+        observed
+            .minimum
+            .insert(property::CPU_MILLICORES.to_owned(), 96_000);
+        observed.pool_multipliers.insert(
+            property::CPU_MILLICORES.to_owned(),
+            std::num::NonZeroU64::new(3).unwrap(),
+        );
+        observed
+            .action_ceilings
+            .insert(property::CPU_MILLICORES.to_owned(), 16_000);
+        observed
+            .minimum
+            .insert(property::DISK_KB.to_owned(), 120 * 1024 * 1024);
+        let (_sender, receiver) = watch::channel(snapshot(vec![observed]));
+        let runtime = RuntimeCatalog::new(
+            FleetCatalog::try_new(vec![fleet("alpha")]).unwrap(),
+            receiver,
+        );
+        let catalog = runtime.current().unwrap();
+        let actual = &catalog.fleets()[0];
+        assert_eq!(actual.capacity(property::CPU_COUNT), Some(32));
+        assert_eq!(actual.capacity(property::MEMORY_KB), Some(80 * 1024 * 1024));
+        assert_eq!(actual.capacity(property::DISK_KB), Some(120 * 1024 * 1024));
+    }
+
+    #[test]
+    fn current_observations_restore_actual_capacity_and_reuse_catalog() {
         let original = fleet("alpha");
         let (sender, receiver) = watch::channel(snapshot(vec![]));
         let runtime = RuntimeCatalog::new(
@@ -224,7 +282,7 @@ mod tests {
         let later = runtime.current().unwrap();
         assert_eq!(
             later.fleets()[0].capacity(property::MEMORY_KB),
-            Some(63 * 1024 * 1024)
+            Some(64 * 1024 * 1024)
         );
         assert_eq!(
             later.fleets()[0].limit(property::MEMORY_KB),
@@ -242,11 +300,16 @@ mod tests {
         );
         let mut unnamed = row("alpha", 1024);
         unnamed.exact.clear();
+        let mut wrong_selector = row("alpha", 1024);
+        wrong_selector
+            .exact
+            .insert("capacity".to_owned(), "on-demand".to_owned());
         sender
             .send(snapshot(vec![
                 row("alpha", 30 * 1024 * 1024),
                 row("alpha", 40 * 1024 * 1024),
                 row("unknown", 1),
+                wrong_selector,
                 unnamed,
             ]))
             .unwrap();
@@ -274,18 +337,98 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_zero_and_overflowing_matched_memory_without_caching() {
+    fn all_dimensions_follow_observed_minimum_and_recover() {
+        let (sender, receiver) = watch::channel(snapshot(vec![]));
+        let original = fleet("alpha");
+        let runtime = RuntimeCatalog::new(
+            FleetCatalog::try_new(vec![original.clone()]).unwrap(),
+            receiver,
+        );
+        for (ledger_key, catalog_key, estimate, lower, higher, highest, divisor) in [
+            (
+                property::CPU_MILLICORES,
+                property::CPU_COUNT,
+                16,
+                8_000,
+                40_000,
+                48_000,
+                2_000,
+            ),
+            (
+                property::MEMORY_KB,
+                property::MEMORY_KB,
+                63 * 1024 * 1024,
+                32 * 1024 * 1024,
+                80 * 1024 * 1024,
+                90 * 1024 * 1024,
+                1,
+            ),
+            (
+                property::DISK_KB,
+                property::DISK_KB,
+                100 * 1024 * 1024,
+                50 * 1024 * 1024,
+                120 * 1024 * 1024,
+                140 * 1024 * 1024,
+                1,
+            ),
+        ] {
+            assert_eq!(
+                runtime.current().unwrap().fleets()[0].capacity(catalog_key),
+                Some(estimate)
+            );
+            let mut make_row = |value| {
+                let mut result = row("alpha", 63 * 1024 * 1024);
+                result.minimum.insert(ledger_key.to_owned(), value);
+                result
+            };
+            for (values, expected) in [
+                (vec![higher, highest], higher / divisor),
+                (vec![higher, lower], lower / divisor),
+                (vec![higher], higher / divisor),
+            ] {
+                sender
+                    .send(snapshot(values.into_iter().map(&mut make_row).collect()))
+                    .unwrap();
+                let current = runtime.current().unwrap();
+                let actual = &current.fleets()[0];
+                assert_eq!(actual.capacity(catalog_key), Some(expected));
+                assert_eq!(
+                    actual.action_ceilings().collect::<Vec<_>>(),
+                    original.action_ceilings().collect::<Vec<_>>()
+                );
+            }
+            sender.send(snapshot(vec![])).unwrap();
+            assert_eq!(
+                runtime.current().unwrap().fleets()[0].capacity(catalog_key),
+                Some(estimate)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_matched_capacities_without_caching() {
         let (sender, receiver) = watch::channel(snapshot(vec![]));
         let runtime = RuntimeCatalog::new(
             FleetCatalog::try_new(vec![fleet("alpha")]).unwrap(),
             receiver,
         );
-        let mut missing = row("alpha", 1);
-        missing.minimum.clear();
-        for invalid in [missing, row("alpha", 0), row("alpha", u64::MAX)] {
-            sender.send(snapshot(vec![invalid])).unwrap();
-            assert!(matches!(runtime.current(), Err(error) if error.code == Code::Internal));
-            assert!(matches!(runtime.current(), Err(error) if error.code == Code::Internal));
+        for key in [
+            property::CPU_MILLICORES,
+            property::MEMORY_KB,
+            property::DISK_KB,
+        ] {
+            for value in [None, Some(0), Some(u64::MAX)] {
+                let mut invalid = row("alpha", 1024);
+                if let Some(value) = value {
+                    invalid.minimum.insert(key.to_owned(), value);
+                } else {
+                    invalid.minimum.remove(key);
+                }
+                sender.send(snapshot(vec![invalid])).unwrap();
+                assert!(matches!(runtime.current(), Err(error) if error.code == Code::Internal));
+                assert!(matches!(runtime.current(), Err(error) if error.code == Code::Internal));
+            }
         }
         sender.send(snapshot(vec![row("alpha", 1024)])).unwrap();
         assert_eq!(

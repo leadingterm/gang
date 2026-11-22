@@ -11,7 +11,7 @@ use gang_spi::{
     LeaderLeasePort, LearnedHistory, Lease, LeaseCandidate, PortError, RecordKind, Takeover,
 };
 use gang_testkit::TestResult;
-use nativelink_scheduler::resource_sketch::{Observation, SketchKey, Snapshot};
+use nativelink_scheduler::resource_sketch::{HistoryScope, Observation, SketchKey, Snapshot};
 use serde_json::json;
 
 const DAY: u64 = 86_400_000;
@@ -60,6 +60,7 @@ fn observe(source: &HistoryFixture, key: &SketchKey, now: u64) {
         cpu_millicores: Some(1500),
         peak_disk_kb: 1536,
         now_s: now / 1000,
+        completed: true,
         ..Default::default()
     };
     if matches!(key, SketchKey::Command { .. }) {
@@ -104,6 +105,7 @@ pub async fn history_restart<D: ExpiringRecordPort + LeaderLeasePort>(db: &D) ->
             .resource()
             .lookup(&key, START / 1000)
             .ok_or("restart resource was not learned")?,
+        HistoryScope::Aggregate,
     );
     assert!(expected.memory_kb > 0 && expected.cpu_count > 0 && expected.disk_kb > 0);
     let mut writer = store();
@@ -122,7 +124,7 @@ pub async fn history_restart<D: ExpiringRecordPort + LeaderLeasePort>(db: &D) ->
         .resource()
         .lookup(&key, (START + 2000) / 1000)
         .ok_or("restart resource was not restored")?;
-    assert_eq!(second.resource().shape(&entry), expected);
+    assert_eq!(second.resource().shape(&entry, HistoryScope::Aggregate), expected);
     assert_eq!(
         second.expected("target", "compile", at(START + 2000)),
         Some(Duration::from_millis(1200))
@@ -258,6 +260,7 @@ pub async fn history_new_leader<D: ExpiringRecordPort + LeaderLeasePort>(db: &D)
             .resource()
             .lookup(&key, START / 1000)
             .ok_or("leader resource was not learned")?,
+        HistoryScope::Aggregate,
     );
     assert!(expected.memory_kb > 0 && expected.cpu_count > 0 && expected.disk_kb > 0);
     first.record("", "leader", 800, at(START));
@@ -276,7 +279,7 @@ pub async fn history_new_leader<D: ExpiringRecordPort + LeaderLeasePort>(db: &D)
         .resource()
         .lookup(&key, (START + 6000) / 1000)
         .ok_or("successor resource was not restored")?;
-    assert_eq!(second.resource().shape(&entry), expected);
+    assert_eq!(second.resource().shape(&entry, HistoryScope::Aggregate), expected);
     assert_eq!(
         second.expected("", "leader", at(START + 6000)),
         Some(Duration::from_millis(800))
@@ -312,12 +315,14 @@ pub async fn history_incompatible<D: ExpiringRecordPort + LeaderLeasePort>(db: &
                     _ => return Err("resource fixture key is not a command".into()),
                 };
                 match label {
-                    "format" => record.body[0] = 99,
-                    "window" => record.body[1..9].copy_from_slice(&1_u64.to_be_bytes()),
+                    "format" => std::sync::Arc::make_mut(&mut record.body)[0] = 99,
+                    "window" => std::sync::Arc::make_mut(&mut record.body)[1..9]
+                        .copy_from_slice(&1_u64.to_be_bytes()),
                     "sampler" => {
                         snap.sampler_generation += 1;
-                        record.body.truncate(9);
-                        record.body.extend_from_slice(&snap.encode());
+                        let mut body = record.body[..9].to_vec();
+                        body.extend_from_slice(&snap.encode());
+                        record.body = body.into();
                     }
                     _ => return Err("unexpected resource fixture key".into()),
                 }
@@ -330,7 +335,7 @@ pub async fn history_incompatible<D: ExpiringRecordPort + LeaderLeasePort>(db: &
                     Some("sampler") => value["sampler_generation"] = json!(999),
                     _ => return Err("unexpected duration fixture key".into()),
                 }
-                record.body = serde_json::to_vec(&value)?;
+                record.body = serde_json::to_vec(&value)?.into();
             }
             _ => return Err("unexpected history record kind".into()),
         }
@@ -398,6 +403,7 @@ pub async fn history_resource_eviction<D: ExpiringRecordPort + LeaderLeasePort>(
             .resource()
             .lookup(&new, (START + 1000) / 1000)
             .ok_or("replacement resource was not learned")?,
+        HistoryScope::Aggregate,
     );
     assert!(expected.memory_kb > 0 && expected.cpu_count > 0 && expected.disk_kb > 0);
     writer
@@ -422,6 +428,6 @@ pub async fn history_resource_eviction<D: ExpiringRecordPort + LeaderLeasePort>(
         .resource()
         .lookup(&new, (START + 2000) / 1000)
         .ok_or("replacement resource was not restored")?;
-    assert_eq!(second.resource().shape(&restored), expected);
+    assert_eq!(second.resource().shape(&restored, HistoryScope::Aggregate), expected);
     Ok(())
 }

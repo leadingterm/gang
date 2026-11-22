@@ -1,5 +1,6 @@
 //! `gang worker`: composes one worker from the configured plugins and runs it until shutdown.
 
+use std::num::NonZeroU32;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -7,9 +8,9 @@ use gang_client::ClientOptions;
 use gang_clock::{Clock, SystemClock};
 use gang_config::{GangConfig, WorkerConfig};
 use gang_nativelink::{NativeLink, NativeLinkConfig};
-use gang_spi::{ActionIsolationPort, PluginContext, SchedulerPort};
+use gang_spi::{ActionIsolationPort, PluginContext, PortError, SchedulerPort};
 use gang_types::{AuthenticationSettings, ProviderName, Url};
-use gang_worker::{Transport, WorkerDeployment, WorkerParts, WorkerSettings};
+use gang_worker::{PhysicalResources, Transport, WorkerDeployment, WorkerParts, WorkerSettings};
 
 use crate::cli::WorkerArgs;
 use crate::config_file::LoadedConfig;
@@ -117,6 +118,20 @@ async fn serve(
             let sandbox =
                 Sandbox::build(key, config.clone(), &context).map_err(|error| error.source)?;
             Ok(sandbox.environment().clone())
+        },
+        || {
+            let count = std::thread::available_parallelism().map_err(PortError::backend)?;
+            let vcpus = u32::try_from(count.get())
+                .ok()
+                .and_then(NonZeroU32::new)
+                .ok_or_else(|| {
+                    PortError::backend(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "physical CPU count cannot be represented as a nonzero u32",
+                    ))
+                })?;
+            let memory = gang_os::physical_memory().map_err(PortError::backend)?;
+            Ok(PhysicalResources { vcpus, memory })
         },
         shutdown,
     ))

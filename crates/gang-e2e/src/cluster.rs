@@ -650,7 +650,7 @@ impl<'a> Cluster<'a> {
         self.runtime.block_on(DatabaseLink::start(target))
     }
 
-    fn wait_for_serve(&self) -> Result<()> {
+    pub(crate) fn wait_for_serve(&self) -> Result<()> {
         let timeout = self.stack.settings().startup_timeout;
         let start = Instant::now();
         loop {
@@ -1761,6 +1761,17 @@ impl<'a> Cluster<'a> {
 
     pub(crate) const fn stack(&self) -> &Stack<'a> {
         &self.stack
+    }
+
+    /// Raw shared store endpoint for observing persisted history, not a reader substitute.
+    pub(crate) fn history_database_endpoint(&self) -> Result<Url> {
+        match &self.database {
+            ClusterDatabase::DynamoDb(database) => Url::parse(database.endpoint().as_str())
+                .map_err(E2eError::system_from("parsing history database endpoint")),
+            ClusterDatabase::Postgres { .. } => {
+                Err(E2eError::system("history rollback requires DynamoDB"))
+            }
+        }
     }
 }
 

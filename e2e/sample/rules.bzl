@@ -98,6 +98,37 @@ environment_witness = rule(
     attrs = {"probe": attr.label(allow_single_file = True, mandatory = True)},
 )
 
+def _history_memory_impl(ctx):
+    training = ctx.var.get("e2e_history_train", "") == "1"
+    properties = dict(ctx.attr.exec_properties)
+    # Only training declares capacity. The held oracle has no resource minimum.
+    if training:
+        properties.update({"cpu_count": "1", "memory_kb": "524288"})
+    report = ctx.actions.declare_file(ctx.label.name + ".report")
+    ctx.actions.run(
+        executable = ctx.executable.probe,
+        arguments = [
+            "--gang-e2e-action-environment-probe",
+            "history-memory",
+            report.path,
+            "train" if training else "hold",
+        ],
+        inputs = [ctx.executable.probe],
+        outputs = [report],
+        env = {"E2E_RUN": ctx.var.get("e2e_run", "")},
+        exec_properties = properties,
+        mnemonic = ctx.attr.mnemonic,
+    )
+    return [DefaultInfo(files = depset([report]))]
+
+history_memory = rule(
+    implementation = _history_memory_impl,
+    attrs = {
+        "probe": attr.label(mandatory = True, executable = True, cfg = "exec", allow_single_file = True),
+        "mnemonic": attr.string(mandatory = True),
+    },
+)
+
 def _rate_step(step):
     return ("0" if step < 10 else "") + str(step)
 

@@ -2674,7 +2674,7 @@ mod tests {
                     kind: RecordKind::ResourceHistory,
                     id: RecordId::new([id; 32]),
                 },
-                body: vec![id; if id == 0 { 410 * 1024 } else { 8192 }],
+                body: vec![id; if id == 0 { 410 * 1024 } else { 8192 }].into(),
                 expires_at: handles.clock.wall() + Duration::from_hours(1),
             });
         }
@@ -2722,7 +2722,7 @@ mod tests {
         };
         let mut history = LearnedHistory {
             key,
-            body: vec![1],
+            body: vec![1].into(),
             expires_at: now + Duration::from_mins(2),
         };
         handles
@@ -2758,7 +2758,7 @@ mod tests {
             "unchanged history must not be rewritten"
         );
 
-        history.body = vec![2];
+        history.body = vec![2].into();
         handles
             .scheduler
             .restore_learned_history(handles.clock.wall(), &[history.clone()])
@@ -2808,7 +2808,7 @@ mod tests {
             .load(&handles.repository, &lease, now, &mut loaded)
             .await?;
         assert_eq!(loaded, vec![history.clone()]);
-        history.body = vec![3];
+        history.body = vec![3].into();
         handles
             .scheduler
             .restore_learned_history(now, &[history])
@@ -3009,7 +3009,7 @@ mod tests {
         };
         let history = LearnedHistory {
             key,
-            body: vec![1],
+            body: vec![1].into(),
             expires_at: handles.clock.wall() + std::time::Duration::from_mins(2),
         };
         handles
@@ -3108,7 +3108,7 @@ mod tests {
                 kind: RecordKind::ResourceHistory,
                 id: RecordId::new([48; 32]),
             },
-            body: vec![1],
+            body: vec![1].into(),
             expires_at: now + std::time::Duration::from_mins(2),
         };
         old.scheduler
@@ -3196,7 +3196,7 @@ mod tests {
     ) -> gang_testkit::TestResult {
         use gang_clock::Clock;
         use gang_spi::{ExpiringRecordPort, SchedulerPort};
-        history.body = vec![2];
+        history.body = vec![2].into();
         let key = history.key;
         old.scheduler
             .restore_learned_history(old.clock.wall(), &[history])
@@ -3266,7 +3266,7 @@ mod tests {
             .restore_learned_history(
                 now,
                 &[LearnedHistory {
-                    body: vec![2],
+                    body: vec![2].into(),
                     ..history
                 }],
             )
@@ -3318,7 +3318,7 @@ mod tests {
         };
         let mut history = LearnedHistory {
             key,
-            body: vec![1],
+            body: vec![1].into(),
             expires_at: now + Duration::from_mins(2),
         };
         handles
@@ -3334,7 +3334,7 @@ mod tests {
             .get(&key, handles.clock.wall())
             .await?
             .expect("first head");
-        history.body = vec![2];
+        history.body = vec![2].into();
         handles
             .scheduler
             .restore_learned_history(handles.clock.wall(), &[history])
@@ -3399,7 +3399,7 @@ mod tests {
         };
         let history = LearnedHistory {
             key,
-            body: vec![7],
+            body: vec![7].into(),
             expires_at: now + Duration::from_mins(2),
         };
         handles
@@ -3486,7 +3486,7 @@ mod tests {
         };
         let history = LearnedHistory {
             key,
-            body: vec![3],
+            body: vec![3].into(),
             expires_at: now + ttl + Duration::from_mins(2),
         };
         handles
@@ -3575,7 +3575,7 @@ mod tests {
         };
         let mut history = LearnedHistory {
             key,
-            body: vec![1],
+            body: vec![1].into(),
             expires_at: now + Duration::from_mins(2),
         };
         handles
@@ -3596,7 +3596,7 @@ mod tests {
                 .is_some()
         );
 
-        history.body = vec![2];
+        history.body = vec![2].into();
         handles
             .scheduler
             .restore_learned_history(handles.clock.wall(), &[history.clone()])

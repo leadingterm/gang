@@ -68,6 +68,7 @@ async fn rendered(harness: &Harness, program: &Path, search_path: OsString) -> P
         configured(harness, program, search_path),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await;
@@ -140,6 +141,7 @@ async fn empty_search_path_finds_no_program() {
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -162,6 +164,7 @@ async fn program_on_no_path_directory_fails_before_any_worker_starts() {
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -203,6 +206,7 @@ async fn unselected_sandbox_programs_are_not_resolved() {
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -235,6 +239,7 @@ async fn a_program_name_with_a_directory_part_is_not_looked_up_on_the_path() {
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -287,6 +292,7 @@ fn empty_path_entry_child() {
             settings,
             harness.build_limits(),
             harness.build_sandbox(),
+            harness.physical_resources(),
             future::pending(),
         ))
         .expect_err("an empty PATH entry is not the current directory");

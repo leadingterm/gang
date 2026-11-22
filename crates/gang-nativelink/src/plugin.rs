@@ -166,6 +166,8 @@ impl SchedulerPort for NativeLink {
                 )
                 .await
                 .map_err(PortError::backend)?;
+                snapshot::clamp_fleet_capacity(handles.fleets.estimates(), &mut into.fleet_capacity)
+                    .map_err(PortError::backend)?;
                 handles.stores.fill(&mut into.stores);
                 Ok(())
             })
@@ -348,6 +350,7 @@ mod tests {
             &Observation {
                 now_s: 1,
                 peak_memory_kb: 123_456,
+                completed: true,
                 ..Observation::default()
             }
         ));

@@ -119,7 +119,13 @@ fn resource_escalation(actions: &ActionsConfig, fleets: &FleetCatalog) -> Value 
                 })
                 .collect();
             let action_ceilings = action_ceilings(fleet);
-            json!({ "minimum": minimum, "exact": exact, "action_ceilings": action_ceilings })
+            let pool_multipliers = json!({
+                (property::CPU_MILLICORES): actions.cpu_oversubscription.get(),
+            });
+            let physical_sources = json!({
+                (property::CPU_MILLICORES): { "property": property::CPU_COUNT, "scale": 1000 },
+            });
+            json!({ "minimum": minimum, "exact": exact, "action_ceilings": action_ceilings, "pool_multipliers": pool_multipliers, "physical_sources": physical_sources })
         })
         .collect();
     let mut escalation = json!({
@@ -151,16 +157,12 @@ fn scheduler_capacity(key: &str, capacity: u64, actions: &ActionsConfig) -> u64 
     }
 }
 
-/// Keep the effective physical CPU limit per action even when the aggregate budget is larger.
+/// Operator-configured per-action limits, independent of the aggregate pool capacity.
 fn action_ceilings(properties: &FleetProperties) -> Map<String, Value> {
-    let mut ceilings: Map<String, Value> = properties
+    properties
         .action_ceilings()
         .map(|(key, limit)| (key.to_owned(), json!(limit)))
-        .collect();
-    if let Some(limit) = properties.limit(property::CPU_MILLICORES) {
-        ceilings.insert(property::CPU_MILLICORES.to_owned(), json!(limit));
-    }
-    ceilings
+        .collect()
 }
 
 /// The scheduler's cold start: the reservation of an action no hint matches and the client left
@@ -399,7 +401,11 @@ fn local_worker(
         property::GANG_VERSION.to_owned(),
         json!({ "values": [env!("CARGO_PKG_VERSION")] }),
     );
-    let action_ceilings = action_ceilings(&spec.properties);
+    let mut action_ceilings = action_ceilings(&spec.properties);
+    // Workers must also enforce the physical per-action CPU limit.
+    if let Some(limit) = spec.properties.limit(property::CPU_MILLICORES) {
+        action_ceilings.insert(property::CPU_MILLICORES.to_owned(), json!(limit));
+    }
     let worker = json!({
         "name": spec.instance.worker_name(),
         "worker_api_endpoint": api_endpoint,
@@ -705,9 +711,54 @@ mod tests {
         assert!(!minimum.contains_key(property::CPU_COUNT));
         assert_eq!(minimum.get(property::CPU_MILLICORES), Some(&json!(30000)));
         assert_eq!(
-            escalation["capacities"][0]["action_ceilings"][property::CPU_MILLICORES],
-            json!(15000)
+            escalation["capacities"][0]["pool_multipliers"],
+            json!({ "cpu_millicores": 2 })
         );
+        assert_eq!(
+            escalation["capacities"][0]["physical_sources"],
+            json!({ "cpu_millicores": { "property": "cpu_count", "scale": 1000 } })
+        );
+        assert_eq!(escalation["capacities"][0]["action_ceilings"], json!({}));
+    }
+
+    #[test]
+    fn observed_capacity_uses_physical_cpu_not_nominal_or_oversubscribed_cpu() {
+        for explicit in [false, true] {
+            let mut policy = gang_types::FleetActionPolicy::default();
+            if explicit {
+                policy.resources.cpu_count = NonZeroU32::new(16);
+            }
+            let fleet = FleetProperties::new(
+                &FleetName::try_new("fleet-a").expect("fleet"),
+                Isa::X86_64,
+                &"docker",
+                &"host:test".parse().expect("valid environment"),
+                Resources {
+                    vcpus: 15,
+                    memory: Bytes::gib(8),
+                    disk: Bytes::gib(100),
+                },
+                &policy,
+                [],
+            );
+            let fleets = FleetCatalog::try_new(vec![fleet]).expect("catalog");
+            let actions = ActionsConfig {
+                cpu_oversubscription: NonZeroU32::new(3).expect("nonzero factor"),
+                ..ActionsConfig::default()
+            };
+            let escalation = resource_escalation(&actions, &fleets);
+            let mut row: nativelink_config::schedulers::ResourceCapacity =
+                serde_json::from_value(escalation["capacities"][0].clone()).expect("capacity");
+            // The actual worker watch replaces the nominal aggregate ledger.
+            row.minimum
+                .insert(property::CPU_MILLICORES.to_owned(), 96_000);
+            assert_eq!(
+                row.effective_capacity(property::CPU_MILLICORES),
+                Some(if explicit { 16_000 } else { 32_000 })
+            );
+            assert_eq!(row.effective_capacity(property::MEMORY_KB), Some(8_388_608));
+            assert_eq!(row.effective_capacity(property::DISK_KB), Some(104_857_600));
+        }
     }
 
     #[test]
@@ -907,9 +958,14 @@ mod tests {
                 json!(104_857_600)
             );
             assert_eq!(
-                capacities[0]["action_ceilings"][property::CPU_MILLICORES],
-                json!(4000)
+                capacities[0]["pool_multipliers"],
+                json!({ "cpu_millicores": factor })
             );
+            assert_eq!(
+                capacities[0]["physical_sources"],
+                json!({ "cpu_millicores": { "property": "cpu_count", "scale": 1000 } })
+            );
+            assert_eq!(capacities[0]["action_ceilings"], json!({}));
         }
     }
 
@@ -1535,12 +1591,16 @@ mod tests {
                 {
                     "minimum": { "cpu_millicores": 8000, "memory_kb": 8_388_608, "disk_kb": 104_857_600 },
                     "exact": { "fleet": "fleet-a", "ISA": "x86-64", "sandbox": "docker", "capacity": "2" },
-                    "action_ceilings": { "cpu_millicores": 4000 }
+                    "action_ceilings": {},
+                    "pool_multipliers": { "cpu_millicores": 2 },
+                    "physical_sources": { "cpu_millicores": { "property": "cpu_count", "scale": 1000 } }
                 },
                 {
                     "minimum": { "cpu_millicores": 12000, "memory_kb": 16_777_216, "disk_kb": 83_886_080 },
                     "exact": { "fleet": "fleet-b", "ISA": "aarch64", "sandbox": "bwrap", "capacity": "3", "machine_class": "arm" },
-                    "action_ceilings": { "cpu_millicores": 6000 }
+                    "action_ceilings": {},
+                    "pool_multipliers": { "cpu_millicores": 2 },
+                    "physical_sources": { "cpu_millicores": { "property": "cpu_count", "scale": 1000 } }
                 }
             ])
         );

@@ -114,6 +114,25 @@ http_file(
     urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.7/gang-aarch64-unknown-linux-musl"],
 )
 
+# Authentic rollback reader; keep the ordinary v0.3.7 upgrade baseline unchanged.
+http_file(
+    name = "gang_v038_linux_x86_64",
+    dev_dependency = True,
+    downloaded_file_path = "gang",
+    executable = True,
+    sha256 = "8259514ad693ddd84f6b06ac530445ae5f91055fd0568a85496f56049040c1f7",
+    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.8/gang-x86_64-unknown-linux-musl"],
+)
+
+http_file(
+    name = "gang_v038_linux_arm64",
+    dev_dependency = True,
+    downloaded_file_path = "gang",
+    executable = True,
+    sha256 = "1bdbe3fbb9d59e5527931ba9c656383f907962a07ec35431d5ff6dd410c906ce",
+    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.8/gang-aarch64-unknown-linux-musl"],
+)
+
 # Remove archive package boundaries so the generated root filegroup sees every source.
 UPGRADE_SOURCE_BUILD = """
 exports_files(["Cargo.toml"])
@@ -146,6 +165,18 @@ http_archive(
     strip_prefix = "gang-0.3.7",
     type = "tar.gz",
     urls = ["https://codeload.github.com/leadingterm/gang/tar.gz/refs/tags/v0.3.7"],
+)
+
+# v0.3.8's signed release tag resolves to this immutable source commit.
+http_archive(
+    name = "gang_v038_source",
+    build_file_content = UPGRADE_SOURCE_BUILD,
+    dev_dependency = True,
+    patch_cmds = [UPGRADE_SOURCE_PATCH],
+    sha256 = "343d54167242a31049d43111d646ea40a3b68d25fec0f106c6808e1f5203b19a",
+    strip_prefix = "gang-9b56a187bbb413a435f9496200fdab59f69ba716",
+    type = "tar.gz",
+    urls = ["https://codeload.github.com/leadingterm/gang/tar.gz/9b56a187bbb413a435f9496200fdab59f69ba716"],
 )
 
 # The Bazel the e2e harness drives in its sample workspace (crates/gang-e2e); each download below is pinned by checksum.

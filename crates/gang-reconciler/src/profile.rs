@@ -391,7 +391,7 @@ impl SourceProfiles {
             .map_err(PortError::backend)?;
             into.push(LearnedHistory {
                 key: record_key(*source),
-                body,
+                body: body.into(),
                 expires_at: Timestamp::from_unix_millis(expires),
             });
         }
@@ -814,7 +814,7 @@ mod tests {
             let mut record = valid.clone();
             let mut stored = decode(&record);
             match mutation {
-                0 => record.body = b"not json".to_vec(),
+                0 => record.body = b"not json".to_vec().into(),
                 1 => stored.version += 1,
                 2 => stored.window_ms += 1,
                 3 => record.key = record_key(super::tests::source(2)),
@@ -836,7 +836,7 @@ mod tests {
                 _ => stored.entry.period = u64::MAX,
             }
             if mutation != 0 {
-                record.body = serde_json::to_vec(&stored).unwrap();
+                record.body = serde_json::to_vec(&stored).unwrap().into();
             }
             let restored = profiles(1);
             restored.restore(at(100), &[record]);
@@ -961,7 +961,7 @@ mod tests {
                 kind: RecordKind::DurationHistory,
                 id: RecordId::new([0; 32]),
             },
-            body: vec![1, 2, 3],
+            body: vec![1, 2, 3].into(),
             expires_at: Timestamp::from_unix_millis(DAY),
         };
         let mut records = vec![sentinel.clone()];

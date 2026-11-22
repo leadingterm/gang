@@ -27,8 +27,8 @@ use gang_types::{
     NonZeroBytes, PrivateKeyPem, Proof, WorkerLifetime,
 };
 use gang_worker::{
-    Credentials, EnrollError, Enroller, ServerCaError, ServerCaSource, Transport, WorkerDeployment,
-    WorkerParts, WorkerSettings,
+    Credentials, EnrollError, Enroller, PhysicalResources, ServerCaError, ServerCaSource, Transport,
+    WorkerDeployment, WorkerParts, WorkerSettings,
 };
 
 pub use gang_testkit::{Behaviour, FakeCache, FakeScheduler, RecordedSpec, RecordedTls};
@@ -555,6 +555,14 @@ impl Harness {
     {
         let environment = self.sandbox_environment.clone();
         move |_, _| environment.map_err(PortError::config)
+    }
+
+    /// Supplies fixed host facts independent of the machine running the tests.
+    pub fn physical_resources(&self) -> impl FnOnce() -> Result<PhysicalResources, PortError> + use<> {
+        || Ok(PhysicalResources {
+            vcpus: NonZeroU32::new(16).expect("16 is nonzero"),
+            memory: Bytes::gib(64),
+        })
     }
 
     /// Advances the clock by `by`, then lets every tracked task run until it is idle.

@@ -60,6 +60,22 @@ alias(
     target_compatible_with = ["@platforms//os:linux"],
 )
 
+alias(
+    name = "v038_gang",
+    actual = select({
+        "//bazel/platforms:linux_x86_64": "@gang_v038_linux_x86_64//file:gang",
+        "//bazel/platforms:linux_arm64": "@gang_v038_linux_arm64//file:gang",
+    }),
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+upgrade_fixture(
+    name = "v038_fixture",
+    srcs = ["@gang_v038_source//:sources"],
+    source_root = "@gang_v038_source//:Cargo.toml",
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
 upgrade_fixture(
     name = "candidate_fixture",
     srcs = [
@@ -142,6 +158,8 @@ workspace_rust_binary(
             ":candidate_fixture",
             ":previous_fixture",
             ":previous_gang",
+            ":v038_fixture",
+            ":v038_gang",
             "//crates/gang-main/tests/preload:loaded_probe",
         ],
         "//conditions:default": [],
@@ -152,6 +170,8 @@ workspace_rust_binary(
             "GANG_E2E_CANDIDATE_FIXTURE": "$(rootpath :candidate_fixture)",
             "GANG_E2E_PREVIOUS_FIXTURE": "$(rootpath :previous_fixture)",
             "GANG_E2E_PREVIOUS_GANG": "$(rootpath :previous_gang)",
+            "GANG_E2E_HISTORY_FIXTURE": "$(rootpath :v038_fixture)",
+            "GANG_E2E_HISTORY_GANG": "$(rootpath :v038_gang)",
             "GANG_E2E_GANG": "$(rootpath //crates/gang-main:gang)",
             "GANG_E2E_GATE_SCRIPT": "$(rootpath //:tools/e2e-gate.sh)",
             "GANG_E2E_GLIBC_TOOL": "$(rootpath //crates/gang-main/tests/preload:loaded_probe)",
@@ -184,6 +204,8 @@ e2e_bundle(
     target_compatible_with = ["@platforms//os:linux"],
     v035_fixture = ":v035_fixture",
     v035_gang = ":v035_gang",
+    v038_fixture = ":v038_fixture",
+    v038_gang = ":v038_gang",
 )
 
 workspace_rust_binary(

@@ -29,6 +29,8 @@ bundle_file() {
 previous_gang=$(bundle_file previous.binary)
 previous_fixture=$(bundle_file previous.fixture)
 candidate_fixture=$(bundle_file candidate_fixture)
+history_gang=$(bundle_file history.binary)
+history_fixture=$(bundle_file history.fixture)
 XDG_RUNTIME_DIR="/run/user/$(id -u)"
 export XDG_RUNTIME_DIR
 unit=gang-e2e-$$
@@ -41,6 +43,7 @@ start=$SECONDS
 systemd-run --user --unit="$unit" --collect --pipe --wait --same-dir --slice=gang.slice -p Type=oneshot -p Delegate=yes -p TimeoutStartSec="$budget" -p TimeoutStopSec=10 \
   --setenv=PATH="$PATH" --setenv=GANG_E2E_GLIBC_TOOL="$bundle/loaded_probe" \
   --setenv=GANG_E2E_PREVIOUS_GANG="$previous_gang" --setenv=GANG_E2E_PREVIOUS_FIXTURE="$previous_fixture" \
+  --setenv=GANG_E2E_HISTORY_GANG="$history_gang" --setenv=GANG_E2E_HISTORY_FIXTURE="$history_fixture" \
   --setenv=GANG_E2E_CANDIDATE_FIXTURE="$candidate_fixture" -- \
   nix develop -c env -u XDG_CONFIG_HOME -u XDG_CACHE_HOME HOME="$home" \
   "$bundle/local" --gang "$gang" --bazel "$bundle/bazel" --postgres "$bundle/postgresql.tar.gz" \
