@@ -1,5 +1,7 @@
 # Changelog
 
+This file is the historical archive. New release notes come from [change fragments](changes/) and are assembled into the release's generated `CHANGELOG.md` asset.
+
 ## 0.3.6 — 2026-11-22
 
 ### Added

@@ -1,0 +1,61 @@
+name: PR preflight
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-preflight-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: nix develop -c bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  preflight:
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-bazel
+        with:
+          cache-job: linux-x86_64
+      - name: Run PR preflight
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.sha }}
+        run: |
+          tools/ci-pr.sh "$BASE" "$HEAD"
+          echo 'PR preflight passed: portable lint, build, generated Clippy/rustfmt and affected unit tests. Full platform and E2E coverage runs in the merge queue.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Save the Bazel cache
+        if: success() && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/save-bazel-cache
+        with:
+          mode: save
+          prune: 'true'
+
+  readiness:
+    name: ${{ matrix.check }}
+    needs: [preflight]
+    if: always() && github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [lint, cross, linux-x86_64, linux-arm64, e2e-gate-1, e2e-gate-2]
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    steps:
+      - name: Require PR preflight
+        shell: bash
+        env:
+          RESULT: ${{ needs.preflight.result }}
+        run: test "$RESULT" = success

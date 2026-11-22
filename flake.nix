@@ -250,6 +250,7 @@
               pkgs.alejandra
               pkgs.findutils
               pkgs.gnutar
+              pkgs.python3
               pkgs.shellcheck
               pkgs.yq-go
               pkgs.zstd

@@ -1,155 +1,124 @@
 #!/usr/bin/env bash
-# Guard the x86 PR path and trusted release validation graph.
+# Guard the PR preflight and the merge-queue validation graph.
 set -euo pipefail
 
-if (( $# > 1 )); then
-  echo "Usage: $0 [workflow]" >&2
+if (( $# > 2 )); then
+  echo "usage: $0 [ci.yml [pr.yml]]" >&2
   exit 2
 fi
-
 script_dir=$(cd "$(dirname "$0")" && pwd)
-workflow=${1-"$script_dir/../.github/workflows/ci.yml"}
+ci=${1-"$script_dir/../.github/workflows/ci.yml"}
+pr=${2-"$script_dir/../.github/workflows/pr.yml"}
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+yq -o=json '.' "$ci" >"$scratch/ci.json"
+yq -o=json '.' "$pr" >"$scratch/pr.json"
 
-yq -o=json '.' "$workflow" | jq -e '
-  .jobs as $jobs
-  | def needs($id; $expected):
-      if ($jobs[$id].needs | if type == "string" then [.] else . end | sort)
-         == ($expected | sort) then .
-      else error($id + " must depend on exactly: " + ($expected | join(", "))) end;
-    def results($id):
-      ([$jobs[$id].steps[]?.env[]? | strings
-        | scan("needs\\.([A-Za-z0-9_-]+)\\.result") | .[0]] | unique) as $results
-      | if $results == ($jobs[$id].needs | unique) then .
-        else error($id + " results must cover every dependency") end;
-    def status_only($id):
-      if ($jobs[$id].steps | type) == "array" and ($jobs[$id].steps | length) == 1
-         and $jobs[$id].steps[0].uses == null
-         and ($jobs[$id].steps[0].run | type) == "string"
-         and ($jobs[$id].steps[0].env.NEEDS_RESULTS | type) == "string" then .
-      else error($id + " must contain only its status check") end;
-    def push_only($id):
-      ($jobs[$id].if // "") as $condition
-      | if ($condition | contains("github.event_name == '\''push'\''"))
-           and ($condition | contains("refs/heads/main"))
-           and ($condition | contains("refs/heads/master"))
-           and ($condition | contains("refs/tags/v")) then .
-        else error($id + " must run only for main/master pushes and v* tags") end;
-    def release_scope:
-      "(github.event_name == '\''merge_group'\'' || github.event_name == '\''push'\'' && (github.ref == '\''refs/heads/main'\'' || github.ref == '\''refs/heads/master'\'' || startsWith(github.ref, '\''refs/tags/v'\'')) || github.event_name == '\''pull_request'\'' && startsWith(github.event.pull_request.head.ref, '\''release/'\'') && github.event.pull_request.head.repo.full_name == github.repository)";
-    def release_checkout:
-      "${{ github.event_name == '\''pull_request'\'' && startsWith(github.event.pull_request.head.ref, '\''release/'\'') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}";
-  if .on.merge_group.types != ["checks_requested"] then
-    error("merge_group must trigger exactly on checks_requested")
-  elif ($jobs | type) != "object" or ($jobs.required | type) != "object" then
-    error("workflow must contain a required job")
-  elif ($jobs.changes | type) != "object" then
-    error("workflow must contain a changes job")
-  else . end
-  | if ([$jobs.changes.steps[]? | select(.id == "filter") | .env.BASE]
-        == ["${{ github.event_name == '\''pull_request'\'' && github.event.pull_request.base.sha || '\''0000000000000000000000000000000000000000'\'' }}"]) then .
-    else error("change classification must use the PR base or zero fallback") end
-  | if ([$jobs.changes.steps[]? | select(.id == "filter") | .env.EVENT] == ["${{ github.event_name }}"])
-       and ([$jobs.changes.steps[]? | select(.id == "filter") | .env.REF] == ["${{ github.ref }}"]) then .
-    else error("change classification must use the event name and queue ref") end
-  | if ([$jobs.changes.steps[]? | select(.id == "filter") | .run]
-        == ["if [[ \"$EVENT\" == merge_group ]]; then\n  tools/ci-changes.sh --merge-group \"$REF\" \"$HEAD\"\nelse\n  tools/ci-changes.sh \"$BASE\" \"$HEAD\"\nfi >> \"$GITHUB_OUTPUT\"\n"]) then .
-    else error("change classification must dispatch merge groups and ordinary events correctly") end
-  | if ([$jobs[].steps[]? | select((.uses // "") | startswith("actions/checkout@"))
-         | select(.with.ref != release_checkout)] | length) == 0
-       and ([$jobs.changes.steps[]? | select(.id == "filter") | .env.HEAD] == [release_checkout]) then .
-    else error("all CI checkouts and change classification must use the release PR head") end
-  | needs("required"; ["changes", "nativelink-memory-tests", "nix-vm", "lint", "linux-x86_64-shards", "linux-x86_64", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-1", "e2e-gate-2-shards", "e2e-gate-2"])
-  | results("required")
-  | needs("nativelink-memory-tests"; ["changes"])
-  | if $jobs["nativelink-memory-tests"].if == "needs.changes.outputs.heavy == '\''true'\''" then .
-    else error("nativelink-memory-tests must run whenever heavy is true") end
-  | needs("nix-vm"; ["changes"])
-  | needs("linux-x86_64-shards"; ["changes"])
-  | needs("lint"; ["changes"])
-  | if ([$jobs.lint.steps[]?.run | strings | select(contains("tools/lint.sh --portable"))] | length) != 1 then
-      error("lint must execute tools/lint.sh --portable")
-    elif ([$jobs.lint.steps[]? | select(.uses == "./.github/actions/setup-bazel")
-           | select(.with."cache-job" == "linux-x86_64" and .with."restore-only" == "true")] | length) != 1 then
-      error("lint must restore the canonical x86 cache read-only")
-    elif ([$jobs.lint.steps[]? | select(.uses == "./.github/actions/save-bazel-cache")
-           | select(.with.mode == "export" and .with.shard == "x86-lint")] | length) != 1 then
-      error("lint must export x86-lint")
-    elif ([$jobs.lint.steps[]? | select(.run? | strings | contains("tools/lint.sh --portable"))
-           | select(."timeout-minutes" > 0 and ."timeout-minutes" <= 3)] | length) != 1 then
-      error("portable lint must be bounded to three minutes")
-    else . end
-  | needs("linux-x86_64"; ["changes", "linux-x86_64-shards"])
-  | status_only("linux-x86_64")
-  | needs("linux-x86_64-bundle"; ["changes"])
-  | ($jobs["linux-x86_64-bundle"].steps | to_entries) as $bundle_steps
-  | if ([$jobs["linux-x86_64-bundle"].steps[]? | select(.uses == "./.github/actions/setup-bazel")
-         | select(.with."cache-job" == "linux-x86_64" and .with."restore-only" == "true")] | length) != 1
-       or ([$jobs["linux-x86_64-bundle"].steps[]? | select(.uses == "./.github/actions/save-bazel-cache")] | length) != 0
-       or ([$bundle_steps[]
-         | select(.value.run? | strings | contains("bazel build")
-           and test("(^|\\s)//:gang(\\s|$)") and test("(^|\\s)//crates/gang-e2e:bundle(\\s|$)"))
-         | select(.key < ([$bundle_steps[] | select(.value.uses == "./.github/actions/upload-gang") | .key] | min))] | length) != 1
-       or ([$jobs["linux-x86_64-bundle"].steps[]? | select(.uses == "./.github/actions/upload-gang")
-         | select(.with.target == "x86_64-unknown-linux-musl")] | length) != 1
-       or ([$jobs["linux-x86_64-bundle"].steps[]? | select(.uses == "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9")
-         | select(.with.name == "e2e-harness-x86_64")] | length) != 1 then
-      error("x86 bundle must build explicit gang and harness top-levels before upload without a redundant working-set export")
-    else . end
-  | if ([$jobs["linux-x86_64-bundle"].steps[]?
-         | select(.uses == "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9")
-         | select(.if == "always()" and .with.name == "bazel-metrics-x86-bundle"
-           and .with."retention-days" == 7
-           and (.with.path | split("\n") | map(select(length > 0)) | sort)
-             == ["${{ runner.temp }}/bazel-build.bep.json", "${{ runner.temp }}/bazel-build.profile.gz"])] | length) != 1 then
-      error("x86 bundle must always upload its BEP and profile through the pinned artifact action")
-    else . end
-  | needs("cache-x86_64"; ["changes", "linux-x86_64-shards", "linux-x86_64-bundle", "lint"])
-  | if ([$jobs["cache-x86_64"].steps[]?.with.pattern | select(. == "bazel-working-set-x86-*")] | length) != 1 then
-      error("cache-x86_64 must merge every x86 working set")
-    else . end
-  | reduce ["linux-x86_64-shards", "linux-x86_64-bundle", "lint"][] as $id (.;
-      if ($jobs["cache-x86_64"].if | contains("needs." + $id + ".result == '\''success'\''")) then .
-      else error("cache-x86_64 must wait for successful " + $id) end)
-  | needs("linux-arm64-bundle"; ["changes"])
-  | needs("cross"; ["changes"])
-  | needs("macos"; ["changes"])
-  | needs("linux-arm64"; ["changes", "linux-arm64-bundle", "linux-arm64-checks"])
-  | needs("linux-arm64-checks"; ["changes", "linux-arm64-bundle"])
-  | needs("release-validation"; ["changes", "required", "linux-arm64", "cross"])
-  | results("release-validation")
-  | if ([$jobs["release-validation"].steps[]? | select(.env.REQUIRED_RESULT != null) | .env.HEAVY]
-        == ["${{ needs.changes.outputs.heavy }}"]) then .
-    else error("release-validation must use the changes heavy output") end
-  | reduce ["e2e-gate-1", "e2e-gate-2"][] as $id (.;
-      needs($id + "-shards"; ["changes", "linux-x86_64-bundle"])
-      | needs($id; ["changes", $id + "-shards"])
-      | if $jobs[$id + "-shards"].strategy.matrix == {"shard": [1, 2, 3, 4, 5, 6, 7, 8]} then .
-        else error($id + " must run all eight shards with no extra matrix dimensions or exclusions") end
-      | (if $id == "e2e-gate-1" then "--gate 1" else "--gate 2 --additions" end) as $selection
-      | if ([$jobs[$id + "-shards"].steps[]? | select(.uses == "./.github/actions/run-e2e")
-             | .with.args] == [$selection + " --shard ${{ matrix.shard }}/${{ strategy.job-total }}"]) then .
-        else error($id + " must run its complete selection with the matrix job total as denominator") end)
-  | reduce ["linux-x86_64", "e2e-gate-1", "e2e-gate-2", "required"][] as $id (.;
-      results($id)
-      | if $jobs[$id].if == "always()" then .
-      else error("unsafe aggregator " + $id + ": if must be always()") end)
-  | push_only("macos")
-  | reduce ["linux-arm64-bundle", "linux-arm64-checks", "cross"][] as $id (.;
-      if $jobs[$id].if == (release_scope + " && needs.changes.outputs.heavy == '\''true'\''") then .
-      else error($id + " must run only on heavy merge groups, main/master/tag pushes and trusted release PRs") end)
-  | reduce ["linux-arm64", "release-validation"][] as $id (.;
-      if $jobs[$id].if == ("always() && " + release_scope) then .
-      else error($id + " must always aggregate on trusted release events") end)
-  | reduce ["nix-vm", "lint", "linux-x86_64-shards", "linux-x86_64-bundle", "cache-x86_64", "e2e-gate-1-shards", "e2e-gate-2-shards", "linux-arm64-bundle", "linux-arm64-checks", "cross", "macos"][] as $id (.;
-      if ($jobs[$id].if | contains("needs.changes.outputs.heavy == '\''true'\''")) then .
-      else error($id + " must skip intentionally when heavy is false") end)
-  | reduce ["nativelink-memory-tests", "nix-vm", "lint", "linux-x86_64-shards", "linux-x86_64", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-1", "e2e-gate-2-shards", "e2e-gate-2", "required"][] as $id (.;
-      ($jobs[$id]."runs-on" // "") as $runner
-      | if ($runner | type) == "string" and ($runner | contains("ubuntu-24.04"))
-           and ($runner | contains("linux-x64")) and ($runner | contains("arm64") | not) then .
-        else error($id + " must use the existing x86 runner labels") end)
-  | reduce (($jobs | keys) - ["changes"])[] as $id (.;
-      ($jobs[$id].needs // []) as $deps
-      | if $deps == "changes" or (($deps | type) == "array" and ($deps | index("changes")) != null) then .
-        else error("job " + $id + " must directly depend on changes") end)
+jq -en --slurpfile ci "$scratch/ci.json" --slurpfile pr "$scratch/pr.json" '
+  def require($ok; $message): if $ok then . else error($message) end;
+  def deps: (.needs // [] | if type == "string" then [.] else . end | sort);
+  def scope: (.if // "" | gsub("^\\$\\{\\{\\s*|\\s*\\}\\}$"; "") | gsub("^\\s+|\\s+$"; ""));
+  def checked($dep):
+    . as $job
+    | require(($job.steps | type) == "array" and ($job.steps | length) == 1
+       and $job.steps[0].uses == null and $job.steps[0].if == null and $job.steps[0].shell == "bash" and ($job.steps[0].run | type) == "string"
+       and $job.steps[0].env.RESULT == ("${{ needs." + $dep + ".result }}")
+       and ($job.steps[0].run | gsub("\\s+$"; "")) == "test \"$RESULT\" = success"; "status job must check the dependency result in its only step");
+  def readiness($dep; $condition):
+    require(deps == [$dep]; "readiness must depend only on " + $dep)
+    | require(scope == $condition; "readiness condition is unsafe")
+    | require(.name == "${{ matrix.check }}" and .strategy.matrix == {"check": ["lint", "cross", "linux-x86_64", "linux-arm64", "e2e-gate-1", "e2e-gate-2"]}; "readiness must expose exactly the six required checks")
+    | checked($dep);
+  def checkout:
+    require((.uses == "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1") and (.with.ref == "${{ github.sha }}") and (.with."persist-credentials" == false) and .if == null; "checkout must use pinned action and github.sha without persisted credentials");
+  def no_continue:
+    require((."continue-on-error" == null or ."continue-on-error" == false) and .permissions == null
+      and all(.steps[]?; ."continue-on-error" == null or ."continue-on-error" == false); "critical work must not continue on error or override permissions");
+  ["nativelink-memory-tests", "nix-vm", "lint-checks", "linux-x86_64-shards", "linux-x86_64-bundle", "linux-arm64-bundle", "linux-arm64-checks", "cross-build", "e2e-gate-1-shards", "e2e-gate-2-shards"] as $critical
+  | $ci[0] as $c | $pr[0] as $p
+  | $c | require((.on | keys) == ["merge_group"] and .on.merge_group.types == ["checks_requested"]; "CI must trigger only for requested merge groups")
+  | require(.permissions == {"contents":"read"}; "CI permissions must be read-only")
+  | require((.jobs | keys | sort) == (($critical + ["macos", "readiness", "release-validation"]) | sort); "unexpected or missing full CI job")
+  | .jobs as $jobs
+  | reduce $critical[] as $id (.;
+      $jobs[$id] | require(type == "object"; "missing critical job " + $id)
+      | require(scope == "github.event_name == '\''merge_group'\''"; "unsafe event scope for " + $id)
+      | require([.steps[]? | select((.uses // "") | startswith("actions/checkout@")) | checkout] | length == 1; "critical job must check out the queue SHA")
+      | require(all(.steps[]?; .if == null or (.uses == "./.github/actions/save-bazel-cache" and .if == "always() && job.status == '\''success'\''") or (.with.name == "bazel-metrics-x86-bundle" and .if == "always()")); "critical steps must not skip")
+      | no_continue)
+  | reduce ($critical - ["linux-arm64-checks", "e2e-gate-1-shards", "e2e-gate-2-shards"])[] as $id (.; $jobs[$id] | require(deps == []; "unexpected dependency for " + $id))
+  | $jobs["linux-arm64-checks"] | require(deps == ["linux-arm64-bundle"]; "ARM checks must depend on the ARM bundle")
+  | reduce ["nativelink-memory-tests", "nix-vm", "lint-checks", "linux-x86_64-shards", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-2-shards"][] as $id (.;
+      $jobs[$id] | require((."runs-on" | strings | contains("linux-x64") and contains("ubuntu-24.04")); "x86 job must use x86 runners"))
+  | $jobs["nativelink-memory-tests"] | require([.steps[]? | select(.name == "Run NativeLink memory tests" and (.run | contains("cargo test -p nativelink-scheduler") and contains("cargo test -p nativelink-worker") and contains("cargo test -p nativelink-service")))] | length == 1; "NativeLink memory tests must run")
+  | $jobs["nix-vm"] | require([.steps[]? | select(.run == "tools/lint.sh --nix-vm")] | length == 1; "Nix VM checks must run")
+  | $jobs["cross-build"] | require([.steps[]? | select(.run? | strings | contains("bazel build") and contains("--platforms=@zig_sdk//libc_aware/platform:linux_amd64_musl") and contains("//:gang"))] | length == 1; "ARM-to-x86 cross-build must run")
+  | $jobs["linux-arm64-checks"] | require([.steps[]? | select(.name == "Test" and (.run | contains("bazel test") and contains("static_binary_test") and contains("hold_signal_test") and contains("postgres_test")))] | length == 1; "native ARM boundary checks must run")
+  | $jobs["linux-x86_64-shards"] | require([.steps[]? | select(.name == "Select shard targets" and .run == "tools/ci-targets.sh --query | tools/ci-targets.sh \"$SHARD\" 4 > \"$RUNNER_TEMP/targets\"" and .env.SHARD == "${{ matrix.shard }}")] | length == 1; "x86 shard selection must use the full selector")
+  | $jobs["linux-x86_64-shards"] | require([.steps[]? | select(.name == "Test" and (.run | contains("bazel test") and contains("--target_pattern_file=\"$RUNNER_TEMP/targets\"")))] | length == 1; "x86 shard tests must execute selected targets")
+  | $jobs["release-validation"]
+  | require(.steps[0].env.NEEDS_RESULTS == "${{ join(needs.*.result, '\'' '\'') }}"; "release validation must receive every dependency result")
+  | require(deps == ($critical | sort); "release validation must directly depend on all ten critical jobs")
+  | require(scope == "always() && github.event_name == '\''merge_group'\''"; "release validation must always run on merge groups")
+  | no_continue
+  | require((.steps | length) == 1 and .steps[0].if == null and .steps[0].shell == "bash" and (.steps[0].run | type) == "string"; "release validation must have one unconditional Bash result-checking step")
+  | $jobs.readiness | readiness("release-validation"; "always() && github.event_name == '\''merge_group'\''") | no_continue
+  | $jobs.macos | require(scope == "github.event_name == '\''merge_group'\'' && !github.event.repository.private"; "macOS must remain advisory and queue-only")
+  | [$jobs[].steps[]? | select((.uses // "") | startswith("actions/checkout@")) | checkout] | . as $checkouts
+  | require(($checkouts | length) >= 10; "full jobs require checkouts")
+  | reduce ["e2e-gate-1-shards", "e2e-gate-2-shards"][] as $id (.;
+      $jobs[$id] | require(deps == ["linux-x86_64-bundle"]; "E2E must depend on the x86 bundle")
+      | require(.strategy.matrix == {"shard":[1,2,3,4,5,6,7,8]}; "E2E must run all eight shards")
+      | (if $id == "e2e-gate-1-shards" then "--gate 1" else "--gate 2 --additions" end) as $selection
+      | require([.steps[]? | select(.uses == "./.github/actions/run-e2e") | .with.args] == [$selection + " --shard ${{ matrix.shard }}/${{ strategy.job-total }}"]; "incorrect E2E selection"))
+  | $jobs["linux-x86_64-shards"]
+  | require(.strategy.matrix == {"shard":[1,2,3,4]}; "x86 must run four shards")
+  | require([.steps[]? | select(.uses == "./.github/actions/save-bazel-cache") | select(.with.mode == "export" and .with.shard == "x86-${{ matrix.shard }}")] | length == 1; "x86 shards must export working sets")
+  | $jobs["lint-checks"]
+  | require([.steps[]? | select((.uses // "") | startswith("actions/checkout@")) | select(.with."fetch-depth" == 0)] | length == 1; "portable lint requires full checkout history")
+  | require([.steps[]? | select(.run == "tools/lint.sh --portable")] | length == 1; "portable lint must run")
+  | require([.steps[]? | select(.uses == "./.github/actions/save-bazel-cache") | select(.with.mode == "export" and .with.shard == "x86-lint")] | length == 1; "lint must export its working set")
+  | reduce ["linux-x86_64-bundle", "linux-arm64-bundle"][] as $id (.;
+      $jobs[$id] | (if $id == "linux-x86_64-bundle" then "x86_64" else "aarch64" end) as $arch
+      | require([.steps[]? | select(.run? | strings | contains("bazel build") and contains("//:gang") and contains("//crates/gang-e2e:bundle"))] | length == 1; "bundle must build gang and harness")
+      | require([.steps[]? | select(.uses == "./.github/actions/upload-gang")] | length == 1; "bundle must upload gang")
+      | require([.steps[]? | select((.uses // "") | startswith("actions/upload-artifact@")) | select(.with.name == ("e2e-harness-" + $arch) and .with."if-no-files-found" == "error")] | length == 1; "bundle must export its harness"))
+  | $jobs["linux-x86_64-bundle"]
+  | require([.steps[]? | select(.with.name == "bazel-metrics-x86-bundle" and .uses == "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9" and .if == "always()" and .with."retention-days" == 7 and (.with.path | contains("bazel-build.bep.json") and contains("bazel-build.profile.gz")))] | length == 1; "bundle metrics must always be exported")
+  | (.steps | to_entries) as $steps
+  | require(([$steps[] | select(.value.name == "Build gang and e2e harness") | .key] | first) < ([$steps[] | select(.value.uses == "./.github/actions/upload-gang") | .key] | first); "bundle must be built before upload")
+  | $p | require((.on | keys) == ["pull_request"]; "PR workflow must trigger only on pull_request")
+  | require(.permissions == {"contents":"read"}; "PR permissions must be read-only")
+  | require((.jobs | keys | sort) == ["preflight", "readiness"]; "PR workflow must contain only preflight and readiness")
+  | .jobs.preflight | no_continue
+  | require((.needs // []) == [] and ."timeout-minutes" == 30 and scope == "github.event_name == '\''pull_request'\''"; "preflight must run for every PR with a 30 minute timeout")
+
+  | require([.steps[]? | select((.uses // "") | startswith("actions/checkout@")) | checkout | select(.with."fetch-depth" == 0)] | length == 1; "preflight must check out the test merge with full history")
+  | require([.steps[]? | select(.uses == "./.github/actions/setup-nix")] | length == 1; "preflight must set up Nix")
+  | require([.steps[]? | select(.uses == "./.github/actions/setup-bazel" and .with."cache-job" == "linux-x86_64")] | length == 1; "preflight must use the x86 cache")
+  | require([.steps[]? | select((.run // "" | startswith("tools/ci-pr.sh \"$BASE\" \"$HEAD\"\n")) and .env.BASE == "${{ github.event.pull_request.base.sha }}" and .env.HEAD == "${{ github.sha }}" and .if == null)] | length == 1; "preflight must run the real command on the PR base and test merge")
+  | require([.steps[]? | select(.uses == "./.github/actions/save-bazel-cache" and .if == "success() && github.event.pull_request.head.repo.full_name == github.repository" and .with.mode == "save" and .with.prune == "true")] | length == 1; "preflight cache writes must be restricted to same-repo PRs")
+  | $p.jobs.readiness | readiness("preflight"; "always() && github.event_name == '\''pull_request'\''") | no_continue
+  | true
 ' >/dev/null
+# Exercise the workflow's actual release result check, not a copy of its logic.
+jq -r '.jobs["release-validation"].steps[0].run' "$scratch/ci.json" >"$scratch/release.sh"
+good="success success success success success success success success success success"
+if ! NEEDS_RESULTS="$good" bash --noprofile --norc -e -u -o pipefail "$scratch/release.sh"; then
+  echo "release validation rejects successful jobs" >&2
+  exit 1
+fi
+for ((i = 0; i < 10; i++)); do
+  for bad in failure cancelled skipped missing; do
+    results=(success success success success success success success success success success)
+    if [[ $bad == missing ]]; then
+      unset 'results[i]'
+    else
+      results[i]=$bad
+    fi
+    if NEEDS_RESULTS="${results[*]}" bash --noprofile --norc -e -u -o pipefail "$scratch/release.sh"; then
+      echo "release validation accepted $bad at dependency $i" >&2
+      exit 1
+    fi
+  done
+done

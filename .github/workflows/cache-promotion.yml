@@ -1,0 +1,51 @@
+name: Cache promotion
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cache-promotion-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  promote:
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-nix
+        with:
+          cache-save: 'true'
+      - uses: ./.github/actions/setup-bazel
+        with:
+          cache-job: linux-x86_64
+      - name: Select qualified queue run
+        id: queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          SHA: ${{ github.sha }}
+        run: python3 tools/queue_ci.py --sha "$SHA" --github-output "$GITHUB_OUTPUT" --require-working-sets
+      - name: Download validated working sets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ steps.queue.outputs.working-set-artifact-ids }}
+          run-id: ${{ steps.queue.outputs.run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/bazel-working-sets
+          merge-multiple: false
+      - name: Promote Bazel cache
+        uses: ./.github/actions/save-bazel-cache
+        with:
+          mode: merge
+          merge-path: ${{ runner.temp }}/bazel-working-sets
+          prune: 'true'

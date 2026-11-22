@@ -1,20 +1,14 @@
 name: CI
 
 on:
-  # PRs (including drafts) validate branch updates; main and master are supported default-branch conventions.
-  pull_request:
   merge_group:
     types: [checks_requested]
-  push:
-    branches: [main, master]
-    tags: ['v*']
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -23,35 +17,8 @@ defaults:
 
 jobs:
   # Private Linux jobs use RunsOn (4 CPU/16 GB); public labels remain free standard runners.
-  # The required check covers the x86 PR path; release-validation adds release platforms.
-  changes:
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
-    timeout-minutes: 5
-    outputs:
-      heavy: ${{ steps.filter.outputs.heavy }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-          fetch-depth: 0
-      - id: filter
-        shell: bash
-        env:
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '0000000000000000000000000000000000000000' }}
-          HEAD: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
-          EVENT: ${{ github.event_name }}
-          REF: ${{ github.ref }}
-        run: |
-          if [[ "$EVENT" == merge_group ]]; then
-            tools/ci-changes.sh --merge-group "$REF" "$HEAD"
-          else
-            tools/ci-changes.sh "$BASE" "$HEAD"
-          fi >> "$GITHUB_OUTPUT"
-
   nativelink-memory-tests:
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: github.event_name == 'merge_group'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 90
     defaults:
@@ -62,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Select pinned NativeLink and Rust
         run: |
@@ -95,14 +62,13 @@ jobs:
           cargo test -p nativelink-service --test worker_api_server_test --locked --profile smol
 
   nix-vm:
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: github.event_name == 'merge_group'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/family=m8i/image=ubuntu24-full-x64/nested-virt', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
         with:
@@ -117,23 +83,24 @@ jobs:
           NIX_CHECK_RESULTS: ${{ runner.temp }}/nix-check-results
         run: tools/lint.sh --nix-vm
 
-  lint:
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+  lint-checks:
+    if: github.event_name == 'merge_group'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+          fetch-depth: 0
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
         with:
           cache-job: linux-x86_64
           restore-only: 'true'
       - name: Lint
-        timeout-minutes: 3
+        # Portable lint includes the real Git/Bazel selector regression fixtures.
+        timeout-minutes: 5
         run: tools/lint.sh --portable
       - name: Export the Bazel working set
         uses: ./.github/actions/save-bazel-cache
@@ -143,8 +110,7 @@ jobs:
           prune: 'true'
 
   linux-x86_64-shards:
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: github.event_name == 'merge_group'
     strategy:
       fail-fast: false
       matrix:
@@ -154,7 +120,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
@@ -177,14 +143,13 @@ jobs:
           prune: ${{ job.status == 'success' }}
 
   linux-x86_64-bundle:
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: github.event_name == 'merge_group'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 65
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
@@ -221,66 +186,14 @@ jobs:
             ${{ runner.temp }}/bazel-build.profile.gz
           retention-days: 7
 
-  linux-x86_64:
-    needs: [changes, linux-x86_64-shards]
-    if: always()
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
-    timeout-minutes: 10
-    steps:
-      - name: Require x86 shards to succeed
-        shell: bash
-        env:
-          CHANGES_RESULT: ${{ needs.changes.result }}
-          HEAVY: ${{ needs.changes.outputs.heavy }}
-          NEEDS_RESULTS: ${{ format('{0} {1}', needs.changes.result, needs.linux-x86_64-shards.result) }}
-        run: |
-          test "$CHANGES_RESULT" = success
-          case "$HEAVY" in true|false) ;; *) exit 1 ;; esac
-          read -r -a results <<< "$NEEDS_RESULTS"
-          test "${#results[@]}" -eq 2
-          for result in "${results[@]}"; do
-            case "$result" in
-              success) ;;
-              skipped) test "$HEAVY" = false ;;
-              *) exit 1 ;;
-            esac
-          done
-
-  cache-x86_64:
-    needs: [changes, linux-x86_64-shards, linux-x86_64-bundle, lint]
-    if: needs.changes.outputs.heavy == 'true' && needs.linux-x86_64-shards.result == 'success' && needs.linux-x86_64-bundle.result == 'success' && needs.lint.result == 'success'
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - uses: ./.github/actions/setup-nix
-      - uses: ./.github/actions/setup-bazel
-        with:
-          cache-job: linux-x86_64
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: bazel-working-set-x86-*
-          path: ${{ runner.temp }}/bazel-working-sets
-          merge-multiple: false
-      - name: Merge the Bazel working sets
-        uses: ./.github/actions/save-bazel-cache
-        with:
-          mode: merge
-          merge-path: ${{ runner.temp }}/bazel-working-sets
-          prune: 'true'
-
-  cross:
-    needs: changes
-    if: (github.event_name == 'merge_group' || github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository) && needs.changes.outputs.heavy == 'true'
+  cross-build:
+    if: github.event_name == 'merge_group'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64', github.run_id) || 'ubuntu-24.04-arm' }}
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
@@ -289,9 +202,8 @@ jobs:
         run: bazel build --build_event_json_file="$RUNNER_TEMP/bazel-cross.bep.json" --profile="$RUNNER_TEMP/bazel-cross.profile.gz" --platforms=@zig_sdk//libc_aware/platform:linux_amd64_musl //:gang
 
   macos:
-    # RunsOn does not support macOS; public release CI still runs this job.
-    needs: changes
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && needs.changes.outputs.heavy == 'true' && !github.event.repository.private }}
+    # RunsOn does not support macOS; public queue CI runs this advisory job.
+    if: github.event_name == 'merge_group' && !github.event.repository.private
     runs-on: macos-15
     timeout-minutes: 75
     env:
@@ -303,7 +215,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
@@ -324,14 +236,13 @@ jobs:
           bazel test --build_event_json_file="$RUNNER_TEMP/bazel-darwin-test.bep.json" --profile="$RUNNER_TEMP/bazel-darwin-test.profile.gz" "${targets[@]}"
 
   linux-arm64-bundle:
-    needs: changes
-    if: (github.event_name == 'merge_group' || github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository) && needs.changes.outputs.heavy == 'true'
+    if: github.event_name == 'merge_group'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64', github.run_id) || 'ubuntu-24.04-arm' }}
     timeout-minutes: 65
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
@@ -363,14 +274,14 @@ jobs:
           if-no-files-found: error
 
   linux-arm64-checks:
-    needs: [changes, linux-arm64-bundle]
-    if: (github.event_name == 'merge_group' || github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository) && needs.changes.outputs.heavy == 'true'
+    needs: [linux-arm64-bundle]
+    if: github.event_name == 'merge_group'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64', github.run_id) || 'ubuntu-24.04-arm' }}
     timeout-minutes: 65
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
@@ -389,34 +300,9 @@ jobs:
           //crates/gang-postgres:gang_postgres_integration_tests_tests/plugin_test
           //crates/gang-testkit:gang_testkit_integration_tests_tests/postgres_test
 
-  linux-arm64:
-    needs: [changes, linux-arm64-bundle, linux-arm64-checks]
-    if: always() && (github.event_name == 'merge_group' || github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
-    timeout-minutes: 5
-    steps:
-      - name: Require ARM jobs to succeed
-        shell: bash
-        env:
-          CHANGES_RESULT: ${{ needs.changes.result }}
-          HEAVY: ${{ needs.changes.outputs.heavy }}
-          NEEDS_RESULTS: ${{ format('{0} {1} {2}', needs.changes.result, needs.linux-arm64-bundle.result, needs.linux-arm64-checks.result) }}
-        run: |
-          test "$CHANGES_RESULT" = success
-          case "$HEAVY" in true|false) ;; *) exit 1 ;; esac
-          read -r -a results <<< "$NEEDS_RESULTS"
-          test "${#results[@]}" -eq 3
-          for result in "${results[@]}"; do
-            case "$result" in
-              success) ;;
-              skipped) test "$HEAVY" = false ;;
-              *) exit 1 ;;
-            esac
-          done
-
   e2e-gate-1-shards:
-    needs: [changes, linux-x86_64-bundle]
-    if: needs.changes.outputs.heavy == 'true'
+    needs: [linux-x86_64-bundle]
+    if: github.event_name == 'merge_group'
     strategy:
       fail-fast: false
       matrix:
@@ -427,40 +313,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/run-e2e
         with:
           args: --gate 1 --shard ${{ matrix.shard }}/${{ strategy.job-total }}
 
-  e2e-gate-1:
-    needs: [changes, e2e-gate-1-shards]
-    if: always()
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
-    timeout-minutes: 5
-    steps:
-      - name: Require gate 1 shards to succeed
-        shell: bash
-        env:
-          CHANGES_RESULT: ${{ needs.changes.result }}
-          HEAVY: ${{ needs.changes.outputs.heavy }}
-          NEEDS_RESULTS: ${{ format('{0} {1}', needs.changes.result, needs.e2e-gate-1-shards.result) }}
-        run: |
-          test "$CHANGES_RESULT" = success
-          case "$HEAVY" in true|false) ;; *) exit 1 ;; esac
-          read -r -a results <<< "$NEEDS_RESULTS"
-          test "${#results[@]}" -eq 2
-          for result in "${results[@]}"; do
-            case "$result" in
-              success) ;;
-              skipped) test "$HEAVY" = false ;;
-              *) exit 1 ;;
-            esac
-          done
-
   e2e-gate-2-shards:
-    needs: [changes, linux-x86_64-bundle]
-    if: needs.changes.outputs.heavy == 'true'
+    needs: [linux-x86_64-bundle]
+    if: github.event_name == 'merge_group'
     strategy:
       fail-fast: false
       matrix:
@@ -470,93 +331,43 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/run-e2e
         with:
           args: --gate 2 --additions --shard ${{ matrix.shard }}/${{ strategy.job-total }}
 
-  e2e-gate-2:
-    needs: [changes, e2e-gate-2-shards]
-    if: always()
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
-    timeout-minutes: 5
-    steps:
-      - name: Require gate 2 shards to succeed
-        shell: bash
-        env:
-          CHANGES_RESULT: ${{ needs.changes.result }}
-          HEAVY: ${{ needs.changes.outputs.heavy }}
-          NEEDS_RESULTS: ${{ format('{0} {1}', needs.changes.result, needs.e2e-gate-2-shards.result) }}
-        run: |
-          test "$CHANGES_RESULT" = success
-          case "$HEAVY" in true|false) ;; *) exit 1 ;; esac
-          read -r -a results <<< "$NEEDS_RESULTS"
-          test "${#results[@]}" -eq 2
-          for result in "${results[@]}"; do
-            case "$result" in
-              success) ;;
-              skipped) test "$HEAVY" = false ;;
-              *) exit 1 ;;
-            esac
-          done
-
-  required:
-    needs: [changes, nativelink-memory-tests, nix-vm, lint, linux-x86_64-shards, linux-x86_64, linux-x86_64-bundle, e2e-gate-1-shards, e2e-gate-1, e2e-gate-2-shards, e2e-gate-2]
-    if: always()
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
-    timeout-minutes: 5
-    steps:
-      - name: Require blocking jobs to succeed
-        shell: bash
-        env:
-          CHANGES_RESULT: ${{ needs.changes.result }}
-          HEAVY: ${{ needs.changes.outputs.heavy }}
-          # Every blocking job result is mandatory.
-          NEEDS_RESULTS: >-
-            ${{ format('{0} {1} {2} {3} {4} {5} {6} {7} {8} {9} {10}',
-                  needs.changes.result, needs.nativelink-memory-tests.result, needs.nix-vm.result, needs.lint.result,
-                  needs.linux-x86_64-shards.result, needs.linux-x86_64.result, needs.linux-x86_64-bundle.result,
-                  needs.e2e-gate-1-shards.result, needs.e2e-gate-1.result,
-                  needs.e2e-gate-2-shards.result, needs.e2e-gate-2.result) }}
-        run: |
-          test "$CHANGES_RESULT" = success
-          case "$HEAVY" in true|false) ;; *) exit 1 ;; esac
-          read -r -a results <<< "$NEEDS_RESULTS"
-          test "${#results[@]}" -eq 11
-          for result in "${results[@]}"; do
-            case "$result" in
-              success) ;;
-              skipped) test "$HEAVY" = false ;;
-              *) exit 1 ;;
-            esac
-          done
-
   release-validation:
-    # macOS remains a standalone advisory; omitting it avoids waiting for it or gating releases.
-    needs: [changes, required, linux-arm64, cross]
-    if: always() && (github.event_name == 'merge_group' || github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository)
+    # macOS remains advisory and is not a release prerequisite.
+    needs: [nativelink-memory-tests, nix-vm, lint-checks, linux-x86_64-shards, linux-x86_64-bundle, linux-arm64-bundle, linux-arm64-checks, cross-build, e2e-gate-1-shards, e2e-gate-2-shards]
+    if: always() && github.event_name == 'merge_group'
     runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
-      - name: Require release platforms to succeed
+      - name: Require every full validation job
         shell: bash
         env:
-          CHANGES_RESULT: ${{ needs.changes.result }}
-          REQUIRED_RESULT: ${{ needs.required.result }}
-          ARM_RESULT: ${{ needs.linux-arm64.result }}
-          CROSS_RESULT: ${{ needs.cross.result }}
-          HEAVY: ${{ needs.changes.outputs.heavy }}
+          NEEDS_RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
-          test "$CHANGES_RESULT" = success
-          test "$REQUIRED_RESULT" = success
-          test "$ARM_RESULT" = success
-          case "$HEAVY" in
-            true|false) ;;
-            *) exit 1 ;;
-          esac
-          case "$CROSS_RESULT" in
-            success) ;;
-            skipped) test "$HEAVY" = false ;;
-            *) exit 1 ;;
-          esac
+          read -r -a results <<< "$NEEDS_RESULTS"
+          test "${#results[@]}" -eq 10
+          for result in "${results[@]}"; do
+            test "$result" = success
+          done
+
+  readiness:
+    name: ${{ matrix.check }}
+    needs: [release-validation]
+    if: always() && github.event_name == 'merge_group'
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [lint, cross, linux-x86_64, linux-arm64, e2e-gate-1, e2e-gate-2]
+    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    steps:
+      - name: Require full queue validation
+        shell: bash
+        env:
+          RESULT: ${{ needs.release-validation.result }}
+        run: test "$RESULT" = success

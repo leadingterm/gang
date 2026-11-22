@@ -121,6 +121,7 @@ if ! (
 fi
 
 mkdir -p "$scratch/fixture"
+cp "$script_dir/../.bazelversion" "$scratch/fixture/.bazelversion"
 cat >"$scratch/fixture/MODULE.bazel" <<'EOF'
 module(name = "ci_targets_fixture")
 EOF

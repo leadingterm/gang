@@ -47,6 +47,22 @@ translate() {
   printf '%s' "$expr"
 }
 
+# The push promotion job is the only workflow that writes a queue-derived cache.
+promotion="$script_dir/../.github/workflows/cache-promotion.yml"
+yq -o=json '.' "$promotion" | jq -e '
+  .on.push.branches == ["main"] and
+  .concurrency.group == "cache-promotion-${{ github.ref }}" and
+  .concurrency["cancel-in-progress"] == true and
+  .permissions.contents == "read" and .permissions.actions == "read" and
+  ([.jobs.promote.steps[] | select(.uses == "./.github/actions/setup-nix") |
+    .with["cache-save"]] == ["true"]) and
+  ([.jobs.promote.steps[] | select(.uses == "./.github/actions/setup-bazel") |
+    .with["cache-job"]] == ["linux-x86_64"]) and
+  ([.jobs.promote.steps[] | select(.name == "Select qualified queue run") |
+    .run | contains("--require-working-sets")] == [true]) and
+  ([.jobs.promote.steps[] | .run // "" | select(test("bazel (build|test)"))] | length == 0)
+' >/dev/null
+
 # yq parses the actual action YAML rather than matching source formatting.
 bazel=$(yq -er '.runs.steps[] | select(.name == "Mark the start of the build") | .env.SAVE' "$script_dir/../.github/actions/setup-bazel/action.yml")
 nix=$(yq -o=json '.runs.steps' "$script_dir/../.github/actions/setup-nix/action.yml" | jq -er '.[] | select((.uses // "") | startswith("nix-community/cache-nix-action@")) | .with.save')

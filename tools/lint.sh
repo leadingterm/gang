@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# The x86_64 PR gate runs portable lint and a separate nix-vm job.
-# Rustfmt and Clippy for every x86 Rust target, tests included, run in the full test shards.
+# PR preflight and the queue run portable lint; the queue also runs a separate nix-vm job.
+# Rustfmt and Clippy for every x86 Rust target run in PR preflight and the full test shards.
 # Portable lint checks BUILD sync, infra, scripts, workflows and flake evaluation; no Darwin compilation.
 # With no arguments, run portable lint plus VM checks (x86_64 Linux/KVM). Stop at the first failure.
 # Usage: nix develop -c tools/lint.sh [--portable|--nix-vm]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 portable() {
+  export PYTHONDONTWRITEBYTECODE=1
   "${BAZEL:-bazel}" run --config=local -c opt --remote_executor= --remote_cache= //:gazelle.check
   tools/check-required-jobs_test.sh
   tools/check-opentofu-tests.sh
-  tools/ci-changes_test.sh
+  tools/ci-pr_test.sh
+  python3 tools/changelog.py check
+  python3 -m unittest discover -s tools -p '*_test.py'
   tools/ci-targets_test.sh
   tools/ci-cache_test.sh
   tools/ci-cache-policy_test.sh
