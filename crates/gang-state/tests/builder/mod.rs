@@ -169,7 +169,7 @@ fn fill_into(
         catalog: &catalog,
         actions: world.actions.as_ref(),
         events: &[],
-        infrastructure: &world.infrastructure,
+        infrastructure: &[],
         builds: world.builds.as_ref().unwrap_or(&empty_builds),
         traffic: world.traffic,
         measured: world.measured.as_ref(),
@@ -206,6 +206,11 @@ fn fill_into(
     } else {
         &passes
     };
+    let infrastructure = if matches!(&pass, PassStatus::Observed { .. }) {
+        &[][..]
+    } else {
+        &world.infrastructure
+    };
     let empty_builds = gang_insight::Builds::new(&gang_config::BuildsConfig::default());
     let inputs = Inputs {
         wall: ts(wall),
@@ -214,7 +219,7 @@ fn fill_into(
         catalog: &catalog,
         actions: world.actions.as_ref(),
         events: &[],
-        infrastructure: &world.infrastructure,
+        infrastructure,
         builds: world.builds.as_ref().unwrap_or(&empty_builds),
         traffic: world.traffic,
         measured: world.measured.as_ref(),
@@ -3274,17 +3279,7 @@ fn current_launch_warning_tracks_canonical_outcomes_on_every_pass() -> TestResul
             replacing: None,
         },
     ));
-    let fourth = fill(
-        &mut builder,
-        &third,
-        4,
-        &world,
-        8,
-        Outcome::Observed {
-            known: true,
-            supplies: vec![true],
-        },
-    )?;
+    let fourth = fill(&mut builder, &third, 4, &world, 8, ok(0))?;
     assert!(fourth.fleets[0].launch_warning.is_none());
 
     world
@@ -3301,6 +3296,115 @@ fn current_launch_warning_tracks_canonical_outcomes_on_every_pass() -> TestResul
         &event.change, EventChange::Aws { event }
             if matches!(&event.kind, AwsEventKind::CapacityUnavailable { .. })
     )));
+    Ok(())
+}
+
+#[test]
+fn launch_warning_survives_observations_and_tracks_current_supply() -> TestResult {
+    use gang_spi::{
+        FleetInfrastructureEvent, InfrastructureEvent, InfrastructureEventKind as Kind,
+    };
+
+    let policy = policy("alpha", 0, 4)?;
+    let mut world = World::default();
+    world.properties.push(properties(&policy, vec![]));
+    world.policies.push(policy);
+    world.supplies.push(FleetSupply {
+        desired: 1,
+        requested: Some(2),
+        ..FleetSupply::default()
+    });
+    let fleet = FleetName::try_new("alpha")?;
+    let instance = instance_id(1)?;
+    let record = |id: &str, at, kind| FleetInfrastructureEvent {
+        fleet: fleet.clone(),
+        event: InfrastructureEvent {
+            id: id.into(),
+            at: ts(at),
+            kind,
+        },
+    };
+    world.infrastructure.push(record(
+        "failure",
+        1,
+        Kind::CapacityUnavailable {
+            reason: "no capacity".into(),
+        },
+    ));
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let first = fill(&mut builder, &blank(), 1, &world, 2, ok(0))?;
+    assert_eq!(first.fleets[0].desired, 2);
+    assert_eq!(
+        first.fleets[0].launch_warning.as_ref().map(|w| w.at),
+        Some(ts(1))
+    );
+    let observed = || Outcome::Observed {
+        known: true,
+        supplies: vec![true],
+    };
+    let second = fill(&mut builder, &first, 2, &world, 3, observed())?;
+    let third = fill(&mut builder, &second, 3, &world, 4, observed())?;
+    assert_eq!(
+        second.fleets[0].launch_warning,
+        first.fleets[0].launch_warning
+    );
+    assert_eq!(
+        third.fleets[0].launch_warning,
+        first.fleets[0].launch_warning
+    );
+
+    world.supplies[0].instances = vec![
+        fleet_instance(&instance, InstanceLifecycle::InService, 1),
+        fleet_instance(&instance_id(2)?, InstanceLifecycle::Pending, 1),
+    ];
+    let met = fill(&mut builder, &third, 4, &world, 5, observed())?;
+    assert_eq!(met.fleets[0].instances.in_service, 1);
+    assert_eq!(met.fleets[0].instances.pending, 1);
+    assert!(met.fleets[0].launch_warning.is_none());
+    // A control snapshot must refresh the cache even while capacity is met.
+    world.infrastructure.push(record(
+        "new-failure",
+        6,
+        Kind::CapacityUnavailable {
+            reason: "still unavailable".into(),
+        },
+    ));
+    let met_control = fill(&mut builder, &met, 5, &world, 7, ok(0))?;
+    assert!(met_control.fleets[0].launch_warning.is_none());
+    world.supplies[0].instances.pop();
+    let short = fill(&mut builder, &met_control, 6, &world, 8, observed())?;
+    let warning = short.fleets[0]
+        .launch_warning
+        .as_ref()
+        .ok_or("missing warning")?;
+    assert_eq!((&*warning.reason, warning.at), ("still unavailable", ts(6)));
+
+    world.infrastructure.push(record(
+        "success",
+        9,
+        Kind::InstanceLaunched {
+            instance: instance.clone(),
+        },
+    ));
+    let success = fill(&mut builder, &short, 7, &world, 10, ok(0))?;
+    assert!(success.fleets[0].launch_warning.is_none());
+    let after_success = fill(&mut builder, &success, 8, &world, 11, observed())?;
+    assert!(after_success.fleets[0].launch_warning.is_none());
+
+    world.infrastructure.push(record(
+        "another-failure",
+        12,
+        Kind::CapacityUnavailable {
+            reason: "unavailable again".into(),
+        },
+    ));
+    let failed = fill(&mut builder, &after_success, 9, &world, 13, ok(0))?;
+    assert!(failed.fleets[0].launch_warning.is_some());
+    world.infrastructure.clear();
+    let empty = fill(&mut builder, &failed, 10, &world, 14, ok(0))?;
+    assert!(empty.fleets[0].launch_warning.is_none());
+    let after_empty = fill(&mut builder, &empty, 11, &world, 15, observed())?;
+    assert!(after_empty.fleets[0].launch_warning.is_none());
     Ok(())
 }
 

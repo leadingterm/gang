@@ -909,6 +909,13 @@ test("legacy fleet samples show not recorded instead of zero", (t) => {
   }
 });
 
+test("Workers shows only the empty message when no fleets are configured", (t) => {
+  const state = { ...recentState(2), fleets: [], workers: [], instances: [] };
+  const markup = html({ state }, <Workers />);
+  t.assert.match(visibleText(markup), /No workers/);
+  t.assert.doesNotMatch(markup, /class="toolbar"|<select\b|wgrid__axis|Instance history/);
+});
+
 test("Workers shows histories for idle fleets without workers and offers them in the fleet filter", (t) => {
   const fleet = live.fleets[0];
   if (!fleet) throw new Error("the live recording has a fleet");

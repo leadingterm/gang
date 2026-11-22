@@ -58,6 +58,7 @@ pub struct Builder {
     last_evicted: Option<u64>,
     last_completed: Option<u64>,
     last_unknown_step: Option<Timestamp>,
+    launch_outcomes: BTreeMap<String, gang_wire::LaunchWarning>,
     scratch: Scratch,
 }
 
@@ -90,6 +91,7 @@ impl Builder {
             last_evicted: baseline.evicted,
             last_completed: Some(0),
             last_unknown_step: None,
+            launch_outcomes: BTreeMap::new(),
             scratch: Scratch::default(),
         }
     }
@@ -160,11 +162,7 @@ impl Builder {
                 scheduler_known = Some(known);
             }
         }
-        crate::infrastructure::fill_launch_warnings(
-            &mut cur.fleets,
-            inputs.infrastructure,
-            &mut self.scratch.status_name,
-        );
+        self.project_launch_warnings(cur, inputs);
         let running = cur
             .fleets
             .iter()
@@ -207,6 +205,19 @@ impl Builder {
             }
         });
         fill_actions(cur, prev, inputs, &self.config, &mut self.scratch);
+    }
+
+    /// Retains canonical outcomes across independent observations and projects current capacity.
+    fn project_launch_warnings(&mut self, cur: &mut State, inputs: &Inputs<'_>) {
+        if !matches!(inputs.pass, PassStatus::Observed { .. }) {
+            crate::infrastructure::refresh_launch_outcomes(
+                &mut self.launch_outcomes,
+                inputs.fleets,
+                inputs.infrastructure,
+                &mut self.scratch.status_name,
+            );
+        }
+        crate::infrastructure::fill_launch_warnings(&mut cur.fleets, &self.launch_outcomes);
     }
 
     /// Applies control-owned outlook and derived metadata without replacing observations.

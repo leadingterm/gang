@@ -1,5 +1,7 @@
 //! Pure projection of operational infrastructure observations onto current fleet membership.
 
+use std::collections::BTreeMap;
+
 use gang_reconciler::FleetPass;
 use gang_spi::{
     FleetInfrastructureEvent, InfrastructureEventKind, InfrastructureInterruptionAction,
@@ -11,49 +13,77 @@ use gang_wire::{
     InfrastructurePhase, InfrastructureReason, name,
 };
 
-/// Projects the newest canonical launch outcome independently of the bounded event history.
-pub(crate) fn fill_launch_warnings(
-    fleets: &mut [gang_wire::Fleet],
+/// Refreshes the latest failed launch outcomes from a complete canonical snapshot.
+pub(crate) fn refresh_launch_outcomes(
+    outcomes: &mut BTreeMap<String, gang_wire::LaunchWarning>,
+    fleets: &[FleetPass],
     records: &[FleetInfrastructureEvent],
     scratch: &mut String,
 ) {
+    outcomes.retain(|fleet, _| {
+        fleets
+            .iter()
+            .any(|pass| same_name::<name::Fleets>(fleet, &pass.policy.name, scratch))
+    });
     for fleet in fleets {
-        let latest = if fleet
-            .instances
-            .pending
-            .saturating_add(fleet.instances.in_service)
-            < fleet.desired
-        {
-            records
-                .iter()
-                .filter(|record| {
-                    matches!(
+        name::write_of::<name::Fleets>(scratch, &fleet.policy.name);
+        let latest = records
+            .iter()
+            .filter(|record| {
+                record.fleet == fleet.policy.name
+                    && matches!(
                         record.event.kind,
                         InfrastructureEventKind::CapacityUnavailable { .. }
                             | InfrastructureEventKind::InstanceLaunched { .. }
                             | InfrastructureEventKind::ReplacementLaunched { .. }
-                    ) && same_name::<name::Fleets>(&fleet.name, &record.fleet, scratch)
-                })
-                .max_by(|a, b| {
-                    a.event
-                        .at
-                        .cmp(&b.event.at)
-                        .then_with(|| name::cmp_of::<name::AwsEvents>(&a.event.id, &b.event.id))
-                })
-        } else {
-            None
-        };
+                    )
+            })
+            .max_by(|a, b| {
+                a.event
+                    .at
+                    .cmp(&b.event.at)
+                    .then_with(|| name::cmp_of::<name::AwsEvents>(&a.event.id, &b.event.id))
+            });
         if let Some(record) = latest
             && let InfrastructureEventKind::CapacityUnavailable { reason } = &record.event.kind
         {
-            if let Some(warning) = &mut fleet.launch_warning {
+            if let Some(warning) = outcomes.get_mut(scratch.as_str()) {
                 warning.reason.clone_from(reason);
                 warning.at = record.event.at;
             } else {
-                fleet.launch_warning = Some(gang_wire::LaunchWarning {
-                    reason: reason.clone(),
-                    at: record.event.at,
-                });
+                outcomes.insert(
+                    scratch.clone(),
+                    gang_wire::LaunchWarning {
+                        reason: reason.clone(),
+                        at: record.event.at,
+                    },
+                );
+            }
+        } else {
+            outcomes.remove(scratch.as_str());
+        }
+    }
+}
+
+/// Projects cached outcomes against the current observed supply on every publication.
+pub(crate) fn fill_launch_warnings(
+    fleets: &mut [gang_wire::Fleet],
+    outcomes: &BTreeMap<String, gang_wire::LaunchWarning>,
+) {
+    for fleet in fleets {
+        let warning = (fleet
+            .instances
+            .pending
+            .saturating_add(fleet.instances.in_service)
+            < fleet.desired)
+            .then(|| outcomes.get(&fleet.name))
+            .flatten();
+        if let Some(warning) = warning {
+            if let Some(current) = &mut fleet.launch_warning {
+                current.reason.clone_from(&warning.reason);
+                current.at = warning.at;
+            } else {
+                fleet.launch_warning = Some(warning.clone());
             }
         } else {
             fleet.launch_warning = None;

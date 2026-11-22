@@ -279,6 +279,7 @@ export const Workers = () => {
   const ws = state.workers;
   const pending = sum(state.fleets, (f) => f.instances.pending);
   const empty = ws.length === 0 && state.instances.length === 0;
+  if (empty && state.fleets.length === 0) return <Empty><h2>No workers</h2></Empty>;
   return (
     <>
       {empty && <Empty><h2>{pending ? `No workers yet · ${pending} booting` : "No workers"}</h2></Empty>}
