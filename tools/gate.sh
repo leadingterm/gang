@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# The local x86_64 Linux diagnostic mirrors the PR gate, stopping at the first failure:
+# The local x86_64 Linux diagnostic covers the queue's x86 checks, stopping at the first failure:
 # portable lint (including BUILD sync), nix-vm checks, the full workspace and bundle, then
 # all CI Gate 1 and Gate 2 addition shards through the same tools/e2e-gate.sh launcher as CI.
-# Run these harnesses sequentially: local parity means identical scenario coverage, not
-# launching CI's sixteen independent harness jobs together on one bounded host.
-# ARM, cross and macOS validation run separately on default-branch pushes and v* tags.
+# Run these harnesses sequentially: coverage matches CI, without launching sixteen
+# independent harness jobs together on one bounded host.
+# ARM, cross and advisory macOS validation run separately in the merge queue.
 # Usage: nix develop -c tools/gate.sh [--list-e2e]. BAZEL names the Bazel command (default: the devShell's `bazel`).
 set -euo pipefail
 cd "$(dirname "$0")/.."

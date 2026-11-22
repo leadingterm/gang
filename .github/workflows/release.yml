@@ -25,7 +25,6 @@ defaults:
     shell: bash
 
 jobs:
-  # gh and sha256sum are the runner's own: this job checks out nothing and installs no Nix.
   locate:
     if: ${{ !(github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')) }}
     runs-on: ubuntu-24.04-arm
@@ -36,81 +35,18 @@ jobs:
     outputs:
       run-id: ${{ steps.ci.outputs.run-id }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - name: Find the CI run to release
         id: ci
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
-        run: |
-          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid release SHA" >&2; exit 1; }
-          gh api "repos/$GH_REPO/compare/$SHA...main" \
-            | jq -se 'length == 1 and (.[0] | type == "object" and (.status == "identical" or .status == "ahead"))' >/dev/null
-          release_tree="$(gh api "repos/$GH_REPO/git/commits/$SHA" \
-            | jq -ser 'if length == 1 then .[0].tree.sha | select(type == "string" and test("^[0-9a-f]{40}$")) else error("invalid commit") end')"
-          pr_heads="$(gh api --paginate "repos/$GH_REPO/commits/$SHA/pulls?per_page=100" \
-            | jq -rs --arg sha "$SHA" --arg repo "$GH_REPO" '
-              if length == 0 or any(.[]; type != "array") or
-                any(.[][]; type != "object" or
-                  (has("merged_at") | not) or (has("merge_commit_sha") | not) or
-                  (.head | type) != "object" or (.head | has("repo") | not) or
-                  ((.merged_at | type) != "string" and .merged_at != null) or
-                  (.base.ref | type) != "string" or
-                  ((.head.repo.full_name | type) != "string" and .head.repo != null) or
-                  (.head.sha | type) != "string" or
-                  ((.merge_commit_sha | type) != "string" and .merge_commit_sha != null))
-              then error("invalid pull requests")
-              else [ .[][] | select(.merged_at != null and .base.ref == "main"
-                and .head.repo.full_name == $repo and .merge_commit_sha == $sha)
-                | .head.sha | if test("^[0-9a-f]{40}$") then "pr:" + . else error("invalid pull request head SHA") end ] | unique | .[] end')"
-          candidates=""
-          for source in $pr_heads "push:$SHA"; do
-            head="${source#*:}"
-            kind="${source%%:*}"
-            runs="$(gh api --paginate "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$head&per_page=100" \
-              | jq -rs --arg head "$head" --arg kind "$kind" --arg repo "$GH_REPO" '
-                if length == 0 or any(.[]; (.workflow_runs | type) != "array") or
-                  any(.[].workflow_runs[]; type != "object" or (.id | type) != "number" or (.id <= 0) or (.id != (.id | floor)) or
-                    (.created_at | type) != "string" or (.head_sha | type) != "string" or
-                    (.event | type) != "string" or (.head_branch | type) != "string" or
-                    (.head_repository.full_name | type) != "string" or
-                    (.status | type) != "string" or (has("conclusion") | not) or
-                    ((.conclusion | type) != "string" and .conclusion != null))
-                then error("invalid runs")
-                else [.[].workflow_runs[] | select(.head_sha == $head and
-                  .head_repository.full_name == $repo and .status == "completed" and
-                  (if $kind == "push" then
-                    (.event == "push" and .head_branch == "main") or
-                    (.event == "merge_group" and (.head_branch | startswith("gh-readonly-queue/main/")))
-                   else .event == "pull_request" end))]
-                  | sort_by(.created_at) | reverse | .[].id end')"
-            if [[ -n "$runs" ]]; then
-              head_tree="$(gh api "repos/$GH_REPO/git/commits/$head" \
-                | jq -ser 'if length == 1 then .[0].tree.sha | select(type == "string" and test("^[0-9a-f]{40}$")) else error("invalid commit") end')"
-              if [[ "$head_tree" == "$release_tree" ]]; then
-                candidates+="$runs"$'\n'
-              fi
-            fi
-          done
-          run_id=""
-          for candidate in $candidates; do
-            gates="$(gh api --paginate "repos/$GH_REPO/actions/runs/$candidate/jobs?filter=latest&per_page=100" \
-              | jq -s 'if length == 0 or any(.[]; (.jobs | type) != "array") or any(.[].jobs[]; type != "object" or (.name | type) != "string" or (has("conclusion") | not) or ((.conclusion | type) != "string" and .conclusion != null)) then error("invalid jobs") else [.[].jobs[] | select(.name == "required" or .name == "release-validation")] end')"
-            if ! jq -e 'length == 2 and ([.[] | select(.name == "required" and .conclusion == "success")] | length == 1) and ([.[] | select(.name == "release-validation" and .conclusion == "success")] | length == 1)' <<< "$gates" >/dev/null; then
-              continue
-            fi
-            artifacts="$(gh api --paginate "repos/$GH_REPO/actions/runs/$candidate/artifacts?per_page=100" \
-              | jq -s 'if length == 0 or any(.[]; (.artifacts | type) != "array") or any(.[].artifacts[]; type != "object" or (.name | type) != "string" or (.expired | type) != "boolean") then error("invalid artifacts") else [.[].artifacts[] | select(.expired == false) | .name] end')"
-            if jq -e '["gang-x86_64-unknown-linux-musl", "gang-aarch64-unknown-linux-musl"] - . == []' <<< "$artifacts" >/dev/null; then
-              run_id="$candidate"
-              break
-            fi
-          done
-          if [[ -z "$run_id" ]]; then
-            echo "::error::no trusted CI run on the release tree has successful latest required and release-validation jobs and both required unexpired Linux artifacts" >&2
-            exit 1
-          fi
-          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+        run: python3 tools/queue_ci.py --sha "$SHA" --github-output "$GITHUB_OUTPUT"
 
   # Build each architecture's disk image from the binaries CI tested.
   images:
@@ -314,6 +250,12 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .source
+          fetch-depth: 0
+          persist-credentials: false
       - name: Select available CI binaries
         id: binaries
         env:
@@ -350,10 +292,18 @@ jobs:
         with:
           name: gang-amis
           path: dist
+      - name: Render changelog
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+          TAG: ${{ github.ref_name }}
+          SECTION: ${{ runner.temp }}/release-section.md
+        run: |
+          python3 .source/tools/changelog.py --repo .source render --ref "$RELEASE_COMMIT" \
+            --tag "$TAG" --output dist/CHANGELOG.md --section-output "$SECTION"
       - name: Write SHA256SUMS
         working-directory: dist
         run: |
-          sha256sum gang-* >SHA256SUMS
+          sha256sum gang-* CHANGELOG.md >SHA256SUMS
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS
@@ -363,18 +313,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-          RELEASE_COMMIT: ${{ github.sha }}
+          SECTION: ${{ runner.temp }}/release-section.md
+          NOTES: ${{ runner.temp }}/release-notes.md
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ needs.locate.outputs.run-id }}
         run: |
-          message="$(gh api "repos/$GH_REPO/commits/$RELEASE_COMMIT" --jq .commit.message)"
-          printf -v notes '%s\n\n%s' "$message" \
-            "Binaries built and tested by CI run $RUN_URL. Primary public AMIs of each architecture: gang-amis.json."
+          cat "$SECTION" > "$NOTES"
+          printf '\n\n%s\n' \
+            "Binaries built and tested by CI run $RUN_URL. Primary public AMIs of each architecture: gang-amis.json." >> "$NOTES"
           if [[ ! -f gang-aarch64-apple-darwin ]]; then
-            notes+=$'\n\n'"The macOS binary is not included in this release."
+            printf '\n%s\n' "The macOS binary is not included in this release." >> "$NOTES"
           fi
           prerelease=()
           if [[ "$TAG" == *-* ]]; then
             prerelease=(--prerelease)
           fi
-          gh release create "$TAG" --verify-tag --title "$TAG" --notes "$notes" \
-            --generate-notes "${prerelease[@]}" gang-* SHA256SUMS
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$NOTES" \
+            --generate-notes "${prerelease[@]}" gang-* CHANGELOG.md SHA256SUMS

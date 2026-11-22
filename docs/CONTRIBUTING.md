@@ -43,11 +43,21 @@ not a delay before creating builds.
 
 ## Checks and failures
 
-Pull request checks validate the PR checkout. Queue checks run on a
-synthetic `merge_group` commit, which may include earlier queued changes; the
-combined head is tested before a batch lands. Some checks intentionally skip
-for docs-only changes, but `docs/API.md` and `docs/PLAN.md` are live inputs.
-A skipped check is not evidence that its underlying tests ran.
+Pull request checks run portable lint, build `//:gang`, run all generated
+Clippy and rustfmt tests, and run affected Rust unit tests selected through
+reverse dependencies, with a conservative all-unit fallback for uncertain
+changes. Even docs-only PRs run the real build and lint. Queue checks run the
+full suite on a synthetic `merge_group` commit, including for docs-only changes.
+The same six required check names mean all PR preflight work succeeded in a PR
+context, and full qualification succeeded in a queue context; PR success does
+not mean ARM, cross or E2E ran. Failure, cancellation, skipped or missing
+producers cannot pass.
+
+On every push to `main`, a trusted-main conflict diagnostic uses `git
+merge-tree` against every open PR, including drafts and PRs with other base
+branches. It adds `bot:needs-rebase` and a comment with escaped conflicting
+paths when needed, and clears the report when clean. It never checks out or
+executes PR code and is not a waiver of the queue gates.
 
 If a queue check fails, inspect the failing merge-group run, for example:
 
@@ -57,3 +67,15 @@ gh run view <run-id> --repo leadingterm/gang --log-failed
 
 Fix the cause, push the change, and enable auto-merge again to re-enqueue the
 pull request. Do not bypass or reorder the queue.
+
+## Changelog entries
+
+Add new release notes in a uniquely named `changes/<topic>.md` fragment instead
+of appending to the shared Unreleased section. Use one or more headings from
+`### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`,
+`### Security` and `### Upgrade notes`, each followed by nonempty bullets;
+indent continuation lines under their bullet. Fragments may be edited before
+release, but released fragments are immutable and retained as history. The
+root `CHANGELOG.md` is the legacy archive; releases generate the current section
+and reconstruct later history from fragments and tags before appending it.
+

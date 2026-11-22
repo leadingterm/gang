@@ -13,6 +13,21 @@ yq -er '.runs.steps[] | select(.name == "Prepare snapshot") | .run' \
 export_body="$scratch/export.sh"
 yq -er '.runs.steps[] | select(.name == "Export shard working set") | .run' \
   "$repo/.github/actions/save-bazel-cache/action.yml" >"$export_body"
+# Exercise the actual promotion wiring as well as the shared merge implementation.
+yq -o=json '.' "$repo/.github/workflows/cache-promotion.yml" | jq -e '
+  [.jobs.promote.steps[] | select(.name == "Download validated working sets")] as $download |
+  [.jobs.promote.steps[] | select(.name == "Promote Bazel cache")] as $merge |
+  ($download | length == 1) and
+  ($download[0].uses | startswith("actions/download-artifact@")) and
+  ($download[0].with["artifact-ids"] == "${{ steps.queue.outputs.working-set-artifact-ids }}") and
+  ($download[0].with["run-id"] == "${{ steps.queue.outputs.run-id }}") and
+  ($download[0].with["github-token"] == "${{ github.token }}") and
+  ($download[0].with["merge-multiple"] == false) and
+  ($merge | length == 1) and
+  ($merge[0].uses == "./.github/actions/save-bazel-cache") and
+  ($merge[0].with.mode == "merge") and ($merge[0].with.prune == "true") and
+  ($merge[0].with["merge-path"] == $download[0].with.path)
+' >/dev/null
 cd "$repo"
 
 key1=$(printf '%064x' 1)
