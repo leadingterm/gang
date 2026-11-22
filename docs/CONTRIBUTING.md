@@ -53,6 +53,12 @@ context, and full qualification succeeded in a queue context; PR success does
 not mean ARM, cross or E2E ran. Failure, cancellation, skipped or missing
 producers cannot pass.
 
+`gh pr checks <number> --required --watch` follows the PR's latest commit, not
+its prepared merge-group commit. A successful PR check watch is therefore not
+evidence that queue validation has finished. Follow the PR's queue entry and
+its linked `merge_group` run for combined-tree results. Advisory macOS results
+are not required for merging.
+
 On every push to `main`, a trusted-main conflict diagnostic uses `git
 merge-tree` against every open PR, including drafts and PRs with other base
 branches. It adds `needs-rebase` and a comment with escaped conflicting
