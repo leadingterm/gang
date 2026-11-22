@@ -60,6 +60,7 @@ mod glibc_toolchain;
 mod h2_frames;
 mod held_build;
 mod hold;
+mod history_rollback;
 mod host;
 mod http;
 mod identity;

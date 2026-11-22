@@ -9,10 +9,10 @@ use std::time::Duration;
 use gang_clock::Tick;
 use gang_config::{FleetPolicy, ScalingConfig};
 use gang_spi::{CompletionRates, SchedulerSnapshot};
-use gang_types::{SourceId, property::MILLICORES_PER_CORE};
+use gang_types::SourceId;
 
 use crate::profile::{ActivityForecast, SourceProfiles};
-use crate::vectors::{CapacityVector, Horizon, ResourceVector, product, u64_to_f64, u128_to_u64};
+use crate::vectors::{CapacityVector, Horizon, ResourceVector, product, u128_to_u64, worker_resources};
 use crate::{FleetPass, HostedSnapshot, PassTime};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -545,16 +545,8 @@ impl SourceRates {
             if f64::from(worker.running_actions) <= known.actions {
                 continue;
             }
-            let policy = &fleets[fleet].policy;
-            let cpu = u64::from(policy.vcpus_per_instance.get())
-                .saturating_mul(MILLICORES_PER_CORE)
-                .saturating_mul(u64::from(self.cpu_oversubscription.get()));
-            let budget = ResourceVector {
-                cpu_millicores: u64_to_f64(cpu),
-                memory: u64_to_f64(policy.memory_per_instance.get().get()),
-                disk: u64_to_f64(policy.disk_per_instance.get().get()),
-                ..ResourceVector::default()
-            };
+            let mut budget = ResourceVector::from_action(worker_resources(worker));
+            budget.actions = 0.0;
             let missing = budget.sub_floor(known);
             self.fleet_scratch[fleet].actual += missing;
             if self.worker_serving[index] {
@@ -1006,7 +998,11 @@ mod tests {
             environment: Some(fleet.action_environment.clone()),
             running_actions: running,
             max_inflight_actions: Some(nonzero_u32(16)),
-            capacity: None,
+            capacity: Some(ActionResources {
+                cpu_millicores: u64::from(fleet.vcpus_per_instance.get()) * 1_000,
+                memory: fleet.memory_per_instance.get(),
+                disk: fleet.disk_per_instance.get(),
+            }),
             reserved: None,
             cache: None,
             draining,
@@ -1802,6 +1798,45 @@ mod tests {
         assert_eq!(world.rates.fleet(0).serving_load, CapacityVector::ONE);
         assert_eq!(world.rates.fleet(0).total_load, CapacityVector::ONE);
         assert_eq!(world.rates.index.len(), 0);
+    }
+
+    #[test]
+    fn partial_listing_charges_actual_worker_capacity_without_source_attribution() {
+        use gang_types::Bytes;
+
+        for capacity in [
+            Some(ActionResources {
+                cpu_millicores: 120_000,
+                memory: Bytes::new(131_558_744_064),
+                disk: Bytes::gib(240),
+            }),
+            None,
+            Some(ActionResources::default()),
+        ] {
+            let mut world = World::new(1, 2);
+            let mut host = worker(&world.fleets[0].policy, "large", 2, false);
+            host.capacity = capacity;
+            world.snapshot.workers.push(host);
+            let mut row = executing(source(1), 0, 0, Some(10));
+            row.resources = ActionResources {
+                cpu_millicores: 70_000,
+                memory: Bytes::gib(70),
+                disk: Bytes::gib(70),
+            };
+            let known = ResourceVector::from_action(row.resources);
+            world.snapshot.executing.push(row);
+            world.observe(0);
+            let expected = capacity.map_or(known, |resources| {
+                ResourceVector::from_action(resources).component_max(known)
+            });
+            let normalized = expected.normalized(&world.fleets[0].policy, nonzero_u32(1));
+            assert_eq!(world.rates.fleet(0).serving_load, normalized);
+            assert_eq!(world.rates.fleet(0).total_load, normalized);
+            assert_eq!(world.cell(source(1), 0).running, known);
+            if capacity.is_some_and(|resources| resources.memory.get() > 0) {
+                exact(normalized.utilization(normalized).unwrap(), 1.0);
+            }
+        }
     }
 
     #[test]

@@ -12,7 +12,8 @@ use crate::history::history_id;
 use gang_spi::{LearnedHistory, PortError, RecordKey, RecordKind};
 
 const FORMAT_VERSION: u32 = 1;
-const SAMPLER_GENERATION: u32 = nativelink_scheduler::resource_sketch::SAMPLER_GENERATION;
+// Duration samples have not changed with resource-sketch policy generations.
+const SAMPLER_GENERATION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct StoredDuration {
@@ -266,7 +267,7 @@ impl ActionDurations {
             let body = serde_json::to_vec(&stored).map_err(PortError::backend)?;
             into.push(LearnedHistory {
                 key: key.record_key(),
-                body,
+                body: body.into(),
                 expires_at: Timestamp::from_unix_millis(expires),
             });
         }
@@ -331,6 +332,8 @@ mod tests {
         source.record("", "new", 20, at(2));
         let mut records = Vec::new();
         source.snapshot(at(3), &mut records).unwrap();
+        let stored: StoredDuration = serde_json::from_slice(&records[0].body).unwrap();
+        assert_eq!(stored.sampler_generation, 2);
         let mut later = Vec::new();
         source.snapshot(at(4), &mut later).unwrap();
         assert_eq!(records, later);
@@ -354,7 +357,7 @@ mod tests {
         let mut corrupt = records.clone();
         let mut body: serde_json::Value = serde_json::from_slice(&corrupt[1].body).unwrap();
         body["sampler_generation"] = serde_json::json!(999);
-        corrupt[1].body = serde_json::to_vec(&body).unwrap();
+        corrupt[1].body = serde_json::to_vec(&body).unwrap().into();
         restored.restore(at(3), &corrupt);
         assert_eq!(restored.expected("", "new", at(3)), None);
     }

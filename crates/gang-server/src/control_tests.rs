@@ -529,6 +529,15 @@ fn supply_with(name: &str, launched_at: Timestamp, desired: u32) -> FleetSupply 
     }
 }
 
+/// Actual capacity for the 4-vCPU, 8-GiB memory, 100-GiB disk test fleet.
+fn worker_capacity(cpu_factor: u32) -> gang_types::ActionResources {
+    gang_types::ActionResources {
+        cpu_millicores: 4_000 * u64::from(cpu_factor),
+        memory: gang_types::Bytes::new(8 << 30),
+        disk: gang_types::Bytes::new(100 << 30),
+    }
+}
+
 /// An idle worker on `instance`, connected at `last_seen`.
 fn idle_worker(instance: &InstanceId, last_seen: Timestamp) -> TestResult<WorkerState> {
     Ok(WorkerState {
@@ -537,7 +546,7 @@ fn idle_worker(instance: &InstanceId, last_seen: Timestamp) -> TestResult<Worker
         environment: Some("host:test".parse().expect("valid test environment")),
         running_actions: 0,
         max_inflight_actions: NonZeroU32::new(4),
-        capacity: None,
+        capacity: Some(worker_capacity(2)),
         reserved: None,
         cache: None,
         current_build: true,
@@ -2559,6 +2568,7 @@ async fn overflow_resource_demand_is_independent_of_execution_duration() -> Test
             workers: vec![WorkerState {
                 fleet: first.clone(),
                 running_actions: 4,
+                capacity: Some(worker_capacity(factor)),
                 ..idle_worker(&instance_id("first-1"), clock.wall())?
             }],
             queued: vec![queued],

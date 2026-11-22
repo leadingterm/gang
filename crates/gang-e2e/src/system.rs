@@ -189,6 +189,10 @@ gang_types::string_enum! {
         InputRoot = "input_root",
         /// Runs in its own cgroup scope and waits until released, leaving an orphan process behind.
         Hold = "hold",
+        /// Holds an untrained, floor-free negative control for history rollback.
+        HistoryCold = "history_cold",
+        /// Trains or holds the same floor-free target and mnemonic across controller versions.
+        HistoryMemory = "history_memory",
         /// Allocates above its reservation on a healthy worker.
         MemoryHog = "memory_hog",
         /// Holds a plateau above the explicitly enabled soft limit until killed and requeued.

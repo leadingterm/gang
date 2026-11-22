@@ -2,6 +2,7 @@
 //! value that carries an instance of each, and the settings the run loop reads.
 
 use std::ffi::OsString;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,6 +15,15 @@ use gang_spi::{
 
 use crate::credentials::Enroller;
 use crate::transport::{ServerCaSource, Transport};
+
+/// Physical host measurements supplied by the host composition, not operator configuration.
+#[derive(Clone, Copy, Debug)]
+pub struct PhysicalResources {
+    /// Logical CPUs available to the worker.
+    pub vcpus: NonZeroU32,
+    /// Physical host memory before the worker reserve.
+    pub memory: gang_types::Bytes,
+}
 
 /// The concrete adapter types a worker runs on.
 pub trait WorkerDeployment: 'static {

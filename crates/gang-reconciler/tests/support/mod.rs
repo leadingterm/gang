@@ -20,6 +20,7 @@ use gang_spi::{
 };
 use gang_testkit::{TestResult, worker_id};
 use gang_types::health::CLIENT_REROUTE_BOUND;
+use gang_types::property::MILLICORES_PER_CORE;
 use gang_types::{ActionResources, Bytes, FleetName, FleetSet, InstanceId, InstanceLifecycle, Isa};
 
 /// Index of the x86-64 test fleet in the harness's fleets.
@@ -294,6 +295,17 @@ impl Harness {
                     .get(cordon.fleet)
                     .is_some_and(|pass| pass.policy.name == fleet)
         });
+        let capacity = self
+            .passes
+            .iter()
+            .find(|pass| pass.policy.name == fleet)
+            .map(|pass| ActionResources {
+                cpu_millicores: u64::from(pass.policy.vcpus_per_instance.get())
+                    .saturating_mul(MILLICORES_PER_CORE)
+                    .saturating_mul(u64::from(self.cpu_oversubscription.get())),
+                memory: pass.policy.memory_per_instance.get(),
+                disk: pass.policy.disk_per_instance.get(),
+            });
         self.snapshot.workers.push(WorkerState {
             id: worker_id(instance)?,
             environment: Some(
@@ -308,7 +320,7 @@ impl Harness {
             fleet,
             running_actions: 0,
             max_inflight_actions: None,
-            capacity: None,
+            capacity,
             reserved: None,
             cache: None,
             paused: false,

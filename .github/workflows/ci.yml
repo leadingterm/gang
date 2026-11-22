@@ -170,11 +170,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/e2e"
           cp $(bazel cquery --output=files //crates/gang-e2e:bundle) "$RUNNER_TEMP/e2e/"
           files=$(jq -er '
-            if .v035 == {"binary":"gang-v035","fixture":"deployment-v035.json"} then
-              [.previous.binary, .previous.fixture, .v035.binary, .v035.fixture, .candidate_fixture] |
+            if .v035 == {"binary":"gang-v035","fixture":"deployment-v035.json"}
+              and .history == {"binary":"gang-v038","fixture":"deployment-v038.json"} then
+              [.previous.binary, .previous.fixture, .v035.binary, .v035.fixture, .history.binary, .history.fixture, .candidate_fixture] |
               if all(.[]; if type == "string" then test("^[A-Za-z0-9][A-Za-z0-9._-]*$") else false end)
               then .[] else error("invalid upgrade bundle manifest") end
-            else error("invalid v035 upgrade pair") end
+            else error("invalid published upgrade or history rollback pair") end
           ' "$RUNNER_TEMP/e2e/upgrade-inputs.json")
           readarray -t files <<< "$files"
           for file in "${files[@]}"; do
@@ -270,11 +271,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/e2e"
           cp $(bazel cquery --output=files //crates/gang-e2e:bundle) "$RUNNER_TEMP/e2e/"
           files=$(jq -er '
-            if .v035 == {"binary":"gang-v035","fixture":"deployment-v035.json"} then
-              [.previous.binary, .previous.fixture, .v035.binary, .v035.fixture, .candidate_fixture] |
+            if .v035 == {"binary":"gang-v035","fixture":"deployment-v035.json"}
+              and .history == {"binary":"gang-v038","fixture":"deployment-v038.json"} then
+              [.previous.binary, .previous.fixture, .v035.binary, .v035.fixture, .history.binary, .history.fixture, .candidate_fixture] |
               if all(.[]; if type == "string" then test("^[A-Za-z0-9][A-Za-z0-9._-]*$") else false end)
               then .[] else error("invalid upgrade bundle manifest") end
-            else error("invalid v035 upgrade pair") end
+            else error("invalid published upgrade or history rollback pair") end
           ' "$RUNNER_TEMP/e2e/upgrade-inputs.json")
           readarray -t files <<< "$files"
           for file in "${files[@]}"; do

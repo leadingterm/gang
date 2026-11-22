@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::future;
+use std::num::NonZeroU32;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use gang_types::{
     Bytes, FleetName, InstanceId, Isa, NonZeroBytes, NonZeroDuration, Percent, WorkerLifetime,
     property,
 };
-use gang_worker::{Layout, ServerCaError, WorkerError, WorkerSettings};
+use gang_worker::{Layout, PhysicalResources, ServerCaError, WorkerError, WorkerSettings};
 use tokio::task::JoinHandle;
 
 use crate::support::{
@@ -40,10 +41,78 @@ async fn spawn_run(
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     ));
     harness.settle().await;
     run
+}
+
+#[tokio::test]
+async fn registration_uses_injected_physical_capacity_and_preserves_action_ceilings() {
+    for (cpus, memory_gib) in [(2, 20), (12, 40)] {
+        let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+        harness.scheduler.set_behaviour(Behaviour::Finish);
+        let mut settings = harness.settings();
+        settings.limits = None;
+        let name = FleetName::try_new("example-fleet").expect("valid fleet");
+        let fleet = settings.fleets.by_name(&name).expect("fleet exists");
+        let mut policy = fleet.policy.clone();
+        policy.actions.resources.cpu_count = NonZeroU32::new(1);
+        policy.actions.resources.memory = Some(NonZeroBytes::gib(3));
+        settings.fleets = Fleets::try_new(vec![FleetMember {
+            policy,
+            sandbox: fleet.sandbox,
+            options: fleet.options.clone(),
+        }]).expect("valid fleet");
+        let calls = std::cell::Cell::new(0);
+        gang_worker::run(
+            harness.parts(true),
+            settings,
+            harness.build_limits(),
+            harness.build_sandbox(),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(PhysicalResources {
+                    vcpus: NonZeroU32::new(cpus).expect("nonzero test CPU count"),
+                    memory: Bytes::gib(memory_gib),
+                })
+            },
+            future::pending(),
+        ).await.expect("worker registers");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(harness.enroller.calls(), 1);
+        let spec = only_spec(&harness);
+        assert_eq!(spec.properties.capacity(property::CPU_COUNT), Some(u64::from(cpus)));
+        assert_eq!(spec.properties.capacity(property::CPU_MILLICORES), Some(u64::from(cpus) * 1000));
+        assert_eq!(spec.properties.limit(property::CPU_COUNT), Some(1));
+        assert_eq!(spec.properties.limit(property::CPU_MILLICORES), Some(1000));
+        assert_eq!(spec.properties.capacity(property::MEMORY_KB), Some((memory_gib - 2) * GIB / 1024));
+        assert_eq!(spec.properties.limit(property::MEMORY_KB), Some(3 * GIB / 1024));
+        assert_eq!(spec.properties.capacity(property::DISK_KB), Some(5 * GIB / 1024));
+    }
+}
+
+#[tokio::test]
+async fn physical_discovery_failure_prevents_preparation_and_enrollment() {
+    let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+    let calls = std::cell::Cell::new(0);
+    let error = gang_worker::run(
+        harness.parts(true),
+        harness.settings(),
+        harness.build_limits(),
+        harness.build_sandbox(),
+        || {
+            calls.set(calls.get() + 1);
+            Err(gang_spi::PortError::backend(std::io::Error::other("discovery failed")))
+        },
+        future::pending(),
+    ).await.expect_err("discovery failure stops startup");
+    assert!(matches!(error, WorkerError::Port(_)));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(harness.limits.prepared_reserve(), None);
+    assert_eq!(harness.enroller.calls(), 0);
+    assert!(harness.scheduler.specs().is_empty());
 }
 
 #[tokio::test]
@@ -55,6 +124,7 @@ async fn plain_mode_records_the_identity_fleet_and_layout() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await;
@@ -70,9 +140,17 @@ async fn plain_mode_records_the_identity_fleet_and_layout() {
         spec.properties.get(property::ACTION_ENVIRONMENT),
         Some("host:test")
     );
-    assert_eq!(spec.properties.get(property::CPU_COUNT), Some("4"));
-    let physical = gang_os::physical_memory().expect("physical memory is readable");
-    let expected_memory = physical.saturating_sub(NonZeroBytes::gib(2).get()).get() / 1024;
+    let cpus = 16;
+    assert_eq!(spec.properties.capacity(property::CPU_COUNT), Some(cpus));
+    assert_eq!(
+        spec.properties.capacity(property::CPU_MILLICORES),
+        Some(cpus * 1000)
+    );
+    assert_eq!(
+        spec.properties.capacity(property::DISK_KB),
+        Some(5 * GIB / 1024)
+    );
+    let expected_memory = 62 * GIB / 1024;
     assert_eq!(
         spec.properties.get(property::MEMORY_KB),
         Some(expected_memory.to_string().as_str())
@@ -129,6 +207,7 @@ async fn wrong_image_is_rejected_before_enrollment_and_registration() {
                     .expect("valid E2 identity"),
             )
         },
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -181,6 +260,7 @@ async fn selected_root_is_pinned_before_identity_and_serialization() {
                 .parse()
                 .expect("valid identity"))
         },
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -226,6 +306,7 @@ async fn fleet_without_network_grant_does_not_receive_egress_configuration() {
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -278,6 +359,7 @@ async fn selected_network_grant_projects_policy_and_effective_endpoints() {
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -305,6 +387,7 @@ async fn single_use_worker_takes_one_action_and_run_returns_ok() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await;
@@ -322,6 +405,7 @@ async fn limits_are_prepared_once_before_the_first_worker_starts() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await;
@@ -350,6 +434,7 @@ async fn memory_pool_and_actions_reach_the_scheduler() {
         settings,
         move |_| Ok(limits),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -393,6 +478,7 @@ async fn measured_pool_smaller_than_estimate_enrolls_and_preserves_action_ceilin
         settings,
         move |_| Ok(limits),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -433,6 +519,7 @@ async fn pool_below_configured_minimum_prevents_enrollment_and_registration() {
         settings,
         move |_| Ok(limits),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -465,6 +552,7 @@ async fn pool_at_configured_minimum_enrolls_and_advertises_capacity() {
         settings,
         move |_| Ok(limits),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -491,6 +579,7 @@ async fn one_byte_pool_prevents_enrollment_and_registration() {
         settings,
         move |_| Ok(limits),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -510,7 +599,7 @@ async fn fallback_capacity_below_minimum_prevents_enrollment_and_registration() 
     let mut settings = harness.settings();
     settings.limits = None;
     let minimum = settings.actions.memory.min_reservation;
-    let physical = gang_os::physical_memory().expect("physical memory is readable");
+    let physical = Bytes::gib(64);
     let reserve = NonZeroBytes::new(physical.saturating_sub(Bytes::new(1)))
         .expect("physical memory exceeds one byte");
     std::sync::Arc::make_mut(&mut settings.actions)
@@ -521,6 +610,7 @@ async fn fallback_capacity_below_minimum_prevents_enrollment_and_registration() 
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -545,6 +635,7 @@ async fn no_limits_plugin_passes_no_pool() {
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -552,8 +643,7 @@ async fn no_limits_plugin_passes_no_pool() {
     assert_eq!(harness.limits.prepared_reserve(), None);
     let spec = only_spec(&harness);
     assert_eq!(spec.memory_pool, None);
-    let physical = gang_os::physical_memory().expect("physical memory is readable");
-    let expected = physical.saturating_sub(NonZeroBytes::gib(2).get()).get() / 1024;
+    let expected = 62 * GIB / 1024;
     assert_eq!(
         spec.properties.capacity(property::MEMORY_KB),
         Some(expected)
@@ -569,7 +659,7 @@ async fn reserve_exhausting_physical_memory_prevents_enrollment() {
     let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
     let mut settings = harness.settings();
     settings.limits = None;
-    let physical = gang_os::physical_memory().expect("physical memory is readable");
+    let physical = Bytes::gib(64);
     let reserve = NonZeroBytes::new(physical).expect("physical memory is nonzero");
     std::sync::Arc::make_mut(&mut settings.actions)
         .memory
@@ -579,6 +669,7 @@ async fn reserve_exhausting_physical_memory_prevents_enrollment() {
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -603,6 +694,7 @@ async fn tls_mode_enrolls_with_the_proof_and_passes_the_credential_paths() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await;
@@ -655,6 +747,7 @@ async fn server_only_transport_passes_custom_ca_or_system_roots() {
             harness.settings(),
             harness.build_limits(),
             harness.build_sandbox(),
+            harness.physical_resources(),
             future::pending(),
         )
         .await
@@ -684,6 +777,7 @@ async fn shutdown_stops_a_running_generation() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         async {
             let _ = receive.await;
         },
@@ -863,6 +957,7 @@ async fn a_preemption_notice_inside_the_margin_returns_immediately_and_starts_no
             harness.settings(),
             harness.build_limits(),
             harness.build_sandbox(),
+            harness.physical_resources(),
             future::pending(),
         ))
         .await;
@@ -881,6 +976,7 @@ async fn shutdown_ends_the_run_with_ok() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::ready(()),
     )
     .await;
@@ -965,6 +1061,7 @@ async fn shutdown_while_parked_ends_the_run_without_enrolling() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         async {
             let _ = stopped.await;
         },
@@ -989,6 +1086,7 @@ async fn a_parked_server_only_node_fetches_no_server_ca_until_it_serves() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     ));
     harness.settle().await;
@@ -1018,6 +1116,7 @@ async fn shutdown_while_parked_ends_a_server_only_run_without_fetching_the_serve
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         async {
             let _ = stopped.await;
         },
@@ -1047,6 +1146,7 @@ async fn a_preemption_notice_at_unparking_ends_a_server_only_run_without_fetchin
             harness.settings(),
             harness.build_limits(),
             harness.build_sandbox(),
+            harness.physical_resources(),
             future::pending(),
         ))
         .await;
@@ -1067,6 +1167,7 @@ async fn shutdown_during_the_server_ca_fetch_ends_the_run() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         async {
             let _ = stopped.await;
         },
@@ -1090,6 +1191,7 @@ async fn preemption_during_the_server_ca_fetch_ends_the_run() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     ));
     harness.settle().await;
@@ -1118,6 +1220,7 @@ async fn a_pinned_server_without_a_ca_fails_the_run_after_unparking() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     ));
     let polls = harness.provisioner.parked_calls();
@@ -1155,6 +1258,7 @@ async fn unknown_fleet_has_no_fleet() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -1173,6 +1277,7 @@ async fn isa_mismatch_stops_before_anything_starts() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -1201,6 +1306,7 @@ async fn a_scratch_volume_below_the_fleet_disk_stops_the_worker_before_it_enroll
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -1257,6 +1363,7 @@ async fn stale_work_is_reclaimed_before_capacity_check() {
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -1322,6 +1429,7 @@ async fn read_only_stale_work_is_reclaimed_without_following_links() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -1372,6 +1480,7 @@ async fn sealed_stale_work_is_reclaimed_where_pinnable() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await;
@@ -1416,6 +1525,7 @@ async fn sandbox_file_selects_the_identity_fleets_sandbox() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await;
@@ -1440,6 +1550,7 @@ async fn scheduler_failure_is_reported_as_a_worker_stop() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -1456,6 +1567,7 @@ async fn enroller_failure_is_reported_as_an_enroll_error() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await
@@ -1635,6 +1747,7 @@ async fn sandbox_file_names_the_canonical_program_path() {
         harness.settings(),
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await;
@@ -1682,13 +1795,19 @@ async fn fast_cas_percent_20_gives_a_two_gib_budget() {
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await;
     result.expect("the scheduler finished");
 
     // 20 percent of the 10 GiB scratch volume.
-    assert_eq!(only_spec(&harness).fast_cas_budget.get(), 2 * GIB);
+    let spec = only_spec(&harness);
+    assert_eq!(spec.fast_cas_budget.get(), 2 * GIB);
+    assert_eq!(
+        spec.properties.capacity(property::DISK_KB),
+        Some(8 * GIB / 1024)
+    );
 }
 
 #[tokio::test]
@@ -1713,13 +1832,19 @@ async fn a_restart_with_a_filled_fast_cas_keeps_the_cold_start_budget() {
         settings,
         harness.build_limits(),
         harness.build_sandbox(),
+        harness.physical_resources(),
         future::pending(),
     )
     .await;
     result.expect("the scheduler finished");
 
     // The cold-start budget: 50 percent of the 10 GiB scratch volume.
-    assert_eq!(only_spec(&harness).fast_cas_budget.get(), 5 * GIB);
+    let spec = only_spec(&harness);
+    assert_eq!(spec.fast_cas_budget.get(), 5 * GIB);
+    assert_eq!(
+        spec.properties.capacity(property::DISK_KB),
+        Some(5 * GIB / 1024)
+    );
 }
 
 #[tokio::test]

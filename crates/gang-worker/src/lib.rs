@@ -20,7 +20,7 @@ mod transport;
 mod worker;
 
 pub use credentials::{Credentials, EnrollError, Enroller, Retry};
-pub use deployment::{WorkerDeployment, WorkerParts, WorkerSettings};
+pub use deployment::{PhysicalResources, WorkerDeployment, WorkerParts, WorkerSettings};
 pub use errors::WorkerError;
 pub use layout::{IdentityFiles, Layout};
 pub use transport::{ServerCaError, ServerCaSource, Transport};

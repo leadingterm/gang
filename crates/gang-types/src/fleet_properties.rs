@@ -3,8 +3,8 @@
 use std::fmt::Display;
 
 use crate::{
-    ActionEnvironment, Capability, FleetActionPolicy, FleetName, Isa, NetworkRequest, NonZeroBytes,
-    Resources, property,
+    ActionEnvironment, Capability, FleetActionPolicy, FleetName, Isa, NetworkRequest, Resources,
+    property,
 };
 
 /// How a request value matches a fleet's value for one key.
@@ -52,7 +52,7 @@ impl FleetProperties {
     const FLEET_POSITION: usize = 0;
     const SANDBOX_POSITION: usize = 2;
     const ENVIRONMENT_POSITION: usize = 3;
-    const MEMORY_POSITION: usize = 6;
+    const CPU_POSITION: usize = 4;
     const FIXED_ENTRY_COUNT: usize = 8;
 
     /// Creates a fleet's properties.
@@ -152,15 +152,37 @@ impl FleetProperties {
         self.entries[Self::ENVIRONMENT_POSITION].value = environment.to_string();
     }
 
-    /// Replaces the estimated memory with actual worker capacity, preserving the action ceiling.
-    pub fn set_memory_capacity(&mut self, actual: NonZeroBytes) {
-        let capacity = actual.as_u64() / 1024;
-        let limit = self
-            .actions
-            .resources
-            .memory
-            .map_or(capacity, |ceiling| capacity.min(ceiling.as_u64() / 1024));
-        self.entries[Self::MEMORY_POSITION] = minimum(property::MEMORY_KB, capacity, limit);
+    /// Replaces estimated pools with actual worker capacity, preserving configured action ceilings.
+    pub fn set_capacity(&mut self, actual: Resources) {
+        let effective = self.actions.resources.effective(actual);
+        for (offset, key, capacity, limit) in [
+            (
+                0,
+                property::CPU_COUNT,
+                u64::from(actual.vcpus),
+                u64::from(effective.vcpus),
+            ),
+            (
+                1,
+                property::CPU_MILLICORES,
+                u64::from(actual.vcpus) * property::MILLICORES_PER_CORE,
+                u64::from(effective.vcpus) * property::MILLICORES_PER_CORE,
+            ),
+            (
+                2,
+                property::MEMORY_KB,
+                actual.memory.get() / 1024,
+                effective.memory.get() / 1024,
+            ),
+            (
+                3,
+                property::DISK_KB,
+                actual.disk.get() / 1024,
+                effective.disk.get() / 1024,
+            ),
+        ] {
+            self.entries[Self::CPU_POSITION + offset] = minimum(key, capacity, limit);
+        }
     }
 
     /// The fleet's name.
@@ -281,7 +303,7 @@ fn minimum(key: &'static str, capacity: u64, limit: u64) -> Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Bytes, FleetCatalog};
+    use crate::{Bytes, FleetCatalog, NonZeroBytes};
 
     fn gang_x86() -> FleetProperties {
         let name = FleetName::try_new("gang-x86").unwrap();
@@ -436,27 +458,45 @@ mod tests {
     }
 
     #[test]
-    fn actual_memory_capacity_preserves_action_ceiling_and_other_properties() {
+    fn actual_capacity_preserves_independent_action_ceilings() {
         let mut fleet = gang_x86();
+        fleet.actions.resources.cpu_count = std::num::NonZeroU32::new(4);
         fleet.actions.resources.memory = Some(NonZeroBytes::gib(4));
-        fleet.set_memory_capacity(NonZeroBytes::gib(12));
-        assert_eq!(fleet.capacity(property::MEMORY_KB), Some(12 * 1024 * 1024));
-        assert_eq!(fleet.limit(property::MEMORY_KB), Some(4 * 1024 * 1024));
-        assert_eq!(fleet.get(property::MEMORY_KB), Some("12582912"));
+        fleet.actions.resources.disk = Some(NonZeroBytes::gib(6));
+        let mut actual = Resources {
+            vcpus: 20,
+            memory: Bytes::gib(12),
+            disk: Bytes::gib(120),
+        };
+        fleet.set_capacity(actual);
+        for (key, capacity, limit) in [
+            (property::CPU_COUNT, 20, 4),
+            (property::CPU_MILLICORES, 20_000, 4_000),
+            (property::MEMORY_KB, 12 * 1024 * 1024, 4 * 1024 * 1024),
+            (property::DISK_KB, 120 * 1024 * 1024, 6 * 1024 * 1024),
+        ] {
+            assert_eq!(fleet.capacity(key), Some(capacity));
+            assert_eq!(fleet.limit(key), Some(limit));
+            assert_eq!(fleet.get(key), Some(capacity.to_string().as_str()));
+        }
         assert_eq!(fleet.options().collect::<Vec<_>>(), [("capacity", "spot")]);
-        assert_eq!(fleet.get(property::CPU_COUNT), Some("15"));
         let catalog = FleetCatalog::try_new(vec![fleet.clone()]).unwrap();
         assert!(catalog.admit([(property::MEMORY_KB, "4194304")]).is_ok());
         assert!(catalog.admit([(property::MEMORY_KB, "4194305")]).is_err());
 
-        fleet.set_memory_capacity(NonZeroBytes::gib(2));
-        assert_eq!(fleet.capacity(property::MEMORY_KB), Some(2 * 1024 * 1024));
+        actual.vcpus = 2;
+        actual.memory = Bytes::gib(2);
+        actual.disk = Bytes::gib(3);
+        fleet.set_capacity(actual);
+        assert_eq!(fleet.limit(property::CPU_COUNT), Some(2));
         assert_eq!(fleet.limit(property::MEMORY_KB), Some(2 * 1024 * 1024));
+        assert_eq!(fleet.limit(property::DISK_KB), Some(3 * 1024 * 1024));
 
-        fleet.actions.resources.memory = None;
-        fleet.set_memory_capacity(NonZeroBytes::gib(8));
-        assert_eq!(fleet.capacity(property::MEMORY_KB), Some(8 * 1024 * 1024));
-        assert_eq!(fleet.limit(property::MEMORY_KB), Some(8 * 1024 * 1024));
+        fleet.actions.resources = crate::ResourceCeilings::default();
+        fleet.set_capacity(actual);
+        assert_eq!(fleet.limit(property::CPU_COUNT), Some(2));
+        assert_eq!(fleet.limit(property::MEMORY_KB), Some(2 * 1024 * 1024));
+        assert_eq!(fleet.limit(property::DISK_KB), Some(3 * 1024 * 1024));
     }
 
     #[test]

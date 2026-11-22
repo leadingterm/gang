@@ -563,7 +563,11 @@ mod tests {
         Arc<RuntimeCatalog>,
     ) {
         let mut fleets = large_memory_catalog().fleets().to_vec();
-        fleets[0].set_memory_capacity(gang_types::NonZeroBytes::gib(63));
+        fleets[0].set_capacity(Resources {
+            vcpus: 15,
+            memory: Bytes::gib(63),
+            disk: Bytes::gib(100),
+        });
         let (sender, receiver) = tokio::sync::watch::channel(Arc::new(
             nativelink_scheduler::worker_scheduler::ResourceCapacitySnapshot::new(Vec::new()),
         ));
@@ -585,6 +589,10 @@ mod tests {
             .insert(property::FLEET.to_owned(), "fleet-a".to_owned());
         row.minimum
             .insert(property::MEMORY_KB.to_owned(), memory_kb);
+        row.minimum
+            .insert(property::CPU_MILLICORES.to_owned(), 15_000);
+        row.minimum
+            .insert(property::DISK_KB.to_owned(), 100 * 1024 * 1024);
         sender
             .send(Arc::new(
                 nativelink_scheduler::worker_scheduler::ResourceCapacitySnapshot::new(vec![row]),
@@ -616,7 +624,7 @@ mod tests {
             .insert(property::CPU_MILLICORES.to_owned(), "1500".to_owned());
         Arc::make_mut(&mut learned).memory_reservation =
             Some(nativelink_util::action_messages::MemoryReservation {
-                minimum_kb: Some(u64::MAX),
+                minimum_kb: Some(4 * 1024 * 1024),
                 desired_kb: Some(1),
                 cpu_before_memory_fit: Some(u64::MAX),
                 fitted_revision: None,
@@ -633,7 +641,7 @@ mod tests {
         );
         assert_eq!(action.platform_properties[property::CPU_MILLICORES], "1500");
         let reservation = action.memory_reservation.as_ref().unwrap();
-        assert_eq!(reservation.minimum_kb, Some(2 * 1024 * 1024));
+        assert_eq!(reservation.minimum_kb, Some(4 * 1024 * 1024));
         assert_eq!(reservation.desired_kb, Some(73_400_320));
         assert_eq!(reservation.cpu_before_memory_fit, Some(1500));
         assert_eq!(reservation.fitted_revision, None);
@@ -643,6 +651,124 @@ mod tests {
                 cpu_millicores: 1500,
                 memory_bytes: 73_400_320 * 1024,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn measured_peak_is_a_hard_floor_but_headroom_is_not() {
+        const GIB_KB: u64 = 1024 * 1024;
+        for (capacity, client_floor, succeeds, expected_floor) in [
+            (49, None, false, 50),
+            (55, None, true, 50),
+            (55, Some(52), true, 52),
+            (55, Some(56), false, 56),
+        ] {
+            let fake = Arc::new(Fake::default());
+            let (sender, runtime) = measured_catalog();
+            observe_memory(&sender, capacity * GIB_KB);
+            let admitted = AdmittedFleets::default();
+            let mask = runtime.current().unwrap().accepting(|_| None);
+            let _admission =
+                admitted.insert(operation(), mask, client_floor.map(|floor| floor * GIB_KB));
+            let fitted = FittedActions::new(
+                fake.clone(),
+                runtime,
+                admitted.clone(),
+                MinReservation::from_units(8192),
+                DiskMinReservation::from_units(2048),
+            );
+            let mut action = info(property::MEMORY_KB, &(60 * GIB_KB).to_string());
+            Arc::make_mut(&mut action).memory_reservation =
+                Some(nativelink_util::action_messages::MemoryReservation {
+                    minimum_kb: Some(50 * GIB_KB),
+                    desired_kb: None,
+                    cpu_before_memory_fit: None,
+                    fitted_revision: None,
+                });
+            let result = fitted.add_action(operation(), action).await;
+            if succeeds {
+                result.expect("capacity between peak and headroom fits");
+                let calls = fake.calls.lock();
+                assert_eq!(calls.len(), 1);
+                let action = &calls[0];
+                assert_eq!(
+                    action.platform_properties[property::MEMORY_KB],
+                    (capacity * GIB_KB).to_string()
+                );
+                let reservation = action.memory_reservation.as_ref().unwrap();
+                assert_eq!(reservation.minimum_kb, Some(expected_floor * GIB_KB));
+                assert_eq!(reservation.desired_kb, Some(60 * GIB_KB));
+            } else {
+                let Err(error) = result else {
+                    panic!("capacity below hard floor accepted");
+                };
+                assert_eq!(error.code, Code::FailedPrecondition);
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&(expected_floor * GIB_KB).to_string())
+                );
+                assert!(fake.calls.lock().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fitting_never_selects_a_fleet_below_the_measured_peak() {
+        const GIB_KB: u64 = 1024 * 1024;
+        let fleets = FleetCatalog::try_new(
+            [("small", 48, 100), ("large", 55, 10)]
+                .into_iter()
+                .map(|(name, memory, disk)| {
+                    FleetProperties::new(
+                        &FleetName::try_new(name).unwrap(),
+                        Isa::X86_64,
+                        &"docker",
+                        &"host:test".parse().unwrap(),
+                        Resources {
+                            vcpus: 15,
+                            memory: Bytes::gib(memory),
+                            disk: Bytes::gib(disk),
+                        },
+                        &gang_types::FleetActionPolicy::default(),
+                        Vec::<(&'static str, String)>::new(),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let fake = Arc::new(Fake::default());
+        let fitted = FittedActions::new(
+            fake.clone(),
+            crate::capacity::test_catalog(fleets),
+            AdmittedFleets::default(),
+            MinReservation::from_units(8192),
+            DiskMinReservation::from_units(2048),
+        );
+        let mut action = info(property::MEMORY_KB, &(60 * GIB_KB).to_string());
+        let action_info = Arc::make_mut(&mut action);
+        action_info
+            .platform_properties
+            .insert(property::DISK_KB.to_owned(), (90 * GIB_KB).to_string());
+        action_info.memory_reservation =
+            Some(nativelink_util::action_messages::MemoryReservation {
+                minimum_kb: Some(50 * GIB_KB),
+                desired_kb: None,
+                cpu_before_memory_fit: None,
+                fitted_revision: None,
+            });
+        fitted
+            .add_action(operation(), action)
+            .await
+            .expect("fits large fleet");
+        let calls = fake.calls.lock();
+        assert_eq!(
+            calls[0].platform_properties[property::MEMORY_KB],
+            (55 * GIB_KB).to_string()
+        );
+        assert_eq!(
+            calls[0].platform_properties[property::DISK_KB],
+            (10 * GIB_KB).to_string()
         );
     }
 

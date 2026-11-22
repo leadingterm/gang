@@ -24,7 +24,7 @@ use crate::hosted_snapshot::HostedSnapshot;
 use crate::pass_time::PassTime;
 use crate::profile::SourceProfiles;
 use crate::rates::{FleetRates, SourceRates};
-use crate::vectors::{CapacityVector, Horizon, ResourceVector, ScalingDimension};
+use crate::vectors::{CapacityVector, Horizon, ResourceVector, ScalingDimension, worker_resources};
 
 #[derive(Debug)]
 pub(crate) struct Capacity {
@@ -55,6 +55,7 @@ struct InstanceTimeline {
     view: InstanceView,
     ready_after: Duration,
     usable: bool,
+    capacity: Reservation,
     dispatch: Option<usize>,
 }
 
@@ -84,6 +85,27 @@ impl Reservation {
             memory: u128::from(policy.memory_per_instance.get().get()),
             disk: u128::from(policy.disk_per_instance.get().get()),
         }
+    }
+
+    fn normalized(self, policy: &FleetPolicy, factor: NonZeroU32) -> CapacityVector {
+        ResourceVector {
+            actions: 0.0,
+            cpu_millicores: crate::vectors::u64_to_f64(u64::try_from(self.cpu).unwrap_or(u64::MAX)),
+            memory: crate::vectors::u64_to_f64(u64::try_from(self.memory).unwrap_or(u64::MAX)),
+            disk: crate::vectors::u64_to_f64(u64::try_from(self.disk).unwrap_or(u64::MAX)),
+        }
+        .normalized(policy, factor)
+    }
+
+    fn credit(self, nominal: Self) -> [i128; 3] {
+        [
+            i128::try_from(self.cpu).unwrap_or(i128::MAX)
+                - i128::try_from(nominal.cpu).unwrap_or(i128::MAX),
+            i128::try_from(self.memory).unwrap_or(i128::MAX)
+                - i128::try_from(nominal.memory).unwrap_or(i128::MAX),
+            i128::try_from(self.disk).unwrap_or(i128::MAX)
+                - i128::try_from(nominal.disk).unwrap_or(i128::MAX),
+        ]
     }
 
     fn add(self, other: Self) -> Self {
@@ -491,6 +513,7 @@ pub(crate) struct WorkPlanner {
     matching: Vec<FleetSet>,
     work: Vec<u32>,
     demand: Vec<CapacityVector>,
+    credit: Vec<[i128; 3]>,
     horizons: Vec<Horizon>,
     capacities: Vec<CapacityVector>,
     serving_capacities: Vec<CapacityVector>,
@@ -521,6 +544,7 @@ impl WorkPlanner {
             matching: Vec::new(),
             work: vec![0; n],
             demand: vec![CapacityVector::default(); n],
+            credit: vec![[0; 3]; n],
             horizons: vec![
                 Horizon {
                     readiness: Duration::ZERO,
@@ -556,6 +580,64 @@ impl WorkPlanner {
         self.work[index]
     }
 
+    pub(crate) fn credit(&self, index: usize) -> [i128; 3] {
+        self.credit[index]
+    }
+
+    pub(crate) fn placement_credit(
+        &self,
+        index: usize,
+        policy: &FleetPolicy,
+        capacity: &Capacity,
+        limit: u32,
+    ) -> [i128; 3] {
+        let mut credit = self.credit[index];
+        let slots = limit.min(policy.instances.max().get()).saturating_sub(capacity.reliable);
+        for &position in capacity.resumable.iter().take(slots as usize) {
+            for (value, delta) in credit.iter_mut().zip(self.instance_credit(index, position, policy)) {
+                *value = value.saturating_add(delta);
+            }
+        }
+        credit
+    }
+
+    pub(crate) fn resume(&mut self, index: usize, position: usize, policy: &FleetPolicy) {
+        let record = &mut self.instances[index][position];
+        if record.view.serving {
+            return;
+        }
+        record.usable = true;
+        record.view.serving = true;
+        record.view.cap = record.view.resume_cap;
+        record.ready_after = Duration::ZERO;
+        self.capacities[index] += record.view.cap;
+        self.serving_capacities[index] += record.view.cap;
+        self.serving[index] = self.serving[index].saturating_add(1);
+        for (value, delta) in self.credit[index].iter_mut().zip(
+            record.capacity.credit(Reservation::capacity(policy, self.factor)),
+        ) {
+            *value = value.saturating_add(delta);
+        }
+    }
+
+    pub(crate) fn refresh_demand(&mut self, index: usize, fleet: &mut FleetPass) {
+        self.demand[index] = ResourceVector::from_action(fleet.outlook.demand.resources())
+            .normalized(&fleet.policy, self.factor);
+        self.work[index] = self.physical_work(index, fleet);
+        fleet.outlook.needed = fleet.outlook.minimum.max(self.work[index]);
+    }
+
+    pub(crate) fn instance_credit(
+        &self,
+        fleet: usize,
+        position: usize,
+        policy: &FleetPolicy,
+    ) -> [i128; 3] {
+        self.instances[fleet][position]
+            .capacity
+            .credit(Reservation::capacity(policy, self.factor))
+    }
+
     pub(crate) fn interrupt(&mut self) {
         self.rates.interrupt();
     }
@@ -563,6 +645,7 @@ impl WorkPlanner {
     fn reset(&mut self, snapshot: &SchedulerSnapshot) {
         self.dispatch.clear(snapshot);
         self.capacities.fill(CapacityVector::default());
+        self.credit.fill([0; 3]);
         self.serving_capacities.fill(CapacityVector::default());
         self.serving.fill(0);
         self.booting.fill(0);
@@ -579,7 +662,7 @@ impl WorkPlanner {
         }
     }
 
-    fn prepare(
+    pub(crate) fn prepare(
         &mut self,
         fleets: &mut [FleetPass],
         hosted: &HostedSnapshot,
@@ -610,21 +693,34 @@ impl WorkPlanner {
             }
             self.instances[index].clear();
             for (position, instance) in fleet.supply.instances.iter().enumerate() {
+                let nominal = Reservation::capacity(&fleet.policy, self.factor);
+                let mut observed: Option<Reservation> = None;
                 let mut connected = false;
                 let mut active = false;
                 for worker_index in hosted.workers_on(&fleet.policy.name, &instance.id) {
+                    let worker = &snapshot.workers[worker_index];
                     connected = true;
-                    active |= !snapshot.workers[worker_index].draining;
+                    active |= !worker.draining;
+                    let candidate = Reservation::action(worker_resources(worker));
+                    observed = Some(observed.map_or(candidate, |previous| Reservation {
+                        cpu: previous.cpu.min(candidate.cpu),
+                        memory: previous.memory.min(candidate.memory),
+                        disk: previous.disk.min(candidate.disk),
+                    }));
                 }
+                let actual = observed.unwrap_or(nominal);
                 let usable = self.usable[position];
                 let serving = usable && active;
-                let cap = if usable && (!connected || active) {
+                let actual_vector = actual.normalized(&fleet.policy, self.factor);
+                let cap = if serving {
+                    actual_vector
+                } else if usable && !connected {
                     CapacityVector::ONE
                 } else {
                     CapacityVector::default()
                 };
-                let resume_cap = if connected {
-                    cap
+                let resume_cap = if serving {
+                    actual_vector
                 } else {
                     CapacityVector::default()
                 };
@@ -642,9 +738,14 @@ impl WorkPlanner {
                     },
                     ready_after,
                     usable,
+                    capacity: actual,
                     dispatch: None,
                 });
                 if serving {
+                    for (credit, delta) in self.credit[index].iter_mut().zip(actual.credit(nominal))
+                    {
+                        *credit = credit.saturating_add(delta);
+                    }
                     self.serving[index] = self.serving[index].saturating_add(1);
                     self.serving_capacities[index] += cap;
                 } else if usable && !connected {
@@ -653,7 +754,8 @@ impl WorkPlanner {
                 self.capacities[index] += cap;
             }
             for &position in &capacities[index].resumable {
-                self.instances[index][position].view.resume_cap = CapacityVector::ONE;
+                let record = &mut self.instances[index][position];
+                record.view.resume_cap = record.capacity.normalized(&fleet.policy, self.factor);
             }
             if fleet.supply.launch_failure.is_none() {
                 let unborn = fleet.supply.desired.saturating_sub(capacities[index].live);
@@ -695,7 +797,7 @@ impl WorkPlanner {
             if worker.running_actions > found {
                 self.releases.push(Release {
                     after: self.scaling.unknown_action_duration.get(),
-                    occupied: Reservation::capacity(&fleet.policy, self.factor).sub(known),
+                    occupied: Reservation::action(worker_resources(worker)).sub(known),
                 });
             }
         }
@@ -724,7 +826,7 @@ impl WorkPlanner {
                         } else {
                             Duration::ZERO
                         },
-                        Reservation::capacity(&fleet.policy, self.factor),
+                        record.capacity,
                     );
                     record.dispatch = Some(dispatch_instance);
                     if resumable {
@@ -756,15 +858,69 @@ impl WorkPlanner {
         }
     }
 
-    pub(crate) fn plan(
+    fn physical_work(&self, index: usize, fleet: &FleetPass) -> u32 {
+        let demand = &fleet.outlook.demand;
+        let raw = Reservation::action(demand.resources());
+        let floor = u32::from(demand.actions() > 0);
+        if raw == Reservation::default() {
+            return floor;
+        }
+
+        let nominal = Reservation::capacity(&fleet.policy, self.factor);
+        let mut total = Reservation::default();
+        let mut physical_pending = 0u32;
+        for record in &self.instances[index] {
+            if record.view.serving {
+                total = total.add(record.capacity);
+            } else if record.usable && record.view.cap.max_component() > 0.0 {
+                physical_pending = physical_pending.saturating_add(1);
+            }
+        }
+        let unborn = self.booting[index].saturating_sub(physical_pending);
+        let projected = physical_pending.saturating_add(unborn);
+        total = total.add(Reservation {
+            cpu: nominal.cpu.saturating_mul(u128::from(projected)),
+            memory: nominal.memory.saturating_mul(u128::from(projected)),
+            disk: nominal.disk.saturating_mul(u128::from(projected)),
+        });
+        if !raw.fits(Reservation::default(), total) {
+            return demand.instances_with_credit(&fleet.policy, self.factor, self.credit[index]);
+        }
+
+        let mut count = self.serving[index].saturating_add(self.booting[index]);
+        // Projected pools are identical, so remove them in bulk rather than
+        // iterating over a potentially very large desired count.
+        let removable = u128::from(projected.min(count.saturating_sub(floor)))
+            .min((total.cpu - raw.cpu) / nominal.cpu)
+            .min((total.memory - raw.memory) / nominal.memory)
+            .min((total.disk - raw.disk) / nominal.disk);
+        let removable = u32::try_from(removable).unwrap_or(u32::MAX);
+        count -= removable;
+        total = total.sub(Reservation {
+            cpu: nominal.cpu * u128::from(removable),
+            memory: nominal.memory * u128::from(removable),
+            disk: nominal.disk * u128::from(removable),
+        });
+        // Remove only whole serving pools, in supply order. This produces a
+        // feasible conservative subset, not an optimal packing.
+        for record in &self.instances[index] {
+            if record.view.serving && count > floor {
+                let remaining = total.sub(record.capacity);
+                if raw.fits(Reservation::default(), remaining) {
+                    total = remaining;
+                    count -= 1;
+                }
+            }
+        }
+        count.min(fleet.policy.instances.max().get())
+    }
+
+    pub(crate) fn observe(
         &mut self,
         fleets: &mut [FleetPass],
         hosted: &HostedSnapshot,
         time: PassTime,
-        capacities: &[Capacity],
-        readiness: &[Option<Duration>],
     ) {
-        self.prepare(fleets, hosted, time, capacities, readiness);
         self.rates.observe(
             fleets,
             hosted,
@@ -773,13 +929,20 @@ impl WorkPlanner {
             &self.horizons,
             time,
         );
+        for (index, fleet) in fleets.iter_mut().enumerate() {
+            self.refresh_demand(index, fleet);
+        }
+    }
+
+    pub(crate) fn finalize(
+        &mut self,
+        fleets: &mut [FleetPass],
+        hosted: &HostedSnapshot,
+        time: PassTime,
+    ) {
         self.build_timeline(fleets, hosted, time);
         for (index, fleet) in fleets.iter_mut().enumerate() {
-            let demand = ResourceVector::from_action(fleet.outlook.demand.resources())
-                .normalized(&fleet.policy, self.factor);
-            self.demand[index] = demand;
-            self.work[index] = fleet.outlook.demand.instances(&fleet.policy, self.factor);
-            fleet.outlook.needed = fleet.outlook.minimum.max(self.work[index]);
+            let demand = self.demand[index];
             let base = self.serving[index].saturating_add(self.booting[index]);
             let dimension = demand.max_dimension();
             self.summaries[index] = ScaleDecision {
@@ -796,29 +959,22 @@ impl WorkPlanner {
                 self.rates.fleet(index),
                 self.serving_capacities[index],
             );
-            let additional = fleet.outlook.needed.saturating_sub(base);
-            let planned = if fleet.supply.launch_failure.is_some() {
-                additional.min(capacities[index].draining())
-            } else {
-                additional
-            };
-            let rescues = usize::try_from(planned)
-                .unwrap_or(usize::MAX)
-                .min(capacities[index].resumable.len());
-            for &position in capacities[index].resumable.iter().take(rescues) {
-                if let Some(instance) = self.instances[index][position].dispatch {
-                    self.dispatch.instances[instance].enabled = true;
-                }
-            }
-            let resumed_count = u32::try_from(rescues).unwrap_or(u32::MAX);
-            for _ in 0..planned.saturating_sub(resumed_count) {
-                if fleet.supply.launch_failure.is_none() {
-                    self.dispatch.add_instance(
-                        index,
-                        self.horizons[index].readiness,
-                        Reservation::capacity(&fleet.policy, self.factor),
-                    );
-                }
+        }
+    }
+
+    pub(crate) fn project_wait(
+        &mut self,
+        fleets: &mut [FleetPass],
+        hosted: &HostedSnapshot,
+        purchases: &[u32],
+    ) {
+        for (index, fleet) in fleets.iter().enumerate() {
+            for _ in 0..purchases[index] {
+                self.dispatch.add_instance(
+                    index,
+                    self.horizons[index].readiness,
+                    Reservation::capacity(&fleet.policy, self.factor),
+                );
             }
         }
         self.dispatch.dispatch(
@@ -861,14 +1017,14 @@ impl WorkPlanner {
         self.demand[fleet].component_max(forecast)
     }
 
-    pub(crate) fn needs_resume(&self, fleet: usize, extra_capacity: CapacityVector) -> bool {
+    pub(crate) fn needs_resume(&self, fleet: usize) -> bool {
         if self.horizons.get(fleet).is_none() {
             return false;
         }
         // Pending credit belongs to requested usable capacity, never projected purchases.
         // At zero horizon the forecast uses finite concurrent resource demand instead.
         !self.forecast_demand(fleet).within(
-            self.serving_capacities[fleet] + extra_capacity,
+            self.serving_capacities[fleet],
             f64::from(self.scaling.scale_in_waterline_percent.get()) / 100.0,
         )
     }
@@ -911,7 +1067,8 @@ mod tests {
     use gang_config::{HistoryWindow, InstanceBounds};
     use gang_spi::{ExecutingDemand, FleetInstance, LaunchFailure, QueuedDemand, WorkerState};
     use gang_types::{
-        ActionResources, InstanceId, InstanceLifecycle, NonZeroDuration, WorkerId, nonzero_u32,
+        ActionResources, Bytes, InstanceId, InstanceLifecycle, NonZeroDuration, WorkerId,
+        nonzero_u32,
     };
 
     fn policy(name: &str) -> FleetPolicy {
@@ -952,7 +1109,11 @@ mod tests {
             environment: Some(policy.action_environment.clone()),
             running_actions: running,
             max_inflight_actions: Some(nonzero_u32(cap)),
-            capacity: None,
+            capacity: Some(ActionResources {
+                cpu_millicores: u64::from(policy.vcpus_per_instance.get()) * 2_000,
+                memory: Bytes::new(policy.memory_per_instance.get().get()),
+                disk: Bytes::new(policy.disk_per_instance.get().get()),
+            }),
             reserved: None,
             cache: None,
             draining: false,
@@ -1061,18 +1222,314 @@ mod tests {
         }
 
         fn run(&mut self, readiness: &[Option<Duration>]) {
-            self.planner.plan(
+            self.planner.prepare(
                 &mut self.fleets,
                 &self.hosted,
                 PassTime::read(&self.clock),
                 &self.capacities,
                 readiness,
             );
+            let time = PassTime::read(&self.clock);
+            self.planner.observe(&mut self.fleets, &self.hosted, time);
+            self.planner.finalize(&mut self.fleets, &self.hosted, time);
+            let purchases: Vec<_> = self.fleets.iter().enumerate()
+                .map(|(index, fleet)| if fleet.supply.launch_failure.is_some() {
+                    0
+                } else {
+                    self.planner.scale_decision(index).extra_instances
+                })
+                .collect();
+            self.planner.project_wait(&mut self.fleets, &self.hosted, &purchases);
         }
     }
 
     fn cpu(p: &FleetPolicy) -> u64 {
         u64::from(p.vcpus_per_instance.get()) * 1000
+    }
+
+    fn set_dimension(resources: &mut ActionResources, dimension: usize, value: u64) {
+        match dimension {
+            0 => resources.cpu_millicores = value,
+            1 => resources.memory = Bytes::new(value),
+            2 => resources.disk = Bytes::new(value),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn observed_capacity_drives_each_dimension_and_shortfall() {
+        for dimension in 0..3 {
+            let p = policy("workers");
+            let nominal = [
+                cpu(&p) * 2,
+                p.memory_per_instance.get().get(),
+                p.disk_per_instance.get().get(),
+            ][dimension];
+            let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
+            scene.member(0, "large", InstanceLifecycle::InService, true);
+            let mut large = worker(&p, "large", 1, 16);
+            set_dimension(large.capacity.as_mut().unwrap(), dimension, nominal * 2);
+            let mut running = executing(0, None);
+            set_dimension(&mut running.resources, dimension, nominal + nominal / 2);
+            scene.snapshot(
+                SchedulerSnapshot {
+                    workers: vec![large.clone()],
+                    executing: vec![running.clone()],
+                    ..SchedulerSnapshot::default()
+                },
+                &[],
+            );
+            scene.run(&[None]);
+            assert_eq!(scene.planner.work(0), 1, "dimension {dimension}");
+            let mut waiting = queued(&[0], None);
+            set_dimension(&mut waiting.resources, dimension, nominal * 2);
+            scene.snapshot(
+                SchedulerSnapshot {
+                    workers: vec![large],
+                    executing: vec![running],
+                    queued: vec![waiting],
+                    ..SchedulerSnapshot::default()
+                },
+                &[Some(0)],
+            );
+            scene.run(&[None]);
+            assert_eq!(scene.planner.work(0), 3, "dimension {dimension}");
+            scene.fleets[0].outlook.minimum = 4;
+            scene.run(&[None]);
+            assert_eq!(scene.fleets[0].outlook.needed, 4);
+        }
+    }
+
+    #[test]
+    fn physical_need_counts_whole_observed_pools_in_every_dimension() {
+        for dimension in 0..3 {
+            let p = policy("workers");
+            let nominal = [
+                cpu(&p) * 2,
+                p.memory_per_instance.get().get(),
+                p.disk_per_instance.get().get(),
+            ][dimension];
+            let unit = nominal / 1000;
+            for (count, actual, demand, expected, extra) in [
+                (1, unit * 1945, unit * 1084, 1, 0),
+                (2, unit * 1945, unit * 2019, 2, 0),
+                (2, nominal * 2, nominal, 1, 0),
+                (2, nominal * 2, nominal * 5 + 1, 4, 2),
+            ] {
+                let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
+                let mut workers = Vec::new();
+                for id in ["first", "second"].into_iter().take(count) {
+                    scene.member(0, id, InstanceLifecycle::InService, true);
+                    let mut observed = worker(&p, id, 0, 16);
+                    set_dimension(observed.capacity.as_mut().unwrap(), dimension, actual);
+                    workers.push(observed);
+                }
+                let mut waiting = queued(&[0], None);
+                set_dimension(&mut waiting.resources, dimension, demand);
+                scene.snapshot(
+                    SchedulerSnapshot {
+                        workers,
+                        queued: vec![waiting],
+                        ..SchedulerSnapshot::default()
+                    },
+                    &[Some(0)],
+                );
+                scene.run(&[None]);
+                assert_eq!(scene.planner.work(0), expected, "dimension {dimension}");
+                assert_eq!(scene.fleets[0].outlook.needed, expected, "dimension {dimension}");
+                assert_eq!(scene.planner.scale_decision(0).extra_instances, extra);
+            }
+
+            let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
+            scene.member(0, "unknown", InstanceLifecycle::InService, true);
+            let mut unknown = worker(&p, "unknown", 0, 16);
+            unknown.capacity = None;
+            let mut waiting = queued(&[0], None);
+            set_dimension(&mut waiting.resources, dimension, nominal);
+            scene.snapshot(
+                SchedulerSnapshot {
+                    workers: vec![unknown],
+                    queued: vec![waiting],
+                    ..SchedulerSnapshot::default()
+                },
+                &[Some(0)],
+            );
+            scene.run(&[None]);
+            assert_eq!(scene.planner.work(0), 2, "unknown dimension {dimension}");
+            assert_eq!(scene.planner.scale_decision(0).extra_instances, 1);
+        }
+    }
+
+    #[test]
+    fn physical_need_removes_unborn_capacity_in_bulk() {
+        let p = policy("workers");
+        let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
+        scene.member(0, "pending", InstanceLifecycle::Pending, true);
+        scene.fleets[0].supply.desired = u32::MAX;
+        let mut waiting = queued(&[0], None);
+        waiting.resources.memory = Bytes::new(p.memory_per_instance.get().get() * 2);
+        scene.snapshot(
+            SchedulerSnapshot {
+                queued: vec![waiting],
+                ..SchedulerSnapshot::default()
+            },
+            &[Some(0)],
+        );
+        scene.planner.prepare(
+            &mut scene.fleets,
+            &scene.hosted,
+            PassTime::read(&scene.clock),
+            &scene.capacities,
+            &[None],
+        );
+        assert_eq!(scene.planner.physical_work(0, &scene.fleets[0]), 2);
+    }
+
+    #[test]
+    fn overlap_unknown_capacity_and_real_victim_are_conservative() {
+        for dimension in 0..3 {
+            let p = policy("workers");
+            let nominal = [
+                cpu(&p) * 2,
+                p.memory_per_instance.get().get(),
+                p.disk_per_instance.get().get(),
+            ][dimension];
+            let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
+            scene.member(0, "mixed", InstanceLifecycle::InService, true);
+            let mut first = worker(&p, "mixed", 1, 16);
+            set_dimension(first.capacity.as_mut().unwrap(), dimension, nominal * 2);
+            let mut second = worker(&p, "mixed", 0, 16);
+            second.id = WorkerId::try_new(format!(
+                "{}6c5e4f3a-9b1d-4e2a-8f7c-000000000002",
+                scene.fleets[0].supply.instances[0].id.worker_name(),
+            ))
+            .unwrap();
+            let mut running = executing(0, None);
+            set_dimension(&mut running.resources, dimension, nominal + nominal / 2);
+            scene.snapshot(
+                SchedulerSnapshot {
+                    workers: vec![first.clone(), second],
+                    executing: vec![running.clone()],
+                    ..SchedulerSnapshot::default()
+                },
+                &[],
+            );
+            scene.run(&[None]);
+            assert_eq!(scene.planner.work(0), 2, "duplicate dimension {dimension}");
+            first.capacity = None;
+            scene.snapshot(
+                SchedulerSnapshot {
+                    workers: vec![first],
+                    executing: vec![running.clone()],
+                    ..SchedulerSnapshot::default()
+                },
+                &[],
+            );
+            scene.run(&[None]);
+            assert_eq!(scene.planner.work(0), 3, "unknown dimension {dimension}");
+
+            let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
+            for id in ["first", "second"] {
+                scene.member(0, id, InstanceLifecycle::InService, true);
+            }
+            let mut workers = vec![worker(&p, "first", 1, 16), worker(&p, "second", 0, 16)];
+            for worker in &mut workers {
+                set_dimension(worker.capacity.as_mut().unwrap(), dimension, nominal * 2);
+            }
+            set_dimension(&mut running.resources, dimension, nominal * 2 + 1);
+            scene.snapshot(
+                SchedulerSnapshot {
+                    workers,
+                    executing: vec![running],
+                    ..SchedulerSnapshot::default()
+                },
+                &[],
+            );
+            scene.run(&[None]);
+            assert!(
+                scene.planner.removal(0, 0).is_none(),
+                "victim dimension {dimension}"
+            );
+            assert!(
+                scene.planner.removal(0, 1).is_none(),
+                "victim dimension {dimension}"
+            );
+        }
+    }
+
+    #[test]
+    fn booting_capacity_is_nominal_and_work_is_capped() {
+        let p = policy("workers");
+        let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
+        scene.member(0, "pending", InstanceLifecycle::Pending, true);
+        let mut waiting = queued(&[0], None);
+        waiting.resources.memory = Bytes::new(p.memory_per_instance.get().get() * 30);
+        scene.snapshot(
+            SchedulerSnapshot {
+                queued: vec![waiting],
+                ..SchedulerSnapshot::default()
+            },
+            &[Some(0)],
+        );
+        scene.run(&[None]);
+        assert_eq!(scene.planner.credit(0), [0; 3]);
+        assert_eq!(scene.planner.work(0), 20);
+        let mut one = queued(&[0], None);
+        one.resources.memory = p.memory_per_instance.get();
+        scene.snapshot(
+            SchedulerSnapshot {
+                queued: vec![one],
+                ..SchedulerSnapshot::default()
+            },
+            &[Some(0)],
+        );
+        scene.run(&[None]);
+        assert_eq!(scene.planner.work(0), 1);
+        assert_eq!(scene.planner.scale_decision(0).extra_instances, 0);
+    }
+
+    #[test]
+    fn incident_memory_thresholds_use_exact_observed_bytes() {
+        let mut p = policy("workers");
+        p.memory_per_instance = gang_types::NonZeroBytes::new(Bytes::new(67_645_734_912)).unwrap();
+        let mut single = Scene::new(vec![p.clone()], ScalingConfig::default());
+        single.member(0, "single", InstanceLifecycle::InService, true);
+        let mut large = worker(&p, "single", 1, 16);
+        large.capacity.as_mut().unwrap().memory = Bytes::new(131_558_744_064);
+        let mut one = executing(0, None);
+        one.resources.memory = Bytes::new(73_328_000_000);
+        single.snapshot(
+            SchedulerSnapshot {
+                workers: vec![large],
+                executing: vec![one],
+                ..SchedulerSnapshot::default()
+            },
+            &[],
+        );
+        single.run(&[None]);
+        assert_eq!(single.planner.work(0), 1);
+        assert_eq!(single.planner.scale_decision(0).extra_instances, 0);
+        let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
+        for id in ["first", "second"] {
+            scene.member(0, id, InstanceLifecycle::InService, true);
+        }
+        let mut workers = vec![worker(&p, "first", 1, 16), worker(&p, "second", 0, 16)];
+        for worker in &mut workers {
+            worker.capacity.as_mut().unwrap().memory = Bytes::new(131_558_744_064);
+        }
+        let mut running = executing(0, None);
+        running.resources.memory = Bytes::new(136_574_000_000);
+        scene.snapshot(
+            SchedulerSnapshot {
+                workers,
+                executing: vec![running],
+                ..SchedulerSnapshot::default()
+            },
+            &[],
+        );
+        scene.run(&[None]);
+        assert_eq!(scene.planner.work(0), 2);
+        assert!(scene.planner.removal(0, 0).is_none());
     }
 
     #[test]
@@ -1408,6 +1865,37 @@ mod tests {
     }
 
     #[test]
+    fn partial_listing_reserves_actual_not_nominal_worker_resources() {
+        for dimension in 0..3 {
+            let p = policy("workers");
+            let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
+            scene.member(0, "busy", InstanceLifecycle::InService, true);
+            let mut host = worker(&p, "busy", 2, 16);
+            let nominal = Reservation::capacity(&p, nonzero_u32(2));
+            let baseline = [nominal.cpu, nominal.memory, nominal.disk][dimension];
+            set_dimension(host.capacity.as_mut().unwrap(), dimension, u64::try_from(baseline * 2).unwrap());
+            let capacity = Reservation::action(host.capacity.unwrap());
+            let mut known = executing(0, Some(Duration::from_secs(100)));
+            set_dimension(&mut known.resources, dimension, u64::try_from(baseline).unwrap());
+            scene.snapshot(
+                SchedulerSnapshot {
+                    workers: vec![host],
+                    executing: vec![known],
+                    ..SchedulerSnapshot::default()
+                },
+                &[],
+            );
+            scene.run(&[Some(Duration::from_secs(90))]);
+            let occupied = scene.planner.dispatch.instances[0]
+                .events
+                .iter()
+                .filter(|event| event.reserve)
+                .fold(Reservation::default(), |sum, event| sum.add(event.resources));
+            assert_eq!(occupied, capacity);
+        }
+    }
+
+    #[test]
     fn booting_and_launch_failure_control_wait_and_census() {
         let mut scene = Scene::new(vec![policy("workers")], ScalingConfig::default());
         scene.member(0, "booting", InstanceLifecycle::Pending, true);
@@ -1547,7 +2035,7 @@ mod tests {
         scene.run(&[Some(Duration::from_secs(45))]);
         assert_eq!(scene.fleets[0].outlook.needed, 4);
         assert_eq!(scene.planner.scale_decision(0).booting, 1);
-        assert!(!scene.planner.needs_resume(0, CapacityVector::default()));
+        assert!(!scene.planner.needs_resume(0));
         assert!(scene.planner.removal(0, 0).is_none());
 
         // When the credited instance connects, static resource demand still protects all
@@ -1557,7 +2045,7 @@ mod tests {
         scene.run(&[Some(Duration::from_secs(45))]);
         assert_eq!(scene.fleets[0].outlook.needed, 4);
         assert_eq!(scene.planner.scale_decision(0).booting, 0);
-        assert!(!scene.planner.needs_resume(0, CapacityVector::default()));
+        assert!(!scene.planner.needs_resume(0));
         assert!(scene.planner.removal(0, 0).is_none());
     }
 
@@ -1751,9 +2239,9 @@ mod tests {
         assert_eq!(scene.planner.scale_decision(0).booting, 0);
         assert_eq!(scene.planner.scale_decision(0).extra_instances, 2);
         assert!(scene.planner.removal(0, 0).is_none());
-        assert!(scene.planner.needs_resume(0, CapacityVector::ONE));
-        let ample_capacity = CapacityVector::ONE.scaled(4.0);
-        assert!(!scene.planner.needs_resume(0, ample_capacity));
+        assert!(scene.planner.needs_resume(0));
+        scene.planner.serving_capacities[0] += CapacityVector::ONE.scaled(4.0);
+        assert!(!scene.planner.needs_resume(0));
         assert_eq!(scene.fleets[0].outlook.readiness, Some(Duration::ZERO));
     }
 
@@ -1790,7 +2278,7 @@ mod tests {
             assert_eq!(scene.planner.work(0), 1);
             assert_eq!(scene.planner.scale_decision(0).booting, u32::from(!failed));
             assert_eq!(
-                scene.planner.needs_resume(0, CapacityVector::default()),
+                scene.planner.needs_resume(0),
                 failed,
                 "{kind}",
             );

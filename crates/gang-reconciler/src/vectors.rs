@@ -8,6 +8,11 @@ use gang_config::{FleetPolicy, PaybackPercent};
 use gang_spi::ResourceRates;
 use gang_types::{ActionResources, property::MILLICORES_PER_CORE};
 
+/// Connected workers contribute only their reported actual resource capacity.
+pub(crate) fn worker_resources(worker: &gang_spi::WorkerState) -> ActionResources {
+    worker.capacity.unwrap_or_default()
+}
+
 /// The limiting resource of a scaling decision; ties prefer this declaration order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScalingDimension {

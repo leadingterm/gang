@@ -11,12 +11,12 @@ use futures::StreamExt;
 
 use gang_clock::Timestamp;
 use gang_spi::{
-    ExecutingDemand, FleetMemoryCapacity, QueuedDemand, SchedulerSnapshot, WorkerCacheStats,
+    ExecutingDemand, FleetResourceCapacity, QueuedDemand, SchedulerSnapshot, WorkerCacheStats,
     WorkerState,
 };
 use gang_types::{
-    ActionResources, Bytes, FleetCatalog, FleetName, FleetSet, NonZeroBytes, Refusal, SourceId,
-    WorkerId, property,
+    ActionResources, Bytes, FleetCatalog, FleetName, FleetProperties, FleetSet, Refusal, Resources,
+    SourceId, WorkerId, property,
 };
 use nativelink_error::{Code, Error, make_err};
 use nativelink_scheduler::worker_scheduler::WorkerSummary;
@@ -93,27 +93,38 @@ fn worker_state(summary: &WorkerSummary) -> Option<WorkerState> {
 
 /// Projects the scheduler's registered and remaining resource ledger as a pair.
 fn worker_ledger(summary: &WorkerSummary) -> Option<(ActionResources, ActionResources)> {
-    let total = &summary.platform_properties;
-    let available = &summary.available_platform_properties;
-    let read =
-        |properties: &HashMap<String, String>, key: &str| properties.get(key)?.parse::<u64>().ok();
-    let cpu = read(total, property::CPU_MILLICORES)?;
-    let memory_kb = read(total, property::MEMORY_KB)?;
-    let available_cpu = read(available, property::CPU_MILLICORES)?;
-    let available_memory_kb = read(available, property::MEMORY_KB)?;
-    let reserved_cpu = cpu.checked_sub(available_cpu)?;
-    let reserved_memory_kb = memory_kb.checked_sub(available_memory_kb)?;
-    let memory = |kb: u64| Bytes::new(kb.saturating_mul(Bytes::kib(1).get()));
+    let dimensions = [
+        (property::CPU_MILLICORES, 1),
+        (property::MEMORY_KB, Bytes::kib(1).get()),
+        (property::DISK_KB, Bytes::kib(1).get()),
+    ];
+    let [
+        Some((cpu, reserved_cpu)),
+        Some((memory, reserved_memory)),
+        Some((disk, reserved_disk)),
+    ] = dimensions.map(|(key, unit)| {
+        let total = summary.platform_properties.get(key)?.parse::<u64>().ok()?;
+        let available = summary
+            .available_platform_properties
+            .get(key)?
+            .parse::<u64>()
+            .ok()?;
+        let reserved = total.checked_sub(available)?;
+        Some((total.saturating_mul(unit), reserved.saturating_mul(unit)))
+    })
+    else {
+        return None;
+    };
     Some((
         ActionResources {
             cpu_millicores: cpu,
-            memory: memory(memory_kb),
-            disk: Bytes::new(0),
+            memory: Bytes::new(memory),
+            disk: Bytes::new(disk),
         },
         ActionResources {
             cpu_millicores: reserved_cpu,
-            memory: memory(reserved_memory_kb),
-            disk: Bytes::new(0),
+            memory: Bytes::new(reserved_memory),
+            disk: Bytes::new(reserved_disk),
         },
     ))
 }
@@ -303,25 +314,60 @@ impl Drop for ScratchGuard<'_> {
     }
 }
 
+/// Reads physical pool capacities, independently of action ceilings and oversubscription.
+fn physical_capacity(properties: &FleetProperties) -> Result<Resources, Error> {
+    let invalid = || {
+        make_err!(
+            Code::Internal,
+            "invalid physical capacity for fleet {}",
+            properties.name()
+        )
+    };
+    let vcpus = properties
+        .capacity(property::CPU_COUNT)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(invalid)?;
+    let bytes = |key| {
+        properties
+            .capacity(key)
+            .and_then(|value| value.checked_mul(1024))
+            .filter(|value| *value > 0)
+            .map(Bytes::new)
+            .ok_or_else(invalid)
+    };
+    Ok(Resources {
+        vcpus,
+        memory: bytes(property::MEMORY_KB)?,
+        disk: bytes(property::DISK_KB)?,
+    })
+}
+
 /// Reuses the snapshot buffer while reporting physical capacity independently of action ceilings.
-fn fill_fleet_memory(
+fn fill_fleet_capacity(
     fleets: &FleetCatalog,
-    into: &mut Vec<FleetMemoryCapacity>,
+    into: &mut Vec<FleetResourceCapacity>,
 ) -> Result<(), Error> {
     into.clear();
     for (fleet, properties) in fleets.fleets().iter().enumerate() {
-        let capacity = properties
-            .capacity(property::MEMORY_KB)
-            .and_then(|kb| kb.checked_mul(1024))
-            .and_then(|bytes| NonZeroBytes::new(Bytes::new(bytes)))
-            .ok_or_else(|| {
-                make_err!(
-                    Code::Internal,
-                    "invalid physical memory for fleet {}",
-                    properties.name()
-                )
-            })?;
-        into.push(FleetMemoryCapacity { fleet, capacity });
+        into.push(FleetResourceCapacity {
+            fleet,
+            capacity: physical_capacity(properties)?,
+        });
+    }
+    Ok(())
+}
+
+/// Pending workers cannot be credited with more than the prelaunch estimate.
+pub(crate) fn clamp_fleet_capacity(
+    estimates: &FleetCatalog,
+    capacities: &mut [FleetResourceCapacity],
+) -> Result<(), Error> {
+    for entry in capacities {
+        let estimate = physical_capacity(&estimates.fleets()[entry.fleet])?;
+        entry.capacity.vcpus = entry.capacity.vcpus.min(estimate.vcpus);
+        entry.capacity.memory = entry.capacity.memory.min(estimate.memory);
+        entry.capacity.disk = entry.capacity.disk.min(estimate.disk);
     }
     Ok(())
 }
@@ -347,7 +393,7 @@ pub(crate) async fn fill(
     into.workers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
     into.queued.clear();
     into.executing.clear();
-    fill_fleet_memory(fleets, &mut into.fleet_memory)?;
+    fill_fleet_capacity(fleets, &mut into.fleet_capacity)?;
 
     let mut listing = scheduler
         .filter_operations(actions::queued_filter())
@@ -433,7 +479,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use crate::actions::tests::{Fake, bazel, info, row};
-    use gang_types::{FleetProperties, FleetSet, Isa, Resources};
+    use gang_types::{Isa, NonZeroBytes};
     use nativelink_util::action_messages::ActionStage;
     use nativelink_util::operation_state_manager::OrderDirection;
 
@@ -442,6 +488,10 @@ pub(crate) mod tests {
     const WORKER: &str = "local-1-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b";
     const OTHER_WORKER: &str = "local-2-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6c";
     const LEGACY_WORKER: &str = "legacy-worker";
+
+    pub(crate) fn project_worker(summary: &WorkerSummary) -> Option<WorkerState> {
+        worker_state(summary)
+    }
 
     fn props(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -673,6 +723,7 @@ pub(crate) mod tests {
         listing.available_platform_properties = props(&[
             (property::CPU_MILLICORES, "5500"),
             (property::MEMORY_KB, "10000"),
+            (property::DISK_KB, "400"),
         ]);
         for running in [0, 1, 999] {
             listing.running_actions = running;
@@ -682,7 +733,7 @@ pub(crate) mod tests {
                 Some(ActionResources {
                     cpu_millicores: 8000,
                     memory: Bytes::kib(16384),
-                    disk: Bytes::new(0),
+                    disk: Bytes::kib(999),
                 })
             );
             assert_eq!(
@@ -690,7 +741,7 @@ pub(crate) mod tests {
                 Some(ActionResources {
                     cpu_millicores: 2500,
                     memory: Bytes::kib(6384),
-                    disk: Bytes::new(0),
+                    disk: Bytes::kib(599),
                 })
             );
         }
@@ -701,50 +752,84 @@ pub(crate) mod tests {
         let mut valid = summary(WORKER);
         valid.platform_properties.extend(props(&[
             (property::CPU_MILLICORES, "100"),
-            (property::MEMORY_KB, "200"),
+            (property::MEMORY_KB, "100"),
+            (property::DISK_KB, "100"),
         ]));
         valid.available_platform_properties = props(&[
             (property::CPU_MILLICORES, "50"),
-            (property::MEMORY_KB, "100"),
+            (property::MEMORY_KB, "50"),
+            (property::DISK_KB, "50"),
         ]);
-        for (registered, key, value) in [
-            (true, property::CPU_MILLICORES, None),
-            (true, property::MEMORY_KB, Some("bad")),
-            (false, property::CPU_MILLICORES, Some("-1")),
-            (false, property::MEMORY_KB, None),
-            (false, property::CPU_MILLICORES, Some("101")),
-            (false, property::MEMORY_KB, Some("201")),
-            (true, property::MEMORY_KB, Some("18446744073709551616")),
+        for key in [
+            property::CPU_MILLICORES,
+            property::MEMORY_KB,
+            property::DISK_KB,
+        ] {
+            for (registered, value) in [
+                (true, None),
+                (false, None),
+                (true, Some("bad")),
+                (false, Some("bad")),
+                (true, Some("-1")),
+                (false, Some("-1")),
+                (true, Some("18446744073709551616")),
+                (false, Some("18446744073709551616")),
+                (false, Some("101")),
+            ] {
+                let mut listing = valid.clone();
+                let properties = if registered {
+                    &mut listing.platform_properties
+                } else {
+                    &mut listing.available_platform_properties
+                };
+                if let Some(value) = value {
+                    properties.insert(key.to_owned(), value.to_owned());
+                } else {
+                    properties.remove(key);
+                }
+                let state = worker_state(&listing).expect("managed worker");
+                assert_eq!(
+                    (state.capacity, state.reserved),
+                    (None, None),
+                    "{key}, registered={registered}, value={value:?}"
+                );
+            }
+        }
+        for key in [
+            property::CPU_MILLICORES,
+            property::MEMORY_KB,
+            property::DISK_KB,
         ] {
             let mut listing = valid.clone();
-            let properties = if registered {
-                &mut listing.platform_properties
-            } else {
-                &mut listing.available_platform_properties
-            };
-            if let Some(value) = value {
-                properties.insert(key.to_owned(), value.to_owned());
-            } else {
-                properties.remove(key);
-            }
+            listing
+                .platform_properties
+                .insert(key.to_owned(), u64::MAX.to_string());
+            listing
+                .available_platform_properties
+                .insert(key.to_owned(), "0".to_owned());
             let state = worker_state(&listing).expect("managed worker");
-            assert_eq!((state.capacity, state.reserved), (None, None), "{key}");
+            let capacity = state.capacity.expect("capacity");
+            let reserved = state.reserved.expect("reserved");
+            let value = |resources: ActionResources| match key {
+                property::CPU_MILLICORES => resources.cpu_millicores,
+                property::MEMORY_KB => resources.memory.get(),
+                property::DISK_KB => resources.disk.get(),
+                _ => unreachable!(),
+            };
+            assert_eq!(value(capacity), u64::MAX, "{key} capacity");
+            assert_eq!(value(reserved), u64::MAX, "{key} reserved");
+            listing
+                .available_platform_properties
+                .insert(key.to_owned(), (u64::MAX - 1).to_string());
+            let state = worker_state(&listing).expect("managed worker");
+            let unit = if key == property::CPU_MILLICORES {
+                1
+            } else {
+                1024
+            };
+            assert_eq!(value(state.capacity.expect("capacity")), u64::MAX, "{key}");
+            assert_eq!(value(state.reserved.expect("reserved")), unit, "{key}");
         }
-        valid
-            .platform_properties
-            .insert(property::MEMORY_KB.to_owned(), u64::MAX.to_string());
-        valid
-            .available_platform_properties
-            .insert(property::MEMORY_KB.to_owned(), "0".to_owned());
-        let state = worker_state(&valid).expect("managed worker");
-        assert_eq!(
-            state.capacity.expect("capacity").memory,
-            Bytes::new(u64::MAX)
-        );
-        assert_eq!(
-            state.reserved.expect("reserved").memory,
-            Bytes::new(u64::MAX)
-        );
     }
 
     #[tokio::test]
@@ -754,10 +839,12 @@ pub(crate) mod tests {
         worker.platform_properties.extend(props(&[
             (property::CPU_MILLICORES, "4000"),
             (property::MEMORY_KB, "8000"),
+            (property::DISK_KB, "7000"),
         ]));
         worker.available_platform_properties = props(&[
             (property::CPU_MILLICORES, "3000"),
             (property::MEMORY_KB, "6000"),
+            (property::DISK_KB, "4000"),
         ]);
         let scheduler = Fake {
             by_worker: HashMap::from([(
@@ -797,7 +884,7 @@ pub(crate) mod tests {
             Some(ActionResources {
                 cpu_millicores: 1000,
                 memory: Bytes::kib(2000),
-                disk: Bytes::new(0),
+                disk: Bytes::kib(3000),
             })
         );
         Ok(())
@@ -1950,7 +2037,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_reports_current_physical_memory_not_action_ceiling_and_reuses_buffer() {
+    async fn snapshot_limits_pending_resources_to_estimates_and_reuses_buffer() {
         let mut policy = gang_types::FleetActionPolicy::default();
         policy.resources.memory = Some(NonZeroBytes::gib(4));
         let fleets = FleetCatalog::try_new(vec![FleetProperties::new(
@@ -1973,12 +2060,24 @@ pub(crate) mod tests {
         let runtime = crate::capacity::RuntimeCatalog::new(fleets, receiver);
         let mut snapshot = SchedulerSnapshot::default();
         let mut buffer = None;
-        for memory_kb in [62_229 * 1024, 61 * 1024 * 1024] {
+        for (cpu, memory_kb, disk_kb) in [
+            (8_u64, 62_229 * 1024, 80 * 1024 * 1024),
+            (32, 64 * 1024 * 1024, 120 * 1024 * 1024),
+            (12, 61 * 1024 * 1024, 90 * 1024 * 1024),
+        ] {
             let mut row = nativelink_config::schedulers::ResourceCapacity::default();
             row.exact
                 .insert(property::FLEET.to_owned(), "measured".to_owned());
             row.minimum
                 .insert(property::MEMORY_KB.to_owned(), memory_kb);
+            row.minimum
+                .insert(property::CPU_MILLICORES.to_owned(), cpu * 1000);
+            row.pool_multipliers.insert(
+                property::CPU_MILLICORES.to_owned(),
+                std::num::NonZeroU64::new(2).unwrap(),
+            );
+            row.minimum
+                .insert(property::DISK_KB.to_owned(), disk_kb);
             sender
                 .send(Arc::new(
                     nativelink_scheduler::worker_scheduler::ResourceCapacitySnapshot::new(vec![
@@ -1998,11 +2097,16 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
+            clamp_fleet_capacity(runtime.estimates(), &mut snapshot.fleet_capacity).unwrap();
             assert_eq!(
-                snapshot.fleet_memory,
-                vec![FleetMemoryCapacity {
+                snapshot.fleet_capacity,
+                vec![FleetResourceCapacity {
                     fleet: 0,
-                    capacity: NonZeroBytes::new(Bytes::kib(memory_kb)).unwrap(),
+                    capacity: Resources {
+                        vcpus: u32::try_from(cpu.min(16)).unwrap(),
+                        memory: Bytes::kib(memory_kb.min(63 * 1024 * 1024)),
+                        disk: Bytes::kib(disk_kb.min(100 * 1024 * 1024)),
+                    },
                 }]
             );
             assert_eq!(
@@ -2010,9 +2114,35 @@ pub(crate) mod tests {
                 Some(4 * 1024 * 1024)
             );
             if let Some(pointer) = buffer {
-                assert_eq!(snapshot.fleet_memory.as_ptr(), pointer);
+                assert_eq!(snapshot.fleet_capacity.as_ptr(), pointer);
             }
-            buffer = Some(snapshot.fleet_memory.as_ptr());
+            buffer = Some(snapshot.fleet_capacity.as_ptr());
+        }
+        for missing in [
+            property::CPU_MILLICORES,
+            property::MEMORY_KB,
+            property::DISK_KB,
+        ] {
+            let mut row = nativelink_config::schedulers::ResourceCapacity::default();
+            row.exact
+                .insert(property::FLEET.to_owned(), "measured".to_owned());
+            for key in [
+                property::CPU_MILLICORES,
+                property::MEMORY_KB,
+                property::DISK_KB,
+            ] {
+                if key != missing {
+                    row.minimum.insert(key.to_owned(), 1024);
+                }
+            }
+            sender
+                .send(Arc::new(
+                    nativelink_scheduler::worker_scheduler::ResourceCapacitySnapshot::new(vec![
+                        row,
+                    ]),
+                ))
+                .unwrap();
+            assert!(runtime.current().is_err(), "missing {missing} must fail");
         }
     }
 }

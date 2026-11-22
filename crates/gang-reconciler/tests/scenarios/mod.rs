@@ -14,7 +14,190 @@ use gang_types::health::CLIENT_REROUTE_BOUND;
 use gang_types::{FleetSet, InstanceId, InstanceLifecycle, Isa, ScalingCause, WorkerId};
 
 use crate::support::{ARM, Harness, X86, policy, policy_named};
-use work_aware::{Workload, fleet, purchases, secs, settings, source};
+use work_aware::{Workload, fleet, purchases, secs, settings, source, summary};
+
+const ARM_NOMINAL_MEMORY: u64 = 67_645_734_912;
+const ARM_OBSERVED_MEMORY: u64 = 131_558_744_064;
+
+#[derive(Clone, Copy, Debug)]
+enum CapacityDimension {
+    Cpu,
+    Memory,
+    Disk,
+}
+
+impl CapacityDimension {
+    fn nominal(self) -> u64 {
+        match self {
+            Self::Cpu => 16_000,
+            Self::Memory | Self::Disk => ARM_NOMINAL_MEMORY,
+        }
+    }
+
+    fn observed(self) -> u64 {
+        match self {
+            Self::Cpu => 31_117,
+            Self::Memory | Self::Disk => ARM_OBSERVED_MEMORY,
+        }
+    }
+
+    fn resources(self, value: u64) -> gang_types::ActionResources {
+        let mut resources = gang_types::ActionResources::default();
+        match self {
+            Self::Cpu => resources.cpu_millicores = value,
+            Self::Memory => resources.memory = gang_types::Bytes::new(value),
+            Self::Disk => resources.disk = gang_types::Bytes::new(value),
+        }
+        resources
+    }
+}
+
+fn oversized_arm_world() -> TestResult<Workload> {
+    let mut policy = policy_named("gang-arm", Isa::Aarch64)?;
+    policy.instances = InstanceBounds::try_new(1, gang_types::nonzero_u32(8))?;
+    policy.vcpus_per_instance = gang_types::nonzero_u32(16);
+    policy.memory_per_instance = gang_types::NonZeroBytes::gib(63);
+    policy.disk_per_instance = gang_types::NonZeroBytes::gib(63);
+    policy.idle_timeout = secs(600);
+    let mut w = Workload {
+        h: Harness::with_scaling(vec![policy], settings(50)?),
+    };
+    w.h.settle_term()?;
+    Ok(w)
+}
+
+fn arm_serve(w: &mut Workload, name: &str, dimension: CapacityDimension) -> TestResult {
+    w.serve(X86, name)?;
+    let worker =
+        w.h.snapshot
+            .workers
+            .last_mut()
+            .ok_or("missing ARM worker")?;
+    worker.capacity = Some(dimension.resources(dimension.observed()));
+    Ok(())
+}
+
+fn arm_running(
+    w: &mut Workload,
+    name: &str,
+    dimension: CapacityDimension,
+    value: u64,
+) -> TestResult {
+    w.h.set_running(name, 1)?;
+    let id = worker_id(name)?;
+    let worker =
+        w.h.snapshot
+            .workers
+            .iter()
+            .position(|row| row.id == id)
+            .ok_or("missing ARM worker")?;
+    let execution =
+        w.h.snapshot
+            .executing
+            .iter_mut()
+            .find(|row| row.worker == worker)
+            .ok_or("missing ARM execution")?;
+    execution.resources = dimension.resources(value);
+    Ok(())
+}
+
+#[test]
+fn oversized_arm_worker_absorbs_repeated_zero_queue_bursts() -> TestResult {
+    for dimension in [
+        CapacityDimension::Cpu,
+        CapacityDimension::Memory,
+        CapacityDimension::Disk,
+    ] {
+        let mut w = oversized_arm_world()?;
+        arm_serve(&mut w, "arm-1", dimension)?;
+
+        // Each burst is 1.084 nominal workers, but fits on the observed worker.
+        for _ in 0..4 {
+            arm_running(
+                &mut w,
+                "arm-1",
+                dimension,
+                dimension.nominal() * 1084 / 1000,
+            )?;
+            assert!(w.h.snapshot.queued.is_empty());
+            let steps = w.run();
+            assert!(
+                purchases(&steps).is_empty(),
+                "{dimension:?}: unexpected burst purchase: {steps:?}"
+            );
+            assert_eq!(w.h.supply(X86)?.desired, 1);
+
+            w.h.set_running("arm-1", 0)?;
+            w.h.advance(secs(299));
+            let quiet = w.run();
+            assert!(
+                quiet.iter().all(|step| !matches!(
+                    step.action,
+                    Action::ScaleOut { .. } | Action::StartDrain { .. } | Action::Terminate { .. }
+                )),
+                "{dimension:?}: unexpected quiet-interval churn: {quiet:?}"
+            );
+            assert_eq!(w.h.supply(X86)?.desired, 1);
+            w.h.advance(secs(1));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn two_oversized_arm_workers_cover_running_demand_but_not_real_shortfall() -> TestResult {
+    for dimension in [
+        CapacityDimension::Cpu,
+        CapacityDimension::Memory,
+        CapacityDimension::Disk,
+    ] {
+        let mut w = oversized_arm_world()?;
+        arm_serve(&mut w, "arm-1", dimension)?;
+        arm_serve(&mut w, "arm-2", dimension)?;
+        let total = dimension.nominal() * 2019 / 1000;
+        arm_running(&mut w, "arm-1", dimension, total / 2)?;
+        arm_running(&mut w, "arm-2", dimension, total - total / 2)?;
+        assert!(w.h.snapshot.queued.is_empty());
+        let steps = w.run();
+        assert!(
+            purchases(&steps).is_empty(),
+            "{dimension:?}: unexpected third worker: {steps:?}"
+        );
+        assert_eq!(w.h.supply(X86)?.desired, 2);
+
+        // Future workers must still be purchased at nominal capacity.
+        w.h.queue_sized(X86, 3, dimension.resources(dimension.nominal()))?;
+        assert_eq!(
+            purchases(&w.run()),
+            vec![(X86, 2, 4, NeedCause::Demand)],
+            "{dimension:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn duplicate_connections_do_not_double_credit_observed_capacity() -> TestResult {
+    for dimension in [
+        CapacityDimension::Cpu,
+        CapacityDimension::Memory,
+        CapacityDimension::Disk,
+    ] {
+        let mut w = oversized_arm_world()?;
+        arm_serve(&mut w, "arm-1", dimension)?;
+        arm_running(&mut w, "arm-1", dimension, dimension.observed())?;
+        let mut duplicate = renewed(&w.h.snapshot.workers[0], 1)?;
+        duplicate.running_actions = 0;
+        w.h.snapshot.workers.push(duplicate);
+        w.h.queue_sized(X86, 1, dimension.resources(dimension.nominal() / 2))?;
+        assert_eq!(
+            purchases(&w.run()),
+            vec![(X86, 1, 2, NeedCause::Demand)],
+            "{dimension:?}"
+        );
+    }
+    Ok(())
+}
 
 #[test]
 fn mismatched_and_unknown_workers_supply_capacity_without_early_draining() -> TestResult {
@@ -55,7 +238,10 @@ fn stale_busy_instance_is_replaced_at_max_without_duplicate_purchase() -> TestRe
         .unwrap()
         .current_build = false;
 
-    let first = changes(&h.run());
+    let first_steps = h.run();
+    assert_eq!(purchases(&first_steps), vec![(X86, 2, 3, NeedCause::Minimum)]);
+    assert_eq!(summary(&first_steps)?.extra_instances, 1);
+    let first = changes(&first_steps);
     assert!(first.contains(&Change::Reinforce(X86, "local-old".into())));
     assert_eq!(
         first
@@ -845,6 +1031,92 @@ fn zero_horizon_fractional_demand_reopens_busy_drain_above_waterline() -> TestRe
 }
 
 #[test]
+fn oversized_rescue_is_used_by_the_final_outlook_and_timeline() -> TestResult {
+    for dimension in [CapacityDimension::Cpu, CapacityDimension::Memory, CapacityDimension::Disk] {
+        let mut w = oversized_arm_world()?;
+        arm_serve(&mut w, "arm-1", dimension)?;
+        w.h.set_draining("arm-1", true)?;
+        w.h.queue_sized(X86, 1, dimension.resources(dimension.nominal() * 3 / 2))?;
+        let steps = w.pass();
+        assert!(steps.iter().any(|step| matches!(step.action, Action::CancelDrain(_, _))), "{dimension:?}");
+        assert!(purchases(&steps).is_empty(), "{dimension:?}: {steps:?}");
+        assert_eq!(w.h.outlook(X86)?.needed, 1, "{dimension:?}");
+        assert_eq!(w.h.outlook(X86)?.expected_wait, Some(Duration::ZERO), "{dimension:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn minimum_purchase_after_oversized_rescue_uses_final_decision() -> TestResult {
+    for dimension in [CapacityDimension::Cpu, CapacityDimension::Memory, CapacityDimension::Disk] {
+        let mut w = oversized_arm_world()?;
+        w.h.passes[X86].policy.instances = InstanceBounds::try_new(2, gang_types::nonzero_u32(8))?;
+        arm_serve(&mut w, "arm-1", dimension)?;
+        w.h.set_draining("arm-1", true)?;
+        w.h.queue_sized(X86, 1, dimension.resources(dimension.nominal() * 3 / 2))?;
+        let steps = w.pass();
+        assert!(changes(&steps).iter().any(|change| matches!(change, Change::Cancel(X86, name, _) if name == "arm-1")), "{dimension:?}");
+        assert_eq!(purchases(&steps), vec![(X86, 1, 2, NeedCause::Minimum)], "{dimension:?}");
+        let outlook = w.h.outlook(X86)?;
+        assert_eq!(outlook.needed, 2, "{dimension:?}");
+        assert_eq!(outlook.expected_wait, Some(Duration::ZERO), "{dimension:?}");
+        let decision = summary(&steps)?;
+        assert_eq!(decision.needed, outlook.needed, "{dimension:?}");
+        assert_eq!(decision.reliable, 1, "{dimension:?}");
+        assert_eq!(decision.extra_instances, 1, "{dimension:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn failed_launch_queue_uses_actual_resumable_capacity() -> TestResult {
+    let mut preferred = fleet("gang-preferred", 4, 16)?;
+    preferred.memory_per_instance = gang_types::NonZeroBytes::gib(63);
+    let fallback = fleet("gang-fallback", 4, 16)?;
+    let mut w = Workload { h: Harness::with_scaling(vec![preferred, fallback], settings(50)?) };
+    w.h.settle_term()?;
+    w.serve(0, "preferred-1")?;
+    w.h.snapshot.workers[0].capacity.as_mut().unwrap().memory =
+        gang_types::Bytes::new(ARM_OBSERVED_MEMORY);
+    w.h.set_draining("preferred-1", true)?;
+    w.h.set_desired_capacity(0, 4);
+    w.h.supply_mut(0)?.launch_failure = Some(gang_spi::LaunchFailure { reason: "capacity".into() });
+    w.h.queue_candidates(FleetSet::prefix(2)?, 1);
+    w.h.snapshot.queued[0].resources.memory = gang_types::Bytes::new(ARM_NOMINAL_MEMORY * 3 / 2);
+    let steps = w.pass();
+    assert_eq!(w.h.outlook(0)?.queued, 1);
+    assert_eq!(w.h.outlook(1)?.queued, 0);
+    assert_eq!(w.h.outlook(0)?.needed, 1);
+    assert!(steps.iter().any(|step| step.fleet == 0 && matches!(step.action, Action::CancelDrain(_, _))));
+    Ok(())
+}
+
+#[test]
+fn resumed_busy_worker_remains_demand_and_requires_a_purchase() -> TestResult {
+    for dimension in [CapacityDimension::Cpu, CapacityDimension::Memory, CapacityDimension::Disk] {
+        let mut w = oversized_arm_world()?;
+        arm_serve(&mut w, "arm-1", dimension)?;
+        arm_running(&mut w, "arm-1", dimension, dimension.nominal() / 2)?;
+        let mut duplicate = renewed(&w.h.snapshot.workers[0], 1)?;
+        duplicate.running_actions = 1;
+        w.h.snapshot.workers.push(duplicate);
+        let mut second_execution = w.h.snapshot.executing[0].clone();
+        second_execution.worker = 1;
+        w.h.snapshot.executing.push(second_execution);
+        w.h.set_draining("arm-1", true)?;
+        w.h.queue_sized(X86, 1, dimension.resources(dimension.nominal()))?;
+        let steps = w.pass();
+        assert!(changes(&steps).contains(&Change::Cancel(X86, "arm-1".into(), NeedCause::Demand)), "{dimension:?}");
+        assert_eq!(w.h.outlook(X86)?.needed, 2, "{dimension:?}");
+        assert_eq!(purchases(&steps), vec![(X86, 1, 2, NeedCause::Demand)], "{dimension:?}");
+        let decision = summary(&steps)?;
+        assert_eq!(decision.needed, 2, "{dimension:?}");
+        assert_eq!(decision.extra_instances, 1, "{dimension:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn projected_wait_resumes_only_owned_unordered_nonterminating_workers() -> TestResult {
     for excluded in ["unowned", "ordered", "terminating"] {
         let mut w = idle_world(0, 600)?;
@@ -880,6 +1152,7 @@ fn projected_wait_resumes_only_owned_unordered_nonterminating_workers() -> TestR
             },
         )?;
         let steps = w.pass();
+        assert!(purchases(&steps).is_empty(), "{excluded}");
         let resumed: Vec<_> = steps
             .iter()
             .filter_map(|step| match &step.action {
@@ -930,12 +1203,15 @@ fn projected_wait_and_rescue_share_busiest_release_and_worker_id_order() -> Test
         let steps = w.pass();
         assert_eq!(
             changes(&steps),
-            vec![Change::Cancel(X86, "local-1".into(), NeedCause::Demand)],
+            vec![
+                Change::Cancel(X86, "local-1".into(), NeedCause::Demand),
+                Change::Cancel(X86, "local-2".into(), NeedCause::Demand),
+            ],
             "{priority}",
         );
         assert_eq!(
             w.h.outlook(X86)?.expected_wait,
-            Some(secs(30)),
+            Some(secs(5)),
             "{priority}"
         );
     }
@@ -1000,6 +1276,59 @@ fn release_first_busy_or_booting_member_holds_back_idle_spot() -> TestResult {
                 .iter()
                 .any(|step| matches!(step.action, Action::StartDrain { .. }))
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn slightly_undersized_pools_allow_idle_drain_at_physical_need() -> TestResult {
+    for dimension in [CapacityDimension::Cpu, CapacityDimension::Memory, CapacityDimension::Disk] {
+        let mut w = oversized_arm_world()?;
+        // CPU is 30,000 actual versus 32,000 nominal; use the same ratios for bytes.
+        w.h.passes[X86].policy.vcpus_per_instance = gang_types::nonzero_u32(32);
+        let nominal = match dimension {
+            CapacityDimension::Cpu => 32_000,
+            _ => dimension.nominal(),
+        };
+        for name in ["arm-busy", "arm-idle"] {
+            arm_serve(&mut w, name, dimension)?;
+            w.h.snapshot.workers.last_mut().ok_or("missing worker")?.capacity =
+                Some(dimension.resources(nominal * 30 / 32));
+        }
+        arm_running(&mut w, "arm-busy", dimension, nominal * 29 / 32)?;
+        let initial = w.pass();
+        assert!(purchases(&initial).is_empty(), "{dimension:?}");
+        assert_eq!(w.h.outlook(X86)?.needed, 1, "{dimension:?}");
+        w.h.advance(secs(600));
+        let steps = w.pass();
+        assert_eq!(w.h.outlook(X86)?.needed, 1, "{dimension:?}");
+        assert!(changes(&steps).contains(&Change::Drain(X86, "arm-idle".into(), DrainReason::IdleTimeout)), "{dimension:?}: {steps:?}");
+        assert!(purchases(&steps).is_empty(), "{dimension:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn physical_surplus_keeps_idle_spot_behind_busy_release_first_workers() -> TestResult {
+    for dimension in [CapacityDimension::Cpu, CapacityDimension::Memory, CapacityDimension::Disk] {
+        let mut w = oversized_arm_world()?;
+        for name in ["release-1", "release-2", "spot-busy", "spot-idle"] {
+            arm_serve(&mut w, name, dimension)?;
+        }
+        w.h.supply_mut(X86)?.instances[0].release_first = true;
+        w.h.supply_mut(X86)?.instances[1].release_first = true;
+        for name in ["release-1", "release-2"] {
+            arm_running(&mut w, name, dimension, dimension.nominal() * 90 / 63)?;
+        }
+        arm_running(&mut w, "spot-busy", dimension, dimension.nominal() * 60 / 63)?;
+        let initial = w.pass();
+        assert!(purchases(&initial).is_empty(), "{dimension:?}");
+        assert_eq!(w.h.outlook(X86)?.needed, 2, "{dimension:?}");
+        w.h.advance(secs(600));
+        let steps = w.pass();
+        assert_eq!(w.h.outlook(X86)?.needed, 2, "{dimension:?}");
+        assert!(!changes(&steps).contains(&Change::Drain(X86, "spot-idle".into(), DrainReason::IdleTimeout)), "{dimension:?}: {steps:?}");
+        assert!(purchases(&steps).is_empty(), "{dimension:?}");
     }
     Ok(())
 }
@@ -1303,8 +1632,11 @@ fn unowned_drain_after_grace_terminates_and_replaces_exactly_once() -> TestResul
     w.h.snapshot.workers[1].draining = true;
     assert!(w.pass().is_empty());
     w.h.advance(secs(600));
+    let steps = w.pass();
+    assert_eq!(purchases(&steps), vec![(X86, 1, 2, NeedCause::Minimum)]);
+    assert_eq!(summary(&steps)?.extra_instances, 1);
     assert_eq!(
-        changes(&w.pass()),
+        changes(&steps),
         vec![
             Change::Terminate(X86, "local-2".into(), TerminationCause::DrainFinished),
             Change::Scale(X86, 1, 2, NeedCause::Minimum)

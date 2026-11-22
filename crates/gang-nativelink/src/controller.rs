@@ -676,7 +676,7 @@ mod tests {
         ActionResourceUsage, Reservation, ResourceOutcome, StartExecute, UpdateForWorker,
         update_for_worker,
     };
-    use nativelink_scheduler::resource_sketch::{Observation, ResourceSketch, SketchKey};
+    use nativelink_scheduler::resource_sketch::{HistoryScope, Observation, ResourceSketch, SketchKey};
     use nativelink_scheduler::worker::Worker;
     use nativelink_util::action_messages::{
         ActionInfo, ActionResult, ActionStage, ActionUniqueKey, ActionUniqueQualifier, OperationId,
@@ -967,7 +967,7 @@ mod tests {
             ),
             (
                 property::CPU_MILLICORES.to_owned(),
-                PlatformPropertyValue::Minimum(4_000),
+                PlatformPropertyValue::Minimum(8_000),
             ),
             (
                 property::MEMORY_KB.to_owned(),
@@ -1076,10 +1076,10 @@ mod tests {
         }
     }
 
-    async fn assert_available_cpu(stack: &TestStack, expected: &str) {
+    async fn assert_available_cpu(stack: &TestStack, expected: &str, running: u32) {
         let snapshot = stack.workers.worker_snapshot().await;
         assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].running_actions, 1);
+        assert_eq!(snapshot[0].running_actions, running);
         assert_eq!(
             snapshot[0]
                 .available_platform_properties
@@ -1283,7 +1283,32 @@ mod tests {
             Some(update_for_worker::Update::StartAction(start)) => start,
             update => panic!("expected StartAction, got {update:?}"),
         };
-        assert_available_cpu(&stack, "0").await;
+        assert_available_cpu(&stack, "4000", 1).await;
+
+        let mut filler = action(Isa::Aarch64, None);
+        let filler_info = Arc::get_mut(&mut filler).expect("action is uniquely owned");
+        let filler_digest = DigestInfo::new([3; 32], 1);
+        filler_info.command_digest = filler_digest;
+        filler_info.input_root_digest = filler_digest;
+        filler_info.unique_qualifier = ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+            execution_scope: None,
+            instance_name: String::new(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: filler_digest,
+        });
+        filler_info
+            .platform_properties
+            .insert(property::CPU_MILLICORES.to_owned(), "1000".to_owned());
+        let _filler_subscription = stack
+            .actions
+            .add_action(OperationId::from("filler-client"), filler)
+            .await?;
+        stack.simple.do_try_match_for_test().await?;
+        assert!(matches!(
+            rx.try_recv().expect("filler action dispatch").update,
+            Some(update_for_worker::Update::StartAction(_))
+        ));
+        assert_available_cpu(&stack, "3000", 2).await;
 
         let mut second = action(Isa::Aarch64, None);
         let second_info = Arc::get_mut(&mut second).expect("action is uniquely owned");
@@ -1298,7 +1323,7 @@ mod tests {
         });
         second_info
             .platform_properties
-            .insert(property::CPU_MILLICORES.to_owned(), "1000".to_owned());
+            .insert(property::CPU_MILLICORES.to_owned(), "4000".to_owned());
         let second_client = OperationId::from("millicore-client");
         let _second_subscription = stack
             .actions
@@ -1313,7 +1338,7 @@ mod tests {
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
-        assert_available_cpu(&stack, "0").await;
+        assert_available_cpu(&stack, "3000", 2).await;
 
         let operation_id = OperationId::from(first_start.operation_id.as_str());
         stack
@@ -1331,7 +1356,7 @@ mod tests {
             rx.try_recv().expect("millicore action dispatch").update,
             Some(update_for_worker::Update::StartAction(_))
         ));
-        assert_available_cpu(&stack, "3000").await;
+        assert_available_cpu(&stack, "3000", 2).await;
         let properties = &first_start
             .platform
             .as_ref()
@@ -1457,7 +1482,7 @@ mod tests {
             .workers
             .get_platform_property_manager()
             .make_platform_properties(pairs)?;
-        let worker_id = WorkerId("rendered-worker".to_owned());
+        let worker_id = WorkerId("local-1-0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b".to_owned());
         let (tx, mut rx) = mpsc::channel(64);
         let mut worker = Worker::new(
             worker_id.clone(),
@@ -1540,6 +1565,24 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].running_actions, u32::from(dispatched));
         assert_eq!(snapshot[0].max_inflight_tasks, 0);
+        let projected = crate::snapshot::tests::project_worker(&snapshot[0])
+            .expect("registered managed worker");
+        assert_eq!(
+            projected.capacity,
+            Some(gang_types::ActionResources {
+                cpu_millicores: 2000 * u64::from(factor),
+                memory: Bytes::new(memory),
+                disk: Bytes::new(disk),
+            })
+        );
+        assert_eq!(
+            projected.reserved,
+            Some(gang_types::ActionResources {
+                cpu_millicores: 250 * u64::from(dispatched),
+                memory: Bytes::new((64 << 20) * u64::from(dispatched)),
+                disk: Bytes::new((1 << 30) * u64::from(dispatched)),
+            })
+        );
         let remaining = snapshot[0]
             .available_platform_properties
             .get(property::CPU_MILLICORES)
@@ -1781,21 +1824,20 @@ mod tests {
         ));
 
         let action = action(Isa::Aarch64, None);
-        let key = SketchKey::for_attempt(None, None, &action.command_digest.to_string());
+        let key = SketchKey::for_action(&action);
         let now_s = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let observation = Observation {
             peak_memory_kb: 22_387,
             now_s,
             ..Default::default()
         };
-        // A successful command's first sighting is probation; the second records one sample.
-        assert!(!stack.sketch.observe(key.clone(), &observation));
+        // Exact action history retains its first sample.
         assert!(stack.sketch.observe(key.clone(), &observation));
         let entry = stack
             .sketch
             .lookup(&key, now_s)
             .expect("sample was learned");
-        assert_eq!(stack.sketch.shape(&entry).memory_kb, 26_865);
+        assert_eq!(stack.sketch.shape(&entry, HistoryScope::Action).memory_kb, 26_865);
 
         let _subscription = stack
             .actions
@@ -1820,7 +1862,7 @@ mod tests {
             ..Default::default()
         });
         let median = stack_with_actions(&fleets, &config, None, &median_actions)?.0;
-        let key = SketchKey::for_attempt(Some("bursty"), None, "");
+        let key = SketchKey::for_action(&action(Isa::Aarch64, None));
         for index in 0..20 {
             let observation = Observation {
                 cpu_millicores: Some(if index < 18 { 500 } else { 12_000 }),
@@ -1834,7 +1876,7 @@ mod tests {
             assert!(median.sketch.observe(key.clone(), &observation));
         }
         let entry = median.sketch.lookup(&key, 100).expect("bursty history");
-        let median_shape = median.sketch.shape(&entry);
+        let median_shape = median.sketch.shape(&entry, HistoryScope::Action);
         assert_eq!(median_shape.cpu_count, 1_200);
         assert_eq!(median_shape.memory_kb, 48_000);
         assert_eq!(median_shape.disk_kb, 1_844);
@@ -1845,6 +1887,7 @@ mod tests {
             &Observation {
                 cpu_millicores: Some(1_500),
                 now_s: 100,
+                completed: true,
                 ..Default::default()
             },
         ));
@@ -1852,7 +1895,7 @@ mod tests {
             .sketch
             .lookup(&steady_key, 100)
             .expect("steady history");
-        assert_eq!(median.sketch.shape(&steady_entry).cpu_count, 1_800);
+        assert_eq!(median.sketch.shape(&steady_entry, HistoryScope::Aggregate).cpu_count, 1_800);
 
         let durations = || {
             Arc::new(Mutex::new(ActionDurations::new(
@@ -1866,7 +1909,7 @@ mod tests {
         let high = stack_with_actions(&fleets, &config, None, &high_actions)?.0;
         Histories::new(Arc::clone(&high.sketch), durations()).restore(now, &records)?;
         let high_entry = high.sketch.lookup(&key, 100).expect("restored history");
-        let high_shape = high.sketch.shape(&high_entry);
+        let high_shape = high.sketch.shape(&high_entry, HistoryScope::Action);
         assert_eq!(high_shape.cpu_count, 14_400);
         assert_eq!(high_shape.memory_kb, median_shape.memory_kb);
         assert_eq!(high_shape.disk_kb, median_shape.disk_kb);
@@ -1875,32 +1918,28 @@ mod tests {
 
     fn seed_controller_history(history: &Histories, now: gang_clock::Timestamp) {
         let now_s = now.as_unix_millis() / 1000;
-        let key = SketchKey::for_attempt(Some("target"), Some("compile"), "");
+        let key = SketchKey::for_action(&action(Isa::Aarch64, None));
         let observation = Observation {
             peak_memory_kb: 22_387,
+            killed: true,
+            killed_peak_memory_kb: Some(22_387),
             now_s,
             ..Default::default()
         };
-        // Only anonymous command keys need probation. A named target records
-        // immediately and also trains the mnemonic fallback.
+        // A killed action learns its own floor, not aggregate fallbacks.
         assert!(history.resource.observe(key.clone(), &observation));
         assert_eq!(
             history
                 .resource
                 .lookup(&key, now_s)
-                .expect("target learned")
+                .expect("action learned")
                 .samples,
             1,
         );
         let mnemonic = SketchKey::for_attempt(None, Some("compile"), "");
-        assert_eq!(
-            history
-                .resource
-                .lookup(&mnemonic, now_s)
-                .expect("mnemonic fallback learned")
-                .samples,
-            1,
-        );
+        let target = SketchKey::for_attempt(Some("target"), Some("compile"), "");
+        assert!(history.resource.lookup(&target, now_s).is_none());
+        assert!(history.resource.lookup(&mnemonic, now_s).is_none());
         history
             .durations
             .lock()
@@ -1970,6 +2009,17 @@ mod tests {
         waiting.await?;
         let history = histories.lock().clone().ok_or("original history missing")?;
         seed_controller_history(&history, now);
+        let now_s = now.as_unix_millis() / 1000;
+        let key = SketchKey::for_action(&action(Isa::Aarch64, None));
+        let target = SketchKey::for_attempt(Some("target"), Some("compile"), "");
+        let mnemonic = SketchKey::for_attempt(None, Some("compile"), "");
+        let action_before = history
+            .resource
+            .lookup(&key, now_s)
+            .expect("action learned");
+        assert_eq!(action_before.killed_peak_memory_kb, 22_387);
+        assert!(history.resource.lookup(&target, now_s).is_none());
+        assert!(history.resource.lookup(&mnemonic, now_s).is_none());
         let mut expected = Vec::new();
         history.snapshot(now, &mut expected)?;
         assert!(
@@ -1999,6 +2049,9 @@ mod tests {
         ));
         let mut actual = Vec::new();
         history.snapshot(now, &mut actual)?;
+        assert_eq!(history.resource.lookup(&key, now_s), Some(action_before));
+        assert!(history.resource.lookup(&target, now_s).is_none());
+        assert!(history.resource.lookup(&mnemonic, now_s).is_none());
         assert_eq!(
             actual, expected,
             "both learned models survive the original engine's drain"
@@ -2015,14 +2068,13 @@ mod tests {
         let resources = OnceLock::new();
         let first = stack_with_resources(&fleets, &config, None, &actions, &resources)?.0;
         let action = action(Isa::Aarch64, None);
-        let key = SketchKey::for_attempt(None, None, &action.command_digest.to_string());
+        let key = SketchKey::for_action(&action);
         let now_s = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let observation = Observation {
             peak_memory_kb: 22_387,
             now_s,
             ..Default::default()
         };
-        assert!(!first.sketch.observe(key.clone(), &observation));
         assert!(first.sketch.observe(key.clone(), &observation));
         drop(first);
         let second = stack_with_resources(&fleets, &config, None, &actions, &resources)?.0;
@@ -2030,7 +2082,7 @@ mod tests {
             .sketch
             .lookup(&key, now_s)
             .expect("reservation survived");
-        assert_eq!(second.sketch.shape(&entry).memory_kb, 26_865);
+        assert_eq!(second.sketch.shape(&entry, HistoryScope::Action).memory_kb, 26_865);
         Ok(())
     }
 
@@ -2069,7 +2121,7 @@ mod tests {
         let fleets = x86_and_arm_fleets();
         let source = stack_on_test_clock(&fleets, &config)?;
         let request = action(Isa::Aarch64, None);
-        let key = SketchKey::for_attempt(None, None, &request.command_digest.to_string());
+        let key = SketchKey::for_action(&request);
         // HistoricalResourceScheduler reads the system wall clock; use the same clock for
         // the observation while keeping the scheduler's test clock deterministic.
         let now_s = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -2080,7 +2132,6 @@ mod tests {
             cpu_millicores: Some(1_200),
             ..Default::default()
         };
-        assert!(!source.sketch.observe(key.clone(), &observation));
         assert!(source.sketch.observe(key, &observation));
         let durations = || {
             Arc::new(Mutex::new(ActionDurations::new(

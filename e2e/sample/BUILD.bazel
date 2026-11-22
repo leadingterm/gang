@@ -1,6 +1,6 @@
 load("@gang_env//:defs.bzl", "EXEC_PROPERTIES")
 load(":config.bzl", "CPU_COUNT", "ISA", "LARGE_FLEET", "LARGE_MEMORY_KB", "MEMORY_KB", "REQUESTED_SANDBOX", "SIGNAL_COMMAND")
-load(":rules.bzl", "environment_witness", "input_root_probe", "probe", "rate_held", "rate_stream")
+load(":rules.bzl", "environment_witness", "history_memory", "input_root_probe", "probe", "rate_held", "rate_stream")
 
 environment_witness(
     name = "rootfs_environment",
@@ -166,6 +166,21 @@ sh -c "{signal}; sleep 3600; : $marker-$E2E_SALT" &
 while [ ! -e release ]; do sleep 1; done
 echo released=yes
 """.format(signal = SIGNAL_COMMAND),
+)
+
+# Separate target/mnemonic prevents cancellation of the cold control from training the oracle.
+history_memory(
+    name = "history_cold",
+    probe = "action-environment-probe",
+    mnemonic = "E2eHistoryCold",
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA),
+)
+
+history_memory(
+    name = "history_memory",
+    probe = "action-environment-probe",
+    mnemonic = "E2eHistoryMemory",
+    exec_properties = dict(EXEC_PROPERTIES, ISA = ISA),
 )
 
 # Limits of the memory and disk probes, in KiB, as their platform properties. They live here rather

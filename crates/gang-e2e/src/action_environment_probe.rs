@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::sync::Arc;
 
-/// Runs a native roots, `PostgreSQL`, or nonblocking lock-witness action probe.
+/// Runs native trust, environment, lock-witness, or sustained-memory action probes.
 #[must_use]
 pub fn action_environment_probe(arguments: &[OsString]) -> ExitCode {
     let result = match arguments {
@@ -25,6 +25,7 @@ pub fn action_environment_probe(arguments: &[OsString]) -> ExitCode {
                 .map_err(|error| error.to_string())
         }
         [mode, output, marker] if mode == "environment" => environment_witness(output, marker),
+        [mode, output, phase] if mode == "history-memory" => history_memory(output, phase),
         [mode, lock, shell, script] if mode == "lock" => {
             let file = File::open(lock).map_err(|error| error.to_string());
             file.and_then(|file| {
@@ -48,7 +49,10 @@ pub fn action_environment_probe(arguments: &[OsString]) -> ExitCode {
                 }
             })
         }
-        _ => Err("expected roots, postgres <archive>, or lock <file> <shell> <script>".to_owned()),
+        _ => Err(
+            "expected roots, postgres <archive>, environment <output> <marker>, lock <file> <shell> <script>, or history-memory <output> train|hold"
+                .to_owned(),
+        ),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -57,6 +61,41 @@ pub fn action_environment_probe(arguments: &[OsString]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+// A native touched allocation, rather than dd's transient buffer, gives the real worker
+// sampler a sustained resident plateau. Held probes never complete or allocate this buffer.
+fn history_memory(output: &OsStr, phase: &OsStr) -> Result<(), String> {
+    if phase == "hold" {
+        loop {
+            std::thread::park();
+        }
+    }
+    if phase != "train" {
+        return Err("expected history-memory <output> train|hold".to_owned());
+    }
+    let mut memory = vec![0_u8; 192 * 1024 * 1024];
+    for page in memory.chunks_mut(4096) {
+        page[0] = 1;
+    }
+    std::thread::sleep(std::time::Duration::from_secs(8));
+    let status = std::fs::read_to_string("/proc/self/status").map_err(|error| error.to_string())?;
+    let resident_kb = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| "native history probe did not report resident memory".to_owned())?;
+    std::hint::black_box(&memory);
+    std::fs::write(
+        output,
+        format!(
+            "allocated_bytes={}\nresident_bytes={}\n",
+            memory.len(),
+            resident_kb * 1024,
+        ),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn environment_witness(output: &OsStr, marker: &OsStr) -> Result<(), String> {
