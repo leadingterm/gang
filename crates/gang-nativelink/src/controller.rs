@@ -6,7 +6,6 @@ use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
-use std::time::SystemTime;
 
 use axum::Router;
 use axum::body::Body;
@@ -211,7 +210,7 @@ pub(crate) async fn run<P: RequestGate, W: RequestGate, A: ApiService>(
         workers: worker_scheduler,
         resource,
         fleets,
-    } = scheduler_stack(&scheduler, spec.fleets, &spec.actions, resources)?;
+    } = scheduler_stack(&scheduler, spec, resources)?;
     let handoff = HandOff::new();
     let action_scheduler: Arc<dyn KnownPlatformPropertyProvider> =
         Arc::new(HandOffActions::new(action_scheduler, handoff.clone()));
@@ -455,24 +454,35 @@ struct SchedulerStack {
 /// The action stack over `NativeLink`'s simple scheduler.
 fn scheduler_stack(
     scheduler: &SchedulerConfig,
-    fleets: &FleetCatalog,
-    actions: &gang_config::ActionsConfig,
+    spec: &ControllerSpec<'_>,
     resources: &OnceLock<Arc<ResourceSketch>>,
 ) -> Result<SchedulerStack, NativeLinkEmbedError> {
+    let clock = Arc::clone(&spec.clock);
     let mut resource = None;
     let (actions, workers, fleets) = action_stack(
         scheduler,
-        fleets,
-        actions,
+        spec.fleets,
+        &spec.actions,
         resources,
         |simple, notify, sketch| {
             resource = Some(Arc::clone(&sketch));
+            let now = move || {
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_millis(clock.wall().as_unix_millis())
+            };
             let db = memory_awaited_action_db_factory(
                 simple.retain_completed_for_s,
                 &notify,
-                SystemTime::now,
+                now.clone(),
             );
-            SimpleScheduler::new_with_resource_sketch(simple, db, notify, None, Some(sketch))
+            SimpleScheduler::new_with_resource_sketch_and_now(
+                simple,
+                db,
+                notify,
+                None,
+                Some(sketch),
+                Arc::new(now),
+            )
         },
     )?;
     let resource = resource.ok_or_else(|| {
@@ -2313,8 +2323,7 @@ mod tests {
         };
         historical.learn_from_workers = false;
         let SchedulerStack { actions, .. } =
-            scheduler_stack(&scheduler, &fleets, &actions, &OnceLock::new())
-                .expect("scheduler stack");
+            scheduler_stack(&scheduler, &spec, &OnceLock::new()).expect("scheduler stack");
         let operation = OperationId::String("stack-wiring".to_owned());
         let digest = DigestInfo::new([1; 32], 1);
         let info = Arc::new(ActionInfo {
@@ -2420,7 +2429,7 @@ mod tests {
         };
         historical.learn_from_workers = false;
         let SchedulerStack { actions, .. } =
-            scheduler_stack(&scheduler, &fleets, &spec.actions, &OnceLock::new()).expect("stack");
+            scheduler_stack(&scheduler, &spec, &OnceLock::new()).expect("stack");
         let info = origin_test_action();
         let metadata = RequestMetadata {
             tool_invocation_id: "invocation".to_owned(),

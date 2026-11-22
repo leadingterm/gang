@@ -488,6 +488,10 @@ impl WorkerScheduler for ObservingWorkerScheduler {
             .await
     }
 
+    async fn expire_attempts(&self, now: std::time::SystemTime) -> Result<(), Error> {
+        self.inner.expire_attempts(now).await
+    }
+
     async fn worker_snapshot(&self) -> Vec<WorkerSummary> {
         self.inner.worker_snapshot().await
     }
@@ -1273,6 +1277,29 @@ mod tests {
             Ok(())
         }
 
+        async fn expire_attempts(&self, now: SystemTime) -> Result<(), Error> {
+            if let Some(workers) = self.workers.lock().as_mut() {
+                for worker in workers {
+                    if worker.running_actions != 0
+                        && worker
+                            .latest_attempt_deadline
+                            .is_some_and(|stamp| stamp <= now)
+                    {
+                        worker.running_actions = 0;
+                        worker.latest_attempt_deadline = None;
+                        *self.stage.lock() = Some(ActionStage::Completed(ActionResult {
+                            error: Some(make_err!(
+                                Code::DeadlineExceeded,
+                                "attempt reached controller dispatch deadline"
+                            )),
+                            ..ActionResult::default()
+                        }));
+                    }
+                }
+            }
+            Ok(())
+        }
+
         async fn worker_snapshot(&self) -> Vec<WorkerSummary> {
             if let Some(workers) = self.workers.lock().as_ref() {
                 return workers.clone();
@@ -1288,6 +1315,9 @@ mod tests {
                 available_platform_properties: HashMap::new(),
                 free_memory_kb: None,
                 cache: None,
+                latest_attempt_deadline: Some(
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_060),
+                ),
             }]
         }
 
