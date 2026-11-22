@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Plot only complete steps for dashboard count and rate series, while preserving live gauge values and distinguishing the in-progress control-pass step.
 - Show executing counts without slot denominators and display worker reservations against scheduler admission capacity, preserving unknown values.
 - Show per-fleet instance lifecycle history with historical desired and maximum reference lines, leaving unavailable observations as gaps.
 

@@ -4,6 +4,7 @@ import { render } from "preact-render-to-string";
 import type { EarlierBuilds } from "../src/client.ts";
 import { clock } from "../src/format.ts";
 import type { Screen } from "../src/routes.ts";
+import { applyDelta } from "../src/store.ts";
 import { Shell } from "../src/shell.tsx";
 import { ClientContext, Tile, Tiles } from "../src/ui.tsx";
 import { Actions } from "../src/views/actions.tsx";
@@ -15,7 +16,7 @@ import { Forbidden, SignIn, SignInError } from "../src/views/gate.tsx";
 import { EventRow, Overview } from "../src/views/overview.tsx";
 import { WorkerDetail, Workers } from "../src/views/workers.tsx";
 import { ms } from "../src/wire-parse.ts";
-import type { AwsEventKind, ScalingEvent } from "../src/wire.ts";
+import type { AwsEventKind, Delta, ScalingEvent, State } from "../src/wire.ts";
 import { build, clientFor, session, signedOut, type Scenario } from "./scenario.ts";
 import { iso, load, snapshotOf } from "./sse.ts";
 
@@ -707,6 +708,100 @@ const chart = (markup: string, label: string): string =>
 
 const passStrip = (markup: string): string =>
   /<div class="passbar"[^>]*>[\s\S]*?<\/div>/.exec(markup)?.[0] ?? "";
+test("delta folds keep partial counters off charts while live gauges and observed fleets continue", (t) => {
+  const base = recentState(3);
+  const fleet = base.fleets[0];
+  if (!fleet) throw new Error("the live recording has a fleet");
+  const observed = {
+    name: fleet.name,
+    instances: { pending: 2, inService: 3, terminating: 1, warm: 4 },
+    desired: 5,
+    max: 6,
+  };
+  const runningFleet = { ...fleet, demand: { ...fleet.demand, running: 7 } };
+  let state: State = {
+    ...base, schedulerKnown: true, fleets: [runningFleet], queue: { ...base.queue, total: 8 },
+    recent: { ...base.recent, window: "40s", samples: base.recent.samples.map((s, i) => ({
+      ...s, schedulerKnown: true, completed: 10, lookups: 10, hits: 5,
+      downloadedBytes: 100, uploadedBytes: 50, evictedBytes: 10, skipped: i === 1 ? 1 : 0,
+      fleets: [observed],
+    })) },
+  };
+  const fold = (delta: Omit<Delta, "base" | "seq" | "updateTime">, at: string) => {
+    const applied = applyDelta(state, { ...delta, base: state.seq, seq: state.seq + 1, updateTime: at });
+    t.assert.equal(applied.kind, "applied");
+    if (applied.kind !== "applied") throw new Error("delta did not apply");
+    state = applied.state;
+    return html({ state }, <Overview />);
+  };
+  const before = html({ state }, <Overview />);
+  const last = state.recent.samples!.at(-1)!;
+  const partial = {
+    ...last, start: iso(ms(last.start) + 10000), schedulerKnown: true,
+    completed: 0, lookups: 0, hits: 0, downloadedBytes: 0, uploadedBytes: 0, evictedBytes: 0,
+    passes: 1, skipped: 1, fleets: [observed],
+  };
+  const recent = (sample: typeof partial) => ({ window: "40s", step: "10s", samples: [sample] });
+  const counterLabels = ["Done per minute", "Action-cache lookups as area and hits as line per complete step", "Transferred per complete step", "Evicted per complete step"];
+  const noNewestPoint = (markup: string) => {
+    for (const label of counterLabels) {
+      const svg = chart(markup, label);
+      t.assert.notEqual(svg, "", label);
+      for (const [, d] of svg.matchAll(/<path class="spark__(?:run(?: spark__run--secondary)?|area)" d="([^"]*)"/g)) {
+        t.assert.doesNotMatch(d!, /[ML]298\.0 /, label);
+      }
+      t.assert.doesNotMatch(svg, /<circle\b[^>]*cx="298(?:\.0)?"/, label);
+    }
+  };
+  noNewestPoint(before);
+  t.assert.match(passStrip(before), /1 of 2 recorded complete steps had a skipped pass; current step in progress/);
+  t.assert.match(passStrip(before), /is-unrecorded/);
+  t.assert.match(passStrip(before), /is-partial/);
+  const appended = fold({ recent: recent(partial) }, partial.start);
+  noNewestPoint(appended);
+  t.assert.match(passStrip(appended), /1 of 3 recorded complete steps had a skipped pass; current step in progress/);
+  t.assert.match(passStrip(appended), /is-partial/);
+  for (const label of ["Queued", "Executing"]) {
+    const svg = chart(appended, label);
+    t.assert.match(svg, /[ML]298\.0 /, label);
+    t.assert.doesNotMatch(svg, /<circle\b[^>]*cx="298(?:\.0)?"[^>]*cy="42"/, label);
+  }
+  t.assert.match(chart(appended, "Executing"), /[ML]298\.0 39\.2/);
+  t.assert.match(chart(appended, "Queued"), /[ML]298\.0 2\.0/);
+  const fleetLabel = `Instance history for ${fleet.name}; latest sample: Pending 2, In service 3, Terminating 1, Warm 4, Desired 5, Max 6`;
+  t.assert.match(chart(appended, fleetLabel), /data-series="pending"[^>]*d="[^"]*[ML]298\.0 /);
+
+  const changed = { ...partial, schedulerKnown: true, completed: 0, lookups: 4, hits: 2, downloadedBytes: 9, uploadedBytes: 3, evictedBytes: 2, passes: 1 };
+  const replaced = fold({ recent: recent(changed) }, changed.start);
+  noNewestPoint(replaced);
+  t.assert.match(visibleText(replaced), /50%\s+of\s+34\s+lookups/);
+  const next = { ...changed, start: iso(ms(changed.start) + 10000), completed: 1, skipped: 0 };
+  const released = fold({ recent: recent(next) }, next.start);
+  noNewestPoint(released);
+  const done = chart(released, "Done per minute");
+  t.assert.match(done, /[ML]199\.3 42\.0/);
+  t.assert.match(chart(released, "Action-cache lookups as area and hits as line per complete step"), /[ML]199\.3 /);
+  t.assert.match(chart(released, "Transferred per complete step"), /[ML]199\.3 /);
+  t.assert.match(chart(released, "Evicted per complete step"), /[ML]199\.3 /);
+  t.assert.match(passStrip(released), /2 of 3 recorded complete steps had a skipped pass; current step in progress/);
+
+  const zeroFleet = { ...runningFleet, demand: { ...runningFleet.demand, running: 0 } };
+  const zero = fold({ fleets: { upsert: [zeroFleet] }, queue: { ...state.queue, total: 0 } }, next.start);
+  for (const label of ["Queued", "Executing"]) t.assert.match(chart(zero, label), /[ML]298\.0 42\.0/, label);
+  const failed = { ...next, start: iso(ms(next.start) + 10000), schedulerKnown: false, fleets: [] };
+  const unavailable = fold({ schedulerKnown: false, recent: recent(failed) }, failed.start);
+  for (const label of ["Queued", "Executing"]) {
+    const svg = chart(unavailable, label);
+    t.assert.doesNotMatch(svg, /[ML]298\.0 /, label);
+    t.assert.doesNotMatch(svg, /<circle\b[^>]*cx="298(?:\.0)?"/, label);
+  }
+  t.assert.equal(state.fleets[0]?.name, fleet.name);
+  const missingFleet = chart(unavailable, `Instance history for ${fleet.name}; latest sample: not recorded`);
+  t.assert.match(missingFleet, /<title>not recorded<\/title>/);
+  t.assert.doesNotMatch(missingFleet, /data-series="pending"[^>]*d="[^"]*[ML]298\.0 /);
+  t.assert.doesNotMatch(missingFleet, /<circle\b[^>]*cx="298(?:\.0)?"/);
+});
+
 
 test("fleet instance histories retain independent observed series through missing samples", (t) => {
   const fleet = live.fleets[0];
@@ -811,7 +906,7 @@ test("cache chart connects recorded zero-lookup steps and shows lookup area", (t
       })),
     },
   };
-  const svg = chart(html({ state }, <Overview />), "Action-cache lookups as area and hits as line per step");
+  const svg = chart(html({ state }, <Overview />), "Action-cache lookups as area and hits as line per complete step");
   const path = /<path class="spark__run" d="([^"]*)"/.exec(svg)?.[1] ?? "";
   const area = /<path class="spark__area" d="([^"]*)"/.exec(svg)?.[1] ?? "";
   t.assert.equal((path.match(/M/g) ?? []).length, 1);
@@ -819,9 +914,9 @@ test("cache chart connects recorded zero-lookup steps and shows lookup area", (t
   const [hitPoints = [], areaPoints = []] = [path, area].map((d) =>
     [...d.matchAll(/[ML](-?[\d.]+)\s+(-?[\d.]+)/g)]
       .map((match) => [Number(match[1]), Number(match[2])] as const));
-  t.assert.equal(hitPoints.length, 3);
-  t.assert.equal(areaPoints.length, 5);
-  for (let i = 0; i < 3; i++) {
+  t.assert.equal(hitPoints.length, 2);
+  t.assert.equal(areaPoints.length, 4);
+  for (let i = 0; i < 2; i++) {
     const hit = hitPoints[i];
     const lookup = areaPoints[i];
     t.assert.ok(hit && lookup);
@@ -830,8 +925,8 @@ test("cache chart connects recorded zero-lookup steps and shows lookup area", (t
   }
   t.assert.equal(hitPoints[1]?.[1], 42);
   t.assert.equal(areaPoints[1]?.[1], 42);
+  t.assert.equal(areaPoints[2]?.[1], 42);
   t.assert.equal(areaPoints[3]?.[1], 42);
-  t.assert.equal(areaPoints[4]?.[1], 42);
   t.assert.doesNotMatch(svg, /<circle\b[^>]*class="spark__point"/);
 });
 
@@ -879,7 +974,13 @@ test("live scheduler readouts recover without resetting incomplete charts", (t) 
   t.assert.match(visibleText(before), /Queue\s+unknown/);
   t.assert.match(visibleText(after), /Queue\s+17/);
   t.assert.doesNotMatch(visibleText(after), /Executing\s+unknown/);
-  for (const label of ["Queued", "Executing", "Done per minute", "Evicted per step"]) {
+  for (const label of ["Queued", "Executing"]) {
+    t.assert.notEqual(chart(after, label), chart(before, label), label);
+    t.assert.match(chart(after, label), /spark__unknown/, label);
+    t.assert.match(chart(after, label), /[ML]298\.0 /, label);
+    t.assert.doesNotMatch(chart(before, label), /[ML]298\.0 /, label);
+  }
+  for (const label of ["Done per minute", "Evicted per complete step"]) {
     t.assert.equal(chart(after, label), chart(before, label), label);
     t.assert.match(chart(after, label), /spark__unknown/, label);
   }
@@ -898,15 +999,15 @@ test("an interior scheduler outage is hatched without interrupting local cache o
   }));
   const state = { ...base, recent: { ...base.recent, window: "40s", samples } };
   const markup = html({ state }, <Overview />);
-  for (const label of ["Queued", "Executing", "Done per minute", "Evicted per step"]) {
+  for (const label of ["Queued", "Executing", "Done per minute", "Evicted per complete step"]) {
     const svg = chart(markup, label);
     t.assert.match(svg, /viewBox="0 0 300 44"/, label);
     t.assert.match(svg, /class="spark__unknown"[^>]*><title>scheduler unknown<\/title>/, label);
     t.assert.match(svg, /class="spark__run" d="[^"]*M[^"]*M/, label);
   }
-  const cache = chart(markup, "Action-cache lookups as area and hits as line per step");
+  const cache = chart(markup, "Action-cache lookups as area and hits as line per complete step");
   t.assert.doesNotMatch(cache, /spark__unknown/);
-  t.assert.equal((/<path class="spark__run" d="([^"]*)"/.exec(cache)?.[1]?.match(/[ML]/g) ?? []).length, 4);
+  t.assert.equal((/<path class="spark__run" d="([^"]*)"/.exec(cache)?.[1]?.match(/[ML]/g) ?? []).length, 3);
   t.assert.match(markup, /Done \/ min<\/h2><div class="readout__big"><span class="num live">–<\/span>/);
   t.assert.match(visibleText(markup), /Evicted \(window, all stores\) unknown/);
   const outage = { ...state, recent: { ...state.recent, samples: samples.map((s, i) => ({ ...s, schedulerKnown: i !== 3 })) } };
@@ -993,7 +1094,7 @@ test("cache readout, bounded meter and bucket measurement retain their meaning",
   const zeroBudget = html({ state: { ...state, cache: { stores: [{ store: "CAS", usedBytes: 25, budgetBytes: 0 }] } } }, <Overview />);
   t.assert.match(zeroBudget, /aria-label="CAS — of budget"/);
   t.assert.doesNotMatch(zeroBudget, /Infinity|NaN/);
-  for (const label of ["Transferred per step", "Evicted per step"]) {
+  for (const label of ["Transferred per complete step", "Evicted per complete step"]) {
     t.assert.match(chart(bounded, label), /spark__unrecorded/, label);
   }
   const measured = iso(ms(live.updateTime) - 86400000);
@@ -1026,13 +1127,13 @@ test("transfer directions share a scale and missing steps on one chart, separate
     { ...second!, downloadedBytes: 50, uploadedBytes: 25, evictedBytes: 4 },
   ] };
   const markup = html({ state: { ...state, recent } }, <Overview />);
-  const transfer = chart(markup, "Transferred per step");
+  const transfer = chart(markup, "Transferred per complete step");
   t.assert.match(transfer, /spark__unrecorded/);
-  t.assert.match(transfer, /class="spark__run" d="M150\.0 2\.0 L298\.0 22\.0"/);
-  t.assert.match(transfer, /class="spark__run spark__run--secondary" d="M150\.0 22\.0 L298\.0 32\.0"/);
+  t.assert.match(transfer, /class="spark__run" d="M150\.0 2\.0"/);
+  t.assert.match(transfer, /class="spark__run spark__run--secondary" d="M150\.0 22\.0"/);
   t.assert.match(visibleText(markup), /Downloaded/);
   t.assert.match(visibleText(markup), /Uploaded/);
-  const eviction = chart(markup, "Evicted per step");
+  const eviction = chart(markup, "Evicted per complete step");
   t.assert.match(eviction, /spark__unrecorded/);
   t.assert.doesNotMatch(eviction, /spark__run--secondary/);
 });
