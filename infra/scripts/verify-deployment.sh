@@ -72,6 +72,12 @@ readiness_sleep() {
 cancel_unready_refresh() {
   local failure_reason remaining
   failure_reason="controller instance refresh${refresh_id:+ $refresh_id} has no serving incoming controller after 600 seconds"
+  if [[ $refresh_state == inactive ]]; then
+    echo "::error::$failure_reason; no active instance refresh to cancel" >&2; exit 1
+  fi
+  if [[ $refresh_state == cancelling ]]; then
+    echo "::error::$failure_reason; instance refresh is already cancelling" >&2; exit 1
+  fi
   echo "::error::$failure_reason; requesting cancellation" >&2
   remaining=$((deadline - $(date +%s)))
   if (( remaining <= 0 )); then
@@ -103,13 +109,18 @@ controller_sleep() {
 }
 
 if [[ -n $asg ]]; then
-  refresh_id= rollback_observed= serving=
+  refresh_id='' rollback_observed='' serving='' refresh_state=unknown
   startup_deadline=$(($(date +%s) + 600))
   while :; do
     if ! refresh=$(controller_read --region "$region" autoscaling describe-instance-refreshes --auto-scaling-group-name "$asg" --max-records 1 --no-paginate --output json); then
       echo '::error::failed to describe controller instance refreshes' >&2; exit 1
     fi
     status=$(jq -er 'if (.InstanceRefreshes | type) != "array" then error("missing refreshes") elif .InstanceRefreshes | length == 0 then "None" else .InstanceRefreshes[0].Status | select(type == "string" and length > 0) end' <<<"$refresh")
+    case $status in
+      None|Successful) refresh_state=inactive ;;
+      Cancelling|RollbackInProgress) refresh_state=cancelling ;;
+      Pending|InProgress|Baking) refresh_state=active ;;
+    esac
     case $status in
       None|Successful) break ;;
       InProgress)
@@ -125,7 +136,7 @@ if [[ -n $asg ]]; then
             .AutoScalingGroups | select(type == "array" and length == 1 and .[0].AutoScalingGroupName == $name) | .[0]
             | .LaunchTemplate as $template
             | select(($template.LaunchTemplateId | type == "string" and length > 0) and ($template.Version | type == "string" and test("^[0-9]+$")) and (.Instances | type == "array"))
-            | [.Instances[] | select(.LaunchTemplate.LaunchTemplateId == $template.LaunchTemplateId and (.LaunchTemplate.Version | tostring) == $template.Version and (.LifecycleState == "Pending:Wait" or .LifecycleState == "InService") and (.InstanceId | type == "string" and length > 0)) | .InstanceId]
+            | [.Instances[] | select(.LaunchTemplate.LaunchTemplateId == $template.LaunchTemplateId and (.LaunchTemplate.Version | tostring) == $template.Version and (.LifecycleState == "Pending:Wait" or .LifecycleState == "Pending:Proceed" or .LifecycleState == "InService") and (.InstanceId | type == "string" and length > 0)) | .InstanceId]
           ' <<<"$groups"); then
             echo '::error::controller Auto Scaling group is missing its numeric launch template or instances' >&2; exit 1
           fi

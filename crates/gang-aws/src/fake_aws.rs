@@ -714,7 +714,10 @@ async fn query(state: &Shared, body: &[u8]) -> Response {
     {
         let mut fake = state.lock();
         if matches!(service, QueryService::AutoScaling)
-            && fake.account_quota.as_ref().is_some_and(|quota| !quota.admit())
+            && fake
+                .account_quota
+                .as_ref()
+                .is_some_and(|quota| !quota.admit())
         {
             let request = FakeRequest {
                 operation: action.clone(),

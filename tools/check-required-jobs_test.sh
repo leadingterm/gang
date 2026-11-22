@@ -154,10 +154,10 @@ yq -i 'del(.jobs.e2e-v035-upgrade)' "$fixture"
 expect failure 'v035 upgrade job is required' "$guard" "$fixture" "$pr_fixture"
 for mutation in \
   '--gate 2 --scenario rolling-upgrade' \
-  '--gate 1 --scenario rolling-upgrade --previous-gang ${{ runner.temp }}/e2e/gang-v035 --previous-fixture ${{ runner.temp }}/e2e/deployment-v035.json' \
-  '--gate 2 --scenario config-refetch-restart --previous-gang ${{ runner.temp }}/e2e/gang-v035 --previous-fixture ${{ runner.temp }}/e2e/deployment-v035.json' \
-  '--gate 2 --scenario rolling-upgrade --previous-gang ${{ runner.temp }}/e2e/gang-previous --previous-fixture ${{ runner.temp }}/e2e/deployment-v035.json' \
-  '--gate 2 --scenario rolling-upgrade --previous-gang ${{ runner.temp }}/e2e/gang-v035 --previous-fixture ${{ runner.temp }}/e2e/deployment-previous.json'; do
+  "--gate 1 --scenario rolling-upgrade --previous-gang \${{ runner.temp }}/e2e/gang-v035 --previous-fixture \${{ runner.temp }}/e2e/deployment-v035.json" \
+  "--gate 2 --scenario config-refetch-restart --previous-gang \${{ runner.temp }}/e2e/gang-v035 --previous-fixture \${{ runner.temp }}/e2e/deployment-v035.json" \
+  "--gate 2 --scenario rolling-upgrade --previous-gang \${{ runner.temp }}/e2e/gang-previous --previous-fixture \${{ runner.temp }}/e2e/deployment-v035.json" \
+  "--gate 2 --scenario rolling-upgrade --previous-gang \${{ runner.temp }}/e2e/gang-v035 --previous-fixture \${{ runner.temp }}/e2e/deployment-previous.json"; do
   reset_fixtures
   mutation="$mutation" yq -i '(.jobs.e2e-v035-upgrade.steps[] | select(.uses == "./.github/actions/run-e2e") | .with.args) = strenv(mutation)' "$fixture"
   expect failure 'v035 upgrade requires the exact scenario and published pair' "$guard" "$fixture" "$pr_fixture"

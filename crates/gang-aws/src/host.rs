@@ -604,6 +604,72 @@ mod tests {
             .count()
     }
 
+    async fn exhaust_account_quota(
+        fake: &FakeAws,
+        aws: &Aws,
+        clock: &Arc<TestClock>,
+    ) -> TestResult {
+        // Four old, unpaced starts per second exhaust the shared account window.
+        fake.state().account_quota =
+            Some(AccountQuota::new(clock.clone(), 4, Duration::from_secs(1)));
+        let old = aws_sdk_autoscaling::Client::new(&fake.sdk_config().await);
+        let other_session = aws_sdk_autoscaling::Client::new(&fake.sdk_config().await);
+        for index in 0..4 {
+            if index % 2 == 0 {
+                old.describe_auto_scaling_groups().send().await?;
+            } else {
+                old.describe_scaling_activities().send().await?;
+            }
+            if index != 3 {
+                clock.advance(Duration::from_millis(250));
+            }
+        }
+        assert!(
+            other_session
+                .describe_scaling_activities()
+                .send()
+                .await
+                .is_err()
+        );
+        assert!(matches!(aws.state().await, Err(PortError::Unavailable(_))));
+        assert_eq!(fake.state().throttled.len(), 2);
+        clock.advance(Duration::from_millis(500));
+        Ok(())
+    }
+
+    async fn assert_old_promotion_deadline(
+        fake: &FakeAws,
+        aws: &Arc<Aws>,
+        clock: &Arc<TestClock>,
+    ) -> TestResult {
+        // The old path did a state read followed by Serving: four serial ASG calls at
+        // 2/s cannot complete inside its one-second deadline.
+        let groups = request_count(fake, "DescribeAutoScalingGroups");
+        let hooks = request_count(fake, DESCRIBE_HOOKS);
+        let deadline = clock.monotonic() + Duration::from_secs(1);
+        let short = {
+            let aws = aws.clone();
+            let clock = clock.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    () = clock.sleep_until(deadline) => None,
+                    result = async {
+                        aws.state().await?;
+                        Box::pin(aws.reached(HostMilestone::Serving)).await
+                    } => Some(result),
+                }
+            })
+        };
+        wait_for_requests(fake, "DescribeAutoScalingGroups", groups + 1).await;
+        clock.advance(Duration::from_millis(500));
+        wait_for_requests(fake, DESCRIBE_HOOKS, hooks + 1).await;
+        clock.advance(Duration::from_millis(500));
+        assert!(short.await?.is_none());
+        assert!(fake.state().lifecycle_completions.is_empty());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn account_contention_and_bounded_serving_recover_without_duplicate_completion()
     -> TestResult {
@@ -634,57 +700,9 @@ mod tests {
         clock.advance(Duration::from_millis(500));
         prepared.await??;
 
-        // Four old, unpaced starts per second exhaust the shared account window.
-        fake.state().account_quota =
-            Some(AccountQuota::new(clock.clone(), 4, Duration::from_secs(1)));
-        let old = aws_sdk_autoscaling::Client::new(&fake.sdk_config().await);
-        let other_session = aws_sdk_autoscaling::Client::new(&fake.sdk_config().await);
-        for index in 0..4 {
-            if index % 2 == 0 {
-                old.describe_auto_scaling_groups().send().await?;
-            } else {
-                old.describe_scaling_activities().send().await?;
-            }
-            if index != 3 {
-                clock.advance(Duration::from_millis(250));
-            }
-        }
-        assert!(
-            other_session
-                .describe_scaling_activities()
-                .send()
-                .await
-                .is_err()
-        );
-        assert!(matches!(aws.state().await, Err(PortError::Unavailable(_))));
-        assert_eq!(fake.state().throttled.len(), 2);
-        clock.advance(Duration::from_millis(500));
+        exhaust_account_quota(&fake, &aws, &clock).await?;
 
-        // The old promotion path did a state read followed by Serving: four serial ASG
-        // calls at 2/s cannot complete inside its one-second deadline.
-        let groups = request_count(&fake, "DescribeAutoScalingGroups");
-        let hooks = request_count(&fake, DESCRIBE_HOOKS);
-        let deadline = clock.monotonic() + Duration::from_secs(1);
-        let short = {
-            let aws = aws.clone();
-            let clock = clock.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    biased;
-                    _ = clock.sleep_until(deadline) => None,
-                    result = async {
-                        aws.state().await?;
-                        Box::pin(aws.reached(HostMilestone::Serving)).await
-                    } => Some(result),
-                }
-            })
-        };
-        wait_for_requests(&fake, "DescribeAutoScalingGroups", groups + 1).await;
-        clock.advance(Duration::from_millis(500));
-        wait_for_requests(&fake, DESCRIBE_HOOKS, hooks + 1).await;
-        clock.advance(Duration::from_millis(500));
-        assert!(short.await?.is_none());
-        assert!(fake.state().lifecycle_completions.is_empty());
+        assert_old_promotion_deadline(&fake, &aws, &clock).await?;
 
         // A longer attempt can reach completion; lose that response after the effect.
         fake.state().hold_response = Some(COMPLETE_ACTION);
@@ -699,7 +717,7 @@ mod tests {
             tokio::spawn(async move {
                 tokio::select! {
                     biased;
-                    _ = clock.sleep_until(deadline) => None,
+                    () = clock.sleep_until(deadline) => None,
                     result = async {
                         aws.state().await?;
                         Box::pin(aws.reached(HostMilestone::Serving)).await
@@ -728,7 +746,7 @@ mod tests {
             tokio::spawn(async move {
                 tokio::select! {
                     biased;
-                    _ = clock.sleep_until(deadline) => None,
+                    () = clock.sleep_until(deadline) => None,
                     result = Box::pin(aws.reached(HostMilestone::Serving)) => Some(result),
                 }
             })

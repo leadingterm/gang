@@ -113,6 +113,7 @@ async fn acquire<L: LeaderLeasePort>(
 enum FirstHostRead {
     Unavailable,
     Stalled,
+    ActiveThenStalled,
 }
 
 struct RecoveringHost {
@@ -125,9 +126,15 @@ impl ControllerHostPort for RecoveringHost {
     async fn state(&self) -> Result<ControllerHostState, PortError> {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             match self.first {
-                FirstHostRead::Unavailable => return Err(PortError::unavailable("host unavailable")),
+                FirstHostRead::Unavailable => {
+                    return Err(PortError::unavailable("host unavailable"));
+                }
                 FirstHostRead::Stalled => return std::future::pending().await,
+                FirstHostRead::ActiveThenStalled => return Ok(ControllerHostState::Active),
             }
+        }
+        if matches!(self.first, FirstHostRead::ActiveThenStalled) {
+            return std::future::pending().await;
         }
         self.inner.state().await
     }
@@ -221,7 +228,7 @@ async fn unavailable_host_read_retries_without_requesting_takeover() {
 }
 
 #[tokio::test]
-async fn timed_out_host_read_retries_without_requesting_takeover() {
+async fn timed_out_host_read_retries_without_requesting_takeover() -> TestResult {
     let lease = CountingLease::default();
     let clock = clock();
     let id = ControllerId::new("first");
@@ -242,7 +249,11 @@ async fn timed_out_host_read_retries_without_requesting_takeover() {
     assert!(poll!(acquire.as_mut()).is_pending());
     assert_eq!(host.calls.load(Ordering::SeqCst), 1);
     assert_eq!(lease.calls.load(Ordering::SeqCst), 0);
-    clock.advance(host_timeout - RENEW);
+    clock.advance(
+        host_timeout
+            .checked_sub(RENEW)
+            .ok_or("host timeout shorter than renew interval")?,
+    );
     assert!(poll!(acquire.as_mut()).is_pending());
     assert_eq!(host.calls.load(Ordering::SeqCst), 1);
     assert_eq!(lease.calls.load(Ordering::SeqCst), 0);
@@ -250,6 +261,44 @@ async fn timed_out_host_read_retries_without_requesting_takeover() {
     assert!(matches!(poll!(acquire.as_mut()), Poll::Ready(Ok(Some(_)))));
     assert_eq!(host.calls.load(Ordering::SeqCst), 2);
     assert_eq!(lease.calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn contender_acquires_released_lease_without_another_host_read() -> TestResult {
+    let lease = CountingLease::default();
+    let clock = clock();
+    let old_id = ControllerId::new("old");
+    let new_id = ControllerId::new("new");
+    let old = Leadership::new(&lease, &clock, &old_id, timing());
+    let new = Leadership::new(&lease, &clock, &new_id, timing());
+    let old_candidate = old.register_candidate(&host("old")?).await?;
+    let new_candidate = new.register_candidate(&host("new")?).await?;
+    let old_host = FakeProvisioner::default();
+    let old_lease = old
+        .acquire(&old_candidate, &old_host)
+        .await?
+        .ok_or("old retired")?;
+    let new_host = RecoveringHost {
+        inner: FakeProvisioner::default(),
+        first: FirstHostRead::ActiveThenStalled,
+        calls: AtomicUsize::new(0),
+    };
+    let attempt = new.acquire(&new_candidate, &new_host);
+    pin_mut!(attempt);
+    assert!(poll!(attempt.as_mut()).is_pending());
+    assert_eq!(lease.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(new_host.calls.load(Ordering::SeqCst), 1);
+
+    old.release(&old_lease).await;
+    clock.advance(RENEW);
+    let Poll::Ready(Ok(Some(acquired))) = poll!(attempt.as_mut()) else {
+        panic!("contender must acquire at the next database attempt");
+    };
+    assert_eq!(acquired.holder, new_id);
+    assert_eq!(lease.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(new_host.calls.load(Ordering::SeqCst), 1);
+    Ok(())
 }
 
 struct StalledLease {

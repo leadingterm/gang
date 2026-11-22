@@ -402,7 +402,8 @@ mod tests {
     }
 
     #[test]
-    fn leadership_host_timeout_defaults_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    fn leadership_host_timeout_defaults_and_round_trips() -> Result<(), Box<dyn std::error::Error>>
+    {
         let default: ServerConfig = toml::from_str("transport = 'plaintext'")?;
         assert_eq!(
             default.leadership.host_call_timeout.get(),

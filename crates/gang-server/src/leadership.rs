@@ -154,29 +154,36 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
         candidate: &LeaseCandidate,
         host: &impl ControllerHostPort,
     ) -> Result<Option<Lease>, PortError> {
-        let mut reachable_since = None;
         loop {
             match self
                 .clock
                 .timeout(self.host_call_timeout(), host.state())
                 .await
             {
-                Ok(Ok(ControllerHostState::Active)) => {}
+                Ok(Ok(ControllerHostState::Active)) => break,
                 Ok(Ok(ControllerHostState::Retiring)) => return Ok(None),
                 Ok(Err(error @ PortError::Unavailable(_))) => {
-                    reachable_since = None;
                     tracing::warn!(%error, "cannot read controller host state");
                     self.clock.sleep(self.renew_interval()).await;
-                    continue;
                 }
                 Ok(Err(error)) => return Err(error),
                 Err(error) => {
-                    reachable_since = None;
                     tracing::warn!(%error, "timed out reading controller host state");
                     self.clock.sleep(self.renew_interval()).await;
-                    continue;
                 }
             }
+        }
+        tokio::select! {
+            biased;
+            retired = host.retiring() => retired.map(|()| None),
+            acquired = self.acquire_prepared(candidate) => acquired.map(Some),
+        }
+    }
+
+    /// Contends using only database calls after the host has passed preflight.
+    async fn acquire_prepared(&self, candidate: &LeaseCandidate) -> Result<Lease, PortError> {
+        let mut reachable_since = None;
+        loop {
             let started = self.clock.monotonic();
             let wall = self.clock.wall();
             let stale_before = if reachable_since.is_some_and(|since| {
@@ -202,7 +209,7 @@ impl<'a, L: LeaderLeasePort, C: Clock + 'static> Leadership<'a, L, C> {
             match attempt {
                 Ok(Ok(Acquisition::Acquired(lease))) => {
                     self.confirm(started);
-                    return Ok(Some(lease));
+                    return Ok(lease);
                 }
                 Ok(Ok(
                     Acquisition::Contending(_) | Acquisition::Held(_) | Acquisition::Reserved,

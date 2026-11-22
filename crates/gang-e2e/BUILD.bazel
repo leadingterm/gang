@@ -181,9 +181,9 @@ e2e_bundle(
     postgres = "//crates/gang-testkit:postgresql_archive",
     previous_fixture = ":previous_fixture",
     previous_gang = ":previous_gang",
+    target_compatible_with = ["@platforms//os:linux"],
     v035_fixture = ":v035_fixture",
     v035_gang = ":v035_gang",
-    target_compatible_with = ["@platforms//os:linux"],
 )
 
 workspace_rust_binary(
