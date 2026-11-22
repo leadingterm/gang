@@ -160,6 +160,11 @@ impl Builder {
                 scheduler_known = Some(known);
             }
         }
+        crate::infrastructure::fill_launch_warnings(
+            &mut cur.fleets,
+            inputs.infrastructure,
+            &mut self.scratch.status_name,
+        );
         let running = cur
             .fleets
             .iter()
@@ -182,22 +187,7 @@ impl Builder {
             sample.completed = sample.completed.saturating_add(completed.saturating_into());
             sample.evicted_bytes = sample.evicted_bytes.saturating_add(evicted);
             if let Some(supplies) = supplies {
-                let mut count = 0;
-                for (index, fleet) in fleets.iter().enumerate() {
-                    if !supplies.get(index).copied().unwrap_or(false) {
-                        continue;
-                    }
-                    if count == sample.fleets.len() {
-                        sample.fleets.push(FleetInstanceSample::default());
-                    }
-                    let entry = &mut sample.fleets[count];
-                    entry.name.clone_from(&fleet.name);
-                    entry.instances = fleet.instances;
-                    entry.desired = fleet.desired;
-                    entry.max = fleet.policy.max;
-                    count += 1;
-                }
-                sample.fleets.truncate(count);
+                fill_sample_fleets(sample, fleets, supplies);
             }
             if let Some(known) = scheduler_known {
                 if !known {
@@ -688,6 +678,25 @@ fn update_infrastructure(
             other_instance: status.other.map(|_| scratch.clone()),
         });
     }
+}
+
+fn fill_sample_fleets(sample: &mut gang_wire::Sample, fleets: &[Fleet], supplies: &[bool]) {
+    let mut count = 0;
+    for (index, fleet) in fleets.iter().enumerate() {
+        if !supplies.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        if count == sample.fleets.len() {
+            sample.fleets.push(FleetInstanceSample::default());
+        }
+        let entry = &mut sample.fleets[count];
+        entry.name.clone_from(&fleet.name);
+        entry.instances = fleet.instances;
+        entry.desired = fleet.desired;
+        entry.max = fleet.policy.max;
+        count += 1;
+    }
+    sample.fleets.truncate(count);
 }
 
 /// A counter decrease indicates a restarted source.

@@ -2,7 +2,7 @@
 // the page has been open.
 import { sum } from "./format.ts";
 import { ms, seconds } from "./wire-parse.ts";
-import type { Recent, Sample, State } from "./wire.ts";
+import type { Fleet, Recent, Sample, State } from "./wire.ts";
 
 export const stepMs = (r: Recent): number => seconds(r.step) * 1000;
 export const windowMs = (r: Recent): number => seconds(r.window) * 1000;
@@ -63,6 +63,19 @@ export const queuedSeries = (r: Recent, current: number | null): readonly (numbe
   const all = slots(r);
   return all.map((s, i) => !s ? null : i === all.length - 1 ? current : schedulerKnown(s) ? s.queued : null);
 };
+
+/** Observed instances in service across all configured fleets, including the current step. */
+export const inServiceSeries = (r: Recent, fleets: readonly Fleet[]): readonly (number | null)[] =>
+  slots(r).map((sample) => {
+    if (!sample?.fleets || fleets.length === 0) return null;
+    let total = 0;
+    for (const fleet of fleets) {
+      const observation = sample.fleets.find((entry) => entry.name === fleet.name);
+      if (!observation) return null;
+      total += observation.instances.inService;
+    }
+    return total;
+  });
 
 export interface CacheWindow {
   readonly lookups: number;

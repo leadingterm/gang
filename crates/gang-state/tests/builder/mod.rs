@@ -3202,6 +3202,196 @@ fn cache_counters_bridge_skips_and_reset_sources_separately() -> TestResult {
 }
 
 #[test]
+fn current_launch_warning_tracks_canonical_outcomes_on_every_pass() -> TestResult {
+    use gang_spi::{
+        FleetInfrastructureEvent, InfrastructureEvent, InfrastructureEventKind as Kind,
+    };
+    use gang_wire::{AwsEventKind, EventChange};
+
+    let policy = policy("alpha", 0, 4)?;
+    let mut world = World::default();
+    world.properties.push(properties(&policy, vec![]));
+    world.policies.push(policy);
+    world.supplies.push(FleetSupply {
+        desired: 1,
+        requested: Some(2),
+        ..FleetSupply::default()
+    });
+    let fleet = FleetName::try_new("alpha")?;
+    let instance = instance_id(1)?;
+    let record = |id: &str, at, kind| FleetInfrastructureEvent {
+        fleet: fleet.clone(),
+        event: InfrastructureEvent {
+            id: id.into(),
+            at: ts(at),
+            kind,
+        },
+    };
+    let failure = || Kind::CapacityUnavailable {
+        reason: "no capacity".into(),
+    };
+    world.infrastructure.push(record("fail", 1, failure()));
+    let mut builder = Builder::new(config(), gang_state::CacheBaseline::default());
+    let first = fill(&mut builder, &blank(), 1, &world, 2, ok(0))?;
+    assert_eq!(first.fleets[0].desired, 2);
+    let warning = first.fleets[0]
+        .launch_warning
+        .as_ref()
+        .ok_or("missing warning")?;
+    assert_eq!((&*warning.reason, warning.at), ("no capacity", ts(1)));
+
+    world.infrastructure.push(record(
+        "success",
+        3,
+        Kind::InstanceLaunched {
+            instance: instance.clone(),
+        },
+    ));
+    let second = fill(&mut builder, &first, 2, &world, 4, ok(0))?;
+    assert!(second.fleets[0].launch_warning.is_none());
+    assert!(second.status_events.iter().any(|event| matches!(
+        &event.change, EventChange::Aws { event }
+            if matches!(&event.kind, AwsEventKind::CapacityUnavailable { reason } if reason == "no capacity")
+    )));
+
+    world
+        .infrastructure
+        .push(record("fail-again", 5, failure()));
+    let third = fill(
+        &mut builder,
+        &second,
+        3,
+        &world,
+        6,
+        Outcome::Skipped(SkipReason::SchedulerUnavailable),
+    )?;
+    assert!(third.fleets[0].launch_warning.is_some());
+    world.infrastructure.push(record(
+        "replacement",
+        7,
+        Kind::ReplacementLaunched {
+            instance: instance.clone(),
+            replacing: None,
+        },
+    ));
+    let fourth = fill(
+        &mut builder,
+        &third,
+        4,
+        &world,
+        8,
+        Outcome::Observed {
+            known: true,
+            supplies: vec![true],
+        },
+    )?;
+    assert!(fourth.fleets[0].launch_warning.is_none());
+
+    world
+        .infrastructure
+        .push(record("last-failure", 9, failure()));
+    world.supplies[0].instances = vec![
+        fleet_instance(&instance, InstanceLifecycle::InService, 1),
+        fleet_instance(&instance_id(2)?, InstanceLifecycle::Pending, 1),
+    ];
+    let fulfilled = fill(&mut builder, &fourth, 5, &world, 10, ok(0))?;
+    assert_eq!(fulfilled.fleets[0].instances.pending, 1);
+    assert!(fulfilled.fleets[0].launch_warning.is_none());
+    assert!(fulfilled.status_events.iter().any(|event| matches!(
+        &event.change, EventChange::Aws { event }
+            if matches!(&event.kind, AwsEventKind::CapacityUnavailable { .. })
+    )));
+    Ok(())
+}
+
+#[test]
+fn current_launch_warning_uses_source_order_and_full_history() -> TestResult {
+    use gang_spi::{
+        FleetInfrastructureEvent, InfrastructureEvent, InfrastructureEventKind as Kind,
+    };
+
+    let policy = policy("alpha", 0, 4)?;
+    let mut world = World::default();
+    world.properties.push(properties(&policy, vec![]));
+    world.policies.push(policy);
+    world.supplies.push(FleetSupply {
+        desired: 1,
+        ..FleetSupply::default()
+    });
+    let fleet = FleetName::try_new("alpha")?;
+    let instance = instance_id(1)?;
+    let record = |id: &str, at, kind| FleetInfrastructureEvent {
+        fleet: fleet.clone(),
+        event: InfrastructureEvent {
+            id: id.into(),
+            at: ts(at),
+            kind,
+        },
+    };
+    // Encoded resource names order ":" before "0", unlike the raw IDs.
+    world.infrastructure = vec![
+        record(
+            "0",
+            2,
+            Kind::CapacityUnavailable {
+                reason: "newest".into(),
+            },
+        ),
+        record(
+            ":",
+            2,
+            Kind::InstanceLaunched {
+                instance: instance.clone(),
+            },
+        ),
+        record(
+            "older",
+            1,
+            Kind::CapacityUnavailable {
+                reason: "old".into(),
+            },
+        ),
+    ];
+    let mut settings = config();
+    settings.events_limit = 1;
+    let mut builder = Builder::new(settings, gang_state::CacheBaseline::default());
+    let first = fill(&mut builder, &blank(), 1, &world, 3, ok(0))?;
+    assert_eq!(
+        first.fleets[0]
+            .launch_warning
+            .as_ref()
+            .map(|w| w.reason.as_str()),
+        Some("newest")
+    );
+    world.infrastructure.insert(
+        0,
+        record(
+            "later",
+            3,
+            Kind::InstanceLaunched {
+                instance: instance.clone(),
+            },
+        ),
+    );
+    world.infrastructure.push(record(
+        "unrelated",
+        4,
+        Kind::RebalanceRecommendation { instance },
+    ));
+    let second = fill(&mut builder, &first, 2, &world, 5, ok(0))?;
+    assert_eq!(second.status_events.len(), 1);
+    assert!(
+        matches!(&second.status_events[0].change, gang_wire::EventChange::Aws { event }
+        if matches!(event.kind, gang_wire::AwsEventKind::RebalanceRecommendation { .. }))
+    );
+    assert!(second.fleets[0].launch_warning.is_none());
+    world.infrastructure.clear();
+    let empty = fill(&mut builder, &first, 3, &world, 6, ok(0))?;
+    assert!(empty.fleets[0].launch_warning.is_none());
+    Ok(())
+}
+
+#[test]
 fn infrastructure_projection_tracks_connected_overlap_and_clears_completed_pair() -> TestResult {
     use gang_spi::{FleetInfrastructureEvent, InfrastructureEvent, InfrastructureEventKind};
     use gang_wire::{AwsEventKind, EventChange, InfrastructurePhase};

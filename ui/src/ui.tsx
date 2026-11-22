@@ -1,11 +1,12 @@
 // Shared view primitives: live durations, tweened numbers, event glyphs, section frames and filters.
 import { createContext, toChildArray, type ComponentChildren } from "preact";
-import { useContext, useEffect, useRef, useState } from "preact/hooks";
+import { useContext, useEffect, useId, useRef, useState } from "preact/hooks";
 import { useComputed } from "@preact/signals";
 import type { StateClient } from "./client.ts";
 import { clock, day, duration, splitTail, workerInstance } from "./format.ts";
 import { eventKind, idOf, type EventKind, type UnixMs } from "./wire-parse.ts";
-import type { EventChange, Fleet, ScalingEvent } from "./wire.ts";
+import { schedulerKnown, slots as recentSlots, unrecordedSlots } from "./recent.ts";
+import type { EventChange, Fleet, Recent, ScalingEvent } from "./wire.ts";
 
 export const ClientContext = createContext<StateClient | null>(null);
 
@@ -338,6 +339,104 @@ export const Tile = ({ label, value, meter, caption, chart, heading = 2, valueSt
   </div>
 );
 
+const SPARK_W = 300;
+const SPARK_H = 44;
+const SPARK_POINT_RADIUS = 2;
+
+type SparkSeries = { name: string; values: readonly (number | null)[]; reference?: boolean };
+
+export const Spark = ({ values, areaValues, secondary, series, unknown, label, recent, scheduler = false }: {
+  values: readonly (number | null)[];
+  areaValues?: readonly (number | null)[];
+  secondary?: readonly (number | null)[];
+  series?: readonly SparkSeries[];
+  unknown?: readonly boolean[];
+  label: string;
+  recent: Recent;
+  scheduler?: boolean;
+}) => {
+  const missing = unrecordedSlots(recent);
+  const hatch = `spark-hatch-${useId()}`;
+  let peak = 1;
+  for (const value of values) if (value !== null) peak = Math.max(peak, value);
+  if (areaValues) for (const value of areaValues) if (value !== null) peak = Math.max(peak, value);
+  if (secondary) for (const value of secondary) if (value !== null) peak = Math.max(peak, value);
+  if (series) for (const line of series) for (const value of line.values) if (value !== null) peak = Math.max(peak, value);
+  const x = (i: number): number => values.length > 1 ? SPARK_POINT_RADIUS + (i / (values.length - 1)) * (SPARK_W - 2 * SPARK_POINT_RADIUS) : SPARK_POINT_RADIUS;
+  const y = (value: number): number => SPARK_H - SPARK_POINT_RADIUS - (value / peak) * (SPARK_H - 2 * SPARK_POINT_RADIUS);
+  const trace = (series: readonly (number | null)[], fillToBaseline = false): string => {
+    const points: string[] = [];
+    let firstX: string | undefined;
+    let lastX = "";
+    const close = () => {
+      if (fillToBaseline && firstX !== undefined) {
+        const baseline = y(0).toFixed(1);
+        points.push(`L${lastX} ${baseline} L${firstX} ${baseline} Z`);
+      }
+      firstX = undefined;
+    };
+    series.forEach((value, i) => {
+      if (value === null) {
+        close();
+        return;
+      }
+      const pointX = x(i).toFixed(1);
+      points.push(`${firstX === undefined ? "M" : "L"}${pointX} ${y(value).toFixed(1)}`);
+      firstX ??= pointX;
+      lastX = pointX;
+    });
+    close();
+    return points.join(" ");
+  };
+  const path = trace(values);
+  return (
+    <svg class="spark" viewBox={`0 0 ${SPARK_W} ${SPARK_H}`} preserveAspectRatio="none" role="img" aria-label={label}>
+      <title>{label}</title>
+      <defs>
+        <pattern id={hatch} width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+          <rect width="6" height="6" fill="var(--color-rule)" />
+          <path d="M0 0V6" stroke="var(--color-rule-2)" stroke-width="3" />
+        </pattern>
+      </defs>
+      {!unknown && missing > 0 && (
+        <rect class="spark__unrecorded" x="0" y="0" width={values.length ? missing / values.length * SPARK_W : 0} height={SPARK_H} fill={`url(#${hatch})`}>
+          <title>not recorded</title>
+        </rect>
+      )}
+      {scheduler && recentSlots(recent).map((sample, i) => sample && !schedulerKnown(sample) && (
+        <rect key={i} class="spark__unknown" x={i === 0 ? 0 : (x(i - 1) + x(i)) / 2} y="0"
+          width={(i === values.length - 1 ? SPARK_W : (x(i) + x(i + 1)) / 2) - (i === 0 ? 0 : (x(i - 1) + x(i)) / 2)}
+          height={SPARK_H} fill={`url(#${hatch})`}>
+          <title>scheduler unknown</title>
+        </rect>
+      ))}
+      {unknown?.map((missingSlot, i) => missingSlot && (
+        <rect key={i} class="spark__unknown" x={i === 0 ? 0 : (x(i - 1) + x(i)) / 2} y="0"
+          width={(i === values.length - 1 ? SPARK_W : (x(i) + x(i + 1)) / 2) - (i === 0 ? 0 : (x(i - 1) + x(i)) / 2)}
+          height={SPARK_H} fill={`url(#${hatch})`}>
+          <title>not recorded</title>
+        </rect>
+      ))}
+      {areaValues && <path class="spark__area" d={trace(areaValues, true)} />}
+      {!series && <path class="spark__run" d={path} />}
+      {secondary && <path class="spark__run spark__run--secondary" d={trace(secondary)} />}
+      {!series && values.map((value, i) => value !== null && values[i - 1] == null && values[i + 1] == null && (
+        <circle key={i} class="spark__point" cx={x(i)} cy={y(value)} r={SPARK_POINT_RADIUS} />
+      ))}
+      {secondary?.map((value, i) => value !== null && secondary[i - 1] == null && secondary[i + 1] == null && (
+        <circle key={i} class="spark__point spark__point--secondary" cx={x(i)} cy={y(value)} r={SPARK_POINT_RADIUS} />
+      ))}
+      {series?.map((line) => (
+        <g key={line.name} class={`spark__series spark__series--${line.name}${line.reference ? " spark__series--reference" : ""}`}>
+          <path data-series={line.name} class={`spark__run${line.reference ? " spark__run--reference" : ""}`} d={trace(line.values)} />
+          {line.values.map((value, i) => value !== null && line.values[i - 1] == null && line.values[i + 1] == null && (
+            <circle key={i} class="spark__point" cx={x(i)} cy={y(value)} r={SPARK_POINT_RADIUS} />
+          ))}
+        </g>
+      ))}
+    </svg>
+  );
+};
 /** A chart with a shared title, legend and plot geometry. */
 export const ChartFrame = ({ children, title, legend, size = "spark", cls }: {
   children: ComponentChildren;

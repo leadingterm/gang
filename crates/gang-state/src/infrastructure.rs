@@ -11,6 +11,56 @@ use gang_wire::{
     InfrastructurePhase, InfrastructureReason, name,
 };
 
+/// Projects the newest canonical launch outcome independently of the bounded event history.
+pub(crate) fn fill_launch_warnings(
+    fleets: &mut [gang_wire::Fleet],
+    records: &[FleetInfrastructureEvent],
+    scratch: &mut String,
+) {
+    for fleet in fleets {
+        let latest = if fleet
+            .instances
+            .pending
+            .saturating_add(fleet.instances.in_service)
+            < fleet.desired
+        {
+            records
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.event.kind,
+                        InfrastructureEventKind::CapacityUnavailable { .. }
+                            | InfrastructureEventKind::InstanceLaunched { .. }
+                            | InfrastructureEventKind::ReplacementLaunched { .. }
+                    ) && same_name::<name::Fleets>(&fleet.name, &record.fleet, scratch)
+                })
+                .max_by(|a, b| {
+                    a.event
+                        .at
+                        .cmp(&b.event.at)
+                        .then_with(|| name::cmp_of::<name::AwsEvents>(&a.event.id, &b.event.id))
+                })
+        } else {
+            None
+        };
+        if let Some(record) = latest
+            && let InfrastructureEventKind::CapacityUnavailable { reason } = &record.event.kind
+        {
+            if let Some(warning) = &mut fleet.launch_warning {
+                warning.reason.clone_from(reason);
+                warning.at = record.event.at;
+            } else {
+                fleet.launch_warning = Some(gang_wire::LaunchWarning {
+                    reason: reason.clone(),
+                    at: record.event.at,
+                });
+            }
+        } else {
+            fleet.launch_warning = None;
+        }
+    }
+}
+
 /// Converts a canonical observation into a status event, enriching a supported pairing.
 #[must_use]
 pub(crate) fn status_event(

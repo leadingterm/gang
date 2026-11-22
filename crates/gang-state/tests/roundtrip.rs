@@ -343,6 +343,10 @@ fn random_fleet(rng: &mut Rng, fleet: &str) -> Result<Fleet, Box<dyn Error>> {
         launch_failure: rng.chance(50).then(|| gang_wire::LaunchFailure {
             reason: "capacity unavailable".to_owned(),
         }),
+        launch_warning: rng.chance(50).then(|| gang_wire::LaunchWarning {
+            reason: "capacity unavailable".to_owned(),
+            at: timestamp(rng),
+        }),
         instances: InstanceCounts {
             pending: rng.small() % 2,
             in_service: rng.small() % 5,

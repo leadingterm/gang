@@ -740,6 +740,9 @@ pub struct Fleet {
     /// flight; absent when the request is met, a launch is in flight, or the provider cannot tell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_failure: Option<LaunchFailure>,
+    /// The latest failed launch while the fleet is below its desired capacity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_warning: Option<LaunchWarning>,
     /// Instances by lifecycle.
     pub instances: InstanceCounts,
     /// Workers by phase.
@@ -757,6 +760,18 @@ pub struct Fleet {
 pub struct LaunchFailure {
     /// The provider's failure message, verbatim.
     pub reason: String,
+}
+
+/// The latest failed launch outcome while the fleet remains below its desired capacity.
+#[derive(gang_macros::Known, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchWarning {
+    /// The provider's failure message, verbatim.
+    pub reason: String,
+    /// The time the provider observed the failure.
+    #[serde(with = "crate::time")]
+    #[ts(type = "Timestamp")]
+    pub at: Timestamp,
 }
 
 /// The scaling bounds and timeouts of a fleet.
@@ -1159,6 +1174,27 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    #[test]
+    fn launch_warning_is_optional_and_round_trips() {
+        let mut fleet = Fleet::default();
+        let value = serde_json::to_value(&fleet).expect("fleet serializes");
+        assert!(value.get("launchWarning").is_none());
+        assert_eq!(
+            serde_json::from_value::<Fleet>(value).expect("fleet parses"),
+            fleet
+        );
+        fleet.launch_warning = Some(LaunchWarning {
+            reason: "capacity".to_owned(),
+            at: Timestamp::from_unix_millis(1000),
+        });
+        let value = serde_json::to_value(&fleet).expect("fleet serializes");
+        assert_eq!(value["launchWarning"]["reason"], "capacity");
+        assert_eq!(
+            serde_json::from_value::<Fleet>(value).expect("fleet parses"),
+            fleet
+        );
+    }
 
     #[test]
     fn legacy_state_defaults_public_connections() {

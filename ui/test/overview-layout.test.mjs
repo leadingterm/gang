@@ -105,8 +105,21 @@ const probe = async (scenario) => {
     if (meterSlotRect && meterSlotRect.height <= EPS) add(`${name}: meter slot has no height`);
     if (captionRect && captionRect.height <= EPS) add(`${name}: caption slot has no height`);
     if (chartRect && chartRect.height <= 0) add(`${name}: chart slot has no height`);
-    if (name === "Instances" && svgs.length) add("Instances: chart contains fabricated history");
-    if (chart && chartSvgs.length !== (name === "Instances" ? 0 : 1)) add(`${name}: expected ${name === "Instances" ? 0 : 1} chart SVGs, got ${chartSvgs.length}`);
+    if (chart && chartSvgs.length !== 1) add(`${name}: expected one chart SVG, got ${chartSvgs.length}`);
+    if (name === "Instances" && chartSvgs.length === 1) {
+      const svg = chartSvgs[0];
+      const runs = svg.querySelectorAll("path.spark__run");
+      if (runs.length !== 1) add(`Instances: expected one aggregate data path, got ${runs.length}`);
+      if (svg.querySelectorAll("[data-series]").length) add("Instances: unexpected fleet series");
+      if (svg.getAttribute("aria-label") !== "Instances in service") add("Instances: incorrect chart label");
+      if (svg.querySelector(".spark__area, .spark__run--secondary")) add("Instances: unexpected additional series");
+      if (scenario === "instances" && runs.length === 1) {
+        const points = [...(runs[0].getAttribute("d") ?? "").matchAll(/[ML]\s*(-?(?:\d+\.?\d*|\.\d+))[\s,]+(-?(?:\d+\.?\d*|\.\d+))/g)].map((match) => Number(match[2]));
+        const last = points.slice(-3);
+        if (last.length !== 3 || Math.abs((42 - last[0]) / (42 - last[2]) - 16 / 22) > 0.01 ||
+            Math.abs((42 - last[1]) / (42 - last[2]) - 19 / 22) > 0.01) add("Instances: last observations do not sum in-service counts across fleets");
+      }
+    }
     if (name === "Action cache" && chartSvgs.length === 1) {
       const svg = chartSvgs[0];
       if (svg.getAttribute("aria-label") !== "Action-cache lookups as area and hits as line per complete step") add("Action cache: incorrect chart label");
@@ -160,79 +173,11 @@ const probe = async (scenario) => {
     return { name, tile: bounds, label: labelRect, value: rect(value), meter: meterSlotRect, actualMeter: meterRect, caption: captionRect, chart: chartRect, svgs: svgRects };
   });
   if (scenario === "isolated" && isolatedMarkers < 4) add(`isolated: expected at least four Queue/Executing markers, got ${isolatedMarkers}`);
+  if (document.querySelector(".fleet__history, [data-series]")) add("Overview contains a fleet history diagram");
   if (scenario === "instances") {
     const executing = elements.find((element) => element.querySelector(".label")?.textContent.trim() === "Executing")?.querySelector(".readout__big")?.textContent.trim() ?? "";
     if (!/^120$/.test(executing)) add(`Executing: expected 120 without a denominator, got "${executing}"`);
     if (/\/\s*0(?:\D|$)/.test(document.body.innerText)) add("Overview contains a /0 denominator");
-    const fleets = [...document.querySelectorAll(".fleet")];
-    const histories = [...document.querySelectorAll(".fleet__history")];
-    if (fleets.length < 2 || histories.length !== fleets.length) add(`expected one history per fleet, got ${histories.length} histories for ${fleets.length} fleets`);
-    const ids = [...document.querySelectorAll("svg pattern[id]")].map((pattern) => pattern.id);
-    if (new Set(ids).size !== ids.length) add("duplicate SVG hatch IDs");
-    for (const [index, fleet] of fleets.entries()) {
-      const history = fleet.querySelector(".fleet__history");
-      const svg = history?.querySelector("svg");
-      const legend = history?.querySelector('[aria-label="Instance history legend"]');
-      const historyBox = rect(history), svgBox = rect(svg), legendBox = rect(legend);
-      if (!historyBox || !svgBox || !legendBox || svgBox.width <= EPS || svgBox.height <= EPS || legendBox.width <= EPS || legendBox.height <= EPS) {
-        add(`fleet ${index}: chart or legend is missing or invisible`);
-        continue;
-      }
-      const labels = [...legend.children].map((item) => item.textContent.trim());
-      for (const label of ["Pending", "In service", "Terminating", "Warm", "Desired", "Max"]) {
-        if (!labels.includes(label)) add(`fleet ${index}: missing ${label} legend item`);
-      }
-      const tokenProbe = document.createElement("span");
-      legend.append(tokenProbe);
-      const tokenColor = (token) => {
-        tokenProbe.style.color = `var(${token})`;
-        return getComputedStyle(tokenProbe).color;
-      };
-      const muted = tokenColor("--color-muted");
-      for (const [name, label, token] of [
-        ["pending", "Pending", "--color-amber"],
-        ["inService", "In service", "--color-accent"],
-        ["terminating", "Terminating", "--color-bark"],
-        ["warm", "Warm", "--color-accent-deep"],
-        ["desired", "Desired", "--color-ink-2"],
-        ["max", "Max", "--color-muted"],
-      ]) {
-        const item = [...legend.children].find((child) => child.textContent.trim() === label);
-        const swatch = item?.querySelector(".fleet__history-swatch");
-        if (!item || item.className !== "legend__item" || getComputedStyle(item).color !== muted) add(`fleet ${index}: ${label} legend text does not inherit muted color`);
-        if (!swatch || !swatch.classList.contains(`spark__series--${name}`)) {
-          add(`fleet ${index}: missing ${name} swatch`);
-          continue;
-        }
-        const style = getComputedStyle(swatch);
-        const reference = ["desired", "max"].includes(name);
-        if (style.color !== tokenColor(token) || style.borderBlockStartColor !== tokenColor(token)) add(`fleet ${index}: ${name} swatch does not use ${token}`);
-        if (style.borderBlockStartStyle !== (reference ? "dashed" : "solid") || parseFloat(style.borderBlockStartWidth) <= 0 || swatch.getBoundingClientRect().width <= EPS) add(`fleet ${index}: ${name} swatch has incorrect or invisible border`);
-        if (swatch.classList.contains("spark__series--reference") !== reference) add(`fleet ${index}: incorrect reference class for ${name} swatch`);
-      }
-      tokenProbe.remove();
-      if (legend.querySelectorAll(".fleet__history-swatch").length !== 6) add(`fleet ${index}: expected exactly six legend swatches`);
-      for (const [name, node] of [["chart", svg], ["legend", legend], ...[...legend.children].map((item) => ["legend item", item])]) {
-        const box = rect(node);
-        const style = getComputedStyle(node);
-        if (!box || box.width <= EPS || box.height <= EPS || style.display === "none" || style.visibility === "hidden" ||
-            box.left < historyBox.left - EPS || box.right > historyBox.right + EPS ||
-            box.top < historyBox.top - EPS || box.bottom > historyBox.bottom + EPS) add(`fleet ${index}: ${name} is invisible or overflows history`);
-      }
-      for (const name of ["pending", "inService", "terminating", "warm", "desired", "max"]) {
-        const paths = svg.querySelectorAll(`path[data-series="${name}"]`);
-        if (paths.length !== 1) add(`fleet ${index}: expected one ${name} path, got ${paths.length}`);
-        else {
-          const reference = paths[0].classList.contains("spark__run--reference");
-          if (reference !== ["desired", "max"].includes(name)) add(`fleet ${index}: incorrect reference class for ${name}`);
-          const pathStyle = getComputedStyle(paths[0]);
-          if (reference && (pathStyle.strokeDasharray === "none" || parseFloat(pathStyle.strokeWidth) <= 0)) add(`fleet ${index}: ${name} reference line is not visibly dashed`);
-          if (!(paths[0].getAttribute("d") ?? "").trim()) add(`fleet ${index}: ${name} path is empty`);
-          if (index === 0 && name === "pending" && (paths[0].getAttribute("d")?.match(/M/g) ?? []).length !== 2) add("fleet 0: missing-entry gap or scheduler-independent sample not preserved");
-        }
-      }
-      if (svg.querySelectorAll("path[data-series]").length !== 6) add(`fleet ${index}: expected exactly six series paths`);
-    }
   }
   const reference = tiles.find((tile) => tile.label)?.label;
   const referenceTile = tiles.find((tile) => tile.label)?.tile;
@@ -475,15 +420,27 @@ test("overview charts slide only completed counter steps", { timeout: 120000 }, 
             if (!svg) throw new Error("missing gauge " + label);
             return [...vertices(svg.querySelector("path.spark__run")), ...[...svg.querySelectorAll("circle.spark__point")].map(c => [Number(c.getAttribute("cx")), Number(c.getAttribute("cy"))])];
           };
-          const fleet = [...document.querySelectorAll("svg[aria-label^='Instance history for ']")].find(svg => svg.getAttribute("aria-label").includes(${JSON.stringify(fleet.name)}));
-          if (!fleet) throw new Error("missing fleet history");
           return { charts, queued: gauge("Queued"), executing: gauge("Executing"),
             partial: document.querySelector(".passbar > i:last-child")?.className,
             passLabel: document.querySelector(".passbar")?.getAttribute("aria-label"),
-            fleetLabel: fleet.getAttribute("aria-label"),
-            fleetPoints: vertices(fleet.querySelector('[data-series="inService"]')),
-            fleetUnknown: fleet.querySelectorAll(".spark__unknown").length,
             overflow: document.documentElement.scrollWidth > innerWidth };
+        })()`, awaitPromise: true, returnByValue: true,
+      }));
+      if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+      return result.result.value;
+    };
+    const inspectFleet = async (label) => {
+      const result = await wait(page.send("Runtime.evaluate", {
+        expression: `(async () => {
+          const find = () => [...document.querySelectorAll("svg[aria-label^='Instance history for ']")].find(svg => svg.getAttribute("aria-label").includes(${JSON.stringify(fleet.name)}) && svg.getAttribute("aria-label").includes(${JSON.stringify(label)}));
+          if (!find()) await new Promise(resolve => {
+            const observer = new MutationObserver(() => { if (find()) { observer.disconnect(); resolve(); } });
+            observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+            if (find()) { observer.disconnect(); resolve(); }
+          });
+          const svg = find();
+          const points = [...(svg.querySelector('[data-series="inService"]')?.getAttribute("d") ?? "").matchAll(/[ML]\\s*(-?(?:\\d+\\.?\\d*|\\.\\d+))[\\s,]+(-?(?:\\d+\\.?\\d*|\\.\\d+))/g)].map(m => [Number(m[1]), Number(m[2])]);
+          return { label: svg.getAttribute("aria-label"), points, unknown: svg.querySelectorAll(".spark__unknown").length };
         })()`, awaitPromise: true, returnByValue: true,
       }));
       if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
@@ -529,8 +486,6 @@ test("overview charts slide only completed counter steps", { timeout: 120000 }, 
       assertCharts(populated, 199.3);
       assert.deepEqual(populated.charts, appended.charts, "partial counters do not change plots");
       assert.match(populated.passLabel, /0 of 2 recorded complete steps/);
-      assert.match(populated.fleetLabel, /In service 2/);
-      assert.ok(populated.fleetPoints.some(([x, y]) => x === 298 && y < 42), "independently observed current fleet is plotted");
       if (process.env.GANG_LAYOUT_SCREENSHOTS && process.env.TEST_UNDECLARED_OUTPUTS_DIR) {
         const size = await page.send("Runtime.evaluate", { expression: `({ x: 0, y: 0, width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight, scale: 1 })`, returnByValue: true });
         const shot = await page.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, clip: size.result.value });
@@ -540,9 +495,6 @@ test("overview charts slide only completed counter steps", { timeout: 120000 }, 
       assertCharts(completed, 199.3);
       assert.ok(completed.charts.every((paths) => paths.every((points) => points.some(([x, y]) => Math.abs(x - 199.3) < 0.1 && y < 42))), "filled bucket becomes visible when complete");
       assert.match(completed.passLabel, /1 of 3 recorded complete steps/);
-      assert.match(completed.fleetLabel, /latest sample: not recorded/);
-      assert.ok(completed.fleetUnknown > 0, "missing current fleet observation is a gap");
-      assert.ok(!completed.fleetPoints.some(([x]) => x === 298), "missing fleet is not forward-filled");
       if (process.env.GANG_LAYOUT_SCREENSHOTS && process.env.TEST_UNDECLARED_OUTPUTS_DIR) {
         const size = await page.send("Runtime.evaluate", { expression: `({ x: 0, y: 0, width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight, scale: 1 })`, returnByValue: true });
         const shot = await page.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, clip: size.result.value });
@@ -552,11 +504,34 @@ test("overview charts slide only completed counter steps", { timeout: 120000 }, 
       await wait(page.send("Page.navigate", { url: "about:blank" }));
       await wait(unloaded);
       stream.end();
+      const workersConnected = new Promise((resolve) => { acceptStream = resolve; });
+      const workersLoaded = page.once("Page.loadEventFired");
+      await wait(page.send("Page.navigate", { url: `http://127.0.0.1:${server.address().port}/ui/workers` }));
+      await wait(workersLoaded);
+      const workersStream = await wait(workersConnected);
+      const sendWorkers = async (event, data) => {
+        const received = page.once("Network.eventSourceMessageReceived", (message) => message.eventName === event && message.data === JSON.stringify(data));
+        workersStream.write(`event: ${event}\nid: ${data.seq}\ndata: ${JSON.stringify(data)}\n\n`);
+        await wait(received);
+      };
+      await sendWorkers("snapshot", snapshot);
+      await sendWorkers("delta", delta(snapshot.seq + 1, newZero));
+      await sendWorkers("delta", delta(snapshot.seq + 2, filled));
+      const populatedFleet = await inspectFleet("In service 2");
+      assert.ok(populatedFleet.points.some(([x, y]) => x === 298 && y < 42), "independently observed current fleet is plotted");
+      await sendWorkers("delta", delta(snapshot.seq + 3, next));
+      const completedFleet = await inspectFleet("latest sample: not recorded");
+      assert.ok(completedFleet.unknown > 0, "missing current fleet observation is a gap");
+      assert.ok(!completedFleet.points.some(([x]) => x === 298), "missing fleet is not forward-filled");
+      const workersUnloaded = page.once("Page.loadEventFired");
+      await wait(page.send("Page.navigate", { url: "about:blank" }));
+      await wait(workersUnloaded);
+      workersStream.end();
     }
     assert.deepEqual(errors, []);
   } finally {
-    if (browser) await browser.close();
     server.closeAllConnections();
+    if (browser) await browser.close();
     if (server.listening) await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     rmSync(profile, { recursive: true, force: true });
   }

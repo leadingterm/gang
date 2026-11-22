@@ -2,10 +2,10 @@
 // instances without a worker sit under their fleet as counts.
 import { useState } from "preact/hooks";
 import { idOf, ms, type UnixMs } from "../wire-parse.ts";
-import type { Fleet, InfrastructureStatus, Instance, Phase, Recent, State, Worker, WorkerCache } from "../wire.ts";
-import { schedulerCurrent, schedulerKnown, stepMs, windowMs } from "../recent.ts";
+import type { Fleet, FleetInstanceSample, InfrastructureStatus, Instance, Phase, Recent, State, Worker, WorkerCache } from "../wire.ts";
+import { schedulerCurrent, schedulerKnown, slots as recentSlots, stepMs, windowMs } from "../recent.ts";
 import { bytes, sum, workerInstance } from "../format.ts";
-import { Cell, Clock, Disclosure, Duration, Empty, FleetFilter, Ident, Row, Section, Since, Table, Target, useClient, useNowStep } from "../ui.tsx";
+import { Cell, ChartFrame, Clock, Disclosure, Duration, Empty, FleetFilter, Ident, Row, Section, Since, Spark, Table, Target, useClient, useNowStep } from "../ui.tsx";
 import { AsOf, ReservationAmounts } from "./actions.tsx";
 import { fleetCounts, fleetTotals, STATE_NAME, StaticCell, Tally, unhostedInstances, type Counted, type FleetCensus } from "./fleet.tsx";
 
@@ -243,6 +243,31 @@ const InfrastructureInstance = ({ instance }: { instance: Instance }) => (
   </div>
 );
 
+const InstanceHistory = ({ f, recent }: { f: Fleet; recent: Recent }) => {
+  const samples: readonly (FleetInstanceSample | undefined)[] = recentSlots(recent).map((sample) => sample?.fleets?.find((fleet) => fleet.name === f.name));
+  const fields = [
+    { name: "pending", label: "Pending", value: (sample: FleetInstanceSample) => sample.instances.pending },
+    { name: "inService", label: "In service", value: (sample: FleetInstanceSample) => sample.instances.inService },
+    { name: "terminating", label: "Terminating", value: (sample: FleetInstanceSample) => sample.instances.terminating },
+    { name: "warm", label: "Warm", value: (sample: FleetInstanceSample) => sample.instances.warm },
+    { name: "desired", label: "Desired", value: (sample: FleetInstanceSample) => sample.desired, reference: true },
+    { name: "max", label: "Max", value: (sample: FleetInstanceSample) => sample.max, reference: true },
+  ];
+  const series = fields.map((field) => ({ ...field, values: samples.map((sample) => sample ? field.value(sample) : null) }));
+  const latest = samples.at(-1);
+  const historyLabel = `Instance history for ${f.name}; latest sample: ${latest ? fields.map((field) => `${field.label} ${field.value(latest)}`).join(", ") : "not recorded"}`;
+  return (
+    <div class="fleet__history">
+      <ChartFrame size="spark" title="Instance history" legend={<div class="legend" aria-label="Instance history legend">
+        {fields.map((field) => <span key={field.name} class="legend__item"><i class={`fleet__history-swatch spark__series--${field.name}${field.reference ? " spark__series--reference" : ""}`} aria-hidden="true" />{field.label}</span>)}
+      </div>}>
+        <Spark values={series[0]!.values} series={series} unknown={samples.map((sample) => !sample)} label={historyLabel} recent={recent} />
+      </ChartFrame>
+      {samples.every((sample) => !sample) && <p class="dim">not recorded</p>}
+    </div>
+  );
+};
+
 export const Workers = () => {
   const client = useClient();
   const state = client.state.value;
@@ -253,17 +278,12 @@ export const Workers = () => {
   const window = windowMs(state.recent);
   const ws = state.workers;
   const pending = sum(state.fleets, (f) => f.instances.pending);
-  if (ws.length === 0 && state.instances.length === 0) {
-    return (
-      <Empty>
-        <h2>{pending ? `No workers yet · ${pending} booting` : "No workers"}</h2>
-      </Empty>
-    );
-  }
+  const empty = ws.length === 0 && state.instances.length === 0;
   return (
     <>
+      {empty && <Empty><h2>{pending ? `No workers yet · ${pending} booting` : "No workers"}</h2></Empty>}
       <div class="toolbar">
-        <FleetFilter id="wfleet" fleets={state.fleets} value={fleet} onChange={setFleet} count={(f) => ws.filter((w) => w.fleet === f.name).length} />
+        <FleetFilter id="wfleet" fleets={state.fleets} value={fleet} onChange={setFleet} />
         {schedulerCurrent(state) ? <Tally items={fleetTotals(state.fleets, state).filter(([s]) => TALLIED[s])} /> : <span>Scheduler unknown</span>}
       </div>
       <div class="wgrid">
@@ -282,9 +302,9 @@ export const Workers = () => {
           const rows = ws.filter((w) => w.fleet === f.name);
           const gs = ghosts(f, state);
           const marked = unhostedInstances(f, state).filter((i) => i.infrastructure);
-          if (rows.length === 0 && gs.length === 0 && marked.length === 0) return null;
           return (
             <Section key={f.name} id={`wg-${idOf(f.name)}`} title={idOf(f.name)} count={rows.length} mono variant="plain" cls="wgroup" hidden={fleet !== "" && fleet !== f.name}>
+              <InstanceHistory f={f} recent={state.recent} />
               <div class="section__legend">
                 <h3>Worker cache totals</h3>
                 <p class="quiet">Cumulative store-lifetime counters for connected workers reporting cache metrics.</p>

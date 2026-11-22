@@ -688,49 +688,48 @@ test("fleet launch failure shows the unmet request and provider reason", (t) => 
   t.assert.match(text, /2 of 4 · spot quota exceeded/);
 });
 
-test("fleet shows retained AWS launch warnings as historical observations", (t) => {
+test("current launch warnings come only from the canonical fleet warning", (t) => {
   const fleet = live.fleets[0];
   if (!fleet) throw new Error("the live recording has a fleet");
   const at = "2026-01-15T10:00:00Z";
-  const reason = "m7i.large in us-east-1a: InvalidFleetConfiguration: unsupported offering";
+  const reason = "m7i.large: insufficient capacity";
   const warning: ScalingEvent = {
     ...common, name: "awsEvents/warning", createTime: at, fleet: fleet.name,
     aws: { event: { id: "warning", at, kind: { type: "capacityUnavailable", reason } } },
   };
+  const success: ScalingEvent = {
+    ...common, name: "awsEvents/success", createTime: at, fleet: fleet.name,
+    aws: { event: { id: "success", at, kind: { type: "instanceLaunched", instance: "instances/i-success" } } },
+  };
   const { launchFailure: _launchFailure, ...healthyFleet } = fleet;
-  const f = { ...healthyFleet, desired: 18, instances: { ...fleet.instances, inService: 17, pending: 1 } };
+  const f = { ...healthyFleet, desired: 18, instances: { ...fleet.instances, inService: 17, pending: 0 } };
   const fleetMarkup = (state: typeof live) => {
     const markup = html({ state }, <Overview />);
     const row = markup.match(/<li class="fleet(?: is-idle)?"[\s\S]*?<\/li>/);
     if (!row) throw new Error("fleet row missing");
     return row[0];
   };
-  for (const state of [
-    { ...live, fleets: [f], events: [], statusEvents: [warning] },
-    { ...live, fleets: [f], events: [warning], statusEvents: [] },
-  ]) {
-    const row = fleetMarkup(state);
+  const current = { ...f, launchWarning: { at, reason } };
+  for (const events of [[], [success], [warning, success]]) {
+    const row = fleetMarkup({ ...live, fleets: [current], events, statusEvents: events });
     t.assert.match(visibleText(row), /launch warning/);
-    t.assert.match(visibleText(row), /Observed 2026-01-15T10:00:00Z · m7i\.large in us-east-1a: InvalidFleetConfiguration: unsupported offering/);
+    t.assert.match(visibleText(row), /m7i\.large: insufficient capacity/);
     t.assert.match(row, /<time datetime="2026-01-15T10:00:00Z">/i);
     t.assert.doesNotMatch(visibleText(row), /can't launch/);
   }
-  t.assert.match(visibleText(render(<EventRow e={warning} withCause={false} />)), /AWS: launch warning: m7i\.large in us-east-1a: InvalidFleetConfiguration: unsupported offering/);
-
-  const unrelated: ScalingEvent[] = [
-    { ...warning, fleet: "fleets/other" },
-    { ...common, fleet: f.name, launchFailed: { from: 17, to: 18, reason } },
-    { ...common, name: "awsEvents/other", fleet: f.name, aws: { event: { id: "other", at, kind: { type: "instanceLaunched", instance: "instances/i-success" } } } },
-  ];
-  for (const events of [[], unrelated]) {
-    const row = visibleText(fleetMarkup({ ...live, fleets: [f], events: [], statusEvents: events }));
-    t.assert.doesNotMatch(row, /launch warning|can't launch/);
+  for (const events of [[warning], [warning, success]]) {
+    for (const cleared of [f, { ...f, instances: { ...f.instances, inService: 18 } }]) {
+      const state = { ...live, fleets: [cleared], events, statusEvents: events };
+      t.assert.doesNotMatch(visibleText(fleetMarkup(state)), /launch warning|can't launch/);
+      t.assert.match(visibleText(html({ state }, <Activity />)), /launch warning: m7i\.large: insufficient capacity/);
+    }
   }
-  const failed = { ...f, launchFailure: { reason: "spot quota exceeded" } };
+  const failed = { ...current, launchFailure: { reason: "spot quota exceeded" } };
   const row = visibleText(fleetMarkup({ ...live, fleets: [failed], events: [], statusEvents: [warning] }));
   t.assert.match(row, /can't launch/);
   t.assert.match(row, /17 of 18 · spot quota exceeded/);
-  t.assert.doesNotMatch(row, /launch warning/);
+  t.assert.doesNotMatch(row, /launch warning|m7i\.large: insufficient capacity/);
+  t.assert.match(visibleText(render(<EventRow e={warning} withCause={false} />)), /AWS: launch warning: m7i\.large: insufficient capacity/);
 });
 
 
@@ -815,7 +814,7 @@ test("delta folds keep partial counters off charts while live gauges and observe
   t.assert.match(chart(appended, "Executing"), /[ML]298\.0 39\.2/);
   t.assert.match(chart(appended, "Queued"), /[ML]298\.0 2\.0/);
   const fleetLabel = `Instance history for ${fleet.name}; latest sample: Pending 2, In service 3, Terminating 1, Warm 4, Desired 5, Max 6`;
-  t.assert.match(chart(appended, fleetLabel), /data-series="pending"[^>]*d="[^"]*[ML]298\.0 /);
+  t.assert.match(chart(html({ state }, <Workers />), fleetLabel), /data-series="pending"[^>]*d="[^"]*[ML]298\.0 /);
 
   const changed = { ...partial, schedulerKnown: true, completed: 0, lookups: 4, hits: 2, downloadedBytes: 9, uploadedBytes: 3, evictedBytes: 2, passes: 1 };
   const replaced = fold({ recent: recent(changed) }, changed.start);
@@ -842,7 +841,7 @@ test("delta folds keep partial counters off charts while live gauges and observe
     t.assert.doesNotMatch(svg, /<circle\b[^>]*cx="298(?:\.0)?"/, label);
   }
   t.assert.equal(state.fleets[0]?.name, fleet.name);
-  const missingFleet = chart(unavailable, `Instance history for ${fleet.name}; latest sample: not recorded`);
+  const missingFleet = chart(html({ state }, <Workers />), `Instance history for ${fleet.name}; latest sample: not recorded`);
   t.assert.match(missingFleet, /<title>not recorded<\/title>/);
   t.assert.doesNotMatch(missingFleet, /data-series="pending"[^>]*d="[^"]*[ML]298\.0 /);
   t.assert.doesNotMatch(missingFleet, /<circle\b[^>]*cx="298(?:\.0)?"/);
@@ -866,7 +865,7 @@ test("fleet instance histories retain independent observed series through missin
       : [observation(first.name, i === 2 ? 0 : 1, 2), observation(second.name, 1, 4)] }),
   }));
   const state = { ...base, schedulerKnown: false, fleets: [first, second], recent: { ...base.recent, window: "50s", samples } };
-  const markup = html({ state }, <Overview />);
+  const markup = html({ state }, <Workers />);
   const a = chart(markup, `Instance history for ${first.name}; latest sample: Pending 1, In service 1, Terminating 1, Warm 1, Desired 1, Max 2`);
   const b = chart(markup, `Instance history for ${second.name}; latest sample: Pending 1, In service 1, Terminating 1, Warm 1, Desired 1, Max 4`);
   t.assert.equal(Boolean(a && b), true);
@@ -897,7 +896,7 @@ test("legacy fleet samples show not recorded instead of zero", (t) => {
   if (!fleet) throw new Error("the live recording has a fleet");
   const base = recentState(2);
   const state = { ...base, fleets: [fleet] };
-  const markup = html({ state }, <Overview />);
+  const markup = html({ state }, <Workers />);
   const svg = chart(markup, `Instance history for ${fleet.name}; latest sample: not recorded`);
   t.assert.equal(Boolean(svg), true);
   t.assert.match(svg, /<title>not recorded<\/title>/);
@@ -908,6 +907,22 @@ test("legacy fleet samples show not recorded instead of zero", (t) => {
     t.assert.notEqual(path, "");
     t.assert.doesNotMatch(path, /\bd="[^"]+"/);
   }
+});
+
+test("Workers shows histories for idle fleets without workers and offers them in the fleet filter", (t) => {
+  const fleet = live.fleets[0];
+  if (!fleet) throw new Error("the live recording has a fleet");
+  const first = { ...fleet, name: "fleets/idle-a" };
+  const second = { ...fleet, name: "fleets/idle-b" };
+  const state = { ...recentState(2), fleets: [first, second], workers: [], instances: [] };
+  const markup = html({ state }, <Workers />);
+  for (const f of [first, second]) {
+    t.assert.notEqual(chart(markup, `Instance history for ${f.name}; latest sample: not recorded`), "");
+    const option = new RegExp(`<option\\b[^>]*value="${f.name}"[^>]*>`).exec(markup)?.[0] ?? "";
+    t.assert.notEqual(option, "");
+    t.assert.doesNotMatch(option, /\bdisabled\b/);
+  }
+  t.assert.match(markup, /<option\b[^>]*>All fleets<\/option>/);
 });
 
 test("action cache describes lookup counts and the configured window", (t) => {
@@ -1253,15 +1268,16 @@ test("Tiles flattens nested children and ignores null and false with default col
   t.assert.equal(emptyMarkup.slice(emptyMarkup.indexOf(">") + 1, -6), "");
 });
 
-test("every overview readout reserves a chart slot, including instances", (t) => {
+test("every overview readout reserves a chart slot and Instances has one simple sparkline", (t) => {
   for (const count of [0, 3, 90]) {
     const markup = html({ state: recentState(count) }, <Overview />);
     t.assert.equal((markup.match(/class="[^"]*\breadout__chart\b[^"]*"/g) ?? []).length, 5, `${count} samples`);
-    t.assert.match(
-      markup,
-      /<div class="readout"><h2 class="label">Instances<\/h2>(?:(?!<div class="readout">)[\s\S])*?<div class="[^"]*\breadout__chart\b[^"]*"[^>]*>\s*<\/div>/,
-      `${count} samples: instances chart slot is empty`,
-    );
+    const card = /<div class="readout"><h2 class="label">Instances<\/h2>(?:(?!<div class="readout">)[\s\S])*?<\/svg>/.exec(markup)?.[0] ?? "";
+    t.assert.equal((card.match(/<svg\b/g) ?? []).length, 1, `${count} samples: one instances sparkline`);
+    t.assert.match(card, /aria-label="Instances in service"/);
+    t.assert.match(card, /class="spark__run"/);
+    t.assert.doesNotMatch(markup, /aria-label="Instance history for /);
+    t.assert.doesNotMatch(card, /data-series=|spark__run--secondary/);
   }
 });
 
