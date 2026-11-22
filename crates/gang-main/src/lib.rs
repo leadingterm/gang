@@ -51,6 +51,7 @@ mod errors;
 mod exec_command;
 mod guard_command;
 mod help;
+#[cfg(target_os = "linux")]
 mod host_egress_command;
 mod join_command;
 mod local_down;

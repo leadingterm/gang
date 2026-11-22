@@ -374,6 +374,7 @@ pub enum Command {
     #[command(hide = true, after_help = WORKER_EXAMPLES)]
     Worker(WorkerArgs),
     /// Install the worker's host action-egress policy.
+    #[cfg(target_os = "linux")]
     #[command(name = "__prepare-action-egress", hide = true)]
     PrepareActionEgress(PrepareActionEgressArgs),
     /// Commit a local worker's identity before executing its launcher.
@@ -416,6 +417,7 @@ impl Command {
             Self::Config(ConfigCommand::Check(_)) => "gang config check",
             Self::Database(DatabaseCommand::Copy(_)) => "gang database copy",
             Self::Worker(_) => "gang worker",
+            #[cfg(target_os = "linux")]
             Self::PrepareActionEgress(_) => "gang prepare action egress",
             Self::LocalWorker(_) => "gang local worker",
             Self::Exec(_) => "gang exec",
@@ -431,6 +433,7 @@ impl Command {
 }
 
 /// Arguments for the privileged host policy installer.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Args)]
 pub struct PrepareActionEgressArgs {
     /// Worker configuration.
@@ -1317,6 +1320,40 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_action_egress_parses_host_policy_arguments() {
+        let parsed = command(&[
+            "gang",
+            "__prepare-action-egress",
+            "--config",
+            "/etc/gang/gang.toml",
+            "--cgroup",
+            "/sys/fs/cgroup/gang/actions",
+            "--nft",
+            "/bin/nft",
+            "--ip",
+            "/bin/ip",
+        ]);
+        assert_eq!(parsed.subject(), "gang prepare action egress");
+        let Command::PrepareActionEgress(args) = parsed else {
+            panic!("expected the host action-egress command");
+        };
+        assert_eq!(args.config, Path::new("/etc/gang/gang.toml"));
+        assert_eq!(args.cgroup, Path::new("/sys/fs/cgroup/gang/actions"));
+        assert_eq!(args.nft, Path::new("/bin/nft"));
+        assert_eq!(args.ip, Path::new("/bin/ip"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn prepare_action_egress_is_unavailable() {
+        assert_eq!(
+            rejection(&["gang", "__prepare-action-egress"]),
+            ErrorKind::InvalidSubcommand
+        );
+    }
+
     #[test]
     fn worker_endpoint_flags_reject_a_malformed_url() {
         assert_eq!(
@@ -1872,7 +1909,7 @@ mod tests {
             help.lines()
                 .any(|line| line.split_whitespace().next() == Some("login"))
         );
-        for name in ["exec", "get", "worker", "deploy"] {
+        for name in ["exec", "get", "worker", "deploy", "__prepare-action-egress"] {
             let listed = help
                 .lines()
                 .any(|line| line.split_whitespace().next() == Some(name));

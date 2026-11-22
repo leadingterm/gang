@@ -32,6 +32,7 @@ pub(crate) const fn listen_key(role: ListenerRole) -> &'static str {
 #[derive(Debug, thiserror::Error, gang_types::Fix)]
 pub(crate) enum MainError {
     /// The privileged action-egress policy installation failed.
+    #[cfg(target_os = "linux")]
     #[error("cannot prepare host action egress")]
     HostEgress(#[source] io::Error),
     /// The reset trampoline was not given a program.
