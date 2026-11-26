@@ -4,13 +4,22 @@
 //! composition, directory tree cache, bounded zstd transport codec, and controller-backed remote
 //! CAS gRPC client.
 
+mod codec;
 mod disk;
+mod flight;
 mod layout;
 mod lru;
 mod pins;
+mod remote;
+mod resource;
 mod stats;
 
+pub use codec::{
+    Compression, DEFAULT_ZSTD_LEVEL, compress_zstd, compress_zstd_stream, decompress_zstd_bounded,
+    decompress_zstd_stream, verify_identity_stream,
+};
 pub use disk::{DiskCas, WriteOutcome};
+pub use flight::SingleFlight;
 pub use layout::{
     DETERMINISTIC_MTIME_SECS, ScanReport, ScannedEntry, TMP_DIR_NAME, blob_path,
     deterministic_mtime, entry_file_name, file_mode, hardlink_or_reflink_file, parse_entry_name,
@@ -18,4 +27,6 @@ pub use layout::{
 };
 pub use lru::{BlobMode, CacheKey, EvictedEntry, InsertOutcome, PinKind, SHARD_COUNT, ShardedLru};
 pub use pins::CasPin;
+pub use remote::{RemoteCas, RemoteCasConfig};
+pub use resource::{ResourceName, ResourceNameError};
 pub use stats::CasStats;
