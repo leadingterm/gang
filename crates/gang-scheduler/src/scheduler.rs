@@ -4,7 +4,6 @@
 //! placement, attempt lifecycle, escalation, timers, cordons, handoff, learning, and projections
 //! behind a pure `&mut self` API with caller-owned [`Effects`] output buffers.
 
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -35,7 +34,7 @@ use crate::fitting::ClientFloors;
 use crate::handoff::{ControllerHandOff, HandOffEffects, HandOffError};
 use crate::learned::Learned;
 use crate::listing::fill_actions;
-use crate::operations::{Now, OperationKey, Operations};
+use crate::operations::{DEFAULT_MAX_RETAINED_TERMINAL_OPERATIONS, Now, OperationKey, Operations};
 use crate::placement::{PlacedAssignment, place_operation, scan_queue_for_worker};
 use crate::queue::OperationQueue;
 use crate::sketch::SketchError;
@@ -55,7 +54,7 @@ pub struct SchedulerPolicy {
     pub expected_gang_version: String,
     /// Timeout before an unacknowledged `Assign` triggers worker-loss retry.
     pub dispatch_ack_timeout: Duration,
-    /// Maximum non-fitting queued entries skipped per worker-driven dispatch scan.
+    /// Maximum non-fitting queued entries skipped per dispatch scan.
     pub dispatch_scan_limit: usize,
     /// Silence timeout before a connected worker is dropped.
     pub worker_timeout: Duration,
@@ -63,6 +62,11 @@ pub struct SchedulerPolicy {
     pub client_action_timeout: Duration,
     /// Whole-attempt execution deadline budget (including transfers).
     pub attempt_budget: Duration,
+    /// Maximum time from `Executed` to `Completed`, also bounded by `attempt_budget`.
+    /// Worker heartbeats never extend this deadline.
+    pub completion_timeout: Duration,
+    /// Number of recent terminal operations retained for lookup; must be nonzero.
+    pub max_retained_terminal_operations: usize,
     /// Per-term deterministic seed mixed into minted `UUIDv4` [`AttemptId`]s.
     pub attempt_seed: u64,
 }
@@ -78,6 +82,8 @@ impl Default for SchedulerPolicy {
             worker_timeout: Duration::from_secs(10),
             client_action_timeout: Duration::from_mins(10),
             attempt_budget: Duration::from_mins(20),
+            completion_timeout: Duration::from_mins(6),
+            max_retained_terminal_operations: DEFAULT_MAX_RETAINED_TERMINAL_OPERATIONS,
             attempt_seed: 0,
         }
     }
@@ -237,6 +243,16 @@ impl Scheduler {
                 setting: "attempt_budget",
             });
         }
+        if policy.completion_timeout.is_zero() {
+            return Err(PolicyError::ZeroSetting {
+                setting: "completion_timeout",
+            });
+        }
+        if policy.max_retained_terminal_operations == 0 {
+            return Err(PolicyError::ZeroSetting {
+                setting: "max_retained_terminal_operations",
+            });
+        }
         if learned.rates().fleet_count() != catalog.len() {
             return Err(PolicyError::FleetCountMismatch {
                 expected: catalog.len(),
@@ -250,9 +266,9 @@ impl Scheduler {
         let capacity = CapacityCatalog::new(catalog.clone(), policy.actions.cpu_oversubscription);
 
         Ok(Self {
+            operations: Operations::with_terminal_limit(policy.max_retained_terminal_operations),
             policy,
             capacity,
-            operations: Operations::new(),
             queue,
             workers,
             cordons,
@@ -406,7 +422,7 @@ impl Scheduler {
             self.attempts
                 .on_operation_cancelled(key, &mut self.operations, &mut self.queue);
         if let Some(kill) = outcome.kill {
-            self.timers.disarm_attempt(kill.attempt_key);
+            self.timers.disarm(TimerSubject::Ack(kill.attempt_key));
             out.push(Effect::KillWorker {
                 worker: kill.worker,
                 attempt: kill.attempt_key,
@@ -822,7 +838,7 @@ impl Scheduler {
                     operation,
                     event: OperationUpdate::Queued,
                 });
-                self.try_place_operation(operation, now, out);
+                self.dispatch_pending(now, out);
             }
             DeclineOutcome::DroppedTerminal { attempt_key, .. } => {
                 self.timers.disarm_attempt(attempt_key);
@@ -867,29 +883,17 @@ impl Scheduler {
         );
 
         match outcome {
-            ExecutedOutcome::AwaitingCompletion { attempt_key, .. }
-            | ExecutedOutcome::ReleasedComputeOnly { attempt_key, .. } => {
-                self.timers.disarm_attempt(attempt_key);
-            }
-            ExecutedOutcome::EscalatedRequeue {
-                attempt_key,
-                operation,
-                ..
-            } => {
-                self.timers.disarm_attempt(attempt_key);
+            ExecutedOutcome::AwaitingCompletion { .. }
+            | ExecutedOutcome::ReleasedComputeOnly { .. } => {}
+            ExecutedOutcome::EscalatedRequeue { operation, .. } => {
                 out.push(Effect::NotifyWatchers {
                     operation,
                     event: OperationUpdate::Queued,
                 });
-                self.try_place_operation(operation, now, out);
             }
             ExecutedOutcome::EscalationFailed {
-                attempt_key,
-                operation,
-                publish,
-                ..
+                operation, publish, ..
             } => {
-                self.timers.disarm_attempt(attempt_key);
                 self.timers.disarm(TimerSubject::ClientLess(operation));
                 self.profiles.remove(&operation);
                 self.push_publish(publish, out);
@@ -897,7 +901,15 @@ impl Scheduler {
             ExecutedOutcome::Ignored => return,
         }
 
-        self.dispatch_for_worker(worker, now, out);
+        self.timers.disarm(TimerSubject::Ack(attempt_key));
+        if let Some(deadline) =
+            self.attempts
+                .start_completion_timeout(attempt_key, now, self.policy.completion_timeout)
+        {
+            self.timers
+                .arm(TimerSubject::AttemptDeadline(attempt_key), deadline);
+        }
+        self.dispatch_pending(now, out);
         self.maybe_rehome_idle(worker, out);
     }
 
@@ -971,7 +983,6 @@ impl Scheduler {
                     operation,
                     event: OperationUpdate::Queued,
                 });
-                self.try_place_operation(operation, now, out);
             }
             CompletedOutcome::Failed {
                 attempt_key,
@@ -990,24 +1001,34 @@ impl Scheduler {
             CompletedOutcome::Ignored => return,
         }
 
-        self.dispatch_for_worker(worker, now, out);
+        self.dispatch_pending(now, out);
         self.maybe_rehome_idle(worker, out);
     }
 
-    fn place_requeued(&mut self, mut requeued: Vec<OperationKey>, now: Now, out: &mut Effects) {
-        requeued.sort_unstable_by_key(|&op_key| {
-            self.operations
-                .get(op_key)
-                .map_or((Reverse(i32::MIN), u64::MAX, op_key), |op| {
-                    (Reverse(op.priority), op.seq, op_key)
-                })
-        });
+    fn place_requeued(&mut self, requeued: Vec<OperationKey>, now: Now, out: &mut Effects) {
         for op_key in requeued {
             out.push(Effect::NotifyWatchers {
                 operation: op_key,
                 event: OperationUpdate::Queued,
             });
-            self.try_place_operation(op_key, now, out);
+        }
+        self.dispatch_pending(now, out);
+    }
+
+    fn dispatch_pending(&mut self, now: Now, out: &mut Effects) {
+        if !self.handoff.allows_dispatch() {
+            return;
+        }
+        let mut previous = None;
+        let mut skipped = 0;
+        while let Some(entry) = self.queue.next_after(previous) {
+            previous = Some(entry);
+            if !self.try_place_operation(entry.key, now, out) {
+                skipped += 1;
+                if skipped >= self.policy.dispatch_scan_limit {
+                    break;
+                }
+            }
         }
     }
 
@@ -1348,6 +1369,586 @@ mod tests {
             wall_time: Duration::from_secs(2),
             oom_kills: 0,
         }
+    }
+
+    #[test]
+    fn unseen_test_target_does_not_inherit_another_targets_oom() {
+        let cat = FleetCatalog::try_new(vec![fleet_props("small", 128, None)]).expect("catalog");
+        let mut sched = make_scheduler(&cat, default_policy());
+        let mut out = Effects::new();
+        let worker = sched
+            .register(
+                now(1),
+                worker_reg("small", "i-test", 1, 16_000, 128, 100),
+                &mut out,
+            )
+            .expect("worker");
+        let mut huge = exec_req("operations/huge", b"huge", 100);
+        huge.target = Some(TargetLabel::try_new("//a:huge_test").expect("target"));
+        huge.mnemonic = Some(Mnemonic::try_new("TestRunner").expect("mnemonic"));
+        sched.execute(now(2), huge, &mut out).expect("huge");
+        let (_, _, attempt_id, _) = extract_assign(&out).expect("assigned");
+        sched.on_worker(
+            now(3),
+            worker,
+            WorkerEvent::Executed(WorkerExecuted {
+                attempt_id,
+                usage: AttemptUsage {
+                    peak_memory: Some(Bytes::gib(122)),
+                    ..AttemptUsage::default()
+                },
+                kill: Some(KillCause::Oom),
+                side_channel_memory_failure: false,
+            }),
+            &mut out,
+        );
+        let mut tiny = exec_req("operations/tiny", b"tiny", 100);
+        tiny.target = Some(TargetLabel::try_new("//b:tiny_rustfmt_test").expect("target"));
+        tiny.mnemonic = Some(Mnemonic::try_new("TestRunner").expect("mnemonic"));
+        let key = sched.execute(now(4), tiny, &mut out).expect("tiny");
+        let reservation = sched.operations().get(key).expect("tiny").reservation;
+        assert_eq!(
+            reservation.memory,
+            Bytes::gib(4),
+            "unseen target must use cold start even after a 122 GiB OOM"
+        );
+        assert_eq!(
+            reservation.cpu_millicores, 4_000,
+            "cold start must not promote whole-worker CPU"
+        );
+    }
+
+    #[test]
+    fn repeated_memory_kills_keep_learning_and_fitting_within_capacity() {
+        for cause in [KillCause::Oom, KillCause::MemoryPressure] {
+            let cat =
+                FleetCatalog::try_new(vec![fleet_props("small", 128, None)]).expect("catalog");
+            let mut sched = make_scheduler(&cat, default_policy());
+            let mut out = Effects::new();
+            let worker = sched
+                .register(
+                    now(1),
+                    worker_reg("small", "i-cap", 1, 16_000, 60, 100),
+                    &mut out,
+                )
+                .expect("worker");
+            for index in 0..4 {
+                out.clear();
+                let name = format!("operations/kill-{index}");
+                let op = sched
+                    .execute(
+                        now(2 + index),
+                        exec_req(&name, name.as_bytes(), 100),
+                        &mut out,
+                    )
+                    .expect("execute");
+                let (_, _, attempt_id, _) = extract_assign(&out).expect("assigned");
+                assert!(
+                    sched.operations().get(op).expect("op").reservation.memory <= Bytes::gib(60)
+                );
+                sched.on_worker(
+                    now(2 + index),
+                    worker,
+                    WorkerEvent::Executed(WorkerExecuted {
+                        attempt_id: attempt_id.clone(),
+                        usage: AttemptUsage {
+                            peak_memory: Some(Bytes::gib(122)),
+                            ..AttemptUsage::default()
+                        },
+                        kill: Some(cause),
+                        side_channel_memory_failure: false,
+                    }),
+                    &mut out,
+                );
+                let sketch = sched.learned.histories_mut().resource_mut();
+                let key = crate::SketchKey::for_attempt(Some("//app:bin"), Some("Rustc"), "");
+                let entry = sketch.lookup(&key, 2 + index).expect("learned");
+                assert!(
+                    entry.killed_peak_memory_kb <= Bytes::gib(60).get() / 1024,
+                    "kill floor exceeded observed fleet capacity: {}",
+                    entry.killed_peak_memory_kb
+                );
+                assert!(entry.current.max_memory_kb <= Bytes::gib(60).get() / 1024);
+                sched.on_worker(
+                    now(2 + index),
+                    worker,
+                    WorkerEvent::Completed(WorkerCompleted {
+                        attempt_id,
+                        status: CompletionStatus::Ok,
+                        execution_timestamps: None,
+                    }),
+                    &mut out,
+                );
+            }
+        }
+    }
+
+    fn whole_worker_catalog() -> FleetCatalog {
+        FleetCatalog::try_new(vec![FleetProperties::new(
+            &FleetName::try_new("small").expect("fleet"),
+            Isa::X86_64,
+            &"bwrap",
+            &"host:test".parse().expect("env"),
+            Resources {
+                vcpus: 15,
+                memory: Bytes::gib(60),
+                disk: Bytes::gib(1_000),
+            },
+            &FleetActionPolicy::default(),
+            std::iter::empty(),
+        )])
+        .expect("catalog")
+    }
+
+    #[test]
+    fn whole_worker_head_drains_one_worker_despite_continuous_backfill() {
+        for worker_count in [1_u8, 2] {
+            let cat = whole_worker_catalog();
+            let mut policy = default_policy();
+            policy.actions.cold_start.cpu_millicores = NonZeroU32::new(890).expect("cpu");
+            policy.actions.cold_start.memory = gang_config::WholeKib::from_units(10 * 1024);
+            policy.actions.cold_start.disk = gang_config::WholeKib::from_units(1024 * 1024);
+            let mut sched = make_scheduler(&cat, policy);
+            let mut out = Effects::new();
+            for seed in 1..=worker_count {
+                let mut reg =
+                    worker_reg("small", &format!("i-drain-{seed}"), seed, 15_000, 60, 1_000);
+                reg.ceilings.cpu_millicores = 15_000;
+                sched.register(now(1), reg, &mut out).expect("worker");
+            }
+            let mut initial = Vec::new();
+            for index in 0..u32::from(worker_count) * 16 {
+                out.clear();
+                let name = format!("operations/small-{index}");
+                sched
+                    .execute(now(2), exec_req(&name, name.as_bytes(), 100), &mut out)
+                    .expect("small");
+                let (worker, _, attempt, _) = extract_assign(&out).expect("small assigned");
+                initial.push((worker, attempt));
+            }
+            let mut large = exec_req("operations/large", b"large", 200);
+            large.platform_properties.insert(
+                property::MEMORY_KB.to_owned(),
+                (60_u64 * 1024 * 1024).to_string(),
+            );
+            let large = sched.execute(now(3), large, &mut out).expect("large");
+            let protected = initial[0].0;
+            let other: Vec<_> = initial
+                .iter()
+                .filter(|(worker, _)| *worker != protected)
+                .cloned()
+                .collect();
+            for (index, (worker, attempt_id)) in initial
+                .into_iter()
+                .filter(|(worker, _)| *worker == protected)
+                .enumerate()
+            {
+                out.clear();
+                if let Some((other_worker, other_attempt)) = other.get(index) {
+                    sched.on_worker(
+                        now(4),
+                        *other_worker,
+                        WorkerEvent::Executed(WorkerExecuted {
+                            attempt_id: other_attempt.clone(),
+                            usage: AttemptUsage::default(),
+                            kill: None,
+                            side_channel_memory_failure: false,
+                        }),
+                        &mut out,
+                    );
+                }
+                sched.on_worker(
+                    now(4),
+                    worker,
+                    WorkerEvent::Executed(WorkerExecuted {
+                        attempt_id,
+                        usage: AttemptUsage::default(),
+                        kill: None,
+                        side_channel_memory_failure: false,
+                    }),
+                    &mut out,
+                );
+                let name = format!("operations/incoming-{index}");
+                let incoming = sched
+                    .execute(now(4), exec_req(&name, name.as_bytes(), 100), &mut out)
+                    .expect("incoming");
+                if index < 15 {
+                    assert_eq!(
+                        sched
+                            .workers()
+                            .get(protected)
+                            .expect("worker")
+                            .inflight_attempts,
+                        15 - u32::try_from(index).expect("index"),
+                        "backfill must leave one worker draining"
+                    );
+                    if worker_count == 2 {
+                        assert_eq!(
+                            sched.operations().get(incoming).expect("incoming").stage,
+                            OperationStage::Running,
+                            "other worker must keep accepting backfill"
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                sched.operations().get(large).expect("large").stage,
+                OperationStage::Running,
+                "whole-worker action must dispatch once small actions release compute"
+            );
+        }
+    }
+
+    #[test]
+    fn queued_client_less_expiry_notifies_actor_to_release_operation_state() {
+        let cat = two_fleet_catalog();
+        let mut sched = make_scheduler(&cat, default_policy());
+        let mut out = Effects::new();
+        let mut request = exec_req("operations/client-less", b"client-less", 100);
+        request.initial_watchers = 0;
+        let op = sched.execute(now(1), request, &mut out).expect("execute");
+        out.clear();
+        sched.on_timer(now(601), &mut out);
+        assert!(sched.operations().get(op).is_none());
+        assert!(
+            out.iter().any(|effect| matches!(effect,
+                Effect::NotifyWatchers { operation, event: OperationUpdate::Cancelled }
+                    if *operation == op
+            )),
+            "queued expiration must trigger actor terminal cleanup"
+        );
+    }
+
+    fn assert_gate_precedes_retry(kill: Option<KillCause>) {
+        let cat = FleetCatalog::try_new(vec![fleet_props("small", 16, None)]).expect("catalog");
+        let mut sched = make_scheduler(&cat, default_policy());
+        let mut out = Effects::new();
+        let mut reg = worker_reg("small", "i-priority", 1, 4_000, 16, 100);
+        reg.ceilings.cpu_millicores = 4_000;
+        let worker = sched.register(now(1), reg, &mut out).expect("worker");
+        let background = sched
+            .execute(
+                now(2),
+                exec_req("operations/background", b"background", 0),
+                &mut out,
+            )
+            .expect("background");
+        let (_, _, attempt_id, _) = extract_assign(&out).expect("background assigned");
+        let gate = sched
+            .execute(now(3), exec_req("operations/gate", b"gate", 200), &mut out)
+            .expect("gate");
+        assert_eq!(
+            sched.operations().get(gate).expect("gate").stage,
+            OperationStage::Queued
+        );
+        out.clear();
+        if let Some(kill) = kill {
+            sched.on_worker(
+                now(4),
+                worker,
+                WorkerEvent::Executed(WorkerExecuted {
+                    attempt_id,
+                    usage: AttemptUsage::default(),
+                    kill: Some(kill),
+                    side_channel_memory_failure: false,
+                }),
+                &mut out,
+            );
+        } else {
+            sched.on_worker(
+                now(4),
+                worker,
+                WorkerEvent::Completed(WorkerCompleted {
+                    attempt_id,
+                    status: CompletionStatus::Failed {
+                        message: "execution failed".to_owned(),
+                    },
+                    execution_timestamps: None,
+                }),
+                &mut out,
+            );
+        }
+        let first = out.iter().find_map(|effect| match effect {
+            Effect::AssignWorker { operation, .. } => Some(*operation),
+            _ => None,
+        });
+        assert_eq!(
+            first,
+            Some(gate),
+            "gate must take capacity before retrying background {background:?}"
+        );
+        assert_eq!(
+            sched
+                .operations()
+                .get(background)
+                .expect("background")
+                .stage,
+            OperationStage::Queued
+        );
+    }
+
+    #[test]
+    fn generic_retry_yields_to_queued_gate() {
+        assert_gate_precedes_retry(None);
+    }
+
+    #[test]
+    fn escalation_retry_yields_to_queued_gate() {
+        assert_gate_precedes_retry(Some(KillCause::Oom));
+        assert_gate_precedes_retry(Some(KillCause::DiskPressure));
+    }
+
+    fn register_upload_worker(sched: &mut Scheduler, out: &mut Effects) -> WorkerKey {
+        sched
+            .register(
+                now(1),
+                worker_reg("small", "i-upload", 1, 16_000, 8, 100),
+                out,
+            )
+            .expect("worker")
+    }
+
+    #[test]
+    fn upload_deadline_expires_despite_worker_heartbeats_and_releases_disk() {
+        let cat = two_fleet_catalog();
+        let mut sched = make_scheduler(&cat, default_policy());
+        let mut out = Effects::new();
+        let worker = register_upload_worker(&mut sched, &mut out);
+        let op = sched
+            .execute(
+                now(2),
+                exec_req("operations/upload", b"upload", 100),
+                &mut out,
+            )
+            .expect("execute");
+        let (_, key, attempt_id, _) = extract_assign(&out).expect("assign");
+        sched.on_worker(
+            now(3),
+            worker,
+            WorkerEvent::Executed(WorkerExecuted {
+                attempt_id: attempt_id.clone(),
+                usage: ok_usage(),
+                kill: None,
+                side_channel_memory_failure: false,
+            }),
+            &mut out,
+        );
+        assert_eq!(
+            sched
+                .workers()
+                .get(worker)
+                .expect("worker")
+                .ledger
+                .reserved()
+                .disk,
+            Bytes::gib(10)
+        );
+        for second in 4..=363 {
+            out.clear();
+            if second == 100 {
+                sched.on_worker(
+                    now(second),
+                    worker,
+                    WorkerEvent::Executed(WorkerExecuted {
+                        attempt_id: attempt_id.clone(),
+                        usage: ok_usage(),
+                        kill: None,
+                        side_channel_memory_failure: false,
+                    }),
+                    &mut out,
+                );
+            }
+            sched.on_worker(
+                now(second),
+                worker,
+                WorkerEvent::KeepAlive {
+                    cache: None,
+                    memory_capacity: None,
+                },
+                &mut out,
+            );
+            sched.on_timer(now(second), &mut out);
+            if second < 363 {
+                assert!(
+                    sched.attempts().get(key).is_some(),
+                    "upload expired early at {second}"
+                );
+            }
+        }
+        assert!(
+            sched.attempts().get(key).is_none(),
+            "heartbeats must not extend upload deadline"
+        );
+        let record = sched.workers().get(worker).expect("worker");
+        assert_eq!(record.ledger.reserved(), ActionResources::default());
+        assert_eq!(
+            sched.operations().get(op).expect("operation").stage,
+            OperationStage::Completed
+        );
+        assert!(out.iter().any(|effect| matches!(effect, Effect::KillWorker { attempt, reason: crate::KillReason::DeadlineExceeded, .. } if *attempt == key)));
+        assert!(out.iter().any(|effect| matches!(effect, Effect::NotifyWatchers { operation, event: OperationUpdate::Failed(TerminalFailure::DeadlineExceeded { .. }) } if *operation == op)));
+        out.clear();
+        sched.on_worker(
+            now(364),
+            worker,
+            WorkerEvent::Completed(WorkerCompleted {
+                attempt_id,
+                status: CompletionStatus::Ok,
+                execution_timestamps: None,
+            }),
+            &mut out,
+        );
+        assert!(
+            out.is_empty(),
+            "late completion must not publish a second terminal outcome"
+        );
+        assert_eq!(sched.attempts().completed_count(), 0);
+    }
+
+    #[test]
+    fn detached_upload_deadlines_release_disk_without_terminating_a_retry() {
+        for cancelled in [false, true] {
+            let cat = two_fleet_catalog();
+            let mut policy = default_policy();
+            policy.completion_timeout = Duration::from_secs(5);
+            policy.max_retained_terminal_operations = 1;
+            let mut sched = make_scheduler(&cat, policy);
+            let mut out = Effects::new();
+            let worker = register_upload_worker(&mut sched, &mut out);
+            let op = sched
+                .execute(
+                    now(2),
+                    exec_req("operations/detached", b"detached", 100),
+                    &mut out,
+                )
+                .expect("execute");
+            let (_, old_key, old_id, _) = extract_assign(&out).expect("assign");
+            out.clear();
+            sched.on_worker(
+                now(3),
+                worker,
+                WorkerEvent::Executed(WorkerExecuted {
+                    attempt_id: old_id,
+                    usage: AttemptUsage::default(),
+                    kill: (!cancelled).then_some(KillCause::Oom),
+                    side_channel_memory_failure: false,
+                }),
+                &mut out,
+            );
+            let retry = sched.attempts().active_for_operation(op);
+            if cancelled {
+                sched.cancel(now(4), op, &mut out);
+                let eviction = sched
+                    .execute(
+                        now(4),
+                        exec_req("operations/eviction", b"eviction", 100),
+                        &mut out,
+                    )
+                    .expect("eviction");
+                sched.cancel(now(4), eviction, &mut out);
+                // Retiring the eviction attempt lets its independent reservation go away.
+                let eviction_id = sched
+                    .attempts()
+                    .iter()
+                    .find_map(|(_, a)| (a.operation == eviction).then(|| a.id.clone()))
+                    .expect("eviction attempt");
+                sched.on_worker(
+                    now(4),
+                    worker,
+                    WorkerEvent::Completed(WorkerCompleted {
+                        attempt_id: eviction_id,
+                        status: CompletionStatus::Ok,
+                        execution_timestamps: None,
+                    }),
+                    &mut out,
+                );
+                assert!(
+                    sched.operations().get(op).is_none(),
+                    "terminal retention must evict cancelled operation even while upload is pending"
+                );
+            } else {
+                assert_ne!(retry, Some(old_key));
+                assert!(retry.is_some(), "escalation must start a new attempt");
+            }
+            out.clear();
+            sched.on_worker(
+                now(8),
+                worker,
+                WorkerEvent::KeepAlive {
+                    cache: None,
+                    memory_capacity: None,
+                },
+                &mut out,
+            );
+            sched.on_timer(now(8), &mut out);
+            assert!(sched.attempts().get(old_key).is_none());
+            assert!(out.iter().any(|e| matches!(e, Effect::KillWorker { attempt, reason: crate::KillReason::DeadlineExceeded, .. } if *attempt == old_key)));
+            assert!(
+                !out.iter().any(
+                    |e| matches!(e, Effect::NotifyWatchers { operation, .. } if *operation == op)
+                ),
+                "detached upload timeout must not replace the operation's outcome"
+            );
+            let expected_disk = if cancelled {
+                Bytes::new(0)
+            } else {
+                Bytes::gib(10)
+            };
+            let record = sched.workers().get(worker).expect("worker");
+            assert_eq!(record.ledger.reserved().disk, expected_disk);
+            if !cancelled {
+                assert_eq!(sched.attempts().active_for_operation(op), retry);
+                assert_eq!(
+                    sched.operations().get(op).expect("retry operation").stage,
+                    OperationStage::Running
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completion_timeout_never_extends_the_dispatch_budget() {
+        let cat = two_fleet_catalog();
+        let mut policy = default_policy();
+        policy.attempt_budget = Duration::from_secs(5);
+        let mut sched = make_scheduler(&cat, policy);
+        let mut out = Effects::new();
+        let worker = register_upload_worker(&mut sched, &mut out);
+        sched
+            .execute(
+                now(2),
+                exec_req("operations/budget", b"budget", 100),
+                &mut out,
+            )
+            .expect("execute");
+        let (_, key, id, _) = extract_assign(&out).expect("assign");
+        sched.on_worker(
+            now(6),
+            worker,
+            WorkerEvent::Executed(WorkerExecuted {
+                attempt_id: id,
+                usage: ok_usage(),
+                kill: None,
+                side_channel_memory_failure: false,
+            }),
+            &mut out,
+        );
+        assert_eq!(
+            sched.attempts().latest_attempt_deadline(worker),
+            Some(now(7).wall)
+        );
+        out.clear();
+        sched.on_timer(now(7), &mut out);
+        assert!(sched.attempts().get(key).is_none());
+        assert_eq!(
+            sched
+                .workers()
+                .get(worker)
+                .expect("worker")
+                .ledger
+                .reserved(),
+            ActionResources::default()
+        );
     }
 
     #[test]

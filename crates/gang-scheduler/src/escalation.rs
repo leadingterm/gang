@@ -457,6 +457,56 @@ mod tests {
     }
 
     #[test]
+    fn repeated_memory_kills_never_escalate_past_observed_eligible_capacity() {
+        let cat = FleetCatalog::try_new(vec![
+            fleet_with_caps("eligible", 16, 128, 100, None, None),
+            fleet_with_caps("other", 32, 256, 100, None, None),
+        ])
+        .expect("catalog");
+        let mut cap = CapacityCatalog::new(cat, NonZeroU32::MIN);
+        cap.set_local_observations([gang_spi::FleetMemoryCapacity {
+            fleet: 0,
+            capacity: NonZeroBytes::gib(60),
+        }])
+        .expect("observed memory");
+        let name = op_name();
+        let actions = ActionsConfig::default();
+        for cause in [KillCause::Oom, KillCause::MemoryPressure] {
+            let mut input = EscalationInput {
+                action: &name,
+                cause,
+                measured_peak_kb: None,
+                current_reservation: ActionResources {
+                    cpu_millicores: 890,
+                    memory: Bytes::gib(4),
+                    disk: Bytes::gib(1),
+                },
+                cpu_before_memory_fit: 890,
+                floors: ClientFloors::default(),
+                candidates: FleetSet::try_from_indices([0]).expect("candidates"),
+                retry_counts: RetryCounts::default(),
+            };
+            loop {
+                match evaluate_escalation(&input, &actions, &cap) {
+                    EscalationDecision::Retry {
+                        next_reservation, ..
+                    } => {
+                        assert!(next_reservation.memory <= Bytes::gib(60));
+                        assert!(next_reservation.memory > input.current_reservation.memory);
+                        input.current_reservation = next_reservation;
+                        input.retry_counts.memory_steps += 1;
+                    }
+                    EscalationDecision::Fail(failure) => {
+                        assert_eq!(failure.reason, EscalationFailureReason::AtPhysicalCapacity);
+                        assert_eq!(input.current_reservation.memory, Bytes::gib(60));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn escalation_formula_and_whole_cpu_promotion_at_physical_cap() {
         let cat = FleetCatalog::try_new(vec![fleet_with_caps("a", 8, 16, 100, None, Some(6))])
             .expect("catalog");

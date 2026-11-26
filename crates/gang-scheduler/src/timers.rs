@@ -21,7 +21,7 @@ use crate::workers::{WorkerKey, WorkerRegistry};
 pub enum TimerKind {
     /// Worker failed to send `Accept` or `Decline` before `dispatch_ack_timeout`.
     AckTimeout,
-    /// Dispatch-stamped `attempt_deadline` elapsed.
+    /// Execution or post-`Executed` completion deadline elapsed.
     AttemptDeadline,
     /// Worker exceeded `worker_timeout` without a `KeepAlive` or message.
     WorkerTimeout,
@@ -34,7 +34,7 @@ pub enum TimerKind {
 pub enum TimerSubject {
     /// Dispatch ack deadline for an attempt.
     Ack(crate::attempts::AttemptKey),
-    /// Execution deadline for an attempt.
+    /// Execution or completion deadline for an attempt.
     AttemptDeadline(crate::attempts::AttemptKey),
     /// Silence/keepalive timeout for a connected worker.
     Worker(WorkerKey),
@@ -244,11 +244,13 @@ pub fn on_timer(
             }
             TimerSubject::AttemptDeadline(attempt_key) => {
                 if let AttemptDeadlineOutcome::Expired { kill, publish, .. } =
-                    attempts.on_attempt_deadline(attempt_key, operations, queue)
+                    attempts.on_attempt_deadline(attempt_key, operations, queue, workers)
                 {
                     timers.disarm(TimerSubject::Ack(attempt_key));
                     effects.kills.push(kill);
-                    effects.publish.push(publish);
+                    if let Some(publish) = publish {
+                        effects.publish.push(publish);
+                    }
                 }
             }
             TimerSubject::Worker(worker_key) => {
@@ -277,12 +279,15 @@ pub fn on_timer(
                     match expired.previous_stage {
                         OperationStage::Queued => {
                             effects.dropped_operations.push(expired.key);
+                            effects.publish.push(PublishEvent::Cancelled {
+                                operation: expired.key,
+                            });
                         }
                         OperationStage::Running => {
                             if expired.needs_kill
                                 && let Some(kill) = attempts.mark_cancelled_kill(expired.key)
                             {
-                                timers.disarm_attempt(kill.attempt_key);
+                                timers.disarm(TimerSubject::Ack(kill.attempt_key));
                                 effects.kills.push(kill);
                             }
                             effects.publish.push(PublishEvent::Cancelled {

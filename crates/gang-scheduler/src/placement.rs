@@ -8,6 +8,8 @@
 //! - **Worker-driven:** walks `queue[fleet]` in `(Reverse(priority), seq, OperationKey)` order and
 //!   assigns fitting operations until the worker is full or `dispatch_scan_limit` non-fitting
 //!   entries have been skipped.
+//! - **Headroom:** a runnable queue head blocked by occupancy holds one worker until it fits;
+//!   lower-ranked backfill continues on the other workers.
 
 use std::cmp::Ordering;
 
@@ -16,7 +18,7 @@ use gang_types::ActionResources;
 use crate::ledger::WorkerLedger;
 use crate::operations::{Operation, OperationKey, OperationStage, Operations};
 use crate::qos;
-use crate::queue::OperationQueue;
+use crate::queue::{OperationQueue, QueueKey};
 use crate::workers::{Worker, WorkerKey, WorkerRegistry};
 
 /// A committed assignment emitted by operation-driven or worker-driven placement.
@@ -37,15 +39,6 @@ pub struct PlacedAssignment {
 /// Returns `true` when `worker` is eligible to execute `op` right now.
 #[must_use]
 pub fn is_eligible(worker: &Worker, op: &Operation) -> bool {
-    is_eligible_with_state(worker, worker.ledger, worker.inflight_attempts, op)
-}
-
-const fn is_eligible_with_state(
-    worker: &Worker,
-    ledger: WorkerLedger,
-    inflight_attempts: u32,
-    op: &Operation,
-) -> bool {
     if worker.drain.blocks_assignment()
         || !worker.is_current_build()
         || worker.has_disk_hold()
@@ -55,15 +48,7 @@ const fn is_eligible_with_state(
     {
         return false;
     }
-    if worker.is_single_use() && inflight_attempts > 0 {
-        return false;
-    }
-    if let Some(max) = worker.max_inflight
-        && inflight_attempts >= max.get()
-    {
-        return false;
-    }
-    ledger.fits(op.reservation)
+    worker.has_inflight_slot() && worker.ledger.fits(op.reservation)
 }
 
 /// Ranks two eligible workers within the same candidate fleet (smaller = more preferred).
@@ -85,6 +70,14 @@ pub fn compare_workers(left: &Worker, right: &Worker) -> Ordering {
 /// Selects the best eligible worker for `op` across its candidate fleets in preference order.
 #[must_use]
 pub fn select_worker_for_operation(op: &Operation, workers: &WorkerRegistry) -> Option<WorkerKey> {
+    select_worker(op, workers, None)
+}
+
+fn select_worker(
+    op: &Operation,
+    workers: &WorkerRegistry,
+    queued: Option<(&OperationQueue, QueueKey)>,
+) -> Option<WorkerKey> {
     if !matches!(op.stage, OperationStage::Queued) {
         return None;
     }
@@ -94,7 +87,11 @@ pub fn select_worker_for_operation(op: &Operation, workers: &WorkerRegistry) -> 
             let Some(worker) = workers.get(worker_key) else {
                 continue;
             };
-            if !is_eligible(worker, op) {
+            if !is_eligible(worker, op)
+                || queued.is_some_and(|(queue, entry)| {
+                    !allows_backfill(queue, entry, worker_key, workers)
+                })
+            {
                 continue;
             }
             match best {
@@ -113,6 +110,93 @@ pub fn select_worker_for_operation(op: &Operation, workers: &WorkerRegistry) -> 
     None
 }
 
+fn fits_total(worker: &Worker, op: &Operation) -> bool {
+    if worker.drain.blocks_assignment()
+        || !worker.is_current_build()
+        || worker.has_disk_hold()
+        || worker.is_single_use_exhausted()
+        || (worker.is_single_use() && worker.inflight_attempts > 0)
+    {
+        return false;
+    }
+    op.candidates.contains(worker.fleet)
+        && WorkerLedger::new(worker.ledger.capacity()).fits(op.reservation)
+}
+
+fn allows_backfill(
+    queue: &OperationQueue,
+    entry: QueueKey,
+    worker_key: WorkerKey,
+    workers: &WorkerRegistry,
+) -> bool {
+    let Some(worker) = workers.get(worker_key) else {
+        return false;
+    };
+    queue
+        .headroom(worker.fleet)
+        .is_none_or(|(head, held)| entry <= head || held != worker_key)
+}
+
+/// Hold one worker for a blocked runnable action. Reuse the same worker until it drains;
+/// choosing the currently emptiest worker on every pass would let the hold move forever.
+fn hold_headroom(
+    entry: QueueKey,
+    op: &Operation,
+    queue: &mut OperationQueue,
+    workers: &WorkerRegistry,
+) {
+    if select_worker_for_operation(op, workers).is_some() {
+        return;
+    }
+    if op
+        .candidates
+        .iter()
+        .any(|fleet| queue.headroom(fleet).is_some_and(|(head, _)| head == entry))
+    {
+        return;
+    }
+    for fleet in op.candidates {
+        if let Some((head, _)) = queue.headroom(fleet)
+            && head < entry
+        {
+            continue;
+        }
+        let mut best: Option<(WorkerKey, &Worker)> = None;
+        for &key in workers.fleet_workers(fleet) {
+            let Some(worker) = workers.get(key) else {
+                continue;
+            };
+            if !fits_total(worker, op) {
+                continue;
+            }
+            if best.is_none_or(|(_, current)| compare_workers(worker, current).is_lt()) {
+                best = Some((key, worker));
+            }
+        }
+        if let Some((key, _)) = best {
+            queue.hold_headroom(fleet, entry, key);
+            return;
+        }
+    }
+}
+
+fn refresh_headroom(queue: &mut OperationQueue, operations: &Operations, workers: &WorkerRegistry) {
+    for fleet in 0..queue.fleet_count() {
+        let Some((head, reserved_worker)) = queue.headroom(fleet) else {
+            continue;
+        };
+        let valid = operations.get(head.key).is_some_and(|op| {
+            op.stage == OperationStage::Queued
+                && workers
+                    .get(reserved_worker)
+                    .is_some_and(|worker| fits_total(worker, op))
+        });
+        if !valid {
+            queue.clear_headroom(fleet);
+        }
+    }
+}
+
 /// Attempts to place a single queued operation (`op_key`) onto its best eligible worker.
 ///
 /// On success, reserves on the worker's ledger, removes `op_key` from all queue indices, marks the
@@ -123,8 +207,24 @@ pub fn place_operation(
     queue: &mut OperationQueue,
     workers: &mut WorkerRegistry,
 ) -> Option<PlacedAssignment> {
+    refresh_headroom(queue, operations, workers);
     let op = operations.get(op_key)?;
-    let worker_key = select_worker_for_operation(op, workers)?;
+    let entry = QueueKey::new(op.priority, op.seq, op_key);
+    let Some(worker_key) = select_worker(op, workers, Some((queue, entry))) else {
+        hold_headroom(entry, op, queue, workers);
+        return None;
+    };
+    commit_operation(op_key, worker_key, operations, queue, workers)
+}
+
+fn commit_operation(
+    op_key: OperationKey,
+    worker_key: WorkerKey,
+    operations: &mut Operations,
+    queue: &mut OperationQueue,
+    workers: &mut WorkerRegistry,
+) -> Option<PlacedAssignment> {
+    let op = operations.get(op_key)?;
     let reservation = op.reservation;
     let priority = op.priority;
     let cpu_weight = op.cpu_weight;
@@ -160,6 +260,7 @@ pub fn scan_queue_for_worker(
     out: &mut Vec<PlacedAssignment>,
 ) {
     out.clear();
+    refresh_headroom(queue, operations, workers);
     let Some(worker) = workers.get(worker_key) else {
         return;
     };
@@ -168,59 +269,34 @@ pub fn scan_queue_for_worker(
     }
 
     let fleet = worker.fleet;
-    let mut sim_ledger = worker.ledger;
-    let mut sim_inflight = worker.inflight_attempts;
     let mut skipped = 0_usize;
-
-    {
-        let Some(fleet_entries) = queue.fleet_iter(fleet) else {
-            return;
+    let mut previous = None;
+    while let Some(queue_entry) = queue.fleet_next_after(fleet, previous) {
+        previous = Some(queue_entry);
+        let Some(op) = operations.get(queue_entry.key) else {
+            continue;
         };
-        for queue_entry in fleet_entries {
-            let Some(op) = operations.get(queue_entry.key) else {
-                continue;
-            };
-            if !is_eligible_with_state(worker, sim_ledger, sim_inflight, op) {
-                skipped = skipped.saturating_add(1);
-                if skipped >= scan_limit {
-                    break;
-                }
-                continue;
-            }
-            if sim_ledger.try_reserve(op.reservation).is_err() {
-                skipped = skipped.saturating_add(1);
-                if skipped >= scan_limit {
-                    break;
-                }
-                continue;
-            }
-            sim_inflight = sim_inflight.saturating_add(1);
-            out.push(PlacedAssignment {
-                operation: queue_entry.key,
-                worker: worker_key,
-                reservation: op.reservation,
-                priority: op.priority,
-                cpu_weight: op.cpu_weight,
-            });
-
-            let slot_full = worker.is_single_use()
-                || worker
-                    .max_inflight
-                    .is_some_and(|max| sim_inflight >= max.get())
-                || sim_ledger.is_completely_full();
-            if slot_full {
+        let Some(worker) = workers.get(worker_key) else {
+            break;
+        };
+        if !is_eligible(worker, op) || !allows_backfill(queue, queue_entry, worker_key, workers) {
+            hold_headroom(queue_entry, op, queue, workers);
+            skipped = skipped.saturating_add(1);
+            if skipped >= scan_limit {
                 break;
             }
+            continue;
         }
-    }
-
-    for assignment in out.iter() {
-        let is_gate = qos::is_gate(assignment.priority);
-        if workers
-            .commit_assignment(assignment.worker, assignment.reservation, is_gate)
-            .is_ok()
+        if let Some(assignment) =
+            commit_operation(queue_entry.key, worker_key, operations, queue, workers)
         {
-            operations.mark_running(assignment.operation, queue);
+            out.push(assignment);
+        }
+        if workers
+            .get(worker_key)
+            .is_none_or(|worker| !worker.has_inflight_slot() || worker.ledger.is_completely_full())
+        {
+            break;
         }
     }
 }
@@ -437,6 +513,146 @@ mod tests {
         let p2 = place_operation(op2, &mut ops, &mut queue, &mut workers2).expect("p2");
         assert_eq!(p2.worker, w_m);
         assert_ne!(w_z, w_m);
+    }
+
+    #[test]
+    fn headroom_stays_on_one_worker_and_releases_on_cancellation() {
+        let cat = two_fleet_catalog();
+        let mut workers = WorkerRegistry::from_catalog(&cat).expect("registry");
+        let mut ops = Operations::new();
+        let mut queue = OperationQueue::new(cat.len()).expect("queue");
+        let first = register_worker(&mut workers, "preferred", "i-first", 1, 8_000, 16);
+        let second = register_worker(&mut workers, "preferred", "i-second", 2, 8_000, 16);
+        let busy = ActionResources {
+            cpu_millicores: 4_000,
+            memory: Bytes::gib(1),
+            disk: Bytes::gib(1),
+        };
+        for worker in [first, second] {
+            workers
+                .commit_assignment(worker, busy, false)
+                .expect("busy");
+        }
+        let head = admit_op(
+            &mut ops,
+            &mut queue,
+            "operations/head",
+            &[0],
+            100,
+            8_000,
+            16,
+        );
+        assert!(place_operation(head, &mut ops, &mut queue, &mut workers).is_none());
+        workers
+            .commit_assignment(
+                second,
+                ActionResources {
+                    cpu_millicores: 1_000,
+                    memory: Bytes::gib(1),
+                    disk: Bytes::gib(1),
+                },
+                false,
+            )
+            .expect("remaining work");
+        workers
+            .on_attempt_executed(second, busy, false)
+            .expect("release");
+        // The second worker is now emptier, but the hold must stay on the first.
+        assert!(place_operation(head, &mut ops, &mut queue, &mut workers).is_none());
+        let small = admit_op(
+            &mut ops,
+            &mut queue,
+            "operations/small",
+            &[0],
+            100,
+            1_000,
+            1,
+        );
+        assert_eq!(
+            place_operation(small, &mut ops, &mut queue, &mut workers)
+                .expect("backfill")
+                .worker,
+            second
+        );
+        workers.set_disk_hold(second);
+        let gate = admit_op(&mut ops, &mut queue, "operations/gate", &[0], 200, 1_000, 1);
+        assert_eq!(
+            place_operation(gate, &mut ops, &mut queue, &mut workers)
+                .expect("higher priority")
+                .worker,
+            first
+        );
+        ops.cancel(head, &mut queue).expect("cancel");
+        let next = admit_op(&mut ops, &mut queue, "operations/next", &[0], 100, 1_000, 1);
+        assert_eq!(
+            place_operation(next, &mut ops, &mut queue, &mut workers)
+                .expect("released hold")
+                .worker,
+            first
+        );
+    }
+
+    #[test]
+    fn worker_scan_holds_headroom_and_retargets_after_disconnect() {
+        let cat = two_fleet_catalog();
+        let mut workers = WorkerRegistry::from_catalog(&cat).expect("registry");
+        let mut ops = Operations::new();
+        let mut queue = OperationQueue::new(cat.len()).expect("queue");
+        let first = register_worker(&mut workers, "preferred", "i-first", 1, 8_000, 16);
+        let second = register_worker(&mut workers, "preferred", "i-second", 2, 8_000, 16);
+        let busy = ActionResources {
+            cpu_millicores: 4_000,
+            memory: Bytes::gib(1),
+            disk: Bytes::gib(1),
+        };
+        for worker in [first, second] {
+            workers
+                .commit_assignment(worker, busy, false)
+                .expect("busy");
+        }
+        let head = admit_op(
+            &mut ops,
+            &mut queue,
+            "operations/head",
+            &[0],
+            200,
+            8_000,
+            16,
+        );
+        let small = admit_op(
+            &mut ops,
+            &mut queue,
+            "operations/small",
+            &[0],
+            100,
+            1_000,
+            1,
+        );
+        let mut assigned = Vec::new();
+        scan_queue_for_worker(first, 10, &mut ops, &mut queue, &mut workers, &mut assigned);
+        assert!(
+            assigned.is_empty(),
+            "worker-driven backfill must honor the headroom hold"
+        );
+        workers.disconnect(first);
+        assert!(place_operation(head, &mut ops, &mut queue, &mut workers).is_none());
+        assert!(
+            place_operation(small, &mut ops, &mut queue, &mut workers).is_none(),
+            "replacement worker must drain"
+        );
+        workers
+            .on_attempt_executed(second, busy, false)
+            .expect("release");
+        scan_queue_for_worker(
+            second,
+            10,
+            &mut ops,
+            &mut queue,
+            &mut workers,
+            &mut assigned,
+        );
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].operation, head);
     }
 
     #[test]

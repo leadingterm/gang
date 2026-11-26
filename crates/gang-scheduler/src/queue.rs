@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use gang_types::{FleetCountError, FleetSet, MAX_FLEETS};
 
 use crate::operations::OperationKey;
+use crate::workers::WorkerKey;
 
 /// Total order key for queued operations: highest priority first, then oldest `seq`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -42,6 +43,7 @@ impl QueueKey {
 pub struct OperationQueue {
     global: BTreeSet<QueueKey>,
     by_fleet: Vec<BTreeSet<QueueKey>>,
+    headroom: Vec<Option<(QueueKey, WorkerKey)>>,
 }
 
 impl Default for OperationQueue {
@@ -49,6 +51,7 @@ impl Default for OperationQueue {
         Self {
             global: BTreeSet::new(),
             by_fleet: vec![BTreeSet::new(); MAX_FLEETS],
+            headroom: vec![None; MAX_FLEETS],
         }
     }
 }
@@ -66,6 +69,7 @@ impl OperationQueue {
         Ok(Self {
             global: BTreeSet::new(),
             by_fleet: vec![BTreeSet::new(); fleet_count],
+            headroom: vec![None; fleet_count],
         })
     }
 
@@ -117,6 +121,12 @@ impl OperationQueue {
         let entry = QueueKey::new(priority, seq, key);
         let removed = self.global.remove(&entry);
         for fleet in candidates {
+            if self
+                .headroom(fleet)
+                .is_some_and(|(head, _)| head.key == key)
+            {
+                self.headroom[fleet] = None;
+            }
             if let Some(index) = self.by_fleet.get_mut(fleet) {
                 index.remove(&entry);
             }
@@ -160,6 +170,13 @@ impl OperationQueue {
         }
         for fleet in old_candidates {
             if !new_candidates.contains(fleet)
+                && self
+                    .headroom(fleet)
+                    .is_some_and(|(head, _)| head.key == key)
+            {
+                self.headroom[fleet] = None;
+            }
+            if !new_candidates.contains(fleet)
                 && let Some(index) = self.by_fleet.get_mut(fleet)
             {
                 index.remove(&entry);
@@ -177,6 +194,55 @@ impl OperationQueue {
     /// Iterates over all queued operations in priority/sequence order.
     pub fn global_iter(&self) -> impl Iterator<Item = QueueKey> + '_ {
         self.global.iter().copied()
+    }
+
+    /// Worker held for the first blocked runnable action in this fleet.
+    pub(crate) fn headroom(&self, fleet: usize) -> Option<(QueueKey, WorkerKey)> {
+        self.headroom.get(fleet).copied().flatten()
+    }
+
+    pub(crate) fn clear_headroom(&mut self, fleet: usize) {
+        if let Some(slot) = self.headroom.get_mut(fleet) {
+            *slot = None;
+        }
+    }
+
+    /// Retains a hold until dispatch/removal, or until an earlier queue entry needs it.
+    pub(crate) fn hold_headroom(&mut self, fleet: usize, entry: QueueKey, worker: WorkerKey) {
+        if let Some(slot) = self.headroom.get_mut(fleet)
+            && slot.is_none_or(|(head, _)| entry <= head)
+        {
+            *slot = Some((entry, worker));
+        }
+    }
+
+    /// Resumes a fleet scan after a key that may already have been dequeued.
+    pub(crate) fn fleet_next_after(
+        &self,
+        fleet: usize,
+        previous: Option<QueueKey>,
+    ) -> Option<QueueKey> {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        let index = self.by_fleet.get(fleet)?;
+        match previous {
+            Some(key) => index.range((Excluded(key), Unbounded)).next().copied(),
+            None => index.first().copied(),
+        }
+    }
+
+    /// Resumes an ordered dispatch scan after a key that may already have been dequeued.
+    pub(crate) fn next_after(&self, previous: Option<QueueKey>) -> Option<QueueKey> {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        match previous {
+            Some(key) => self
+                .global
+                .range((Excluded(key), Unbounded))
+                .next()
+                .copied(),
+            None => self.global.first().copied(),
+        }
     }
 
     /// Iterates over queued operations eligible for `fleet` in priority/sequence order.

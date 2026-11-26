@@ -892,24 +892,27 @@ impl ResourceSketch {
     /// Records one attempt observation.
     ///
     /// A `Command` key with no entry yet goes on probation on its first non-killed sighting and
-    /// is recorded on its second sighting or on a kill. A `Target` key with a mnemonic also
-    /// records into that mnemonic's aggregate family. Returns whether a sample was recorded.
+    /// is recorded on its second sighting or on a kill. Target observations remain scoped to
+    /// their target, including resource-kill floors. Returns whether a sample was recorded.
     pub fn observe(&mut self, key: SketchKey, observation: &Observation) -> bool {
-        let mnemonic = match &key {
-            SketchKey::Target {
-                mnemonic: Some(mnemonic),
-                ..
-            } => Some(mnemonic.clone()),
-            _ => None,
-        };
-        let recorded = self.observe_one(key, observation);
-        if recorded && let Some(mnemonic) = mnemonic {
-            self.observe_one(SketchKey::Mnemonic { mnemonic }, observation);
-        }
-        recorded
+        self.record(key, observation, None)
     }
 
-    fn observe_one(&mut self, key: SketchKey, observation: &Observation) -> bool {
+    pub(crate) fn observe_with_memory_ceiling(
+        &mut self,
+        key: SketchKey,
+        observation: &Observation,
+        memory_ceiling_kb: u64,
+    ) -> bool {
+        self.record(key, observation, Some(memory_ceiling_kb))
+    }
+
+    fn record(
+        &mut self,
+        key: SketchKey,
+        observation: &Observation,
+        memory_ceiling_kb: Option<u64>,
+    ) -> bool {
         let family = key.family();
         let window_s = self.window_s();
         let inner = self.shard_mut(&key);
@@ -927,11 +930,11 @@ impl ResourceSketch {
         inner.samples[family.index()] += 1;
         let map = &mut inner.families[family.index()];
         if let Some(entry) = map.get_mut(&key) {
-            entry.record(observation, window_s);
+            entry.record_with_memory_ceiling(observation, window_s, memory_ceiling_kb);
             return true;
         }
         let mut entry = Entry::default();
-        entry.record(observation, window_s);
+        entry.record_with_memory_ceiling(observation, window_s, memory_ceiling_kb);
         inner.insert(key, entry)
     }
 
@@ -1165,6 +1168,22 @@ pub struct HintRow {
 }
 
 impl Entry {
+    fn record_with_memory_ceiling(
+        &mut self,
+        observation: &Observation,
+        window_s: u64,
+        memory_ceiling_kb: Option<u64>,
+    ) {
+        self.record(observation, window_s);
+        if let Some(ceiling) = memory_ceiling_kb {
+            // Restored history and observations from a formerly larger fleet must also obey
+            // the current ceiling. Histogram percentiles are bounded by these exact maxima.
+            self.current.max_memory_kb = self.current.max_memory_kb.min(ceiling);
+            self.previous.max_memory_kb = self.previous.max_memory_kb.min(ceiling);
+            self.killed_peak_memory_kb = self.killed_peak_memory_kb.min(ceiling);
+        }
+    }
+
     /// Maximum peak memory in `KiB` across both half-windows.
     #[must_use]
     pub fn max_memory_kb(&self) -> u64 {
@@ -1723,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn command_probation_and_target_mnemonic_dual_recording() {
+    fn command_probation_and_target_observations_stay_isolated() {
         let mut sketch = ResourceSketch::with_shards(
             policy(20, 50, vec![]),
             small_budget(),
@@ -1767,7 +1786,61 @@ mod tests {
         assert!(sketch.observe(target.clone(), &obs));
         assert!(sketch.lookup(&target, 100).is_some());
         let mnemonic = SketchKey::for_attempt(None, Some("Rustc"), "");
-        assert!(sketch.lookup(&mnemonic, 100).is_some());
+        assert!(sketch.lookup(&mnemonic, 100).is_none());
+        assert!(sketch.observe(
+            target.clone(),
+            &Observation {
+                killed: true,
+                killed_peak_memory_kb: Some(122 * 1024 * 1024),
+                now_s: 101,
+                ..Observation::default()
+            }
+        ));
+        assert!(
+            sketch.lookup(&mnemonic, 101).is_none(),
+            "target kills must not create a mnemonic kill floor"
+        );
+        assert_eq!(
+            sketch
+                .lookup(&target, 101)
+                .expect("target")
+                .killed_peak_memory_kb,
+            122 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn recording_bounds_history_retained_from_a_larger_fleet() {
+        let mut sketch = ResourceSketch::with_shards(
+            policy(20, 50, vec![]),
+            small_budget(),
+            Duration::from_hours(24),
+            1,
+        );
+        let key = SketchKey::for_attempt(Some("//a:huge_test"), Some("TestRunner"), "");
+        sketch.observe(
+            key.clone(),
+            &Observation {
+                peak_memory_kb: 122 * 1024 * 1024,
+                killed_peak_memory_kb: Some(122 * 1024 * 1024),
+                killed: true,
+                now_s: 43_201,
+                ..Observation::default()
+            },
+        );
+        sketch.observe_with_memory_ceiling(
+            key.clone(),
+            &Observation {
+                peak_memory_kb: 60 * 1024 * 1024,
+                now_s: 86_401,
+                ..Observation::default()
+            },
+            60 * 1024 * 1024,
+        );
+        let entry = sketch.lookup(&key, 86_401).expect("entry");
+        assert_eq!(entry.max_memory_kb(), 60 * 1024 * 1024);
+        assert_eq!(entry.previous.max_memory_kb, 60 * 1024 * 1024);
+        assert_eq!(entry.killed_peak_memory_kb, 60 * 1024 * 1024);
     }
 
     #[test]
@@ -1808,7 +1881,7 @@ mod tests {
             Duration::from_hours(24),
             1,
         );
-        assert_eq!(restored.load(decoded, 105), Ok(5));
+        assert_eq!(restored.load(decoded, 105), Ok(4));
 
         // Adding one more target evicts "b" (the LRU), not "a".
         restored.observe(

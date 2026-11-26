@@ -74,7 +74,8 @@ pub struct FittedPlan {
     /// Final reservation to reserve on the worker ledger (includes whole-worker CPU promotion if
     /// memory filled physical capacity without a lower policy cap).
     pub reservation: ActionResources,
-    /// Pre-fit desired reservation (after configured minima raising, before fleet clamping).
+    /// Desired reservation after configured minima and the largest eligible memory ceiling,
+    /// before fitting to a particular fleet.
     pub desired: ActionResources,
     /// CPU reservation in millicores after catalog fitting and before whole-worker CPU promotion.
     pub cpu_before_memory_fit: u64,
@@ -197,9 +198,9 @@ pub fn validate_properties<'a>(
     })
 }
 
-/// Resolves the learned reservation from `sketch` using the `target+mnemonic → target → mnemonic →
-/// command` fallback chain, or falls back to `cold_start` for dimensions left untagged in `floors`
-/// when no sketch entry exists (`§5.3` step 4).
+/// Resolves target-bearing actions using `target+mnemonic → target`, and unlabeled actions using
+/// `mnemonic → command`. Uses `cold_start` for dimensions left untagged in `floors` when no
+/// matching history exists (`§5.3` step 4).
 #[must_use]
 pub fn lookup_learned_or_cold_start(
     sketch: &mut ResourceSketch,
@@ -221,10 +222,14 @@ pub fn lookup_learned_or_cold_start(
     if let Some(t) = target {
         candidate_keys.push(SketchKey::for_attempt(Some(t), None, ""));
     }
-    if let Some(m) = mnemonic {
+    if target.is_none()
+        && let Some(m) = mnemonic
+    {
         candidate_keys.push(SketchKey::for_attempt(None, Some(m), ""));
     }
-    if let Some(cmd) = command {
+    if target.is_none()
+        && let Some(cmd) = command
+    {
         candidate_keys.push(SketchKey::for_attempt(None, None, cmd));
     }
 
@@ -281,8 +286,9 @@ pub fn fit_reservation(
     min_disk: DiskMinReservation,
 ) -> Result<FittedPlan, Refusal> {
     let eligible = filter_eligible_fleets(catalog, admitted, floors)?;
-    let desired = compute_desired(learned, floors, min_memory, min_disk);
+    let mut desired = compute_desired(learned, floors, min_memory, min_disk);
     let fit_mem_kb = clamp_memory_to_largest(catalog, eligible, desired.memory.get() / 1024);
+    desired.memory = Bytes::kib(fit_mem_kb);
     let fit_disk_kb =
         clamp_disk_to_largest(catalog, eligible, fit_mem_kb, desired.disk.get() / 1024);
 
@@ -392,12 +398,22 @@ fn clamp_memory_to_largest(catalog: &FleetCatalog, eligible: FleetSet, mem_kb: u
     if mem_kb == 0 {
         return 0;
     }
-    eligible
+    largest_eligible_memory_kb(catalog, eligible, ClientFloors::default())
+        .map_or(mem_kb, |largest| mem_kb.min(largest))
+}
+
+/// Largest effective memory ceiling among candidate fleets satisfying the original floors.
+pub(crate) fn largest_eligible_memory_kb(
+    catalog: &FleetCatalog,
+    candidates: FleetSet,
+    floors: ClientFloors,
+) -> Option<u64> {
+    candidates
         .iter()
+        .filter(|&fleet| floors.fits_fleet(catalog, fleet))
         .filter_map(|f| catalog.fleets().get(f))
         .filter_map(|f| f.limit(property::MEMORY_KB))
         .max()
-        .map_or(mem_kb, |largest| mem_kb.min(largest))
 }
 
 fn clamp_disk_to_largest(
@@ -612,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn sketch_fallback_order_prefers_target_mnemonic_then_target_then_mnemonic_then_command() {
+    fn sketch_fallback_stays_within_the_actions_identity() {
         let mut sketch = test_sketch();
         let cold = ColdStartTuning::default();
 
@@ -689,7 +705,7 @@ mod tests {
 
         let by_mnemonic_only = lookup_learned_or_cold_start(
             &mut sketch,
-            Some("//pkg:missing"),
+            None,
             Some("CppLink"),
             "cmd1",
             11,
@@ -700,7 +716,7 @@ mod tests {
 
         let by_command_only = lookup_learned_or_cold_start(
             &mut sketch,
-            Some("//pkg:missing"),
+            None,
             Some("MissingMnemonic"),
             "cmd1",
             11,
@@ -708,6 +724,42 @@ mod tests {
             ClientFloors::default(),
         );
         assert_eq!(by_command_only.memory, Bytes::kib(120_000));
+    }
+
+    #[test]
+    fn unseen_targets_ignore_mnemonic_and_command_history() {
+        let mut sketch = test_sketch();
+        let cold = ColdStartTuning::default();
+        for key in [
+            SketchKey::for_attempt(None, Some("CppLink"), ""),
+            SketchKey::for_attempt(None, None, "cmd1"),
+        ] {
+            sketch.observe(
+                key,
+                &Observation {
+                    peak_memory_kb: 122 * 1024 * 1024,
+                    killed: true,
+                    now_s: 10,
+                    ..Observation::default()
+                },
+            );
+        }
+        for mnemonic in [Some("CppLink"), None] {
+            let unseen = lookup_learned_or_cold_start(
+                &mut sketch,
+                Some("//pkg:missing"),
+                mnemonic,
+                "cmd1",
+                11,
+                &cold,
+                ClientFloors::default(),
+            );
+            assert_eq!(
+                unseen.memory,
+                Bytes::kib(cold.memory.as_units()),
+                "target-bearing actions must ignore mnemonic and command history"
+            );
+        }
     }
 
     #[test]
@@ -743,8 +795,8 @@ mod tests {
         assert_eq!(plan.reservation.memory, Bytes::gib(32));
         assert_eq!(plan.reservation.cpu_millicores, 16_000);
         assert_eq!(plan.cpu_before_memory_fit, 1_500);
-        assert_eq!(plan.desired.memory, Bytes::gib(40));
-        assert!(plan.learned_reservation.is_some());
+        assert_eq!(plan.desired.memory, Bytes::gib(32));
+        assert!(plan.learned_reservation.is_none());
 
         // When a policy memory ceiling (4 GiB) is strictly below physical RAM (32 GiB), clamping to
         // 4 GiB must NOT promote whole-worker CPU.

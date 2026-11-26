@@ -22,6 +22,7 @@ use crate::escalation::{
     EscalationDecision, EscalationFailure, EscalationInput, KillCause, KillResource, classify_kill,
     evaluate_escalation,
 };
+use crate::fitting;
 use crate::operations::{Now, OperationKey, OperationStage, Operations, Slab};
 use crate::placement::PlacedAssignment;
 use crate::queue::OperationQueue;
@@ -230,10 +231,9 @@ pub struct Attempt {
     pub dispatched_at: Now,
     /// Monotonic deadline for receiving `Accept`/`Decline`.
     pub ack_deadline: Tick,
-    /// Monotonic execution deadline (`dispatched_at.tick + attempt_budget`).
+    /// Monotonic deadline for execution, replaced by the completion deadline at `Executed`.
     pub attempt_deadline: Tick,
-    /// Wall-clock execution deadline (`dispatched_at.wall + attempt_budget`) for controller
-    /// handoff projections.
+    /// Wall-clock deadline for the current phase, used by controller handoff projections.
     pub deadline_wall: Timestamp,
     /// Timestamp when the worker acknowledged the attempt, if accepted.
     pub accepted_at: Option<Now>,
@@ -424,19 +424,19 @@ pub enum AckTimeoutOutcome {
 /// Result of [`Attempts::on_attempt_deadline`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttemptDeadlineOutcome {
-    /// Dispatch-stamped `attempt_deadline` expired: operation terminated as `DEADLINE_EXCEEDED`,
-    /// `Kill(DeadlineExceeded)` emitted, and reservations retained until `Executed` or worker loss.
+    /// Execution or completion deadline expired. Execution reservations remain until `Executed`
+    /// or worker loss; an executed attempt is retired and its disk reservation released.
     Expired {
         /// Attempt key.
         attempt_key: AttemptKey,
-        /// Terminated operation key.
+        /// Operation key (possibly already terminal or owned by a newer attempt).
         operation: OperationKey,
         /// Worker running the expired attempt.
         worker: WorkerKey,
         /// Kill directive to send to the worker.
         kill: KillDirective,
-        /// Terminal `DeadlineExceeded` event to publish once.
-        publish: PublishEvent,
+        /// Terminal `DeadlineExceeded` event, only when the expired attempt owns the operation.
+        publish: Option<PublishEvent>,
     },
     /// Attempt no longer owns an active operation.
     Stale,
@@ -538,7 +538,7 @@ impl Attempts {
         self.by_worker.get(&worker).map_or(&[], Vec::as_slice)
     }
 
-    /// Returns the latest dispatch-stamped wall-clock deadline among all non-`Completed` attempts
+    /// Returns the latest current-phase wall-clock deadline among all non-`Completed` attempts
     /// owned by `worker` (for `ControllerHandOff::refresh_drain`).
     #[must_use]
     pub fn latest_attempt_deadline(&self, worker: WorkerKey) -> Option<Timestamp> {
@@ -737,14 +737,19 @@ impl Attempts {
         let peak_memory_kb = usage_kib(report.usage.peak_memory);
         let peak_disk_kb = usage_kib(report.usage.peak_disk);
 
+        let memory_ceiling_kb = fitting::largest_eligible_memory_kb(
+            capacity.current(),
+            candidates,
+            report.profile.floors,
+        )
+        .unwrap_or(0);
         record_executed_observation(
             sketch,
             sketch_key,
             report,
             reservation,
             classified_kill,
-            peak_memory_kb,
-            peak_disk_kb,
+            memory_ceiling_kb,
         );
 
         let Some(cause) = classified_kill else {
@@ -926,37 +931,77 @@ impl Attempts {
         }
     }
 
-    /// Expires a dispatch-stamped `attempt_deadline`: terminates the operation as
-    /// `DEADLINE_EXCEEDED` without requeue and emits `Kill(DeadlineExceeded)`, retaining worker
-    /// reservations until `Executed` or worker loss (`§5.5`).
+    /// Bounds the remaining attempt budget by a post-`Executed` completion timeout.
+    /// Duplicate `Executed` messages must not call this method or extend the deadline.
+    pub(crate) fn start_completion_timeout(
+        &mut self,
+        key: AttemptKey,
+        now: Now,
+        timeout: Duration,
+    ) -> Option<Tick> {
+        let attempt = self.slab.get_mut(key.index, key.generation)?;
+        if attempt.phase != AttemptPhase::Executed {
+            return None;
+        }
+        let completion_deadline = now.tick + timeout;
+        if completion_deadline < attempt.attempt_deadline {
+            attempt.attempt_deadline = completion_deadline;
+            attempt.deadline_wall = now.wall + timeout;
+        }
+        Some(attempt.attempt_deadline)
+    }
+
+    /// Expires the current phase deadline and emits `Kill(DeadlineExceeded)`. An owning attempt
+    /// terminates its operation without retry. Executed attempts also release disk and retire,
+    /// including detached attempts whose operation was cancelled or escalated (`§5.5`).
     pub fn on_attempt_deadline(
         &mut self,
         attempt_key: AttemptKey,
         operations: &mut Operations,
         queue: &mut OperationQueue,
+        workers: &mut WorkerRegistry,
     ) -> AttemptDeadlineOutcome {
         let (worker, operation, attempt_id, owns_operation) = {
             let Some(attempt) = self.slab.get_mut(attempt_key.index, attempt_key.generation) else {
                 return AttemptDeadlineOutcome::Stale;
             };
-            if !attempt.owns_operation || attempt.phase == AttemptPhase::Executed {
+            if !attempt.owns_operation && attempt.phase != AttemptPhase::Executed {
                 return AttemptDeadlineOutcome::Stale;
             }
+            let owns_operation = attempt.owns_operation;
             attempt.owns_operation = false;
-            (attempt.worker, attempt.operation, attempt.id.clone(), true)
+            (
+                attempt.worker,
+                attempt.operation,
+                attempt.id.clone(),
+                owns_operation,
+            )
         };
-        if !owns_operation {
-            return AttemptDeadlineOutcome::Stale;
+        if self
+            .get(attempt_key)
+            .is_some_and(|attempt| attempt.phase == AttemptPhase::Executed)
+            && let Some(attempt) = self.remove_attempt(attempt_key)
+        {
+            let _ = workers.on_attempt_completed(worker, attempt.reservation.disk);
         }
         if self.active_by_op.get(&operation) == Some(&attempt_key) {
             self.active_by_op.remove(&operation);
         }
-        let Some(op_name) = operations.get(operation).map(|op| op.name.clone()) else {
-            return AttemptDeadlineOutcome::Stale;
+        let publish = if owns_operation {
+            operations
+                .get(operation)
+                .map(|op| op.name.clone())
+                .and_then(|name| {
+                    operations
+                        .complete(operation, queue)
+                        .then_some(PublishEvent::Failed {
+                            operation,
+                            failure: TerminalFailure::DeadlineExceeded { operation: name },
+                        })
+                })
+        } else {
+            None
         };
-        if !operations.complete(operation, queue) {
-            return AttemptDeadlineOutcome::Stale;
-        }
 
         AttemptDeadlineOutcome::Expired {
             attempt_key,
@@ -968,10 +1013,7 @@ impl Attempts {
                 attempt_id,
                 reason: KillReason::DeadlineExceeded,
             },
-            publish: PublishEvent::Failed {
-                operation,
-                failure: TerminalFailure::DeadlineExceeded { operation: op_name },
-            },
+            publish,
         }
     }
 
@@ -1147,10 +1189,16 @@ fn record_executed_observation(
     report: &ExecutedReport<'_>,
     reservation: ActionResources,
     classified_kill: Option<KillCause>,
-    peak_memory_kb: Option<u64>,
-    peak_disk_kb: Option<u64>,
+    memory_ceiling_kb: u64,
 ) {
-    let reserved_mem_kb = reservation.memory.get().div_ceil(1024);
+    let peak_memory_kb =
+        usage_kib(report.usage.peak_memory).map(|peak| peak.min(memory_ceiling_kb));
+    let peak_disk_kb = usage_kib(report.usage.peak_disk);
+    let reserved_mem_kb = reservation
+        .memory
+        .get()
+        .div_ceil(1024)
+        .min(memory_ceiling_kb);
     let reserved_disk_kb = reservation.disk.get().div_ceil(1024);
     let killed_peak_memory_kb = classified_kill
         .filter(|k| k.resource() == KillResource::Memory)
@@ -1159,7 +1207,7 @@ fn record_executed_observation(
         .filter(|k| k.resource() == KillResource::Disk)
         .map(|_| peak_disk_kb.unwrap_or(reserved_disk_kb));
 
-    sketch.observe(
+    sketch.observe_with_memory_ceiling(
         sketch_key,
         &Observation {
             peak_memory_kb: peak_memory_kb.unwrap_or(0),
@@ -1170,6 +1218,7 @@ fn record_executed_observation(
             killed: classified_kill.is_some(),
             now_s: report.now.wall.as_unix_millis() / 1000,
         },
+        memory_ceiling_kb,
     );
 }
 

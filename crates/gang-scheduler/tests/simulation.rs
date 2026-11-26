@@ -163,6 +163,8 @@ mod harness {
             worker_timeout: Duration::from_secs(15),
             client_action_timeout: Duration::from_secs(12),
             attempt_budget: Duration::from_secs(25),
+            completion_timeout: Duration::from_secs(20),
+            max_retained_terminal_operations: 32,
             attempt_seed: seed,
         }
     }
@@ -182,6 +184,7 @@ mod harness {
         fleet: usize,
         available: bool,
         free: ActionResources,
+        capacity: ActionResources,
         reserved_cpu: u64,
         capacity_cpu: u64,
         gate_running: u32,
@@ -336,6 +339,7 @@ mod harness {
                         fleet: worker.fleet,
                         available: worker.is_available_for_dispatch(),
                         free: worker.ledger.free(),
+                        capacity: worker.ledger.capacity(),
                         reserved_cpu: worker.ledger.reserved().cpu_millicores,
                         capacity_cpu: worker.ledger.capacity().cpu_millicores,
                         gate_running: worker.gate_running,
@@ -615,10 +619,11 @@ mod harness {
             let expected = expected_best_worker(&self.pre_workers, op.candidates, op.reservation);
             match (assigned, expected) {
                 (Some((actual, _)), Some(exp)) => {
-                    assert_eq!(
-                        actual, exp,
+                    assert!(
+                        actual == exp || self.may_be_held_for_headroom(exp, op_key),
                         "seed={} step={}: distributed placement picked {actual:?}, expected {exp:?}",
-                        self.seed, self.step
+                        self.seed,
+                        self.step
                     );
                 }
                 (Some((actual, _)), None) => {
@@ -628,13 +633,42 @@ mod harness {
                     );
                 }
                 (None, Some(exp)) => {
-                    panic!(
+                    assert!(
+                        self.may_be_held_for_headroom(exp, op_key),
                         "seed={} step={}: op {op_key:?} remained queued despite eligible worker {exp:?}",
-                        self.seed, self.step
+                        self.seed,
+                        self.step
                     );
                 }
                 (None, None) => {}
             }
+        }
+
+        // A blocked earlier action may hold one fitting worker out of normal load ranking.
+        // The starvation scenario separately proves that the hold drains exactly one worker.
+        fn may_be_held_for_headroom(&self, worker: WorkerKey, operation: OperationKey) -> bool {
+            let op = self
+                .scheduler
+                .operations()
+                .get(operation)
+                .expect("operation");
+            let candidate = &self.pre_workers[&worker];
+            self.scheduler.queue().global_iter().any(|entry| {
+                if entry >= QueueKey::new(op.priority, op.seq, operation) {
+                    return false;
+                }
+                let head = self
+                    .scheduler
+                    .operations()
+                    .get(entry.key)
+                    .expect("queued head");
+                head.candidates.contains(candidate.fleet)
+                    && head.reservation.cpu_millicores <= candidate.capacity.cpu_millicores
+                    && head.reservation.memory <= candidate.capacity.memory
+                    && head.reservation.disk <= candidate.capacity.disk
+                    && expected_best_worker(&self.pre_workers, head.candidates, head.reservation)
+                        .is_none()
+            })
         }
 
         fn step_random(&mut self) {
@@ -1290,6 +1324,24 @@ mod harness {
                 }
             }
 
+            let terminal_count = ops.iter().filter(|(_, op)| op.stage.is_terminal()).count();
+            assert!(
+                terminal_count <= self.scheduler.policy().max_retained_terminal_operations,
+                "seed={} step={} ({context}): terminal operation retention exceeded policy",
+                self.seed,
+                self.step
+            );
+            for key in self.op_initial_seq.keys() {
+                if ops.get(*key).is_none() {
+                    assert!(
+                        self.terminal_events.contains_key(key),
+                        "seed={} step={} ({context}): removed operation {key:?} has no actor cleanup event",
+                        self.seed,
+                        self.step
+                    );
+                }
+            }
+
             // Pigeonhole: every live non-skip op maps to itself AND dedup_len equals their count,
             // proving zero terminal or leaked entries remain in `dedup`.
             assert_eq!(
@@ -1549,15 +1601,13 @@ mod harness {
             }
 
             for &op_key in &self.admitted_ops {
-                match self.scheduler.operations().get(op_key) {
-                    Some(op) => {
-                        assert!(op.stage.is_terminal());
-                        assert!(self.terminal_events.contains_key(&op_key));
-                    }
-                    None => {
-                        assert!(!self.terminal_events.contains_key(&op_key));
-                    }
+                if let Some(op) = self.scheduler.operations().get(op_key) {
+                    assert!(op.stage.is_terminal());
                 }
+                assert!(
+                    self.terminal_events.contains_key(&op_key),
+                    "every admitted operation must notify actor cleanup before removal"
+                );
             }
 
             for _ in 0..500 {
@@ -1692,6 +1742,112 @@ mod harness {
             mnemonic,
             priority,
             initial_watchers: 1,
+        }
+    }
+
+    #[test]
+    fn whole_worker_action_survives_a_stream_of_small_actions() {
+        for worker_count in [1, 2] {
+            let catalog = FleetCatalog::try_new(vec![FleetProperties::new(
+                &FleetName::try_new("workers").expect("fleet"),
+                Isa::X86_64,
+                &"bwrap",
+                &"host:sim".parse().expect("env"),
+                Resources {
+                    vcpus: 15,
+                    memory: Bytes::gib(60),
+                    disk: Bytes::gib(1_000),
+                },
+                &FleetActionPolicy::default(),
+                std::iter::empty(),
+            )])
+            .expect("catalog");
+            let mut policy = sim_policy(91);
+            policy.actions.cpu_oversubscription = NonZeroU32::MIN;
+            policy.actions.cold_start.cpu_millicores = NonZeroU32::new(890).expect("cpu");
+            policy.actions.cold_start.memory = WholeKib::from_units(10 * 1024);
+            policy.actions.cold_start.disk = WholeKib::from_units(1024 * 1024);
+            let mut sim = Sim::new(91, catalog, policy);
+            for index in 0..worker_count {
+                sim.register_new_worker(
+                    0,
+                    Arc::new(InstanceId::try_new(format!("i-stream-{index}")).expect("instance")),
+                    false,
+                    false,
+                    None,
+                )
+                .expect("worker");
+            }
+            for index in 0..worker_count * 16 {
+                let name = format!("operations/small-{index}");
+                sim.execute_request(simple_request(
+                    &name,
+                    name.as_bytes(),
+                    100,
+                    false,
+                    None,
+                    None,
+                ))
+                .expect("small");
+            }
+            let initial: Vec<_> = sim
+                .scheduler
+                .attempts()
+                .iter()
+                .map(|(_, a)| (a.worker, a.id.clone()))
+                .collect();
+            let mut large = simple_request("operations/whole", b"whole", 200, false, None, None);
+            large.platform_properties.insert(
+                property::MEMORY_KB.to_owned(),
+                (60_u64 * 1024 * 1024).to_string(),
+            );
+            let large = sim.execute_request(large).expect("large");
+            // Complete all initial attempts in discrete event order; a fresh small action arrives
+            // after every release. At least one worker must drain instead of accepting backfill.
+            for (index, (worker, attempt_id)) in initial.into_iter().enumerate() {
+                sim.advance_clock(1, false);
+                sim.deliver_worker_event(
+                    worker,
+                    WorkerEvent::Executed(WorkerExecuted {
+                        attempt_id,
+                        usage: AttemptUsage::default(),
+                        kill: None,
+                        side_channel_memory_failure: false,
+                    }),
+                    "small finished",
+                    true,
+                );
+                let name = format!("operations/stream-{index}");
+                sim.execute_request(simple_request(
+                    &name,
+                    name.as_bytes(),
+                    100,
+                    false,
+                    None,
+                    None,
+                ))
+                .expect("stream");
+            }
+            assert_eq!(
+                sim.scheduler.operations().get(large).expect("large").stage,
+                OperationStage::Running,
+                "large action starved under continuous 890 mCPU arrivals"
+            );
+            let attempt = sim
+                .scheduler
+                .attempts()
+                .active_for_operation(large)
+                .expect("large attempt");
+            assert_eq!(
+                sim.scheduler
+                    .attempts()
+                    .get(attempt)
+                    .expect("attempt")
+                    .reservation
+                    .cpu_millicores,
+                15_000
+            );
+            sim.run_to_quiescence();
         }
     }
 
@@ -2305,6 +2461,11 @@ mod harness {
         assert!(
             sim.scheduler.operations().get(op).is_none(),
             "client-less queued op must expire at original deadline despite redundant unwatch"
+        );
+        assert_eq!(
+            sim.terminal_events.get(&op),
+            Some(&OperationUpdate::Cancelled),
+            "expired queued operation must release actor-owned state through a terminal event"
         );
     }
 

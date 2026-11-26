@@ -351,8 +351,11 @@ One function replaces the three decorators (`PlaceableActions` → `HistoricalRe
    (`INVALID_ARGUMENT` naming property and fleets; SPEC §3.2 "Match rule").
 2. Candidates = `FleetCatalog::accepting` in preference order; empty → `Refusal`.
 3. `cpu_weight = qos::weight(priority)` (§3.2); gate tier emits `AuditGate`.
-4. Learned reservation from the sketch (target+mnemonic → target → mnemonic → command), else
-   cold start; headroom, configured minima; capture the initial learned snapshot.
+4. Learned reservation from the sketch (when a target label is present: `target+mnemonic → target`
+   without cross-target mnemonic fallback so one outlier test never poisons an entire mnemonic;
+   when no target label is present: `mnemonic → command`), else cold start; headroom, configured
+   minima, capped at the largest eligible effective fleet ceiling; capture the initial learned
+   snapshot.
 5. Fit with `FleetCatalog::fit` within the admitted set, then authoritative physical-memory
    fitting against current capacity facts (whole-worker CPU when memory is clamped to full
    physical capacity, bounded by the CPU ceiling). Originals remain floors.
@@ -375,6 +378,11 @@ fleet(w) ∈ op.candidates && inflight < max_inflight && fits(op.reservation, w.
   operation that fits until `w` is full or `dispatch_scan_limit` non-fitting entries have been
   skipped. Every operation in `queue[f]` is waiting because no eligible worker existed when it was
   last considered, so filling `w` respects preference.
+- **Anti-starvation headroom hold:** When the highest-priority queued operation for a fleet fits
+  an empty eligible worker (`op.reservation ≤ w.capacity`) but currently cannot fit any worker's
+  free capacity, the scheduler pins a single eligible worker in that fleet to drain (refusing
+  smaller operations on that held worker across both operation-driven and worker-driven placement)
+  until the large operation is placed or leaves the queue.
 
 Each assignment reserves on the ledger, creates an `Attempt` (`Offered`), arms `ack_deadline`,
 emits `Assign`, removes the operation from all indices, and stamps `w.last_assigned_seq`.

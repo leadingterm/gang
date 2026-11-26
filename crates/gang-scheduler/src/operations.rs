@@ -1,6 +1,6 @@
 //! Slab-indexed operation state, deduplication with priority promotion, watchers, and timeouts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::time::Duration;
 
@@ -407,23 +407,42 @@ pub struct ClientLessExpiry {
 }
 
 /// Slab-indexed registry of operations and their deduplication map.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Operations {
     slab: Slab<Operation>,
     by_name: HashMap<OperationName, OperationKey>,
     dedup: HashMap<DedupKey, OperationKey>,
     next_seq: u64,
+    terminal: VecDeque<OperationKey>,
+    terminal_limit: usize,
+}
+
+pub(crate) const DEFAULT_MAX_RETAINED_TERMINAL_OPERATIONS: usize = 16_384;
+
+impl Default for Operations {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Operations {
     /// Creates an empty operation registry.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_terminal_limit(DEFAULT_MAX_RETAINED_TERMINAL_OPERATIONS)
+    }
+
+    /// Creates a registry retaining at most `limit` terminal operations, oldest completion first.
+    /// Active operations are never evicted; zero disables terminal retention.
+    #[must_use]
+    pub(crate) fn with_terminal_limit(limit: usize) -> Self {
         Self {
             slab: Slab::new(),
             by_name: HashMap::new(),
             dedup: HashMap::new(),
             next_seq: 1,
+            terminal: VecDeque::new(),
+            terminal_limit: limit,
         }
     }
 
@@ -661,13 +680,8 @@ impl Operations {
                 })
             }
             OperationStage::Running => {
-                let name = {
-                    let op = self.get_mut(key)?;
-                    op.stage = OperationStage::Cancelled;
-                    op.client_less_since = None;
-                    op.name.clone()
-                };
-                self.remove_dedup_for(key);
+                let name = self.get(key)?.name.clone();
+                self.cancel(key, queue)?;
                 Some(ClientLessExpiry {
                     key,
                     name,
@@ -722,6 +736,7 @@ impl Operations {
         op.stage = OperationStage::Completed;
         op.client_less_since = None;
         self.remove_dedup_for(key);
+        self.retain_terminal(key, queue);
         true
     }
 
@@ -743,6 +758,7 @@ impl Operations {
         op.stage = OperationStage::Cancelled;
         op.client_less_since = None;
         self.remove_dedup_for(key);
+        self.retain_terminal(key, queue);
         Some(previous)
     }
 
@@ -775,6 +791,22 @@ impl Operations {
         key: OperationKey,
         queue: &mut OperationQueue,
     ) -> Option<Operation> {
+        if self.get(key).is_some_and(|op| op.stage.is_terminal()) {
+            self.terminal.retain(|&retained| retained != key);
+        }
+        self.remove_entry(key, queue)
+    }
+
+    fn retain_terminal(&mut self, key: OperationKey, queue: &mut OperationQueue) {
+        self.terminal.push_back(key);
+        while self.terminal.len() > self.terminal_limit {
+            if let Some(oldest) = self.terminal.pop_front() {
+                self.remove_entry(oldest, queue);
+            }
+        }
+    }
+
+    fn remove_entry(&mut self, key: OperationKey, queue: &mut OperationQueue) -> Option<Operation> {
         let op = self.slab.remove(key.index, key.generation)?;
         if op.stage == OperationStage::Queued {
             queue.dequeue(key, op.candidates, op.priority, op.seq);
@@ -795,6 +827,108 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_retention_reclaims_oldest_entries_without_evicting_active_operations() {
+        let mut ops = Operations::new();
+        let mut queue = OperationQueue::new(1).expect("queue");
+        let AdmitOutcome::Inserted { key: queued, .. } = ops.admit(
+            new_op("operations/queued", b"queued", 100),
+            now(1),
+            &mut queue,
+        ) else {
+            panic!("insert queued")
+        };
+        let AdmitOutcome::Inserted { key: running, .. } = ops.admit(
+            new_op("operations/running", b"running", 100),
+            now(1),
+            &mut queue,
+        ) else {
+            panic!("insert running")
+        };
+        assert!(ops.mark_running(running, &mut queue));
+        let mut first = None;
+        for index in 0..16_400 {
+            let name = format!("operations/terminal-{index}");
+            let AdmitOutcome::Inserted { key, .. } =
+                ops.admit(new_op(&name, name.as_bytes(), 100), now(1), &mut queue)
+            else {
+                panic!("insert terminal")
+            };
+            first.get_or_insert(key);
+            if index % 2 == 0 {
+                assert!(ops.complete(key, &mut queue));
+            } else {
+                assert!(ops.cancel(key, &mut queue).is_some());
+            }
+        }
+        assert!(
+            ops.len() <= 16_384 + 2,
+            "terminal registry grew to {}",
+            ops.len()
+        );
+        assert!(ops.get(first.expect("first terminal")).is_none());
+        assert!(
+            ops.lookup_name(&OperationName::try_new("operations/terminal-0").expect("name"))
+                .is_none()
+        );
+        assert_eq!(
+            ops.get(queued).expect("queued preserved").stage,
+            OperationStage::Queued
+        );
+        assert_eq!(
+            ops.get(running).expect("running preserved").stage,
+            OperationStage::Running
+        );
+        assert_eq!(ops.dedup_len(), 2);
+    }
+
+    #[test]
+    fn terminal_retention_uses_completion_order_and_generation_checked_reuse() {
+        let mut ops = Operations::with_terminal_limit(2);
+        let mut queue = OperationQueue::new(1).expect("queue");
+        let mut keys = Vec::new();
+        for name in ["operations/first", "operations/second", "operations/third"] {
+            let AdmitOutcome::Inserted { key, .. } =
+                ops.admit(new_op(name, name.as_bytes(), 100), now(1), &mut queue)
+            else {
+                panic!("insert")
+            };
+            keys.push(key);
+        }
+        assert!(ops.complete(keys[1], &mut queue));
+        assert!(ops.complete(keys[0], &mut queue));
+        assert!(!ops.complete(keys[1], &mut queue));
+        assert!(ops.complete(keys[2], &mut queue));
+        assert!(
+            ops.get(keys[1]).is_none(),
+            "oldest completion must be evicted first"
+        );
+        assert!(ops.get(keys[0]).is_some());
+        let AdmitOutcome::Inserted {
+            key: replacement, ..
+        } = ops.admit(
+            new_op("operations/second", b"operations/second", 100),
+            now(2),
+            &mut queue,
+        )
+        else {
+            panic!("evicted name and digest must be reusable")
+        };
+        assert_eq!(replacement.index(), keys[1].index());
+        assert_ne!(replacement.generation(), keys[1].generation());
+        assert!(
+            ops.get(keys[1]).is_none(),
+            "stale handle must not alias replacement"
+        );
+        assert_eq!(
+            ops.lookup_name(&ops.get(replacement).expect("replacement").name),
+            Some(replacement)
+        );
+        assert!(ops.cancel(replacement, &mut queue).is_some());
+        assert!(ops.get(keys[0]).is_none());
+        assert!(ops.get(keys[2]).is_some());
+    }
 
     fn now(secs: u64) -> Now {
         Now {

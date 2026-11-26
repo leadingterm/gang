@@ -168,7 +168,7 @@ mod tests {
 
         let mut records = Vec::new();
         learned.snapshot(ts(11), &mut records);
-        assert_eq!(records.len(), 4);
+        assert_eq!(records.len(), 3);
         assert!(
             records
                 .iter()
