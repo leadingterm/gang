@@ -8,8 +8,13 @@
 //! This crate uses only `std`, lower-tier workspace contracts, `serde`, and `thiserror`, with no
 //! Tokio runtime, I/O, or clock reads.
 
+mod admission;
+mod attempts;
+mod capacity;
 mod cordons;
 mod durations;
+mod escalation;
+mod fitting;
 mod handoff;
 mod history;
 mod ledger;
@@ -20,10 +25,29 @@ mod qos;
 mod queue;
 mod rates;
 mod sketch;
+mod timers;
 mod workers;
 
+pub use admission::{
+    ActionProfile, AdmissionError, AdmissionOutcome, AdmissionRequest, admit_action,
+};
+pub use attempts::{
+    AcceptOutcome, AckTimeoutOutcome, Attempt, AttemptDeadlineOutcome, AttemptKey, AttemptPhase,
+    AttemptUsage, Attempts, CancelOutcome, CompletedOutcome, CompletedReport, CompletionStatus,
+    DeclineOutcome, DeclineReason, ExecutedOutcome, ExecutedReport, KillDirective, KillReason,
+    PublishEvent, TerminalFailure, WorkerLossOutcome,
+};
+pub use capacity::{CapacityCatalog, CapacityError, FleetCapacity};
 pub use cordons::{Census, CordonError, CordonRegistry};
 pub use durations::ActionDurations;
+pub use escalation::{
+    EscalationDecision, EscalationFailure, EscalationFailureReason, EscalationInput, KillCause,
+    KillResource, classify_kill, evaluate_escalation,
+};
+pub use fitting::{
+    ClientFloors, FittedPlan, ValidatedProperties, fit_reservation, lookup_learned_or_cold_start,
+    normalized_cpu_millicores, validate_properties,
+};
 pub use handoff::{ControllerHandOff, HandOffEffects, HandOffError, RehomeDirective, RehomeReason};
 pub use history::{Histories, history_id, resource_key};
 pub use ledger::{LedgerError, WorkerLedger, cmp_reserved_cpu_fraction, ledger_capacity};
@@ -54,6 +78,7 @@ pub use sketch::{
     PROBATION_ENTRY_BYTES, Policy, ResourceSketch, SAMPLER_GENERATION, SHARDS, Shaped, SizeClass,
     SketchError, SketchKey, Snapshot, Stats,
 };
+pub use timers::{DueTimer, TimerEffects, TimerKind, TimerQueue, TimerSubject, on_timer};
 pub use workers::{
     DrainSources, InstanceState, RegistrationError, Worker, WorkerIdError, WorkerKey,
     WorkerRegistration, WorkerRegistry, mint_random_worker_id, mint_worker_id,
