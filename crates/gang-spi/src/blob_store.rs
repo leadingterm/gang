@@ -127,6 +127,10 @@ pub trait ContentStore: fmt::Debug + Send + Sync + 'static {
 
     /// Usage of an engine-bounded store; `None` for provider-bounded stores (such as S3).
     fn usage(&self) -> Option<EngineStore>;
+
+    /// Drains background cleanup tasks (such as cancelled multipart upload aborts) after callers
+    /// have stopped writing and before runtime shutdown.
+    async fn shutdown(&self) {}
 }
 
 /// Action-result cache storage keyed by action digest.

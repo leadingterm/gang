@@ -170,7 +170,7 @@ impl KillTrigger {
 }
 
 /// Receiver awaited by the attempt runner for external or pressure-triggered kills.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KillWaiter {
     inner: Arc<KillChannelInner>,
 }

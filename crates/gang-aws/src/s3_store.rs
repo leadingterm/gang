@@ -683,6 +683,10 @@ impl ContentStore for S3ContentStore {
     fn usage(&self) -> Option<EngineStore> {
         None
     }
+
+    async fn shutdown(&self) {
+        self.drain_multipart_aborts().await;
+    }
 }
 
 impl S3ContentStore {

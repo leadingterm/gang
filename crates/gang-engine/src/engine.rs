@@ -559,6 +559,7 @@ impl Engine {
         if let Some(task) = term_guard.finish_actor() {
             let _ = task.await;
         }
+        spec.stores.content.shutdown().await;
         serve_result
     }
 
@@ -609,9 +610,17 @@ impl Engine {
         A: ActionStore,
     {
         raise_open_file_limit(self.config.max_open_files);
-        crate::worker::run_worker(spec, stores, connector, &clock, stop)
+        let direct_content = match &stores {
+            WorkerStores::Direct { content, .. } => Some(Arc::clone(content)),
+            WorkerStores::ViaController => None,
+        };
+        let result = crate::worker::run_worker(spec, stores, connector, &clock, stop)
             .await
-            .map_err(PortError::from)
+            .map_err(PortError::from);
+        if let Some(content) = direct_content {
+            content.shutdown().await;
+        }
+        result
     }
 
     fn live_controller(&self) -> Result<LiveController, PortError> {
@@ -1234,6 +1243,7 @@ mod tests {
         inner: MemoryContentStore,
         used: AtomicU64,
         budget: u64,
+        shutdown_count: AtomicU64,
     }
 
     impl UsageContentStore {
@@ -1242,6 +1252,7 @@ mod tests {
                 inner: MemoryContentStore::new(),
                 used: AtomicU64::new(0),
                 budget,
+                shutdown_count: AtomicU64::new(0),
             }
         }
     }
@@ -1277,6 +1288,10 @@ mod tests {
                 budget: self.budget,
                 evicted: 0,
             })
+        }
+
+        async fn shutdown(&self) {
+            self.shutdown_count.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -1933,6 +1948,7 @@ mod tests {
             ))?);
 
             let content = Arc::new(UsageContentStore::new(64 * 1024 * 1024));
+            let content_observer = Arc::clone(&content);
             let actions = Arc::new(UsageActionStore::new(16 * 1024 * 1024));
             let (sink, _observations) = ObservationSink::channel(
                 NonZeroUsize::new(32).ok_or("nonzero")?,
@@ -2015,7 +2031,9 @@ mod tests {
                 worker_stop_tx,
                 controller_task,
             )
-            .await
+            .await?;
+            assert_eq!(content_observer.shutdown_count.load(Ordering::Acquire), 1);
+            Ok(())
         })
     }
 

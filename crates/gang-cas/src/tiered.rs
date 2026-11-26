@@ -458,6 +458,10 @@ where
     fn usage(&self) -> Option<EngineStore> {
         self.disk().usage()
     }
+
+    async fn shutdown(&self) {
+        self.inner.slow.shutdown().await;
+    }
 }
 
 fn channel_to_stream(

@@ -797,15 +797,13 @@ async fn execute_assigned_attempt<C, A, K>(
         Ok(id) => id,
         Err(error) => {
             let status = rpc_status(rpc_proto::Code::InvalidArgument, error.to_string());
-            let _ = outbound
-                .completed(completed_status(assign.attempt, status))
-                .await;
+            send_attempt_status(&outbound, &assign.attempt, status).await;
             return;
         }
     };
 
     let input_fetch_start = runtime.clock.wall();
-    let mut staged = match stage_assigned_attempt(&runtime, &assign).await {
+    let mut staged = match stage_assigned_attempt(&runtime, &assign, &kill_waiter).await {
         Ok(staged) => staged,
         Err(status) => {
             let _ = runtime.graveyard.retire_attempt(
@@ -814,9 +812,7 @@ async fn execute_assigned_attempt<C, A, K>(
                 0,
             );
             reservation.release();
-            let _ = outbound
-                .completed(completed_status(attempt_id.as_str().to_owned(), status))
-                .await;
+            send_attempt_status(&outbound, attempt_id.as_str(), status).await;
             return;
         }
     };
@@ -835,7 +831,7 @@ async fn execute_assigned_attempt<C, A, K>(
         &run_spec,
         &runtime.clock,
         Some(&runtime.sampling),
-        kill_waiter,
+        kill_waiter.clone(),
         kill_trigger,
     )
     .await
@@ -846,9 +842,7 @@ async fn execute_assigned_attempt<C, A, K>(
             let _ = retire_guard.retire_now();
             reservation.release();
             let status = runner_error_status(&error);
-            let _ = outbound
-                .completed(completed_status(attempt_id.as_str().to_owned(), status))
-                .await;
+            send_attempt_status(&outbound, attempt_id.as_str(), status).await;
             return;
         }
     };
@@ -877,12 +871,19 @@ async fn execute_assigned_attempt<C, A, K>(
         input_fetch_start,
         input_fetch_completed,
         &mut retire_guard,
+        &kill_waiter,
     )
     .await;
 
     let _ = retire_guard.retire_now();
     reservation.release();
     let _ = outbound.completed(outcome).await;
+}
+
+async fn send_attempt_status(outbound: &SessionOutbound, attempt: &str, status: rpc_proto::Status) {
+    let _ = outbound
+        .completed(completed_status(attempt.to_owned(), status))
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -898,12 +899,16 @@ async fn finalize_executed_attempt<C, A, K>(
     input_fetch_start: Timestamp,
     input_fetch_completed: Timestamp,
     retire_guard: &mut RetireOnDrop<'_>,
+    kill_waiter: &KillWaiter,
 ) -> proto::Completed
 where
     C: ContentStore,
     A: ActionStore,
     K: Clock + Clone + 'static,
 {
+    if let Some(reason) = kill_waiter.reason() {
+        return completed_status(attempt_id.as_str().to_owned(), attempt_kill_status(reason));
+    }
     if let Some(kill_reason) = run_outcome.kill {
         let status = executed_status.unwrap_or_else(|| {
             rpc_status(
@@ -927,6 +932,7 @@ where
                 input_fetch_start,
                 input_fetch_completed,
                 retire_guard,
+                kill_waiter,
             )
             .await
         }
@@ -937,6 +943,7 @@ where
 async fn stage_assigned_attempt<C, A, K>(
     runtime: &WorkerRuntime<C, A, K>,
     assign: &proto::Assign,
+    kill_waiter: &KillWaiter,
 ) -> Result<StagedAttempt, rpc_proto::Status>
 where
     C: ContentStore,
@@ -957,11 +964,12 @@ where
     };
 
     let stage_config = StageConfig::from_worker_config(&runtime.spec.worker);
-    let staged_result = runtime
-        .clock
-        .timeout(
+    let staged_result = tokio::select! {
+        biased;
+        reason = kill_waiter.wait() => return Err(attempt_kill_status(reason)),
+        result = runtime.clock.timeout(
             runtime.spec.worker.download_timeout.get(),
-            stage_attempt(
+            Box::pin(stage_attempt(
                 assign,
                 &runtime.spec.work_directory,
                 &runtime.tiered,
@@ -969,9 +977,9 @@ where
                 &runtime.dir_cache,
                 remote_tree.as_ref(),
                 &stage_config,
-            ),
-        )
-        .await;
+            )),
+        ) => result,
+    };
 
     match staged_result {
         Ok(Ok(staged)) => Ok(staged),
@@ -996,6 +1004,7 @@ async fn finish_upload_and_build_completed<C, A, K>(
     input_fetch_start: Timestamp,
     input_fetch_completed: Timestamp,
     retire_guard: &mut RetireOnDrop<'_>,
+    kill_waiter: &KillWaiter,
 ) -> proto::Completed
 where
     C: ContentStore,
@@ -1023,19 +1032,22 @@ where
         },
     };
 
-    let upload_res = runtime
-        .clock
-        .timeout(
+    let upload_res = tokio::select! {
+        biased;
+        reason = kill_waiter.wait() => {
+            return completed_status(attempt_id.as_str().to_owned(), attempt_kill_status(reason));
+        }
+        result = runtime.clock.timeout(
             runtime.spec.worker.upload_timeout.get(),
-            upload_outputs(
+            Box::pin(upload_outputs(
                 upload_input,
                 &runtime.tiered,
                 Some(&runtime.action_store),
                 &runtime.clock,
                 &upload_config,
-            ),
-        )
-        .await;
+            )),
+        ) => result,
+    };
 
     match upload_res {
         Ok(Ok(outcome)) => {
@@ -1053,6 +1065,34 @@ where
             rpc_status(rpc_proto::Code::DeadlineExceeded, "output upload timed out"),
         ),
     }
+}
+
+fn attempt_kill_status(reason: proto::KillReason) -> rpc_proto::Status {
+    let (code, message) = match reason {
+        proto::KillReason::Cancelled => (rpc_proto::Code::Cancelled, "attempt cancelled"),
+        proto::KillReason::DeadlineExceeded => (
+            rpc_proto::Code::DeadlineExceeded,
+            "attempt deadline exceeded",
+        ),
+        proto::KillReason::Timeout => (
+            rpc_proto::Code::DeadlineExceeded,
+            "action execution timed out",
+        ),
+        proto::KillReason::Memory => (
+            rpc_proto::Code::ResourceExhausted,
+            "action killed due to memory limit or pressure",
+        ),
+        proto::KillReason::DiskPressure => (
+            rpc_proto::Code::ResourceExhausted,
+            "action killed due to worker disk pressure",
+        ),
+        proto::KillReason::DiskLimit => (
+            rpc_proto::Code::ResourceExhausted,
+            "action exceeded soft disk ceiling",
+        ),
+        proto::KillReason::Unspecified => (rpc_proto::Code::Aborted, "attempt terminated"),
+    };
+    rpc_status(code, message)
 }
 
 fn captured_for_upload(output: crate::worker_runner::CapturedOutput) -> UploadCapturedOutput {
@@ -1644,9 +1684,9 @@ mod tests {
         runtime.block_on(future)
     }
 
-    fn spawn_direct_worker(
+    fn spawn_direct_worker<C: ContentStore>(
         spec: WorkerRuntimeSpec,
-        content: Arc<MemoryContentStore>,
+        content: Arc<C>,
         actions: Arc<MemoryActionStore>,
         addr: std::net::SocketAddr,
         stop_rx: oneshot::Receiver<()>,
@@ -1730,6 +1770,233 @@ mod tests {
             .ok_or("expected ActionResult in MemoryActionStore")?;
         assert_eq!(reapi::ActionResult::decode(cached)?, *action_result);
         Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockedOutputStore {
+        inner: MemoryContentStore,
+        entered: Notify,
+        cancelled: Notify,
+    }
+
+    struct UploadCancellation<'a>(&'a Notify);
+
+    impl Drop for UploadCancellation<'_> {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    impl ContentStore for BlockedOutputStore {
+        async fn find_missing(
+            &self,
+            digests: &[Digest],
+            missing: &mut Vec<Digest>,
+        ) -> Result<(), PortError> {
+            self.inner.find_missing(digests, missing).await
+        }
+
+        async fn read(
+            &self,
+            digest: Digest,
+            range: ByteRange,
+        ) -> Result<Option<BlobStream>, PortError> {
+            self.inner.read(digest, range).await
+        }
+
+        async fn write(&self, digest: Digest, body: BlobStream) -> Result<(), PortError> {
+            if digest != Digest::from_bytes(b"hello-from-worker") {
+                return self.inner.write(digest, body).await;
+            }
+            let _cancel = UploadCancellation(&self.cancelled);
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+            drop(body);
+            Ok(())
+        }
+
+        fn usage(&self) -> Option<gang_spi::EngineStore> {
+            None
+        }
+    }
+
+    struct UploadAttempt {
+        spec: WorkerRuntimeSpec,
+        content: Arc<BlockedOutputStore>,
+        actions: Arc<MemoryActionStore>,
+        sessions: mpsc::Receiver<MockSession>,
+        session: MockSession,
+        worker: JoinHandle<Result<(), WorkerError>>,
+        server: JoinHandle<()>,
+        stop: oneshot::Sender<()>,
+        attempt: &'static str,
+    }
+
+    async fn start_blocked_upload(root: &Path) -> TestResult<UploadAttempt> {
+        let spec = test_spec(root, WorkerLifetime::LongLived, false)?;
+        let content = Arc::new(BlockedOutputStore::default());
+        let actions = Arc::new(MemoryActionStore::new());
+        let (digest, action, command) = seed_action_in_store(
+            &content.inner,
+            WRITE_OUTPUT_CHILD,
+            Vec::new(),
+            vec!["result.txt".to_owned()],
+            Vec::new(),
+        )
+        .await?;
+        let (controller, mut sessions) = MockController::new();
+        let (addr, server) = spawn_mock_server(controller, None).await?;
+        let (stop, stop_rx) = oneshot::channel();
+        let worker = spawn_direct_worker(
+            spec.clone(),
+            Arc::clone(&content),
+            Arc::clone(&actions),
+            addr,
+            stop_rx,
+        );
+        let (mut session, _) = expect_register_and_ack(
+            &mut sessions,
+            "inst-e5-00000000-0000-4000-8000-000000000024",
+        )
+        .await?;
+        let attempt = "00000000-0000-4000-8000-000000000890";
+        session
+            .outbound_tx
+            .send(Ok(assign_frame(
+                attempt,
+                digest,
+                Some(action),
+                Some(command),
+                128,
+            )?))
+            .await?;
+        assert!(matches!(
+            next_non_keepalive(&mut session.inbound_rx).await?,
+            WorkerKind::Accept(_)
+        ));
+        let WorkerKind::Executed(executed) = next_non_keepalive(&mut session.inbound_rx).await?
+        else {
+            return Err("expected Executed before blocked upload".into());
+        };
+        assert_eq!(executed.exit_code, 0);
+        tokio::time::timeout(Duration::from_secs(5), content.entered.notified()).await?;
+        assert!(spec.work_directory.join(attempt).exists());
+        Ok(UploadAttempt {
+            spec,
+            content,
+            actions,
+            sessions,
+            session,
+            worker,
+            server,
+            stop,
+            attempt,
+        })
+    }
+
+    #[tokio::test]
+    async fn already_killed_attempt_does_not_start_staging() -> TestResult {
+        let tmp = TempDir::new()?;
+        let spec = test_spec(
+            &tmp.path().canonicalize()?,
+            WorkerLifetime::LongLived,
+            false,
+        )?;
+        let prepared = prepare_worker_runtime(
+            &spec,
+            WorkerStores::Direct {
+                content: Arc::new(MemoryContentStore::new()),
+                actions: Arc::new(MemoryActionStore::new()),
+            },
+            &SystemClock::new(),
+        )
+        .await?;
+        let assign = proto::Assign {
+            attempt: "00000000-0000-4000-8000-000000000891".to_owned(),
+            ..Default::default()
+        };
+        for (reason, code) in [
+            (proto::KillReason::Cancelled, rpc_proto::Code::Cancelled),
+            (
+                proto::KillReason::DeadlineExceeded,
+                rpc_proto::Code::DeadlineExceeded,
+            ),
+        ] {
+            let (trigger, waiter) = kill_channel();
+            assert!(trigger.kill(reason));
+            let status = stage_assigned_attempt(&prepared.runtime, &assign, &waiter)
+                .await
+                .expect_err("already killed attempt started staging");
+            assert_eq!(status.code, code as i32);
+            assert!(!spec.work_directory.join(&assign.attempt).exists());
+        }
+        prepared.runtime.graveyard.drain().await;
+        Ok(())
+    }
+
+    #[test]
+    fn deadline_kill_cancels_upload_without_publishing_and_retires_attempt() -> TestResult {
+        run_gated(async {
+            let tmp = TempDir::new()?;
+            let mut upload = start_blocked_upload(&tmp.path().canonicalize()?).await?;
+            upload
+                .session
+                .outbound_tx
+                .send(Ok(proto::ControllerMessage {
+                    kind: Some(ControllerKind::Kill(proto::Kill {
+                        attempt: upload.attempt.to_owned(),
+                        reason: proto::KillReason::DeadlineExceeded as i32,
+                    })),
+                }))
+                .await?;
+            let WorkerKind::Completed(completed) = tokio::time::timeout(
+                Duration::from_secs(5),
+                next_non_keepalive(&mut upload.session.inbound_rx),
+            )
+            .await??
+            else {
+                return Err("expected Completed after upload cancellation".into());
+            };
+            assert_eq!(completed.attempt, upload.attempt);
+            let Some(proto::completed::Outcome::Status(status)) = completed.outcome else {
+                return Err("cancelled upload published an ActionResult".into());
+            };
+            assert_eq!(status.code, rpc_proto::Code::DeadlineExceeded as i32);
+            tokio::time::timeout(Duration::from_secs(5), upload.content.cancelled.notified())
+                .await?;
+            assert!(!upload.spec.work_directory.join(upload.attempt).exists());
+            assert_eq!(upload.actions.put_calls(), 0);
+            let _ = upload.stop.send(());
+            tokio::time::timeout(Duration::from_secs(5), upload.worker).await???;
+            upload.server.abort();
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn disconnect_cancels_upload_before_replacement_session_acknowledges() -> TestResult {
+        run_gated(async {
+            let tmp = TempDir::new()?;
+            let mut upload = start_blocked_upload(&tmp.path().canonicalize()?).await?;
+            drop(upload.session);
+            let (replacement, _) = tokio::time::timeout(
+                Duration::from_secs(5),
+                expect_register_and_ack(
+                    &mut upload.sessions,
+                    "inst-e5-00000000-0000-4000-8000-000000000025",
+                ),
+            )
+            .await??;
+            tokio::time::timeout(Duration::from_secs(5), upload.content.cancelled.notified())
+                .await?;
+            assert!(!upload.spec.work_directory.join(upload.attempt).exists());
+            assert_eq!(upload.actions.put_calls(), 0);
+            let _ = upload.stop.send(());
+            tokio::time::timeout(Duration::from_secs(5), upload.worker).await???;
+            drop(replacement);
+            upload.server.abort();
+            Ok(())
+        })
     }
 
     #[test]

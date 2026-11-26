@@ -36,6 +36,9 @@ use sha2::{Digest as _, Sha256};
 /// Streaming read buffer size used for hashing and uploading output files.
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Maximum descriptor-anchored output directory traversal depth.
+const MAX_OUTPUT_DEPTH: usize = 256;
+
 /// Default concurrent slow-store blob uploads when not overridden.
 const DEFAULT_UPLOAD_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(64).expect("64 is non-zero");
 
@@ -257,12 +260,87 @@ impl RootContext {
 #[derive(Debug, Clone)]
 struct CollectedFile {
     abs_path: PathBuf,
-    handle: Arc<File>,
     executable: bool,
     size: u64,
     dev: u64,
     ino: u64,
     digest: Digest,
+}
+
+#[derive(Debug)]
+struct OpenedFile {
+    metadata: CollectedFile,
+    handle: Arc<File>,
+}
+
+struct FileCollector<'a, F, S> {
+    tiered: &'a Tiered<F, S>,
+    config: &'a UploadConfig,
+    files: Vec<CollectedFile>,
+    pending: Vec<OpenedFile>,
+    counted_inodes: HashSet<(u64, u64)>,
+    cas_shared_bytes: u64,
+}
+
+impl<'a, F, S> FileCollector<'a, F, S>
+where
+    F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
+    S: ContentStore,
+{
+    fn new(tiered: &'a Tiered<F, S>, config: &'a UploadConfig) -> Self {
+        Self {
+            tiered,
+            config,
+            files: Vec::new(),
+            pending: Vec::with_capacity(config.hash_concurrency.get()),
+            counted_inodes: HashSet::new(),
+            cas_shared_bytes: 0,
+        }
+    }
+
+    async fn push(&mut self, path: PathBuf, handle: File) -> Result<usize, UploadError> {
+        let meta = handle
+            .metadata()
+            .map_err(|source| output_io(&path, source))?;
+        let index = self.files.len() + self.pending.len();
+        self.pending.push(OpenedFile {
+            metadata: CollectedFile {
+                abs_path: path,
+                executable: meta.permissions().mode() & 0o111 != 0,
+                size: meta.len(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+                digest: Digest::EMPTY,
+            },
+            handle: Arc::new(handle),
+        });
+        if self.pending.len() == self.config.hash_concurrency.get() {
+            self.flush().await?;
+        }
+        Ok(index)
+    }
+
+    async fn flush(&mut self) -> Result<(), UploadError> {
+        hash_files_parallel(&mut self.pending, self.config.hash_concurrency).await?;
+        let shared = insert_outputs_into_disk_cas(
+            self.tiered.disk(),
+            &self.pending,
+            &mut self.counted_inodes,
+        )
+        .await?;
+        self.cas_shared_bytes = self.cas_shared_bytes.saturating_add(shared);
+        upload_missing_to_slow(
+            self.tiered,
+            &self.pending,
+            &[],
+            self.config.upload_concurrency,
+        )
+        .await?;
+        // Only immutable metadata survives a batch, including when DiskCas bypasses a blob.
+        self.files
+            .extend(self.pending.drain(..).map(|file| file.metadata));
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -345,7 +423,7 @@ where
     let roots = RootContext::new(input.work_dir, input.working_dir)?;
     let use_output_paths = !input.command.output_paths.is_empty();
 
-    let mut files = Vec::new();
+    let mut collector = FileCollector::new(tiered, config);
     let mut top_files = Vec::new();
     let mut top_symlinks = Vec::new();
     let mut top_dirs = Vec::new();
@@ -355,21 +433,24 @@ where
         input.working_dir,
         &roots,
         use_output_paths,
-        &mut files,
+        &mut collector,
         &mut top_files,
         &mut top_symlinks,
         &mut top_dirs,
-    )?;
+    )
+    .await?;
 
-    let stdout_plan = plan_stdio(input.stdout, config.inline_stdio_max_bytes, &mut files)?;
-    let stderr_plan = plan_stdio(input.stderr, config.inline_stdio_max_bytes, &mut files)?;
-
-    hash_files_parallel(&mut files, config.hash_concurrency).await?;
+    let stdout_plan =
+        plan_stdio(input.stdout, config.inline_stdio_max_bytes, &mut collector).await?;
+    let stderr_plan =
+        plan_stdio(input.stderr, config.inline_stdio_max_bytes, &mut collector).await?;
+    collector.flush().await?;
+    let files = &collector.files;
 
     let BuiltDirectories {
         output_directories,
         mut in_memory_blobs,
-    } = build_output_directories(input.command, top_dirs, &files)?;
+    } = build_output_directories(input.command, top_dirs, files)?;
 
     if let StdioPlan::UploadBytes { digest, ref bytes } = stdout_plan {
         in_memory_blobs.push((digest, bytes.clone()));
@@ -378,16 +459,14 @@ where
         in_memory_blobs.push((digest, bytes.clone()));
     }
 
-    let cas_shared_bytes =
-        insert_outputs_into_disk_cas(tiered.disk(), &files, &in_memory_blobs).await?;
-
-    upload_missing_to_slow(tiered, &files, &in_memory_blobs, config.upload_concurrency).await?;
+    insert_memory_blobs(tiered.disk(), &in_memory_blobs).await?;
+    upload_missing_to_slow(tiered, &[], &in_memory_blobs, config.upload_concurrency).await?;
 
     let action_result = build_action_result(
         input.exit_code,
         input.timing,
         use_output_paths,
-        &files,
+        files,
         top_files,
         top_symlinks,
         output_directories,
@@ -411,7 +490,7 @@ where
 
     Ok(UploadOutcome {
         action_result,
-        cas_shared_bytes,
+        cas_shared_bytes: collector.cas_shared_bytes,
         cached_action_result,
     })
 }
@@ -649,16 +728,20 @@ enum DeclaredOutputKind {
 }
 
 #[allow(deprecated, clippy::too_many_arguments)]
-fn collect_declared_outputs(
+async fn collect_declared_outputs<F, S>(
     command: &reapi::Command,
     working_dir: &Path,
     roots: &RootContext,
     use_output_paths: bool,
-    files: &mut Vec<CollectedFile>,
+    collector: &mut FileCollector<'_, F, S>,
     top_files: &mut Vec<TopLevelFile>,
     top_symlinks: &mut Vec<TopLevelSymlink>,
     top_dirs: &mut Vec<TopLevelDir>,
-) -> Result<(), UploadError> {
+) -> Result<(), UploadError>
+where
+    F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
+    S: ContentStore,
+{
     let declarations = if use_output_paths {
         vec![(&command.output_paths, DeclaredOutputKind::Any)]
     } else {
@@ -694,14 +777,14 @@ fn collect_declared_outputs(
                     is_dir_field: expected == DeclaredOutputKind::Directory,
                 }),
                 OpenOutput::File(file) if expected != DeclaredOutputKind::Directory => {
-                    let idx = push_collected_file(files, abs, file)?;
+                    let idx = collector.push(abs, file).await?;
                     top_files.push(TopLevelFile {
                         rel_path: raw.clone(),
                         file_index: idx,
                     });
                 }
                 OpenOutput::Directory(fd) if expected != DeclaredOutputKind::File => {
-                    let tree = walk_output_directory(&fd, &rel, roots, files)?;
+                    let tree = walk_output_directory(&fd, &rel, roots, collector, 0).await?;
                     top_dirs.push(TopLevelDir {
                         rel_path: raw.clone(),
                         tree,
@@ -728,12 +811,23 @@ fn collect_declared_outputs(
     Ok(())
 }
 
-fn walk_output_directory(
+async fn walk_output_directory<F, S>(
     fd: &OwnedFd,
     dir_rel_to_cwd: &Path,
     roots: &RootContext,
-    files: &mut Vec<CollectedFile>,
-) -> Result<CollectedDirNode, UploadError> {
+    collector: &mut FileCollector<'_, F, S>,
+    depth: usize,
+) -> Result<CollectedDirNode, UploadError>
+where
+    F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
+    S: ContentStore,
+{
+    if depth >= MAX_OUTPUT_DEPTH {
+        return Err(UploadError::InvalidPath {
+            path: dir_rel_to_cwd.display().to_string(),
+            reason: "output directory nesting is too deep",
+        });
+    }
     let mut node = CollectedDirNode::new();
     let listing_fd = fd_fs::openat(fd, ".", directory_flags(), Mode::empty())
         .map_err(|source| output_io(dir_rel_to_cwd, source))?;
@@ -751,6 +845,7 @@ fn walk_output_directory(
         })?;
         names.push(name.to_owned());
     }
+    drop(directory);
     names.sort();
     for name in names {
         let rel = dir_rel_to_cwd.join(&name);
@@ -763,44 +858,34 @@ fn walk_output_directory(
                 name,
             }),
             OpenOutput::File(file) => {
-                let idx = push_collected_file(files, rel, file)?;
+                let idx = collector.push(rel, file).await?;
                 node.files.push((name, idx));
             }
             OpenOutput::Directory(child) => {
-                node.subdirs
-                    .insert(name, walk_output_directory(&child, &rel, roots, files)?);
+                let subtree = Box::pin(walk_output_directory(
+                    &child,
+                    &rel,
+                    roots,
+                    collector,
+                    depth + 1,
+                ))
+                .await?;
+                node.subdirs.insert(name, subtree);
             }
         }
     }
     Ok(node)
 }
 
-fn push_collected_file(
-    files: &mut Vec<CollectedFile>,
-    abs_path: PathBuf,
-    handle: File,
-) -> Result<usize, UploadError> {
-    let meta = handle
-        .metadata()
-        .map_err(|source| output_io(&abs_path, source))?;
-    let idx = files.len();
-    files.push(CollectedFile {
-        abs_path,
-        handle: Arc::new(handle),
-        executable: meta.permissions().mode() & 0o111 != 0,
-        size: meta.len(),
-        dev: meta.dev(),
-        ino: meta.ino(),
-        digest: Digest::EMPTY,
-    });
-    Ok(idx)
-}
-
-fn plan_stdio(
+async fn plan_stdio<F, S>(
     captured: Option<CapturedOutput>,
     inline_max: u64,
-    files: &mut Vec<CollectedFile>,
-) -> Result<StdioPlan, UploadError> {
+    collector: &mut FileCollector<'_, F, S>,
+) -> Result<StdioPlan, UploadError>
+where
+    F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
+    S: ContentStore,
+{
     let Some(output) = captured else {
         return Ok(StdioPlan::Empty);
     };
@@ -843,7 +928,7 @@ fn plan_stdio(
                     .map_err(|source| output_io(&path, source))?;
                 return Ok(StdioPlan::Inline(Bytes::from(raw)));
             }
-            let idx = push_collected_file(files, path, file)?;
+            let idx = collector.push(path, file).await?;
             Ok(StdioPlan::UploadFile { file_index: idx })
         }
     }
@@ -865,14 +950,20 @@ fn finalize_stdio(
 }
 
 async fn hash_files_parallel(
-    files: &mut [CollectedFile],
+    files: &mut [OpenedFile],
     concurrency: NonZeroUsize,
 ) -> Result<(), UploadError> {
     let jobs: Vec<(usize, PathBuf, Arc<File>)> = files
         .iter()
         .enumerate()
-        .filter(|(_, file)| file.size > 0)
-        .map(|(idx, file)| (idx, file.abs_path.clone(), Arc::clone(&file.handle)))
+        .filter(|(_, file)| file.metadata.size > 0)
+        .map(|(idx, file)| {
+            (
+                idx,
+                file.metadata.abs_path.clone(),
+                Arc::clone(&file.handle),
+            )
+        })
         .collect();
 
     if jobs.is_empty() {
@@ -896,7 +987,7 @@ async fn hash_files_parallel(
 
     for result in results {
         let (idx, digest) = result?;
-        files[idx].digest = digest;
+        files[idx].metadata.digest = digest;
     }
     Ok(())
 }
@@ -1023,14 +1114,14 @@ fn build_reapi_tree(
 
 async fn insert_outputs_into_disk_cas(
     disk: &DiskCas,
-    files: &[CollectedFile],
-    in_memory_blobs: &[(Digest, Bytes)],
+    files: &[OpenedFile],
+    counted_inodes: &mut HashSet<(u64, u64)>,
 ) -> Result<u64, UploadError> {
     let mut cas_shared_bytes = 0_u64;
-    let mut counted_inodes: HashSet<(u64, u64)> = HashSet::new();
     let mut inserted_keys: HashSet<CacheKey> = HashSet::new();
 
-    for file in files {
+    for opened in files {
+        let file = &opened.metadata;
         if file.digest.is_empty() {
             continue;
         }
@@ -1048,12 +1139,20 @@ async fn insert_outputs_into_disk_cas(
         if let Some(_pin) = disk.pin_attempt(file.digest, file.executable) {
             continue;
         }
-        let stream = file_blob_stream(Arc::clone(&file.handle), file.size);
+        let stream = file_blob_stream(Arc::clone(&opened.handle), file.size);
         let _outcome: WriteOutcome = disk
             .write_with_mode(file.digest, stream, file.executable)
             .await?;
     }
 
+    Ok(cas_shared_bytes)
+}
+
+async fn insert_memory_blobs(
+    disk: &DiskCas,
+    in_memory_blobs: &[(Digest, Bytes)],
+) -> Result<(), UploadError> {
+    let mut inserted_keys = HashSet::new();
     for (digest, bytes) in in_memory_blobs {
         if digest.is_empty() {
             continue;
@@ -1070,7 +1169,7 @@ async fn insert_outputs_into_disk_cas(
             .await?;
     }
 
-    Ok(cas_shared_bytes)
+    Ok(())
 }
 
 fn is_inode_shared_with_disk_cas(
@@ -1092,7 +1191,7 @@ fn is_inode_shared_with_disk_cas(
 
 async fn upload_missing_to_slow<F, S>(
     tiered: &Tiered<F, S>,
-    files: &[CollectedFile],
+    files: &[OpenedFile],
     in_memory_blobs: &[(Digest, Bytes)],
     concurrency: NonZeroUsize,
 ) -> Result<(), UploadError>
@@ -1103,7 +1202,8 @@ where
     let mut payloads: HashMap<Digest, UploadPayload> = HashMap::new();
     let mut unique_digests = Vec::new();
 
-    for file in files {
+    for opened in files {
+        let file = &opened.metadata;
         if file.digest.is_empty() || payloads.contains_key(&file.digest) {
             continue;
         }
@@ -1111,7 +1211,7 @@ where
         payloads.insert(
             file.digest,
             UploadPayload::File {
-                handle: Arc::clone(&file.handle),
+                handle: Arc::clone(&opened.handle),
                 size: file.size,
             },
         );
@@ -1577,10 +1677,15 @@ mod tests {
             gang_cas::CacheKey::new(shared_digest, gang_cas::BlobMode::Plain),
         );
         fs::hard_link(&cas_file, work_dir.join("shared.dat"))?;
+        fs::hard_link(&cas_file, work_dir.join("again.dat"))?;
         fs::write(work_dir.join("fresh.dat"), b"fresh-bytes")?;
 
         let command = reapi::Command {
-            output_paths: vec!["shared.dat".to_owned(), "fresh.dat".to_owned()],
+            output_paths: vec![
+                "shared.dat".to_owned(),
+                "fresh.dat".to_owned(),
+                "again.dat".to_owned(),
+            ],
             ..Default::default()
         };
 
@@ -1793,6 +1898,145 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct OutputFdStore {
+        inner: MemoryContentStore,
+        work: std::path::PathBuf,
+        peak_output_fds: AtomicUsize,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ContentStore for OutputFdStore {
+        async fn find_missing(
+            &self,
+            digests: &[Digest],
+            missing: &mut Vec<Digest>,
+        ) -> Result<(), PortError> {
+            self.inner.find_missing(digests, missing).await
+        }
+
+        async fn read(
+            &self,
+            digest: Digest,
+            range: ByteRange,
+        ) -> Result<Option<BlobStream>, PortError> {
+            self.inner.read(digest, range).await
+        }
+
+        async fn write(&self, digest: Digest, body: BlobStream) -> Result<(), PortError> {
+            let open = fs::read_dir("/proc/self/fd")
+                .map_err(PortError::backend)?
+                .filter_map(Result::ok)
+                .filter_map(|entry| fs::read_link(entry.path()).ok())
+                .filter(|path| path.starts_with(&self.work))
+                .count();
+            self.peak_output_fds.fetch_max(open, Ordering::SeqCst);
+            self.inner.write(digest, body).await
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn upload_many_outputs(budget: u64) -> TestResult {
+        let tmp = TempDir::new()?;
+        let work = tmp.path().join("work");
+        fs::create_dir_all(work.join("out/nested"))?;
+        for index in 0..1500 {
+            fs::write(
+                work.join(format!("out/nested/f{index:04}")),
+                format!("blob-{index}"),
+            )?;
+        }
+        symlink("nested/f0000", work.join("out/link"))?;
+        let slow = OutputFdStore {
+            inner: MemoryContentStore::new(),
+            work: work.canonicalize()?,
+            peak_output_fds: AtomicUsize::new(0),
+        };
+        let tiered = Tiered::new(DiskCas::open(tmp.path().join("cas"), budget).await?, slow);
+        let command = reapi::Command {
+            output_paths: vec!["out".to_owned()],
+            ..Default::default()
+        };
+        let clock = TestClock::new(Timestamp::from_unix_millis(1_000));
+        let config = test_config();
+        let outcome = upload_outputs(
+            UploadInput {
+                action_digest: Digest::from_bytes(b"many-outputs"),
+                do_not_cache: false,
+                exit_code: 0,
+                command: &command,
+                work_dir: &work,
+                working_dir: &work,
+                stdout: None,
+                stderr: None,
+                timing: ExecutionTiming::default(),
+            },
+            &tiered,
+            Some(&MemoryActionStore::new()),
+            &clock,
+            &config,
+        )
+        .await?;
+        assert!(outcome.cached_action_result);
+        assert_eq!(
+            tiered
+                .disk()
+                .pin_attempt(Digest::from_bytes(b"blob-0"), false)
+                .is_some(),
+            budget > 1,
+            "fixture did not exercise the requested DiskCas admission path"
+        );
+        let peak = tiered.slow().peak_output_fds.load(Ordering::SeqCst);
+        assert!(
+            peak > 0,
+            "descriptor measurement did not observe the output tree"
+        );
+        assert!(
+            peak <= config.hash_concurrency.get() + 6,
+            "unbounded output descriptors: {peak}"
+        );
+        assert_many_outputs(&tiered.slow().inner, &outcome.action_result)?;
+        assert_eq!(outcome.cas_shared_bytes, 0);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_many_outputs(slow: &MemoryContentStore, result: &reapi::ActionResult) -> TestResult {
+        assert_eq!(result.output_directories.len(), 1);
+        let digest = from_proto(
+            result.output_directories[0]
+                .tree_digest
+                .as_ref()
+                .ok_or("no Tree digest")?,
+        )?;
+        let tree = reapi::Tree::decode(slow.get_bytes(digest).ok_or("no Tree")?)?;
+        let root = tree.root.ok_or("no root")?;
+        assert_eq!(root.symlinks[0].target, "nested/f0000");
+        assert_eq!(root.directories[0].name, "nested");
+        assert_eq!(tree.children.len(), 1);
+        let files = &tree.children[0].files;
+        assert_eq!(files.len(), 1500);
+        for (index, file) in files.iter().enumerate() {
+            assert_eq!(file.name, format!("f{index:04}"));
+            let digest = from_proto(file.digest.as_ref().ok_or("missing file digest")?)?;
+            assert_eq!(
+                slow.get_bytes(digest),
+                Some(Bytes::from(format!("blob-{index}")))
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn many_outputs_bound_descriptors_with_disk_cas_and_with_bypass() -> TestResult {
+        for budget in [1, 1024 * 1024] {
+            tokio::time::timeout(Duration::from_secs(30), upload_many_outputs(budget)).await??;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn uploads_verified_handles_after_output_paths_are_replaced() -> TestResult {
         let tmp = TempDir::new()?;
@@ -1803,31 +2047,26 @@ mod tests {
         fs::write(work.join("out/data"), b"verified output")?;
         fs::write(outside.join("data"), b"outside secret")?;
         let roots = super::RootContext::new(&work, &work)?;
-        let command = reapi::Command {
-            output_paths: vec!["out".into()],
-            ..Default::default()
+        let directory = super::open_directory_path(&roots.working_fd, std::path::Path::new("out"))?;
+        let Some(super::OpenOutput::File(file)) = super::open_output(
+            &directory,
+            std::path::Path::new("data"),
+            &work.join("out/data"),
+        )?
+        else {
+            return Err("expected verified file descriptor".into());
         };
-        let mut files = Vec::new();
-        super::collect_declared_outputs(
-            &command,
-            &work,
-            &roots,
-            true,
-            &mut files,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            &mut Vec::new(),
-        )?;
         fs::rename(work.join("out"), work.join("saved"))?;
         symlink(&outside, work.join("out"))?;
-        super::hash_files_parallel(&mut files, test_config().hash_concurrency).await?;
-        assert_eq!(files[0].digest, Digest::from_bytes(b"verified output"));
         let disk = DiskCas::open(tmp.path().join("cas"), 1024 * 1024).await?;
         let slow = MemoryContentStore::new();
         let tiered = Tiered::new(disk.clone(), slow.clone());
-        super::insert_outputs_into_disk_cas(&disk, &files, &[]).await?;
-        super::upload_missing_to_slow(&tiered, &files, &[], test_config().upload_concurrency)
-            .await?;
+        let config = test_config();
+        let mut collector = super::FileCollector::new(&tiered, &config);
+        collector.push(work.join("out/data"), file).await?;
+        collector.flush().await?;
+        let files = &collector.files;
+        assert_eq!(files[0].digest, Digest::from_bytes(b"verified output"));
         assert_eq!(
             slow.get_bytes(files[0].digest),
             Some(Bytes::from_static(b"verified output"))
