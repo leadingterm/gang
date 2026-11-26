@@ -1027,7 +1027,7 @@ mod tests {
     use gang_types::{Digest, NonZeroBytes};
     use parking_lot::Mutex;
     use tokio::net::TcpListener;
-    use tokio::sync::Notify;
+    use tokio::sync::watch;
     use tokio::task::JoinHandle;
     use tonic::Code;
     use tonic::transport::server::TcpIncoming;
@@ -1614,19 +1614,28 @@ mod tests {
         writes_started: Arc<std::sync::atomic::AtomicUsize>,
         aborts_registered: Arc<std::sync::atomic::AtomicUsize>,
         aborts_finished: Arc<std::sync::atomic::AtomicUsize>,
-        release_abort: Arc<Notify>,
+        release_abort: watch::Sender<bool>,
         abort_tasks: Mutex<Vec<JoinHandle<()>>>,
     }
 
     impl BarrierAbortStore {
         fn new() -> Self {
+            let (release_abort, _) = watch::channel(false);
             Self {
                 writes_started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 aborts_registered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 aborts_finished: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                release_abort: Arc::new(Notify::new()),
+                release_abort,
                 abort_tasks: Mutex::new(Vec::new()),
             }
+        }
+    }
+
+    struct AbortReleaseGuard(watch::Sender<bool>);
+
+    impl Drop for AbortReleaseGuard {
+        fn drop(&mut self) {
+            let _ = self.0.send(true);
         }
     }
 
@@ -1655,11 +1664,11 @@ mod tests {
                 if let Err(err) = chunk {
                     // Mimic S3ContentStore's MultipartAbortGuard: spawn an async abort task
                     // whose completion is awaited by ContentStore::shutdown().
-                    let release = Arc::clone(&self.release_abort);
+                    let mut release_rx = self.release_abort.subscribe();
                     let finished = Arc::clone(&self.aborts_finished);
                     self.aborts_registered.fetch_add(1, Ordering::AcqRel);
                     self.abort_tasks.lock().push(tokio::spawn(async move {
-                        release.notified().await;
+                        let _ = release_rx.wait_for(|released| *released).await;
                         finished.fetch_add(1, Ordering::AcqRel);
                     }));
                     return Err(err);
@@ -1683,6 +1692,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_drains_unfinished_and_evicted_uploads_before_store_shutdown() {
         let store = Arc::new(BarrierAbortStore::new());
+        let _release_guard = AbortReleaseGuard(store.release_abort.clone());
         let budget = InflightBlobBudget::new(NonZeroBytes::mib(1));
         let cfg = ByteStreamConfig {
             max_pending_uploads: NonZeroUsize::new(1).expect("1 is nonzero"),
@@ -1727,7 +1737,7 @@ mod tests {
             )
         })
         .await;
-        store.release_abort.notify_waiters();
+        let _ = store.release_abort.send(true);
         shutdown_fut.await;
         assert!(
             pending,
