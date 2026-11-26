@@ -1413,6 +1413,25 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn content_store_refuses_oversized_authoritative_write() -> gang_testkit::TestResult {
+        let dir = tempfile::tempdir()?;
+        let store = FilesystemContentStore::new(dir.path().join("content"), 4);
+        let bytes = bytes::Bytes::from_static(b"too large");
+        let digest = Digest::from_bytes(&bytes);
+        assert!(matches!(
+            store.write(digest, BlobStream::from_bytes(bytes)).await,
+            Err(PortError::Rejected {
+                reason: gang_spi::Rejection::ResourceExhausted,
+                ..
+            })
+        ));
+        let mut missing = Vec::new();
+        store.find_missing(&[digest], &mut missing).await?;
+        assert_eq!(missing, vec![digest]);
+        Ok(())
+    }
+
     #[test]
     fn open_stores_refuse_non_private_root_and_leave_unchanged() {
         let dir = tempfile::tempdir().expect("tempdir");

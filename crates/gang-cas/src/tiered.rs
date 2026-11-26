@@ -441,10 +441,13 @@ where
         let disk = self.disk();
         let ((), fast_res, slow_res) = tokio::join!(
             pump_verified_tee(digest, body, fast_tx, slow_tx),
-            disk.write(digest, fast_stream),
+            disk.write_with_mode(digest, fast_stream, false),
             self.inner.slow.write(digest, slow_stream),
         );
 
+        let fast_res = fast_res.map(|outcome| match outcome {
+            WriteOutcome::Cached | WriteOutcome::Bypassed => (),
+        });
         match (fast_res, slow_res) {
             (Err(err @ PortError::Rejected { .. }), _)
             | (_, Err(err @ PortError::Rejected { .. })) => Err(err),
@@ -789,6 +792,29 @@ mod tests {
         fn usage(&self) -> Option<EngineStore> {
             None
         }
+    }
+
+    #[tokio::test]
+    async fn authoritative_slow_write_survives_optional_fast_bypass() -> TestResult {
+        let dir = TempDir::new()?;
+        let fast = DiskCas::open(dir.path(), 4).await?;
+        let slow = Arc::new(MockSlowStore::default());
+        let tiered = Tiered::new(fast.clone(), Arc::clone(&slow));
+        let payload = Bytes::from_static(b"larger than fast capacity");
+        let digest = Digest::from_bytes(&payload);
+        tiered
+            .write(digest, BlobStream::from_bytes(payload.clone()))
+            .await?;
+        assert!(fast.read(digest, ByteRange::FULL).await?.is_none());
+        assert_eq!(
+            slow.read(digest, ByteRange::FULL)
+                .await?
+                .ok_or("authoritative upload")?
+                .collect()
+                .await?,
+            payload
+        );
+        Ok(())
     }
 
     #[tokio::test]

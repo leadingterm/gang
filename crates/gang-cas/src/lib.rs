@@ -17,8 +17,8 @@ mod tiered;
 mod trees;
 
 pub use codec::{
-    Compression, DEFAULT_ZSTD_LEVEL, compress_zstd, compress_zstd_stream, decompress_zstd_bounded,
-    decompress_zstd_stream, verify_identity_stream,
+    Compression, DEFAULT_ZSTD_LEVEL, STREAM_CHUNK_BYTES, compress_zstd, compress_zstd_stream,
+    decompress_zstd_bounded, decompress_zstd_stream, verify_identity_stream,
 };
 pub use disk::{DiskCas, WriteOutcome};
 pub use flight::SingleFlight;

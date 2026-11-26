@@ -21,8 +21,10 @@ use gang_spi::{
     ActionStore, BlobStream, ByteRange, ContentStore, EngineStore, PortError, Rejection,
 };
 use gang_types::{Digest, EnvironmentName};
+use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::OnceCell;
+use tokio::task::JoinSet;
 
 use crate::config::{ExpiryAge, S3CacheConfig};
 use crate::errors::AwsError;
@@ -48,6 +50,7 @@ pub(crate) struct S3Backend {
     clock: Arc<dyn Clock>,
     client: OnceCell<aws_sdk_s3::Client>,
     existence: Arc<S3ExistenceCache>,
+    multipart_aborts: Mutex<JoinSet<()>>,
 }
 
 impl std::fmt::Debug for S3Backend {
@@ -74,6 +77,7 @@ impl S3Backend {
             clock,
             client,
             existence,
+            multipart_aborts: Mutex::new(JoinSet::new()),
         }
     }
 
@@ -103,6 +107,80 @@ impl S3Backend {
     pub(crate) fn existence(&self) -> &S3ExistenceCache {
         &self.existence
     }
+}
+
+impl Drop for S3Backend {
+    fn drop(&mut self) {
+        // Dropping the final store must not cancel aborts already issued by upload guards.
+        // Call drain_multipart_aborts before shutting down the runtime to wait for completion.
+        self.multipart_aborts.get_mut().detach_all();
+    }
+}
+
+struct MultipartAbortGuard {
+    backend: Arc<S3Backend>,
+    client: aws_sdk_s3::Client,
+    runtime: tokio::runtime::Handle,
+    key: String,
+    upload_id: String,
+    armed: bool,
+}
+
+impl MultipartAbortGuard {
+    async fn abort(&mut self) {
+        match abort_multipart(
+            &self.client,
+            self.backend.bucket(),
+            &self.key,
+            &self.upload_id,
+        )
+        .await
+        {
+            Ok(()) => self.armed = false,
+            Err(error) => tracing::warn!(%error, "failed to abort S3 multipart upload"),
+        }
+    }
+}
+
+impl Drop for MultipartAbortGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let client = self.client.clone();
+        let bucket = self.backend.bucket().to_owned();
+        let key = std::mem::take(&mut self.key);
+        let upload_id = std::mem::take(&mut self.upload_id);
+        let mut tasks = self.backend.multipart_aborts.lock();
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn_on(
+            async move {
+                if let Err(error) = abort_multipart(&client, &bucket, &key, &upload_id).await {
+                    tracing::warn!(%error, "failed to abort cancelled S3 multipart upload");
+                }
+            },
+            &self.runtime,
+        );
+    }
+}
+
+async fn abort_multipart(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<(), PortError> {
+    client
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await
+        .map_err(|error| {
+            PortError::from(AwsError::from(call_error("AbortMultipartUpload", error)))
+        })?;
+    Ok(())
 }
 
 /// Computes the CAS S3 key prefix (`<key_prefix>cas/`), matching `v0.3.9`.
@@ -137,6 +215,17 @@ impl S3ContentStore {
     pub(crate) fn new(backend: Arc<S3Backend>) -> Self {
         let prefix = cas_key_prefix(&backend.config);
         Self { backend, prefix }
+    }
+
+    /// Waits for cancellation-triggered multipart aborts to finish.
+    ///
+    /// Stop uploads before calling this during shutdown, and keep the Tokio runtime alive until
+    /// it returns. Abort failures are logged by their cleanup tasks.
+    pub async fn drain_multipart_aborts(&self) {
+        while std::future::poll_fn(|cx| self.backend.multipart_aborts.lock().poll_join_next(cx))
+            .await
+            .is_some()
+        {}
     }
 
     fn key(&self, digest: Digest) -> String {
@@ -267,28 +356,28 @@ impl S3ContentStore {
             PortError::from(AwsError::malformed("CreateMultipartUpload", "upload_id"))
         })?;
 
+        let mut abort_guard = MultipartAbortGuard {
+            backend: Arc::clone(&self.backend),
+            client: client.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            key,
+            upload_id,
+            armed: true,
+        };
         let result = self
-            .upload_multipart_parts(digest, body, &key, &upload_id, part_size)
+            .upload_multipart_parts(
+                digest,
+                body,
+                &abort_guard.key,
+                &abort_guard.upload_id,
+                part_size,
+            )
             .await;
-
-        if let Err(err) = result {
-            if let Err(abort_err) = client
-                .abort_multipart_upload()
-                .bucket(bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .send()
-                .await
-            {
-                tracing::warn!(
-                    key = %key,
-                    upload_id = %upload_id,
-                    error = %abort_err,
-                    "failed to abort S3 multipart upload"
-                );
-            }
-            return Err(err);
+        if let Err(error) = result {
+            abort_guard.abort().await;
+            return Err(error);
         }
+        abort_guard.armed = false;
 
         self.backend
             .existence
@@ -923,6 +1012,7 @@ mod tests {
         upload_part_requests: usize,
         complete_multipart_requests: usize,
         abort_multipart_requests: usize,
+        abort_received: Arc<tokio::sync::Notify>,
         in_flight_heads: Arc<AtomicUsize>,
         max_concurrent_heads: Arc<AtomicUsize>,
         head_delay: Duration,
@@ -943,6 +1033,7 @@ mod tests {
                 upload_part_requests: 0,
                 complete_multipart_requests: 0,
                 abort_multipart_requests: 0,
+                abort_received: Arc::new(tokio::sync::Notify::new()),
                 in_flight_heads: Arc::new(AtomicUsize::new(0)),
                 max_concurrent_heads: Arc::new(AtomicUsize::new(0)),
                 head_delay: Duration::ZERO,
@@ -1284,6 +1375,7 @@ mod tests {
         if let Some(upload_id) = query.get("uploadId") {
             guard.abort_multipart_requests += 1;
             guard.uploads.remove(upload_id);
+            guard.abort_received.notify_one();
             return StatusCode::NO_CONTENT.into_response();
         }
         StatusCode::BAD_REQUEST.into_response()
@@ -1471,6 +1563,88 @@ mod tests {
         let mut missing = Vec::new();
         content.find_missing(&[digest], &mut missing).await?;
         assert_eq!(missing, vec![digest]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_multipart_upload_aborts_uploaded_parts() -> TestResult {
+        cancel_multipart_upload(false).await
+    }
+
+    #[tokio::test]
+    async fn cancelling_multipart_upload_then_dropping_store_still_aborts() -> TestResult {
+        cancel_multipart_upload(true).await
+    }
+
+    async fn cancel_multipart_upload(drop_stores: bool) -> TestResult {
+        let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(
+            1_794_960_000_000,
+        )));
+        let fake = FakeS3::start("example-bucket", Arc::clone(&clock)).await?;
+        let cache = make_cache(
+            &fake,
+            clock,
+            json!({"tuning": {
+                "single_put_max": "5MiB", "multipart_max_concurrent_uploads": 1
+            }}),
+        )
+        .await?;
+        let content = cache.s3_content_store();
+        let payload = Bytes::from(vec![0x5a; 10 * 1024 * 1024 + 1]);
+        let digest = Digest::from_bytes(&payload);
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let body = BlobStream {
+            size: digest.size(),
+            chunks: Box::pin(
+                stream::once(std::future::ready(Ok(payload))).chain(stream::once(async move {
+                    let _ = blocked_tx.send(());
+                    std::future::pending::<Result<Bytes, PortError>>().await
+                })),
+            ),
+        };
+        let mut upload = Box::pin(content.write(digest, body));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut upload => panic!("upload unexpectedly finished: {result:?}"),
+                result = blocked_rx => result.expect("upload reached blocked body"),
+            }
+        })
+        .await?;
+        {
+            let state = fake.state.lock();
+            assert_eq!(state.create_multipart_requests, 1);
+            assert_eq!(
+                state.upload_part_requests, 1,
+                "first part must exist before cancellation"
+            );
+            assert_eq!(
+                state
+                    .uploads
+                    .values()
+                    .next()
+                    .expect("active upload")
+                    .parts
+                    .len(),
+                1
+            );
+        }
+        drop(upload);
+        if drop_stores {
+            let abort_received = Arc::clone(&fake.state.lock().abort_received);
+            drop(content);
+            drop(cache);
+            tokio::time::timeout(Duration::from_secs(10), abort_received.notified()).await?;
+        } else {
+            tokio::time::timeout(Duration::from_secs(10), content.drain_multipart_aborts()).await?;
+        }
+        let state = fake.state.lock();
+        assert_eq!(state.abort_multipart_requests, 1);
+        assert!(
+            state.uploads.is_empty(),
+            "cancelled upload must not leave orphaned parts"
+        );
+        assert_eq!(state.complete_multipart_requests, 0);
+        assert!(state.objects.is_empty());
         Ok(())
     }
 

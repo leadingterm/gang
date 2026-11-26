@@ -380,9 +380,30 @@ impl ShardedLru {
         explicit_stamp: Option<u64>,
         initial_pin: Option<PinKind>,
     ) -> InsertOutcome {
-        let stamp = explicit_stamp.unwrap_or_else(|| self.next_stamp());
         let mut shard = self.shards[Self::shard_index(&key.digest)].lock();
+        self.insert_in_shard(&mut shard, key, size, explicit_stamp, initial_pin)
+    }
 
+    pub(crate) fn publish<E>(
+        &self,
+        key: CacheKey,
+        size: u64,
+        publish: impl FnOnce() -> Result<(), E>,
+    ) -> Result<InsertOutcome, E> {
+        let mut shard = self.shards[Self::shard_index(&key.digest)].lock();
+        publish()?;
+        Ok(self.insert_in_shard(&mut shard, key, size, None, None))
+    }
+
+    fn insert_in_shard(
+        &self,
+        shard: &mut LruShard,
+        key: CacheKey,
+        size: u64,
+        explicit_stamp: Option<u64>,
+        initial_pin: Option<PinKind>,
+    ) -> InsertOutcome {
+        let stamp = explicit_stamp.unwrap_or_else(|| self.next_stamp());
         if let Some(&idx) = shard.index.get(&key) {
             let Some(node) = shard.node_mut(idx) else {
                 return InsertOutcome::AlreadyPresent;
@@ -588,6 +609,15 @@ impl ShardedLru {
     /// Each step inspects the oldest unpinned tail across all 16 shards (without holding two shard
     /// locks simultaneously) and pops from the shard with the smallest stamp.
     pub fn evict_unpinned_until(&self, target_bytes: u64) -> Vec<EvictedEntry> {
+        self.try_evict_unpinned_until(target_bytes, &mut |_| Ok::<_, std::convert::Infallible>(()))
+            .unwrap_or_else(|never| match never {})
+    }
+
+    pub(crate) fn try_evict_unpinned_until<E>(
+        &self,
+        target_bytes: u64,
+        before_remove: &mut dyn FnMut(CacheKey) -> Result<(), E>,
+    ) -> Result<Vec<EvictedEntry>, E> {
         let mut evicted = Vec::new();
         while self.size_bytes.load(Ordering::Acquire) > target_bytes {
             let mut best: Option<(usize, u64)> = None;
@@ -607,6 +637,9 @@ impl ShardedLru {
                 let mut shard = self.shards[winner_idx].lock();
                 if self.size_bytes.load(Ordering::Acquire) <= target_bytes {
                     break;
+                }
+                if let Some(node) = shard.tail.and_then(|idx| shard.node(idx)) {
+                    before_remove(node.key)?;
                 }
                 shard.pop_unpinned_tail()
             };
@@ -628,7 +661,7 @@ impl ShardedLru {
             self.evicted_bytes.fetch_add(size, Ordering::Relaxed);
             evicted.push(EvictedEntry { key, size });
         }
-        evicted
+        Ok(evicted)
     }
 
     /// Removes `key` from the index without recording an eviction (e.g., when a file vanished).

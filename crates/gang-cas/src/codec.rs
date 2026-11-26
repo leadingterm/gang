@@ -18,7 +18,8 @@ use zstd::stream::raw::{Decoder, Encoder, InBuffer, Operation, OutBuffer};
 /// Default ZSTD compression level for transport encoding.
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
-const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+/// Maximum uncompressed byte chunk emitted per poll by [`decompress_zstd_stream`].
+pub const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Transport compression format supported by Gang CAS streams and batch RPCs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -142,6 +143,11 @@ fn finish_encoder(encoder: &mut Encoder<'static>, scratch: &mut [u8]) -> Result<
     Ok(out.freeze())
 }
 
+struct DecodeStep {
+    consumed: usize,
+    produced: usize,
+}
+
 struct BoundedDecoder {
     decoder: Decoder<'static>,
     scratch: Vec<u8>,
@@ -164,50 +170,29 @@ impl BoundedDecoder {
         })
     }
 
-    fn decode_chunk(&mut self, chunk: &[u8]) -> Result<Bytes, PortError> {
-        let mut out = BytesMut::new();
+    fn decode_chunk(&mut self, chunk: &[u8]) -> Result<DecodeStep, PortError> {
         let mut in_buf = InBuffer::around(chunk);
         let hard_cap = self.expected.size().saturating_add(1);
-
-        loop {
-            let before_in = in_buf.pos();
-            let allow = allowed_write_len(self.decoded_bytes, hard_cap, self.scratch.len());
-            let mut out_buf = OutBuffer::around(&mut self.scratch[..allow]);
-            self.frame_remaining = self
-                .decoder
-                .run(&mut in_buf, &mut out_buf)
-                .map_err(map_zstd_decode_err)?;
-
-            let written = out_buf.as_slice();
-            if !written.is_empty() {
-                let written_u64 = u64::try_from(written.len()).unwrap_or(u64::MAX);
-                self.decoded_bytes = self.decoded_bytes.saturating_add(written_u64);
-                if self.decoded_bytes > self.expected.size() {
-                    return Err(PortError::refused(Rejection::DigestMismatch));
-                }
-                self.hasher.update(written);
-                out.extend_from_slice(written);
-            }
-
-            let consumed = in_buf.pos() > before_in;
-            let produced = !written.is_empty();
-            if in_buf.pos() >= chunk.len() && (self.frame_remaining == 0 || !produced) {
-                break;
-            }
-            if !consumed && !produced {
-                break;
-            }
+        let allow = allowed_write_len(self.decoded_bytes, hard_cap, self.scratch.len());
+        let mut out_buf = OutBuffer::around(&mut self.scratch[..allow]);
+        self.frame_remaining = self
+            .decoder
+            .run(&mut in_buf, &mut out_buf)
+            .map_err(map_zstd_decode_err)?;
+        let written = out_buf.as_slice();
+        let written_u64 = u64::try_from(written.len()).unwrap_or(u64::MAX);
+        self.decoded_bytes = self.decoded_bytes.saturating_add(written_u64);
+        if self.decoded_bytes > self.expected.size() {
+            return Err(PortError::refused(Rejection::DigestMismatch));
         }
-
-        Ok(out.freeze())
+        self.hasher.update(written);
+        Ok(DecodeStep {
+            consumed: in_buf.pos(),
+            produced: written.len(),
+        })
     }
 
-    fn finish(&mut self) -> Result<Bytes, PortError> {
-        let tail = if self.frame_remaining != 0 {
-            self.decode_chunk(&[])?
-        } else {
-            Bytes::new()
-        };
+    fn finish(&mut self) -> Result<(), PortError> {
         if self.frame_remaining != 0 || self.decoded_bytes != self.expected.size() {
             return Err(PortError::refused(Rejection::DigestMismatch));
         }
@@ -215,7 +200,7 @@ impl BoundedDecoder {
         if &actual_hash != self.expected.hash() {
             return Err(PortError::refused(Rejection::DigestMismatch));
         }
-        Ok(tail)
+        Ok(())
     }
 }
 
@@ -231,14 +216,21 @@ impl BoundedDecoder {
 /// size mismatch, SHA-256 mismatch, truncated ZSTD frame, or malformed ZSTD data.
 pub fn decompress_zstd_bounded(digest: Digest, compressed: &[u8]) -> Result<Bytes, PortError> {
     let mut decoder = BoundedDecoder::new(digest)?;
-    let first = decoder.decode_chunk(compressed)?;
-    let tail = decoder.finish()?;
-    if tail.is_empty() {
-        return Ok(first);
+    let mut out = BytesMut::new();
+    let mut remaining = compressed;
+    loop {
+        let step = decoder.decode_chunk(remaining)?;
+        remaining = &remaining[step.consumed..];
+        let produced = step.produced != 0;
+        out.extend_from_slice(&decoder.scratch[..step.produced]);
+        if remaining.is_empty() && (!produced || decoder.frame_remaining == 0) {
+            break;
+        }
+        if step.consumed == 0 && !produced {
+            return Err(PortError::refused(Rejection::DigestMismatch));
+        }
     }
-    let mut out = BytesMut::with_capacity(first.len() + tail.len());
-    out.extend_from_slice(&first);
-    out.extend_from_slice(&tail);
+    decoder.finish()?;
     Ok(out.freeze())
 }
 
@@ -256,6 +248,8 @@ pub fn decompress_zstd_stream(
     struct State {
         input: BoxStream<'static, Result<Bytes, PortError>>,
         decoder: BoundedDecoder,
+        pending: Bytes,
+        drain: bool,
         done: bool,
     }
 
@@ -272,6 +266,8 @@ pub fn decompress_zstd_stream(
     let state = State {
         input: compressed,
         decoder,
+        pending: Bytes::new(),
+        drain: false,
         done: false,
     };
 
@@ -279,32 +275,42 @@ pub fn decompress_zstd_stream(
         if state.done {
             return None;
         }
-        while let Some(next) = state.input.next().await {
-            let chunk = match next {
-                Ok(chunk) => chunk,
+        loop {
+            if state.pending.is_empty() && !state.drain {
+                match state.input.next().await {
+                    Some(Ok(chunk)) if chunk.is_empty() => continue,
+                    Some(Ok(chunk)) => state.pending = chunk,
+                    Some(Err(err)) => {
+                        state.done = true;
+                        return Some((Err(err), state));
+                    }
+                    None => {
+                        state.done = true;
+                        return match state.decoder.finish() {
+                            Ok(()) => None,
+                            Err(err) => Some((Err(err), state)),
+                        };
+                    }
+                }
+            }
+            match state.decoder.decode_chunk(&state.pending) {
+                Ok(step) => {
+                    state.pending = state.pending.slice(step.consumed..);
+                    state.drain = step.produced != 0 && state.decoder.frame_remaining != 0;
+                    if step.produced != 0 {
+                        let out = Bytes::copy_from_slice(&state.decoder.scratch[..step.produced]);
+                        return Some((Ok(out), state));
+                    }
+                    if step.consumed == 0 && !state.pending.is_empty() {
+                        state.done = true;
+                        return Some((Err(PortError::refused(Rejection::DigestMismatch)), state));
+                    }
+                }
                 Err(err) => {
                     state.done = true;
                     return Some((Err(err), state));
                 }
-            };
-            if chunk.is_empty() {
-                continue;
             }
-            match state.decoder.decode_chunk(&chunk) {
-                Ok(out) if !out.is_empty() => return Some((Ok(out), state)),
-                Ok(_) => {}
-                Err(err) => {
-                    state.done = true;
-                    return Some((Err(err), state));
-                }
-            }
-        }
-
-        state.done = true;
-        match state.decoder.finish() {
-            Ok(tail) if !tail.is_empty() => Some((Ok(tail), state)),
-            Ok(_) => None,
-            Err(err) => Some((Err(err), state)),
         }
     }));
 
@@ -417,6 +423,26 @@ mod tests {
             ),
             "expected Rejection::DigestMismatch, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn highly_compressible_input_yields_bounded_chunks() {
+        let payload = vec![0_u8; 4 * 1024 * 1024 + 13];
+        let digest = Digest::from_bytes(&payload);
+        let compressed = compress_zstd(&payload, DEFAULT_ZSTD_LEVEL).expect("compress");
+        let mut decoded = decompress_zstd_stream(digest, Box::pin(stream::iter([Ok(compressed)])));
+        let mut offset = 0;
+        while let Some(chunk) = decoded.chunks.next().await {
+            let chunk = chunk.expect("decode");
+            assert!(
+                chunk.len() <= super::STREAM_CHUNK_BYTES,
+                "oversized chunk: {}",
+                chunk.len()
+            );
+            assert_eq!(chunk.as_ref(), &payload[offset..offset + chunk.len()]);
+            offset += chunk.len();
+        }
+        assert_eq!(offset, payload.len());
     }
 
     #[tokio::test]

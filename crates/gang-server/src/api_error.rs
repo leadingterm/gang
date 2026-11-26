@@ -92,6 +92,10 @@ pub(crate) fn port_status(error: &PortError) -> Status {
         // No route of the API reaches a worker or an instance, and a plugin that cannot issue a
         // credential is not mounted: either would be a bug of the server.
         PortError::NotFound(_)
+        | PortError::Rejected {
+            reason: Rejection::ResourceExhausted,
+            ..
+        }
         | PortError::Unsupported { .. }
         | PortError::Config(_)
         | PortError::Backend(_) => (ErrorReason::InternalError, None),

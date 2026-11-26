@@ -4,6 +4,7 @@ use std::fs::{self, File};
 use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -26,6 +27,8 @@ use crate::stats::CasStats;
 const READ_CHUNK_SIZE: usize = 64 * 1024;
 const READ_CHUNK_SIZE_U64: u64 = 64 * 1024;
 const WRITE_CHANNEL_CAPACITY: usize = 8;
+
+static EVICT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Outcome of writing a verified blob to [`DiskCas`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,11 +253,7 @@ impl DiskCas {
                 .map_err(PortError::backend)?
         };
 
-        stream_into_verified_writer(body, writer).await?;
-
-        if let InsertOutcome::Inserted { size } = self.inner.lru.insert(key, digest.size()) {
-            self.inner.stats.add_size_bytes(size);
-        }
+        stream_into_verified_writer(body, writer, Some((Arc::clone(&self.inner), key))).await?;
 
         if self.inner.lru.size_bytes() > self.inner.budget_bytes {
             self.evict_and_unlink_until(self.inner.budget_bytes).await?;
@@ -300,7 +299,7 @@ impl DiskCas {
         .map_err(PortError::backend)?
         .map_err(PortError::backend)?;
 
-        stream_into_verified_writer(body, writer).await?;
+        stream_into_verified_writer(body, writer, None).await?;
         self.inner.stats.record_slow_read(digest.size());
         Ok(())
     }
@@ -354,9 +353,9 @@ impl DiskCas {
             BlobMode::Executable => BlobMode::Plain,
         };
         let other_key = CacheKey::new(digest, other_mode);
-        if !self.inner.lru.touch(other_key) {
+        let Some(_source_pin) = self.pin_attempt(digest, other_mode.is_executable()) else {
             return Ok(false);
-        }
+        };
         let other_path = blob_path(&self.inner.root, other_key);
         if !other_path.exists() {
             if let Some(removed_size) = self.inner.lru.remove(other_key) {
@@ -368,35 +367,26 @@ impl DiskCas {
         if self.can_admit(digest.size()) {
             let target_after_evict = self.inner.budget_bytes.saturating_sub(digest.size());
             if self.inner.lru.size_bytes() > target_after_evict {
-                let evicted = self.inner.lru.evict_unpinned_until(target_after_evict);
-                self.unlink_evicted_sync(&evicted);
+                let tombstones = self.detach_evicted_until(target_after_evict)?;
+                unlink_tombstones(tombstones).map_err(PortError::backend)?;
             }
             if self.inner.lru.size_bytes() <= target_after_evict {
-                match copy_with_metadata(&other_path, &desired_path, mode) {
-                    Ok(()) => {
-                        if let InsertOutcome::Inserted { size } =
-                            self.inner.lru.insert(desired_key, digest.size())
-                        {
-                            self.inner.stats.add_size_bytes(size);
-                        }
-                        hardlink_or_reflink_file(&desired_path, dest, mode)
-                            .map_err(PortError::backend)?;
-                        self.inner.stats.record_local_read(digest.size());
-                        return Ok(true);
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        if let InsertOutcome::Inserted { size } =
-                            self.inner.lru.insert(desired_key, digest.size())
-                        {
-                            self.inner.stats.add_size_bytes(size);
-                        }
-                        hardlink_or_reflink_file(&desired_path, dest, mode)
-                            .map_err(PortError::backend)?;
-                        self.inner.stats.record_local_read(digest.size());
-                        return Ok(true);
-                    }
-                    Err(error) => return Err(PortError::backend(error)),
+                let outcome =
+                    self.inner.lru.publish(
+                        desired_key,
+                        digest.size(),
+                        || match copy_with_metadata(&other_path, &desired_path, mode) {
+                            Ok(()) => Ok(()),
+                            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                            Err(error) => Err(PortError::backend(error)),
+                        },
+                    )?;
+                if let InsertOutcome::Inserted { size } = outcome {
+                    self.inner.stats.add_size_bytes(size);
                 }
+                hardlink_or_reflink_file(&desired_path, dest, mode).map_err(PortError::backend)?;
+                self.inner.stats.record_local_read(digest.size());
+                return Ok(true);
             }
         }
 
@@ -406,39 +396,43 @@ impl DiskCas {
     }
 
     async fn evict_and_unlink_until(&self, target_bytes: u64) -> Result<(), PortError> {
-        let evicted = self.inner.lru.evict_unpinned_until(target_bytes);
-        if evicted.is_empty() {
-            return Ok(());
-        }
-        let inner = Arc::clone(&self.inner);
+        let cas = self.clone();
         tokio::task::spawn_blocking(move || {
-            let mut total_bytes = 0_u64;
-            let mut count = 0_u64;
-            for entry in evicted {
-                let path = blob_path(&inner.root, entry.key);
-                let _ = fs::remove_file(path);
-                total_bytes = total_bytes.saturating_add(entry.size);
-                count = count.saturating_add(1);
-            }
-            inner.stats.record_evictions(count, total_bytes);
-            inner.stats.sub_size_bytes(total_bytes);
+            let tombstones = cas.detach_evicted_until(target_bytes)?;
+            unlink_tombstones(tombstones).map_err(PortError::backend)
         })
         .await
-        .map_err(PortError::backend)?;
-        Ok(())
+        .map_err(PortError::backend)?
     }
 
-    fn unlink_evicted_sync(&self, evicted: &[crate::lru::EvictedEntry]) {
-        let mut total_bytes = 0_u64;
-        let mut count = 0_u64;
-        for entry in evicted {
-            let path = blob_path(&self.inner.root, entry.key);
-            let _ = fs::remove_file(path);
-            total_bytes = total_bytes.saturating_add(entry.size);
-            count = count.saturating_add(1);
+    fn detach_evicted_until(&self, target_bytes: u64) -> Result<Vec<PathBuf>, PortError> {
+        let mut tombstones = Vec::new();
+        let result = self
+            .inner
+            .lru
+            .try_evict_unpinned_until(target_bytes, &mut |key| {
+                let sequence = EVICT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let tombstone = self
+                    .inner
+                    .root
+                    .join(layout::TMP_DIR_NAME)
+                    .join(format!("evict-{}-{sequence}", std::process::id()));
+                // Publication takes the same shard lock: the old inode is detached before this key
+                // can be reinserted or pinned by a replacement writer.
+                match fs::rename(blob_path(&self.inner.root, key), &tombstone) {
+                    Ok(()) => tombstones.push(tombstone),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(PortError::backend(error)),
+                }
+                self.inner.stats.record_evictions(1, key.digest.size());
+                self.inner.stats.sub_size_bytes(key.digest.size());
+                Ok(())
+            });
+        if let Err(error) = result {
+            unlink_tombstones(tombstones).map_err(PortError::backend)?;
+            return Err(error);
         }
-        self.inner.stats.record_evictions(count, total_bytes);
-        self.inner.stats.sub_size_bytes(total_bytes);
+        Ok(tombstones)
     }
 
     fn find_resident_key(&self, digest: Digest) -> Option<CacheKey> {
@@ -575,13 +569,29 @@ impl ContentStore for DiskCas {
     }
 
     async fn write(&self, digest: Digest, body: BlobStream) -> Result<(), PortError> {
-        let _ = self.write_with_mode(digest, body, false).await?;
-        Ok(())
+        match self.write_with_mode(digest, body, false).await? {
+            WriteOutcome::Cached => Ok(()),
+            WriteOutcome::Bypassed => Err(PortError::rejected(
+                Rejection::ResourceExhausted,
+                "content store capacity cannot admit the verified blob",
+            )),
+        }
     }
 
     fn usage(&self) -> Option<EngineStore> {
         Some(self.inner.stats.engine_store(StoreKind::Content))
     }
+}
+
+fn unlink_tombstones(paths: Vec<PathBuf>) -> io::Result<()> {
+    for path in paths {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 async fn verify_empty_stream(mut body: BlobStream) -> Result<(), PortError> {
@@ -623,6 +633,7 @@ async fn verify_stream_only(digest: Digest, mut body: BlobStream) -> Result<(), 
 async fn stream_into_verified_writer(
     mut body: BlobStream,
     mut writer: VerifiedWriter,
+    publication: Option<(Arc<DiskCasInner>, CacheKey)>,
 ) -> Result<(), PortError> {
     let (tx, mut rx) = mpsc::channel::<WriteChunk>(WRITE_CHANNEL_CAPACITY);
 
@@ -630,7 +641,18 @@ async fn stream_into_verified_writer(
         while let Some(msg) = rx.blocking_recv() {
             match msg {
                 WriteChunk::Data(bytes) => writer.write_chunk(&bytes)?,
-                WriteChunk::Commit => return writer.commit(),
+                WriteChunk::Commit => {
+                    if let Some((inner, key)) = publication {
+                        let outcome = inner
+                            .lru
+                            .publish(key, key.digest.size(), || writer.commit())?;
+                        if let InsertOutcome::Inserted { size } = outcome {
+                            inner.stats.add_size_bytes(size);
+                        }
+                        return Ok(());
+                    }
+                    return writer.commit();
+                }
             }
         }
         // Sender dropped before Commit (stream error or caller cancellation): drop temp without publishing.
@@ -711,6 +733,129 @@ mod tests {
         let dir = TempDir::new()?;
         let cas = DiskCas::open(dir.path(), 1024 * 1024).await?;
         content_store_contract(&cas).await
+    }
+
+    #[tokio::test]
+    async fn authoritative_write_refuses_capacity_bypass() -> TestResult {
+        let dir = TempDir::new()?;
+        let cas = DiskCas::open(dir.path(), 4).await?;
+        let payload = Bytes::from_static(b"too large");
+        let digest = Digest::from_bytes(&payload);
+        assert!(matches!(
+            cas.write(digest, BlobStream::from_bytes(payload.clone()))
+                .await,
+            Err(gang_spi::PortError::Rejected {
+                reason: gang_spi::Rejection::ResourceExhausted,
+                ..
+            })
+        ));
+        assert_eq!(
+            cas.write_with_mode(digest, BlobStream::from_bytes(payload), false)
+                .await?,
+            WriteOutcome::Bypassed
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authoritative_write_refuses_pinned_capacity() -> TestResult {
+        let dir = TempDir::new()?;
+        let resident = Bytes::from_static(b"resident");
+        let replacement = Bytes::from_static(b"replaced");
+        let digest = Digest::from_bytes(&resident);
+        let cas = DiskCas::open(dir.path(), digest.size()).await?;
+        cas.write(digest, BlobStream::from_bytes(resident.clone()))
+            .await?;
+        let _pin = cas.pin_attempt(digest, false).ok_or("resident pin")?;
+        let replacement_digest = Digest::from_bytes(&replacement);
+        assert!(matches!(
+            cas.write(
+                replacement_digest,
+                BlobStream::from_bytes(replacement.clone())
+            )
+            .await,
+            Err(gang_spi::PortError::Rejected {
+                reason: gang_spi::Rejection::ResourceExhausted,
+                ..
+            })
+        ));
+        assert_eq!(
+            cas.write_with_mode(
+                replacement_digest,
+                BlobStream::from_bytes(replacement),
+                false
+            )
+            .await?,
+            WriteOutcome::Bypassed
+        );
+        assert_eq!(
+            cas.read(digest, ByteRange::FULL)
+                .await?
+                .ok_or("resident survives")?
+                .collect()
+                .await?,
+            resident
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eviction_cleanup_preserves_republished_pinned_blob() -> TestResult {
+        let dir = TempDir::new()?;
+        let payload = Bytes::from_static(b"republished");
+        let digest = Digest::from_bytes(&payload);
+        let cas = DiskCas::open(dir.path(), digest.size()).await?;
+        cas.write(digest, BlobStream::from_bytes(payload.clone()))
+            .await?;
+        let tombstones = cas.detach_evicted_until(0)?;
+        assert_eq!(tombstones.len(), 1);
+        let canonical = blob_path(dir.path(), CacheKey::new(digest, BlobMode::Plain));
+        assert!(
+            !canonical.exists(),
+            "eviction must detach before permitting publication"
+        );
+        cas.write(digest, BlobStream::from_bytes(payload.clone()))
+            .await?;
+        let _pin = cas
+            .pin_attempt(digest, false)
+            .ok_or("replacement must be pinnable")?;
+        super::unlink_tombstones(tombstones)?;
+        cas.evict_and_unlink_until(0).await?;
+        assert_eq!(
+            cas.read(digest, ByteRange::FULL)
+                .await?
+                .ok_or("pinned replacement missing")?
+                .collect()
+                .await?,
+            payload
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_eviction_detach_preserves_residency() -> TestResult {
+        let dir = TempDir::new()?;
+        let payload = Bytes::from_static(b"resident");
+        let digest = Digest::from_bytes(&payload);
+        let cas = DiskCas::open(dir.path(), digest.size()).await?;
+        cas.write(digest, BlobStream::from_bytes(payload.clone()))
+            .await?;
+        let temporary = dir.path().join(crate::layout::TMP_DIR_NAME);
+        fs::remove_dir(&temporary)?;
+        fs::write(temporary, b"obstructed tombstone parent")?;
+        assert!(cas.detach_evicted_until(0).is_err());
+        let _pin = cas
+            .pin_attempt(digest, false)
+            .ok_or("failed eviction must retain index entry")?;
+        assert_eq!(
+            cas.read(digest, ByteRange::FULL)
+                .await?
+                .ok_or("resident blob")?
+                .collect()
+                .await?,
+            payload
+        );
+        Ok(())
     }
 
     #[tokio::test]

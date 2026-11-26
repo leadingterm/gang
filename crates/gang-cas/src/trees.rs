@@ -38,6 +38,8 @@ const DEFAULT_MAX_TREES: usize = 256;
 const DEFAULT_TREE_PIN_PERCENT: u8 = 50;
 const DOT_TMP_DIR_NAME: &str = ".tmp";
 const MAX_TREE_DEPTH: usize = 256;
+const MAX_EXPANDED_NODES: usize = 250_000;
+const MAX_EXPANDED_PATH_BYTES: usize = 64 * 1024 * 1024;
 
 static TREE_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -593,10 +595,112 @@ struct TreePlan {
     total_bytes: u64,
 }
 
+#[derive(Clone, Copy)]
+struct Expansion {
+    nodes: usize,
+    path_bytes: usize,
+    depth: usize,
+}
+
+fn expansion_limit() -> PortError {
+    PortError::rejected(
+        Rejection::MalformedRequest,
+        "REAPI directory tree exceeds expanded node or path-byte limits",
+    )
+}
+
+// Memoize by digest before allocating per-path state. A diamond DAG is accounted for in O(V+E)
+// work rather than enumerating its exponentially many materialized paths.
+fn measure_expansion(
+    digest: Digest,
+    directories: &HashMap<Digest, Directory>,
+    memo: &mut HashMap<Digest, Expansion>,
+    visiting: &mut HashSet<Digest>,
+) -> Result<Expansion, PortError> {
+    if let Some(&expansion) = memo.get(&digest) {
+        return Ok(expansion);
+    }
+    if visiting.len() >= MAX_TREE_DEPTH || !visiting.insert(digest) {
+        return Err(PortError::rejected(
+            Rejection::MalformedRequest,
+            "REAPI directory tree is cyclic or exceeds maximum depth",
+        ));
+    }
+    let dir = directories.get(&digest).ok_or_else(|| {
+        PortError::rejected(
+            Rejection::MalformedRequest,
+            format!("missing Directory {digest}"),
+        )
+    })?;
+    let mut expansion = Expansion {
+        nodes: 1,
+        path_bytes: 0,
+        depth: 1,
+    };
+    for name in dir
+        .files
+        .iter()
+        .map(|node| node.name.as_str())
+        .chain(dir.symlinks.iter().map(|node| node.name.as_str()))
+    {
+        validate_node_name(name)?;
+        expansion.nodes = expansion.nodes.checked_add(1).ok_or_else(expansion_limit)?;
+        expansion.path_bytes = expansion
+            .path_bytes
+            .checked_add(name.len())
+            .ok_or_else(expansion_limit)?;
+    }
+    for child in &dir.directories {
+        validate_node_name(&child.name)?;
+        let proto = child.digest.as_ref().ok_or_else(|| {
+            PortError::rejected(
+                Rejection::MalformedRequest,
+                format!("directory `{}` has no digest", child.name),
+            )
+        })?;
+        let child_digest = from_proto(proto)
+            .map_err(|err| PortError::rejected(Rejection::MalformedRequest, err))?;
+        let child_expansion = measure_expansion(child_digest, directories, memo, visiting)?;
+        expansion.nodes = expansion
+            .nodes
+            .checked_add(child_expansion.nodes)
+            .ok_or_else(expansion_limit)?;
+        let prefix_bytes = child
+            .name
+            .len()
+            .checked_add(1)
+            .and_then(|prefix| prefix.checked_mul(child_expansion.nodes))
+            .and_then(|bytes| bytes.checked_sub(1))
+            .ok_or_else(expansion_limit)?;
+        expansion.path_bytes = expansion
+            .path_bytes
+            .checked_add(child_expansion.path_bytes)
+            .and_then(|bytes| bytes.checked_add(prefix_bytes))
+            .ok_or_else(expansion_limit)?;
+        expansion.depth = expansion.depth.max(child_expansion.depth + 1);
+        if expansion.nodes > MAX_EXPANDED_NODES || expansion.path_bytes > MAX_EXPANDED_PATH_BYTES {
+            return Err(expansion_limit());
+        }
+    }
+    if expansion.nodes > MAX_EXPANDED_NODES || expansion.path_bytes > MAX_EXPANDED_PATH_BYTES {
+        return Err(expansion_limit());
+    }
+    if expansion.depth > MAX_TREE_DEPTH {
+        return Err(PortError::rejected(
+            Rejection::MalformedRequest,
+            "REAPI directory tree exceeds maximum depth",
+        ));
+    }
+    visiting.remove(&digest);
+    memo.insert(digest, expansion);
+    Ok(expansion)
+}
+
 fn build_tree_plan(
     root: Digest,
     directories: &HashMap<Digest, Directory>,
 ) -> Result<TreePlan, PortError> {
+    measure_expansion(root, directories, &mut HashMap::new(), &mut HashSet::new())?;
     let mut plan = TreePlan {
         dirs: Vec::new(),
         files: Vec::new(),
@@ -910,26 +1014,29 @@ async fn evict_one_unleased(
     inner: &TreeCacheInner,
     await_pin_release: bool,
 ) -> Result<bool, PortError> {
-    let evicted_entry = {
-        let mut index = inner.state.lock();
-        let Some(victim) = index.oldest_unleased_digest() else {
-            return Ok(false);
-        };
-        index.entries.remove(&victim)
-    };
-    let Some(entry) = evicted_entry else {
-        return Ok(false);
-    };
-
+    let state = Arc::clone(&inner.state);
     let dest_parent = inner
         .graveyard
         .clone()
         .unwrap_or_else(|| inner.root.join(DOT_TMP_DIR_NAME));
-    let src_path = entry.path;
-    let graveyard_path =
-        tokio::task::spawn_blocking(move || move_to_graveyard(&src_path, &dest_parent))
-            .await
-            .map_err(PortError::backend)??;
+    let detached = tokio::task::spawn_blocking(move || {
+        let mut index = state.lock();
+        let Some(victim) = index.oldest_unleased_digest() else {
+            return Ok(None);
+        };
+        let Some(entry) = index.entries.get(&victim) else {
+            return Ok(None);
+        };
+        // Keep the entry locked until its canonical path is detached. A new publication/lease
+        // can then use that key while cleanup owns only this unique graveyard path.
+        let path = move_to_graveyard(&entry.path, &dest_parent)?;
+        Ok::<_, PortError>(index.entries.remove(&victim).map(|entry| (entry, path)))
+    })
+    .await
+    .map_err(PortError::backend)??;
+    let Some((entry, graveyard_path)) = detached else {
+        return Ok(false);
+    };
 
     let evicted = EvictedTree {
         path: graveyard_path,
@@ -1024,8 +1131,12 @@ fn build_and_publish_tree(
             normalize_dir(final_path, &times).map_err(PortError::backend)?;
             Ok(())
         }
-        Err(error) if final_path.exists() => {
-            let _ = error;
+        Err(error)
+            if matches!(error.raw_os_error(), Some(code) if code == rustix::io::Errno::EXIST.raw_os_error()
+                || code == rustix::io::Errno::NOTEMPTY.raw_os_error())
+                && fs::symlink_metadata(final_path)
+                    .is_ok_and(|metadata| metadata.file_type().is_dir()) =>
+        {
             Ok(())
         }
         Err(error) => Err(PortError::backend(error)),
@@ -1136,16 +1247,11 @@ fn move_to_graveyard(src_path: &Path, graveyard_dir: &Path) -> Result<PathBuf, P
         let _ = grant_owner_write_dir(src_path);
     }
 
-    fs::rename(src_path, &dest).map_err(|error| {
-        PortError::backend(io::Error::new(
-            error.kind(),
-            format!(
-                "failed to move {} into graveyard {}: {error}",
-                src_path.display(),
-                dest.display()
-            ),
-        ))
-    })?;
+    match fs::rename(src_path, &dest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(PortError::backend(error)),
+    }
     Ok(dest)
 }
 
@@ -1231,6 +1337,73 @@ mod tests {
     use crate::lru::{BlobMode, CacheKey};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
+
+    fn diamond_directories(levels: usize, name_len: usize) -> (Digest, HashMap<Digest, Directory>) {
+        let leaf = Directory::default();
+        let mut digest = Digest::from_bytes(&leaf.encode_to_vec());
+        let mut directories = HashMap::from([(digest, leaf)]);
+        for _ in 0..levels {
+            let directory = Directory {
+                directories: ["a", "b"]
+                    .into_iter()
+                    .map(|name| DirectoryNode {
+                        name: name.repeat(name_len),
+                        digest: Some(to_proto(&digest).expect("test digest")),
+                    })
+                    .collect(),
+                ..Directory::default()
+            };
+            digest = Digest::from_bytes(&directory.encode_to_vec());
+            directories.insert(digest, directory);
+        }
+        (digest, directories)
+    }
+
+    #[test]
+    fn rejects_exponential_dag_before_expanding_paths() {
+        let (root, directories) = diamond_directories(30, 1);
+        let error = super::build_tree_plan(root, &directories).expect_err("exponential expansion");
+        assert!(matches!(
+            error,
+            gang_spi::PortError::Rejected {
+                reason: gang_spi::Rejection::MalformedRequest,
+                ..
+            }
+        ));
+        assert!(
+            std::error::Error::source(&error)
+                .expect("limit explanation")
+                .to_string()
+                .contains("expanded node or path-byte limits")
+        );
+    }
+
+    #[test]
+    fn limits_path_bytes_independently_of_node_count() {
+        let (root, directories) = diamond_directories(16, 255);
+        assert!(super::build_tree_plan(root, &directories).is_err());
+        let (root, directories) = diamond_directories(10, 1);
+        let plan = super::build_tree_plan(root, &directories).expect("bounded diamond");
+        assert_eq!(plan.dirs.len(), 2046);
+    }
+
+    #[test]
+    fn expansion_limit_allows_twenty_thousand_file_canary() {
+        let directory = Directory {
+            files: (0..20_000)
+                .map(|index| FileNode {
+                    name: format!("file-{index}"),
+                    digest: Some(to_proto(&Digest::EMPTY).expect("empty digest")),
+                    ..FileNode::default()
+                })
+                .collect(),
+            ..Directory::default()
+        };
+        let root = Digest::from_bytes(&directory.encode_to_vec());
+        let plan =
+            super::build_tree_plan(root, &HashMap::from([(root, directory)])).expect("canary fits");
+        assert_eq!(plan.files.len(), 20_000);
+    }
 
     struct TempDir {
         path: PathBuf,
@@ -1356,6 +1529,62 @@ mod tests {
         dirs.insert(sub_digest, sub_dir);
         dirs.insert(root_digest, root_dir);
         Ok((root_digest, dirs))
+    }
+
+    #[tokio::test]
+    async fn publication_rejects_existing_non_directory_destination() -> TestResult {
+        let dir = TempDir::new()?;
+        let cas = DiskCas::open(dir.path().join("cas"), 1024).await?;
+        let trees = dir.path().join("trees");
+        fs::create_dir_all(&trees)?;
+        let destination = trees.join("canonical");
+        fs::write(&destination, b"not a directory")?;
+        let plan = super::TreePlan {
+            dirs: Vec::new(),
+            files: Vec::new(),
+            symlinks: Vec::new(),
+            total_bytes: 0,
+        };
+        assert!(
+            super::build_and_publish_tree(&trees, &destination, &cas, &plan).is_err(),
+            "an unexpected rename failure must not acknowledge publication"
+        );
+        assert_eq!(fs::read(destination)?, b"not a directory");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_eviction_detach_preserves_leaseable_tree() -> TestResult {
+        let dir = TempDir::new()?;
+        let cas = DiskCas::open(dir.path().join("cas"), 1024).await?;
+        let file = stage_blob(&cas, b"resident", false).await?;
+        let (root, directories) = build_single_file_tree("file", file, false)?;
+        let graveyard = dir.path().join("graveyard");
+        let cache = TreeCache::open(
+            dir.path().join("trees"),
+            Some(graveyard.clone()),
+            cas,
+            TreeCacheConfig {
+                min_files: 1,
+                max_trees: 1,
+                tree_pin_percent: Percent::from_percent(100),
+            },
+        )
+        .await?;
+        drop(
+            cache
+                .get_or_materialize(root, &directories)
+                .await?
+                .ok_or("tree")?,
+        );
+        fs::write(&graveyard, b"obstructed tombstone parent")?;
+        assert!(super::evict_one_unleased(&cache.inner, true).await.is_err());
+        let lease = cache
+            .get_or_materialize(root, &directories)
+            .await?
+            .ok_or("failed eviction must retain leaseable entry")?;
+        assert_eq!(fs::read(lease.path().join("sub/file"))?, b"resident");
+        Ok(())
     }
 
     #[tokio::test]
@@ -1548,7 +1777,6 @@ mod tests {
             .get_or_materialize(t2, &dirs2)
             .await?
             .ok_or("t2 again")?;
-        drop(l2_again);
 
         let drained: Vec<EvictedTree> = std::mem::take(&mut *evicted_queue.lock());
         assert_eq!(drained.len(), 3);
@@ -1576,6 +1804,12 @@ mod tests {
             item.unlink_and_release()?;
             assert!(!path.exists());
         }
+
+        assert_eq!(fs::read(l2_again.path().join("sub/f2"))?, payload2);
+        assert!(
+            cache.get_or_materialize(t1, &dirs1).await?.is_none(),
+            "replacement lease must still prevent eviction"
+        );
 
         // Now only the currently resident tree `t2` retains its `CasPin`.
         assert_eq!(cas.tree_pinned_bytes(), d2.size());
