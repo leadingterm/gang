@@ -1190,6 +1190,8 @@ fn apply_escalation_decision(
         } => {
             if let Some(op) = operations.get_mut(operation) {
                 op.reservation = next_reservation;
+                op.cpu_weight =
+                    crate::qos::weight_for_reservation(op.priority, op.reservation.cpu_millicores);
                 match resource {
                     KillResource::Memory => {
                         op.retry_counts.memory_steps =

@@ -176,9 +176,11 @@ is re-indexed keeping its original `seq`. On a `Running` operation the promotion
 applies to any worker-loss or escalation retry. Priority is never lowered by deduplication.
 
 **`CpuWeight`** (`gang-types`, `NonZeroU16` in `1..=10_000`, the cgroup v2 `cpu.weight` range).
-One pure mapping in `gang-scheduler::qos`:
+One pure core-scaled mapping in `gang-scheduler::qos`:
+`cpu.weight = clamp(tier_per_core * max(1, ceil(reserved_millicores / 1000)), 1, 10_000)` (leaving
+`cpu.max` untouched for `cpu_millicores` reservations so actions stay work-conserving):
 
-| `priority` | Tier | `cpu_weight` |
+| `priority` | Tier | `tier_per_core` (1-core `cpu.weight`) |
 |---|---|---|
 | `>= 200` | gate | 1000 |
 | `100..=199` | interactive | 100 |
@@ -904,9 +906,10 @@ candidate, provenance and cache state recorded for both sides:
   plus per-action sources); full `gang-e2e` timing.
 - **QoS contention canary:** at 3× CPU oversubscription, gate (`200`) actions' concurrent CPU
   demand is capped at ≤ 1× physical vCPUs, while interactive (`100`) and background (`0`) actions
-  supply the remaining 2× oversubscription; pass when gate-tier p95 wall time ≤ 1.25× its
-  uncontended baseline (achievable because gate demand fits the machine) and background still
-  completes (no starvation).
+  supply the remaining 2× oversubscription; pass when (a) single-core gate-tier p95 wall time
+  ≤ 1.25× its uncontended baseline and background still completes (no starvation), and (b) a
+  12-thread gate action declaring `cpu_millicores = 12000` (without `cpu_count`) under 3×
+  contention receives ≥ 11 cores of `cpu.stat` `usage_usec` per wall second while contended.
 - **ActionCache invariance:** the same build on both binaries; candidate AC hit rate ≥ 99% of the
   v0.3.9-populated cache.
 - **Metrics:** stage-in p50/p95; Execute→Accept p99; post-upload gap p99; end-to-end action latency

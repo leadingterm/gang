@@ -88,10 +88,17 @@ pub const fn classify(priority: i32) -> PriorityTier {
     PriorityTier::from_priority(priority)
 }
 
-/// Maps an `REAPI` `ExecutionPolicy.priority` onto its `cgroup` v2 [`CpuWeight`].
+/// Maps an `REAPI` `ExecutionPolicy.priority` onto its single-core `cgroup` v2 [`CpuWeight`].
 #[must_use]
 pub const fn weight(priority: i32) -> CpuWeight {
     CpuWeight::from_priority(priority)
+}
+
+/// Maps an `REAPI` `ExecutionPolicy.priority` and reserved CPU millicores onto a core-scaled
+/// `cgroup` v2 [`CpuWeight`] (`clamp(tier_per_core * max(1, ceil(millicores / 1000)), 1, 10_000)`).
+#[must_use]
+pub const fn weight_for_reservation(priority: i32, reserved_cpu_millicores: u64) -> CpuWeight {
+    CpuWeight::for_priority_and_millicores(priority, reserved_cpu_millicores)
 }
 
 /// Returns `true` when `priority` falls in the gate tier (`priority >= 200`).

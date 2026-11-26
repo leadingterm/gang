@@ -1375,7 +1375,10 @@ mod tests {
                 .any(|e| matches!(e, Effect::AuditGateTier(a) if a.priority == 250))
         );
         let (assigned_w, _, att1, weight1) = extract_assign(&out).expect("op1 assigned");
-        assert_eq!((assigned_w, weight1), (w, CpuWeight::GATE));
+        assert_eq!(
+            (assigned_w, weight1),
+            (w, CpuWeight::for_priority_and_millicores(250, 4_000))
+        );
 
         out.clear();
         let op2 = sched
@@ -1414,7 +1417,7 @@ mod tests {
         );
 
         let (_, _, att2, weight2) = extract_assign(&out).expect("op2 dispatched on Executed");
-        assert_eq!(weight2, CpuWeight::INTERACTIVE);
+        assert_eq!(weight2, CpuWeight::for_priority_and_millicores(100, 4_000));
 
         out.clear();
         let completed = WorkerEvent::Completed(WorkerCompleted {
@@ -1493,7 +1496,7 @@ mod tests {
         reg.max_inflight = Some(NonZeroU32::new(1).expect("1"));
         let _w = sched.register(now(4), reg, &mut out).expect("register");
         let (_, _, _, weight) = extract_assign(&out).expect("assigned");
-        assert_eq!(weight, CpuWeight::GATE);
+        assert_eq!(weight, CpuWeight::for_priority_and_millicores(250, 4_000));
         assert_eq!(
             sched.operations().get(op_a).expect("op_a").stage,
             OperationStage::Running

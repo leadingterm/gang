@@ -500,7 +500,8 @@ impl Operations {
         }
 
         let seq = self.next_seq;
-        let cpu_weight = qos::weight(spec.priority);
+        let cpu_weight =
+            qos::weight_for_reservation(spec.priority, spec.reservation.cpu_millicores);
         let client_less_since = (spec.initial_watchers == 0).then_some(now.tick);
         let dedup_key = (!spec.skip_cache_lookup)
             .then(|| DedupKey::new(spec.action_digest, spec.platform_key.clone()));
@@ -566,7 +567,8 @@ impl Operations {
         if incoming_priority > op.priority {
             let old_priority = op.priority;
             op.priority = incoming_priority;
-            op.cpu_weight = qos::weight(incoming_priority);
+            op.cpu_weight =
+                qos::weight_for_reservation(incoming_priority, op.reservation.cpu_millicores);
             promoted = true;
             if op.stage == OperationStage::Queued {
                 queue.promote(key, op.candidates, old_priority, op.priority, op.seq);

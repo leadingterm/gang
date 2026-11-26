@@ -31,7 +31,7 @@ mod harness {
         DeclineReason, Effect, Effects, ExecuteError, KillCause, Learned, Now, OperationKey,
         OperationStage, OperationUpdate, QueueKey, RegisterError, RehomeReason, RetryCounts,
         Scheduler, SchedulerPolicy, SketchKey, WorkerCompleted, WorkerEvent, WorkerExecuted,
-        WorkerKey, WorkerRegistration, cmp_reserved_cpu_fraction, weight,
+        WorkerKey, WorkerRegistration, cmp_reserved_cpu_fraction, weight_for_reservation,
     };
     use gang_spi::{
         ActionsView, ControllerDrain, LearnedHistory, ListingLimits, SchedulerSnapshot,
@@ -1093,8 +1093,17 @@ mod harness {
                 .operations()
                 .get(operation)
                 .expect("assigned op exists");
-            assert_eq!(cpu_weight, weight(op.priority));
-            verify_exact_qos_weight(op.priority, cpu_weight, self.seed, self.step);
+            assert_eq!(
+                cpu_weight,
+                weight_for_reservation(op.priority, op.reservation.cpu_millicores)
+            );
+            verify_exact_qos_weight(
+                op.priority,
+                op.reservation.cpu_millicores,
+                cpu_weight,
+                self.seed,
+                self.step,
+            );
             assert!(self.scheduler.attempts().get(attempt).is_some());
             assert_eq!(
                 self.scheduler.attempts().lookup_id(attempt_id),
@@ -1232,7 +1241,10 @@ mod harness {
             let mut expected_dedup_count = 0_usize;
 
             for (op_key, op) in ops.iter() {
-                assert_eq!(op.cpu_weight, weight(op.priority));
+                assert_eq!(
+                    op.cpu_weight,
+                    weight_for_reservation(op.priority, op.reservation.cpu_millicores)
+                );
                 if let Some(&init_seq) = self.op_initial_seq.get(&op_key) {
                     assert_eq!(op.seq, init_seq);
                 }
@@ -1586,18 +1598,31 @@ mod harness {
         }
     }
 
-    fn verify_exact_qos_weight(priority: i32, actual: CpuWeight, seed: u64, step: usize) {
-        let expected_raw = if priority >= 200 {
-            1_000
+    fn verify_exact_qos_weight(
+        priority: i32,
+        reserved_cpu_millicores: u64,
+        actual: CpuWeight,
+        seed: u64,
+        step: usize,
+    ) {
+        let per_core = if priority >= 200 {
+            1_000_u64
         } else if priority >= 100 {
-            100
+            100_u64
         } else {
-            20
+            20_u64
         };
+        let cores = if reserved_cpu_millicores == 0 {
+            1
+        } else {
+            reserved_cpu_millicores.div_ceil(1_000)
+        };
+        let expected_raw =
+            u32::try_from(per_core.saturating_mul(cores).clamp(1, 10_000)).unwrap_or(10_000);
         assert_eq!(
             actual.get(),
             expected_raw,
-            "seed={seed} step={step}: priority {priority} mapped to {}, expected {expected_raw}",
+            "seed={seed} step={step}: priority {priority} ({reserved_cpu_millicores}m) mapped to {}, expected {expected_raw}",
             actual.get()
         );
     }
@@ -1963,9 +1988,15 @@ mod harness {
             exec_simple(&mut sim, "operations/p2-gt", b"d2", 250, false),
             op2
         );
+        let op2_res = sim
+            .scheduler
+            .operations()
+            .get(op2)
+            .expect("op2")
+            .reservation;
         assert_eq!(
             sim.scheduler.operations().get(op2).expect("op2").cpu_weight,
-            CpuWeight::GATE
+            weight_for_reservation(250, op2_res.cpu_millicores)
         );
         assert_ne!(
             exec_simple(&mut sim, "operations/p2-nc", b"d2", 250, true),
@@ -1991,10 +2022,17 @@ mod harness {
         sim.effects.clear();
         sim.scheduler
             .on_worker_lost(sim.now(), op1_worker, &mut sim.effects);
+        let op1_res = sim
+            .scheduler
+            .operations()
+            .get(op1)
+            .expect("op1")
+            .reservation;
+        let expected_op1_weight = weight_for_reservation(260, op1_res.cpu_millicores);
         assert!(sim.effects.iter().any(|e| matches!(
             e,
             Effect::AssignWorker { operation, cpu_weight, .. }
-                if *operation == op1 && *cpu_weight == CpuWeight::GATE
+                if *operation == op1 && *cpu_weight == expected_op1_weight
         )));
         sim.verify_effects("promoted_worker_loss", false);
         sim.check_invariants("promoted_worker_loss");

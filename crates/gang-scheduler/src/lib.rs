@@ -76,7 +76,7 @@ pub use pressure::{
 };
 pub use qos::{
     GATE_PRIORITY_THRESHOLD, GateAudit, INTERACTIVE_PRIORITY_THRESHOLD, PriorityTier, classify,
-    gate_audit, is_gate, weight,
+    gate_audit, is_gate, weight, weight_for_reservation,
 };
 pub use queue::{OperationQueue, QueueKey};
 pub use rates::{RatesError, SourceRates, execution_timing};

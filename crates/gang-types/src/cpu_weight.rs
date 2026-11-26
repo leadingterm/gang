@@ -89,7 +89,7 @@ impl CpuWeight {
         }
     }
 
-    /// Maps an `REAPI` `ExecutionPolicy.priority` onto its `CpuWeight` `QoS` tier.
+    /// Maps an `REAPI` `ExecutionPolicy.priority` onto its per-core `CpuWeight` `QoS` tier.
     ///
     /// - `priority >= 200` -> [`CpuWeight::GATE`] (`1000`)
     /// - `100..=199` -> [`CpuWeight::INTERACTIVE`] (`100`)
@@ -102,6 +102,36 @@ impl CpuWeight {
             Self::INTERACTIVE
         } else {
             Self::BACKGROUND
+        }
+    }
+
+    /// Maps an `REAPI` `ExecutionPolicy.priority` and reserved CPU millicores onto a core-scaled
+    /// `cgroup` v2 `cpu.weight`:
+    /// `clamp(tier_per_core * max(1, ceil(reserved_millicores / 1000)), 1, 10_000)`.
+    ///
+    /// Single-core (or sub-core / zero) reservations preserve the exact `1000 / 100 / 20` tier
+    /// weights, while multi-core reservations scale proportionally so multi-threaded actions are
+    /// not starved by many single-threaded cgroups under oversubscription.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn for_priority_and_millicores(priority: i32, reserved_millicores: u64) -> Self {
+        let per_core = Self::from_priority(priority).get() as u64;
+        let cores = if reserved_millicores == 0 {
+            1
+        } else {
+            reserved_millicores.div_ceil(1_000)
+        };
+        let scaled = per_core.saturating_mul(cores);
+        let clamped = if scaled > 10_000 {
+            10_000_u16
+        } else if scaled == 0 {
+            1_u16
+        } else {
+            scaled as u16
+        };
+        match NonZeroU16::new(clamped) {
+            Some(weight) => Self(weight),
+            None => Self::MIN,
         }
     }
 
@@ -240,6 +270,28 @@ mod tests {
         assert_eq!(CpuWeight::from_priority(0), CpuWeight::BACKGROUND);
         assert_eq!(CpuWeight::from_priority(-1), CpuWeight::BACKGROUND);
         assert_eq!(CpuWeight::from_priority(i32::MIN), CpuWeight::BACKGROUND);
+
+        assert_eq!(
+            CpuWeight::for_priority_and_millicores(200, 0),
+            CpuWeight::GATE
+        );
+        assert_eq!(
+            CpuWeight::for_priority_and_millicores(200, 1_000),
+            CpuWeight::GATE
+        );
+        assert_eq!(
+            CpuWeight::for_priority_and_millicores(200, 1_500).get(),
+            2_000
+        );
+        assert_eq!(
+            CpuWeight::for_priority_and_millicores(200, 12_000),
+            CpuWeight::MAX
+        );
+        assert_eq!(
+            CpuWeight::for_priority_and_millicores(100, 12_000).get(),
+            1_200
+        );
+        assert_eq!(CpuWeight::for_priority_and_millicores(0, 12_000).get(), 240);
     }
 
     #[test]
