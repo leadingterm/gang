@@ -758,6 +758,7 @@ fn build_scheduler_policy<C, A>(
         client_action_timeout: spec.client_action_timeout,
         attempt_budget: spec.attempt_budget,
         attempt_seed: u64::from_be_bytes(seed_bytes),
+        ..SchedulerPolicy::default()
     })
 }
 

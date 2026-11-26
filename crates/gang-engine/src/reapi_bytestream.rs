@@ -89,6 +89,7 @@ enum UploadItem {
 
 struct UploadEntry {
     active_writer: AsyncMutex<()>,
+    decoded_chunk_limit: u64,
     committed_size: AtomicI64,
     chunk_tx: Mutex<Option<mpsc::Sender<UploadItem>>>,
     result_rx: AsyncMutex<Option<oneshot::Receiver<Result<(), PortError>>>>,
@@ -318,6 +319,13 @@ impl<C: ContentStore> ByteStreamService<C> {
 
         let entry = Arc::new(UploadEntry {
             active_writer: AsyncMutex::new(()),
+            decoded_chunk_limit: match compression {
+                Compression::Identity => 0,
+                Compression::Zstd => digest
+                    .size()
+                    .saturating_add(1)
+                    .min(u64::try_from(gang_cas::STREAM_CHUNK_BYTES).unwrap_or(u64::MAX)),
+            },
             committed_size: AtomicI64::new(0),
             chunk_tx: Mutex::new(Some(tx)),
             result_rx: AsyncMutex::new(Some(result_rx)),
@@ -614,6 +622,10 @@ async fn send_chunk_bounded(
         let end = offset.saturating_add(max_slice).min(data.len());
         let slice = data.slice(offset..end);
         let slice_len = u64::try_from(slice.len()).unwrap_or(u64::MAX);
+        // The decoder retains this input permit until it has drained all output
+        // from the slice. Reserve for either representation once; never acquire
+        // an output permit while retaining an input permit from the same budget.
+        let reservation = slice_len.max(entry.decoded_chunk_limit);
 
         let permit = {
             let notified = entry.error_notify.notified();
@@ -623,7 +635,7 @@ async fn send_chunk_bounded(
                 return Err(err);
             }
             tokio::select! {
-                res = budget.acquire(slice_len) => res?,
+                res = budget.acquire(reservation) => res?,
                 () = notified => {
                     return Err(entry.take_terminal_error().unwrap_or_else(|| {
                         Status::internal("upload task terminated unexpectedly")
@@ -920,6 +932,7 @@ impl<C: ContentStore> ByteStream for ByteStreamService<C> {
 mod tests {
     use std::num::NonZeroUsize;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -929,6 +942,7 @@ mod tests {
     };
     use gang_reapi::google::bytestream::byte_stream_client::ByteStreamClient;
     use gang_reapi::google::bytestream::{QueryWriteStatusRequest, ReadRequest, WriteRequest};
+    use gang_spi::{BlobStream, ByteRange, ContentStore, EngineStore, PortError};
     use gang_testkit::MemoryContentStore;
     use gang_types::{Digest, NonZeroBytes};
     use tokio::net::TcpListener;
@@ -955,6 +969,13 @@ mod tests {
         };
         let service = ByteStreamService::new(store, budget.clone(), config);
 
+        let (channel, handle) = serve_service(service).await;
+        (channel, budget, handle)
+    }
+
+    async fn serve_service<C: ContentStore>(
+        service: ByteStreamService<C>,
+    ) -> (Channel, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let incoming = TcpIncoming::from(listener);
@@ -972,7 +993,143 @@ mod tests {
             .await
             .expect("connect");
 
-        (channel, budget, handle)
+        (channel, handle)
+    }
+
+    #[derive(Debug)]
+    struct BudgetedStore {
+        inner: MemoryContentStore,
+        budget: InflightBlobBudget,
+        peak_reserved: Arc<AtomicU64>,
+        decoded_chunks: Arc<AtomicU64>,
+    }
+
+    impl ContentStore for BudgetedStore {
+        async fn find_missing(
+            &self,
+            digests: &[Digest],
+            missing: &mut Vec<Digest>,
+        ) -> Result<(), PortError> {
+            self.inner.find_missing(digests, missing).await
+        }
+
+        async fn read(
+            &self,
+            digest: Digest,
+            range: ByteRange,
+        ) -> Result<Option<BlobStream>, PortError> {
+            self.inner.read(digest, range).await
+        }
+
+        async fn write(&self, digest: Digest, body: BlobStream) -> Result<(), PortError> {
+            let budget = self.budget.clone();
+            let peak = Arc::clone(&self.peak_reserved);
+            let chunks = Arc::clone(&self.decoded_chunks);
+            let guarded = body.chunks.map(move |chunk| {
+                if let Ok(ref bytes) = chunk {
+                    let reserved = budget.capacity() - budget.available();
+                    assert!(
+                        reserved >= u64::try_from(bytes.len()).expect("length"),
+                        "decoded bytes must retain their reservation"
+                    );
+                    assert!(
+                        bytes.len() <= gang_cas::STREAM_CHUNK_BYTES,
+                        "decoder output must stay bounded"
+                    );
+                    peak.fetch_max(reserved, Ordering::Relaxed);
+                    chunks.fetch_add(1, Ordering::Relaxed);
+                }
+                chunk
+            });
+            self.inner
+                .write(
+                    digest,
+                    BlobStream {
+                        size: body.size,
+                        chunks: Box::pin(guarded),
+                    },
+                )
+                .await
+        }
+
+        fn usage(&self) -> Option<EngineStore> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_compressed_writes_account_for_expansion() {
+        let budget = InflightBlobBudget::new(NonZeroBytes::kib(64));
+        let store = Arc::new(BudgetedStore {
+            inner: MemoryContentStore::new(),
+            budget: budget.clone(),
+            peak_reserved: Arc::new(AtomicU64::new(0)),
+            decoded_chunks: Arc::new(AtomicU64::new(0)),
+        });
+        let service = ByteStreamService::with_defaults(Arc::clone(&store), budget.clone());
+        let (channel, handle) = serve_service(service).await;
+        let upload = |id: &'static str, value: u8| {
+            let channel = channel.clone();
+            async move {
+                let payload = Bytes::from(vec![value; 512 * 1024]);
+                let digest = Digest::from_bytes(&payload);
+                let compressed = compress_zstd(&payload, DEFAULT_ZSTD_LEVEL).expect("compress");
+                let mut client = ByteStreamClient::new(channel);
+                let result = client
+                    .write(futures::stream::iter([WriteRequest {
+                        resource_name: ResourceName::upload("", id, Compression::Zstd, digest)
+                            .expect("name")
+                            .to_string(),
+                        write_offset: 0,
+                        finish_write: true,
+                        data: compressed.clone(),
+                    }]))
+                    .await
+                    .expect("compressed write")
+                    .into_inner();
+                assert_eq!(
+                    result.committed_size,
+                    i64::try_from(compressed.len()).expect("wire size")
+                );
+                (digest, payload)
+            }
+        };
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(upload("first", 41), upload("second", 42))
+        })
+        .await
+        .expect("concurrent uploads must not deadlock");
+        assert_eq!(store.inner.get_bytes(first.0), Some(first.1));
+        assert_eq!(store.inner.get_bytes(second.0), Some(second.1));
+        assert_eq!(
+            store.peak_reserved.load(Ordering::Relaxed),
+            budget.capacity()
+        );
+        assert!(store.decoded_chunks.load(Ordering::Relaxed) >= 16);
+        assert_eq!(budget.available(), budget.capacity());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_compressed_upload_rejects_oversized_frame() {
+        let store = Arc::new(MemoryContentStore::new());
+        let (channel, budget, handle) = spawn_service(store, 1024, 64).await;
+        let mut client = ByteStreamClient::new(channel);
+        let name = ResourceName::upload("", "empty-large", Compression::Zstd, Digest::EMPTY)
+            .expect("name")
+            .to_string();
+        let error = client
+            .write(futures::stream::iter(vec![WriteRequest {
+                resource_name: name,
+                write_offset: 0,
+                finish_write: true,
+                data: Bytes::from(vec![0; 64 * 1024 + 1]),
+            }]))
+            .await
+            .expect_err("oversized compressed empty blob");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(budget.available(), budget.capacity());
+        handle.abort();
     }
 
     #[tokio::test]

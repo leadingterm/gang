@@ -27,8 +27,8 @@ use gang_reapi::leadingterm::gang::worker::v1 as proto;
 use gang_reapi::leadingterm::gang::worker::v1::controller_message::Kind as ControllerKind;
 use gang_scheduler::{
     AdmissionRequest, CapacityError, Census, CompletedObservation, CordonError, Effect, Effects,
-    ExecuteError, GateAudit, HandOffError, KillReason, Now, OperationKey, OperationStage,
-    OperationUpdate, RegisterError, RehomeReason, Scheduler, SketchError, WorkerEvent, WorkerKey,
+    ExecuteError, GateAudit, HandOffError, KillReason, Now, OperationKey, OperationUpdate,
+    RegisterError, RehomeReason, Scheduler, SketchError, WorkerEvent, WorkerKey,
     WorkerRegistration,
 };
 use gang_spi::{
@@ -596,29 +596,7 @@ pub(crate) async fn run_actor<C: Clock + Send + Sync + 'static>(
     runtime: ControllerRuntime,
     inboxes: ActorInboxes,
 ) {
-    let mut actor = ControllerActor {
-        scheduler,
-        clock,
-        config,
-        observations: runtime.observations,
-        handoff: runtime.handoff,
-        control_rx: inboxes.control_rx,
-        worker_rx: inboxes.worker_rx,
-        client_rx: inboxes.client_rx,
-        client_tx: inboxes.client_tx,
-        control_closed: false,
-        worker_closed: false,
-        client_closed: false,
-        worker_outbound: HashMap::new(),
-        op_watches: HashMap::new(),
-        op_meta: HashMap::new(),
-        effects: Effects::with_capacity(64),
-        effect_scratch: Effects::with_capacity(64),
-        terminal_cleanup: Vec::new(),
-        pending_audit: VecDeque::new(),
-        pending_completion: None,
-        shutdown_reply: None,
-    };
+    let mut actor = ControllerActor::new(scheduler, clock, config, runtime, inboxes);
 
     actor.run_loop().await;
 
@@ -652,6 +630,11 @@ pub(crate) async fn run_actor<C: Clock + Send + Sync + 'static>(
     }
 }
 
+struct RetainedOperation {
+    key: OperationKey,
+    state: OperationWatchState,
+}
+
 struct ControllerActor<C> {
     scheduler: Scheduler,
     clock: Arc<C>,
@@ -671,12 +654,48 @@ struct ControllerActor<C> {
     effects: Effects,
     effect_scratch: Effects,
     terminal_cleanup: Vec<OperationKey>,
+    terminal_operations: HashMap<OperationName, RetainedOperation>,
+    terminal_order: VecDeque<(OperationKey, OperationName)>,
     pending_audit: VecDeque<AuditContext>,
     pending_completion: Option<CompletionPayload>,
     shutdown_reply: Option<oneshot::Sender<()>>,
 }
 
 impl<C: Clock> ControllerActor<C> {
+    fn new(
+        scheduler: Scheduler,
+        clock: Arc<C>,
+        config: ActorConfig,
+        runtime: ControllerRuntime,
+        inboxes: ActorInboxes,
+    ) -> Self {
+        Self {
+            scheduler,
+            clock,
+            config,
+            observations: runtime.observations,
+            handoff: runtime.handoff,
+            control_rx: inboxes.control_rx,
+            worker_rx: inboxes.worker_rx,
+            client_rx: inboxes.client_rx,
+            client_tx: inboxes.client_tx,
+            control_closed: false,
+            worker_closed: false,
+            client_closed: false,
+            worker_outbound: HashMap::new(),
+            op_watches: HashMap::new(),
+            op_meta: HashMap::new(),
+            effects: Effects::with_capacity(64),
+            effect_scratch: Effects::with_capacity(64),
+            terminal_cleanup: Vec::new(),
+            terminal_operations: HashMap::new(),
+            terminal_order: VecDeque::new(),
+            pending_audit: VecDeque::new(),
+            pending_completion: None,
+            shutdown_reply: None,
+        }
+    }
+
     fn now(&self) -> Now {
         Now {
             tick: self.clock.monotonic(),
@@ -685,58 +704,61 @@ impl<C: Clock> ControllerActor<C> {
     }
 
     async fn run_loop(&mut self) {
-        loop {
-            if self.control_closed && self.worker_closed && self.client_closed {
+        while !(self.control_closed && self.worker_closed && self.client_closed) {
+            if self.run_iteration().await {
                 break;
             }
+        }
+    }
 
-            let next_deadline = self.scheduler.next_deadline();
-            let sleep = next_deadline.map(|deadline| self.clock.sleep_until(deadline));
-            let has_deadline = sleep.is_some();
-            let timer_fut = async {
-                if let Some(sleep) = sleep {
-                    sleep.await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            };
-            tokio::pin!(timer_fut);
+    async fn run_iteration(&mut self) -> bool {
+        let next_deadline = self.scheduler.next_deadline();
+        let sleep = next_deadline.map(|deadline| self.clock.sleep_until(deadline));
+        let has_deadline = sleep.is_some();
+        let timer_fut = async {
+            if let Some(sleep) = sleep {
+                sleep.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(timer_fut);
 
-            let control_open = !self.control_closed;
-            let worker_open = !self.worker_closed;
-            let client_open = !self.client_closed;
+        let control_open = !self.control_closed;
+        let worker_open = !self.worker_closed;
+        let client_open = !self.client_closed;
 
-            tokio::select! {
-                biased;
-                () = &mut timer_fut, if has_deadline => {
-                    let now = self.now();
-                    self.scheduler.on_timer(now, &mut self.effects);
-                    self.drain_effects(now);
-                }
-                msg = self.control_rx.recv(), if control_open => {
-                    match msg {
-                        Some(first) => {
-                            if self.handle_control_batch(first) {
-                                break;
-                            }
-                        }
-                        None => self.control_closed = true,
-                    }
-                }
-                msg = self.worker_rx.recv(), if worker_open => {
-                    match msg {
-                        Some(first) => self.handle_worker_batch(first),
-                        None => self.worker_closed = true,
-                    }
-                }
-                msg = self.client_rx.recv(), if client_open => {
-                    match msg {
-                        Some(first) => self.handle_client_batch(first),
-                        None => self.client_closed = true,
-                    }
-                }
+        let mut control = None;
+        let mut worker = None;
+        let mut client = None;
+        tokio::select! {
+            () = &mut timer_fut, if has_deadline => {}
+            msg = self.control_rx.recv(), if control_open => {
+                control = msg;
+                self.control_closed = control.is_none();
+            }
+            msg = self.worker_rx.recv(), if worker_open => {
+                worker = msg;
+                self.worker_closed = worker.is_none();
+            }
+            msg = self.client_rx.recv(), if client_open => {
+                client = msg;
+                self.client_closed = client.is_none();
             }
         }
+        self.advance_due_timers(self.now());
+        if let Some(first) = control.or_else(|| self.control_rx.try_recv().ok())
+            && self.handle_control_batch(first)
+        {
+            return true;
+        }
+        if let Some(first) = worker.or_else(|| self.worker_rx.try_recv().ok()) {
+            self.handle_worker_batch(first);
+        }
+        if let Some(first) = client.or_else(|| self.client_rx.try_recv().ok()) {
+            self.handle_client_batch(first);
+        }
+        false
     }
 
     fn advance_due_timers(&mut self, now: Now) {
@@ -1092,36 +1114,26 @@ impl<C: Clock> ControllerActor<C> {
     }
 
     fn handle_watch(&mut self, now: Now, operation: &OperationName) -> Option<OperationWatch> {
-        let key = self.scheduler.watch(now, operation)?;
-        let op = self.scheduler.operations().get(key)?;
-        let op_name = op.name.clone();
-        if let Some(tx) = self.op_watches.get(&key) {
+        if let Some(key) = self.scheduler.operations().lookup_name(operation)
+            && let Some(tx) = self.op_watches.get(&key)
+        {
+            self.scheduler.watch(now, operation)?;
             return Some(OperationWatch::new(
                 key,
-                op_name,
+                operation.clone(),
                 tx.subscribe(),
                 self.client_tx.clone(),
                 true,
             ));
         }
-        // Operation already reached a terminal stage and was pruned from active watches.
-        let terminal_update = match op.stage {
-            OperationStage::Completed => OperationUpdate::Completed,
-            OperationStage::Cancelled => OperationUpdate::Cancelled,
-            OperationStage::Queued | OperationStage::Running => OperationUpdate::Queued,
-        };
-        let (_tx, rx) = watch::channel(OperationWatchState {
-            operation: op_name.clone(),
-            update: terminal_update,
-            result: None,
-            status: None,
-        });
+        let retained = self.terminal_operations.get(operation)?;
+        let (_tx, rx) = watch::channel(retained.state.clone());
         Some(OperationWatch::new(
-            key,
-            op_name,
+            retained.key,
+            operation.clone(),
             rx,
             self.client_tx.clone(),
-            true,
+            false,
         ))
     }
 
@@ -1133,6 +1145,7 @@ impl<C: Clock> ControllerActor<C> {
             for effect in batch.drain() {
                 self.apply_effect(now, effect);
             }
+            // Completion observations in this batch still need the operation's origin.
             for op_key in self.terminal_cleanup.drain(..) {
                 self.op_meta.remove(&op_key);
             }
@@ -1299,8 +1312,8 @@ impl<C: Clock> ControllerActor<C> {
         let terminal = is_terminal_update(&event);
         let (mut result, status) = if matches!(event, OperationUpdate::Completed) {
             self.pending_completion
-                .as_ref()
-                .map_or((None, None), |p| (p.result.clone(), p.status.clone()))
+                .as_mut()
+                .map_or((None, None), |p| (p.result.take(), p.status.take()))
         } else {
             (None, None)
         };
@@ -1316,12 +1329,36 @@ impl<C: Clock> ControllerActor<C> {
             self.terminal_cleanup.push(operation);
             if let Some(tx) = self.op_watches.remove(&operation) {
                 let op_name = tx.borrow().operation.clone();
-                tx.send_replace(OperationWatchState {
-                    operation: op_name,
+                let state = OperationWatchState {
+                    operation: op_name.clone(),
                     update: event,
                     result,
                     status,
-                });
+                };
+                if tx.receiver_count() > 0 {
+                    tx.send_replace(state.clone());
+                }
+                let limit = self.scheduler.policy().max_retained_terminal_operations;
+                while self.terminal_order.len() >= limit {
+                    let Some((key, oldest)) = self.terminal_order.pop_front() else {
+                        break;
+                    };
+                    if self
+                        .terminal_operations
+                        .get(&oldest)
+                        .is_some_and(|entry| entry.key == key)
+                    {
+                        self.terminal_operations.remove(&oldest);
+                    }
+                }
+                self.terminal_order.push_back((operation, op_name.clone()));
+                self.terminal_operations.insert(
+                    op_name,
+                    RetainedOperation {
+                        key: operation,
+                        state,
+                    },
+                );
             }
         } else if let Some(tx) = self.op_watches.get(&operation) {
             let current = tx.borrow();
@@ -1399,5 +1436,235 @@ impl<C: Clock> ControllerActor<C> {
             error,
             times,
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gang_clock::TestClock;
+    use gang_scheduler::{Learned, SchedulerPolicy};
+    use gang_types::{
+        Digest, FleetActionPolicy, FleetCatalog, FleetName, FleetProperties, Isa, Resources,
+        SourceId, property,
+    };
+
+    fn actor() -> (
+        ControllerActor<TestClock>,
+        mpsc::Sender<ControlMsg>,
+        mpsc::Sender<WorkerMsg>,
+    ) {
+        let catalog = FleetCatalog::try_new(vec![FleetProperties::new(
+            &FleetName::try_new("small").expect("fleet"),
+            Isa::X86_64,
+            &"bwrap",
+            &"host:test".parse().expect("environment"),
+            Resources {
+                vcpus: 8,
+                memory: Bytes::gib(8),
+                disk: Bytes::gib(100),
+            },
+            &FleetActionPolicy::default(),
+            std::iter::empty(),
+        )])
+        .expect("catalog");
+        let policy = SchedulerPolicy {
+            max_retained_terminal_operations: 2,
+            client_action_timeout: Duration::from_secs(15),
+            ..SchedulerPolicy::default()
+        };
+        let learned =
+            Learned::new(&policy.actions, &policy.scaling, catalog.len()).expect("learned");
+        let scheduler = Scheduler::new(policy, &catalog, learned).expect("scheduler");
+        let (control_tx, control_rx) = mpsc::channel(64);
+        let (worker_tx, worker_rx) = mpsc::channel(64);
+        let (client_tx, client_rx) = mpsc::channel(64);
+        let actor = ControllerActor::new(
+            scheduler,
+            Arc::new(TestClock::new(Timestamp::from_unix_millis(1_000))),
+            ActorConfig {
+                scheduler_batch: NonZeroUsize::new(2).expect("batch"),
+                ..ActorConfig::default()
+            },
+            ControllerRuntime::new(),
+            ActorInboxes {
+                control_rx,
+                worker_rx,
+                client_rx,
+                client_tx,
+            },
+        );
+        (actor, control_tx, worker_tx)
+    }
+
+    fn execute(actor: &mut ControllerActor<TestClock>, name: &str) -> OperationWatch {
+        let request = AdmissionRequest {
+            name: name.parse().expect("operation"),
+            action_digest: Digest::from_bytes(name.as_bytes()),
+            command_digest: "command".to_owned(),
+            platform_properties: [(property::ISA.to_owned(), "x86-64".to_owned())]
+                .into_iter()
+                .collect(),
+            skip_cache_lookup: true,
+            do_not_cache: true,
+            source: SourceId::from_identity_str("test:client"),
+            build: None,
+            target: None,
+            mnemonic: None,
+            priority: 0,
+            initial_watchers: 0,
+        };
+        let mut spec = ExecuteSpec::new(request);
+        spec.inline = Some(InlineActionPayload {
+            action: RawBytes::from_static(b"action"),
+            command: RawBytes::from_static(b"command"),
+        });
+        let (reply, mut receiver) = oneshot::channel();
+        actor.handle_client_msg(ClientMsg::Execute {
+            spec: Box::new(spec),
+            reply,
+        });
+        receiver.try_recv().expect("reply").expect("admitted")
+    }
+
+    #[test]
+    fn clientless_queued_expiration_releases_shell_metadata() {
+        let (mut actor, _control_tx, _worker_tx) = actor();
+        let watch = execute(&mut actor, "operations/expired");
+        let key = watch.key();
+        assert!(actor.op_meta.get(&key).expect("metadata").inline.is_some());
+        assert!(actor.op_watches.contains_key(&key));
+        drop(watch);
+        actor.clock.advance(Duration::from_secs(15));
+        actor.advance_due_timers(actor.now());
+        assert!(
+            !actor.op_watches.contains_key(&key),
+            "expiration must release watch sender"
+        );
+        assert!(
+            !actor.op_meta.contains_key(&key),
+            "expiration must release inline protos"
+        );
+        let replay = actor
+            .handle_watch(actor.now(), &"operations/expired".parse().expect("name"))
+            .expect("retained cancellation");
+        assert_eq!(replay.current().update, OperationUpdate::Cancelled);
+    }
+
+    #[test]
+    fn terminal_replay_evicts_oldest_at_scheduler_retention_limit() {
+        let (mut actor, _control_tx, _worker_tx) = actor();
+        for name in ["operations/first", "operations/second", "operations/third"] {
+            let watch = execute(&mut actor, name);
+            actor
+                .scheduler
+                .cancel(actor.now(), watch.key(), &mut actor.effects);
+            actor.drain_effects(actor.now());
+            assert_eq!(watch.current().update, OperationUpdate::Cancelled);
+            assert!(!actor.op_watches.contains_key(&watch.key()));
+            assert!(!actor.op_meta.contains_key(&watch.key()));
+        }
+        assert_eq!(actor.terminal_operations.len(), 2);
+        assert_eq!(actor.terminal_order.len(), 2);
+        assert!(
+            actor
+                .handle_watch(actor.now(), &"operations/first".parse().expect("name"))
+                .is_none()
+        );
+        for name in ["operations/second", "operations/third"] {
+            let watch = actor
+                .handle_watch(actor.now(), &name.parse().expect("name"))
+                .expect("retained operation");
+            assert_eq!(watch.current().update, OperationUpdate::Cancelled);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reused_expired_name_keeps_replay_current_and_retention_bounded() {
+        let (mut actor, _control_tx, _worker_tx) = actor();
+        let name: OperationName = "operations/reused".parse().expect("name");
+        for _ in 0..4 {
+            let watch = execute(&mut actor, name.as_str());
+            let replay = actor
+                .handle_watch(actor.now(), &name)
+                .expect("active watch");
+            assert_eq!(replay.current().update, OperationUpdate::Queued);
+            replay.close().await;
+            let unwatch = actor.client_rx.try_recv().expect("unwatch");
+            actor.handle_client_msg(unwatch);
+            drop(watch);
+            actor.clock.advance(Duration::from_secs(15));
+            actor.advance_due_timers(actor.now());
+            assert!(actor.terminal_operations.len() <= 2);
+            assert!(actor.terminal_order.len() <= 2);
+            let terminal = actor
+                .handle_watch(actor.now(), &name)
+                .expect("retained cancellation");
+            assert_eq!(terminal.current().update, OperationUpdate::Cancelled);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_backlog_services_client_in_same_iteration() {
+        let (mut actor, _control_tx, worker_tx) = actor();
+        let name: OperationName = "operations/cancel".parse().expect("name");
+        let watch = execute(&mut actor, name.as_str());
+        // Register first so the flood uses valid worker heartbeats.
+        let registration = WorkerRegistration {
+            instance: Arc::new(InstanceId::try_new("i-fair").expect("instance")),
+            fleet: FleetName::try_new("small").expect("fleet"),
+            gang_version: actor.scheduler.policy().expected_gang_version.clone(),
+            properties: BTreeMap::new(),
+            capacity: ActionResources {
+                cpu_millicores: 8_000,
+                memory: Bytes::gib(8),
+                disk: Bytes::gib(100),
+            },
+            ceilings: ActionResources {
+                cpu_millicores: 8_000,
+                memory: Bytes::gib(8),
+                disk: Bytes::gib(100),
+            },
+            max_inflight: None,
+            single_use: false,
+            environment: Some("host:test".parse().expect("environment")),
+            uuid_bytes: [1; 16],
+        };
+        let (reply, mut receiver) = oneshot::channel();
+        actor.handle_worker_msg(WorkerMsg::Register {
+            registration: Box::new(registration),
+            reply,
+        });
+        let worker = receiver.try_recv().expect("reply").expect("registered");
+        for _ in 0..8 {
+            worker_tx
+                .try_send(WorkerMsg::Event {
+                    worker: worker.key,
+                    event: WorkerEvent::KeepAlive {
+                        cache: None,
+                        memory_capacity: None,
+                    },
+                    completion: None,
+                })
+                .expect("heartbeat");
+        }
+        let (reply, mut cancelled) = oneshot::channel();
+        actor
+            .client_tx
+            .try_send(ClientMsg::Cancel {
+                operation: watch.key(),
+                reply,
+            })
+            .expect("cancel");
+        assert!(!actor.run_iteration().await);
+        assert_eq!(
+            actor.worker_rx.len(),
+            6,
+            "exactly one worker batch must drain"
+        );
+        cancelled
+            .try_recv()
+            .expect("client cancel must finish in the same iteration");
+        assert_eq!(watch.current().update, OperationUpdate::Cancelled);
     }
 }

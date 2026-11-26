@@ -854,6 +854,104 @@ async fn fetch_tree_via_grpc(
     Ok(())
 }
 
+/// Expansion budgets apply to paths, including repeated occurrences of a shared Directory.
+const MAX_EXPANDED_NODES: usize = 250_000;
+const MAX_EXPANDED_PATH_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct ExpansionSize {
+    nodes: usize,
+    path_bytes: usize,
+    depth: usize,
+}
+
+fn expansion_error() -> StagingError {
+    StagingError::InvalidTree {
+        reason: "REAPI directory tree exceeds expanded node or path-byte budget".to_owned(),
+    }
+}
+
+fn measure_expansion(
+    digest: Digest,
+    directories: &HashMap<Digest, reapi::Directory>,
+    measured: &mut HashMap<Digest, ExpansionSize>,
+    visiting: &mut HashSet<Digest>,
+) -> Result<ExpansionSize, StagingError> {
+    if let Some(size) = measured.get(&digest) {
+        return Ok(*size);
+    }
+    if visiting.len() >= MAX_TREE_DEPTH || !visiting.insert(digest) {
+        return Err(StagingError::InvalidTree {
+            reason: "REAPI directory tree contains a cycle or exceeds maximum depth".to_owned(),
+        });
+    }
+    let directory = directories
+        .get(&digest)
+        .ok_or_else(|| StagingError::InvalidTree {
+            reason: format!("missing Directory {digest}"),
+        })?;
+    let mut size = ExpansionSize {
+        nodes: 1,
+        path_bytes: 0,
+        depth: 1,
+    };
+    for name in directory
+        .files
+        .iter()
+        .map(|file| file.name.as_str())
+        .chain(directory.symlinks.iter().map(|link| link.name.as_str()))
+    {
+        size.nodes = size.nodes.checked_add(1).ok_or_else(expansion_error)?;
+        size.path_bytes = size
+            .path_bytes
+            .checked_add(name.len())
+            .ok_or_else(expansion_error)?;
+        if size.nodes > MAX_EXPANDED_NODES || size.path_bytes > MAX_EXPANDED_PATH_BYTES {
+            return Err(expansion_error());
+        }
+    }
+    for child in &directory.directories {
+        let proto = child
+            .digest
+            .as_ref()
+            .ok_or(StagingError::MissingField { field: "digest" })?;
+        let child_digest = from_proto(proto).map_err(|source| StagingError::InvalidDigest {
+            field: "directory.digest",
+            source,
+        })?;
+        let child_size = measure_expansion(child_digest, directories, measured, visiting)?;
+        size.nodes = size
+            .nodes
+            .checked_add(child_size.nodes)
+            .ok_or_else(expansion_error)?;
+        // Every descendant receives "name/"; the child root itself has no trailing slash.
+        let prefix_bytes = child
+            .name
+            .len()
+            .checked_add(1)
+            .and_then(|prefix| prefix.checked_mul(child_size.nodes))
+            .and_then(|bytes| bytes.checked_sub(1))
+            .ok_or_else(expansion_error)?;
+        size.path_bytes = size
+            .path_bytes
+            .checked_add(child_size.path_bytes)
+            .and_then(|bytes| bytes.checked_add(prefix_bytes))
+            .ok_or_else(expansion_error)?;
+        size.depth = size.depth.max(child_size.depth + 1);
+        if size.nodes > MAX_EXPANDED_NODES || size.path_bytes > MAX_EXPANDED_PATH_BYTES {
+            return Err(expansion_error());
+        }
+        if size.depth > MAX_TREE_DEPTH {
+            return Err(StagingError::InvalidTree {
+                reason: "REAPI directory tree exceeds maximum depth".to_owned(),
+            });
+        }
+    }
+    visiting.remove(&digest);
+    measured.insert(digest, size);
+    Ok(size)
+}
+
 fn build_inventory(
     root_digest: Digest,
     dir_map: &HashMap<Digest, reapi::Directory>,
@@ -865,6 +963,15 @@ fn build_inventory(
         pending: VecDeque<(PathBuf, Digest)>,
         file_count: usize,
     }
+
+    // Count the DAG with memoization before allocating any expanded paths. A diamond with
+    // billions of occurrences is rejected in work proportional to its distinct directories.
+    measure_expansion(
+        root_digest,
+        dir_map,
+        &mut HashMap::new(),
+        &mut HashSet::new(),
+    )?;
 
     let root_dir = dir_map
         .get(&root_digest)
@@ -1436,7 +1543,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
     use std::fs;
     use std::num::NonZeroUsize;
     use std::os::unix::fs::PermissionsExt as _;
@@ -1523,6 +1630,104 @@ mod tests {
             tree_cache_min_files: NonZeroUsize::new(min_files).expect("min_files non-zero"),
             directory_cache_budget: NonZeroBytes::mib(8),
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_exponential_directory_dag_before_materialization() -> TestResult {
+        let tmp = TempDir::new()?;
+        let slow = MemoryContentStore::new();
+        let mut root = make_dir(&slow, vec![], vec![], vec![])?;
+        for _ in 0..30 {
+            root = make_dir(&slow, vec![], vec![("a", root), ("b", root)], vec![])?;
+        }
+        let command = reapi::Command {
+            arguments: vec!["unused".into()],
+            ..Default::default()
+        };
+        let action = reapi::Action {
+            command_digest: Some(to_proto(&store_proto(&slow, &command))?),
+            input_root_digest: Some(to_proto(&root)?),
+            ..Default::default()
+        };
+        let assign = make_assign(
+            "00000000-0000-4000-8000-000000000777",
+            store_proto(&slow, &action),
+            Some(&action),
+            Some(&command),
+        )?;
+        let disk = DiskCas::open(tmp.path().join("cas"), 1024 * 1024).await?;
+        let tiered = Tiered::new(disk, slow);
+        let result = stage_attempt(
+            &assign,
+            &tmp.path().join("work"),
+            &tiered,
+            None,
+            &DirectoryCache::new(NonZeroBytes::mib(4)),
+            None,
+            &simple_config(2),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(StagingError::InvalidTree { .. })),
+            "diamond expansion was accepted: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_twenty_thousand_file_inventory() -> TestResult {
+        let empty = to_proto(&Digest::EMPTY)?;
+        let directory = reapi::Directory {
+            files: (0..20_000)
+                .map(|index| reapi::FileNode {
+                    name: format!("file-{index}"),
+                    digest: Some(empty.clone()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let digest = Digest::from_bytes(&directory.encode_to_vec());
+        let inventory = super::build_inventory(digest, &HashMap::from([(digest, directory)]))?;
+        assert_eq!(inventory.files.len(), 20_000);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_expanded_path_byte_budget_with_few_nodes() -> TestResult {
+        let leaf = reapi::Directory {
+            files: vec![reapi::FileNode {
+                name: "f".repeat(1024),
+                digest: Some(to_proto(&Digest::EMPTY)?),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let leaf_digest = Digest::from_bytes(&leaf.encode_to_vec());
+        let mut map = HashMap::from([(leaf_digest, leaf)]);
+        let mut root = leaf_digest;
+        for _ in 0..16 {
+            let directory = reapi::Directory {
+                directories: vec![
+                    reapi::DirectoryNode {
+                        name: "a".into(),
+                        digest: Some(to_proto(&root)?),
+                    },
+                    reapi::DirectoryNode {
+                        name: "b".into(),
+                        digest: Some(to_proto(&root)?),
+                    },
+                ],
+                ..Default::default()
+            };
+            root = Digest::from_bytes(&directory.encode_to_vec());
+            map.insert(root, directory);
+        }
+        assert!(matches!(
+            super::build_inventory(root, &map),
+            Err(StagingError::InvalidTree { .. })
+        ));
+        Ok(())
     }
 
     #[tokio::test]

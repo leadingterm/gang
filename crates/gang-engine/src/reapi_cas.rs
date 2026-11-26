@@ -190,7 +190,7 @@ impl InflightBlobBudget {
 /// Configuration for [`CasService`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CasConfig {
-    /// Maximum combined blob byte size accepted by `BatchUpdateBlobs` and `BatchReadBlobs`.
+    /// Maximum batch payload or encoded `GetTreeResponse` size (the gRPC message limit).
     pub max_batch_total_size_bytes: NonZeroBytes,
     /// Maximum number of `Directory` messages emitted in a single `GetTreeResponse` page.
     pub max_tree_page_size: NonZeroUsize,
@@ -272,6 +272,10 @@ pub(crate) fn map_port_error(error: &PortError) -> Status {
             ..
         } => Status::out_of_range(error.to_string()),
         PortError::Rejected {
+            reason: Rejection::ResourceExhausted,
+            ..
+        } => Status::resource_exhausted(error.to_string()),
+        PortError::Rejected {
             reason: Rejection::DigestMismatch | Rejection::MalformedRequest,
             ..
         } => Status::invalid_argument(error.to_string()),
@@ -297,6 +301,10 @@ pub(crate) fn port_error_to_rpc_status(error: &PortError) -> RpcStatus {
             reason: Rejection::OutOfRange,
             ..
         } => RpcCode::OutOfRange,
+        PortError::Rejected {
+            reason: Rejection::ResourceExhausted,
+            ..
+        } => RpcCode::ResourceExhausted,
         PortError::Rejected {
             reason: Rejection::DigestMismatch | Rejection::MalformedRequest,
             ..
@@ -407,13 +415,11 @@ fn decode_tree_token(token: &str, expected_root: Digest) -> Result<u64, Status> 
 
 async fn read_directory<C: ContentStore>(
     store: &C,
-    budget: &InflightBlobBudget,
     digest: Digest,
 ) -> Result<Option<Directory>, Status> {
     if digest.is_empty() {
         return Ok(Some(Directory::default()));
     }
-    let _permit = budget.acquire(digest.size()).await?;
     let Some(stream) = store
         .read(digest, ByteRange::FULL)
         .await
@@ -427,17 +433,24 @@ async fn read_directory<C: ContentStore>(
         .map_err(|err| Status::data_loss(format!("corrupt Directory proto {digest}: {err}")))
 }
 
+fn directory_entry_bytes(size: u64) -> u64 {
+    let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
+    size.saturating_add(1 + prost::length_delimiter_len(size_usize) as u64)
+}
+
 struct TreeTraversalState<C> {
     store: Arc<C>,
     budget: InflightBlobBudget,
     root_digest: Digest,
     page_size: usize,
+    page_byte_limit: u64,
+    page_permits: Vec<BlobPermit>,
     max_directories: usize,
     skip: u64,
     emitted_count: u64,
     queue: VecDeque<Digest>,
     visited: HashSet<Digest>,
-    lookahead: Option<Directory>,
+    lookahead: Option<(Directory, BlobPermit)>,
     yielded_any: bool,
     done: bool,
 }
@@ -461,39 +474,94 @@ impl<C: ContentStore> TreeTraversalState<C> {
         Ok(())
     }
 
-    async fn next_present_directory(&mut self) -> Result<Option<Directory>, Status> {
-        if let Some(dir) = self.lookahead.take() {
-            return Ok(Some(dir));
+    async fn prune_missing_directories(&mut self) -> Result<(), Status> {
+        let mut missing = Vec::new();
+        while let Some(&digest) = self.queue.front() {
+            self.store
+                .find_missing(&[digest], &mut missing)
+                .await
+                .map_err(|err| map_port_error(&err))?;
+            if missing.is_empty() {
+                break;
+            }
+            self.queue.pop_front();
         }
-        while let Some(digest) = self.queue.pop_front() {
-            let Some(dir) = read_directory(self.store.as_ref(), &self.budget, digest).await? else {
-                // REAPI v2: omit missing sub-directories and return the portion present.
-                continue;
-            };
-            self.enqueue_children(&dir)?;
-            return Ok(Some(dir));
-        }
-        Ok(None)
+        Ok(())
     }
 
     async fn next_page(&mut self) -> Result<Option<GetTreeResponse>, Status> {
+        // A poll for the next page acknowledges consumption of the previous page.
+        self.page_permits.clear();
         if self.done {
             return Ok(None);
         }
 
+        let token_bytes = GetTreeResponse {
+            directories: Vec::new(),
+            next_page_token: encode_tree_token(self.root_digest, 0),
+        }
+        .encoded_len() as u64;
         let mut directories = Vec::new();
+        let mut page_bytes = 0_u64;
         while directories.len() < self.page_size {
-            let Some(dir) = self.next_present_directory().await? else {
-                break;
+            let (dir, permit) = if let Some(first) = self.lookahead.take() {
+                first
+            } else {
+                let Some(&digest) = self.queue.front() else {
+                    break;
+                };
+                let entry_bytes = directory_entry_bytes(digest.size());
+                if !directories.is_empty()
+                    && page_bytes
+                        .saturating_add(entry_bytes)
+                        .saturating_add(token_bytes)
+                        > self.page_byte_limit
+                {
+                    break;
+                }
+                if entry_bytes > self.page_byte_limit {
+                    return Err(Status::resource_exhausted(
+                        "Directory exceeds GetTree page byte limit",
+                    ));
+                }
+                let permit = if directories.is_empty() {
+                    self.budget.acquire(digest.size()).await?
+                } else {
+                    // Never wait while holding a partial page, including when another
+                    // traversal owns the rest of the shared budget.
+                    let Some(permit) = self.budget.try_acquire(digest.size())? else {
+                        break;
+                    };
+                    permit
+                };
+                self.queue.pop_front();
+                let Some(dir) = read_directory(self.store.as_ref(), digest).await? else {
+                    continue;
+                };
+                self.enqueue_children(&dir)?;
+                (dir, permit)
             };
             if self.emitted_count < self.skip {
                 self.emitted_count = self.emitted_count.saturating_add(1);
                 continue;
             }
+            page_bytes = page_bytes.saturating_add(directory_entry_bytes(dir.encoded_len() as u64));
+            let response_bytes = page_bytes.saturating_add(if self.queue.is_empty() {
+                0
+            } else {
+                token_bytes
+            });
+            if response_bytes > self.page_byte_limit {
+                return Err(Status::resource_exhausted(
+                    "Directory exceeds GetTree page byte limit",
+                ));
+            }
             self.emitted_count = self.emitted_count.saturating_add(1);
             directories.push(dir);
+            self.page_permits.push(permit);
         }
 
+        self.prune_missing_directories().await?;
         if directories.is_empty() {
             self.done = true;
             if !self.yielded_any {
@@ -506,18 +574,11 @@ impl<C: ContentStore> TreeTraversalState<C> {
             return Ok(None);
         }
 
-        let has_more = if let Some(next_dir) = self.next_present_directory().await? {
-            self.lookahead = Some(next_dir);
-            true
-        } else {
-            false
-        };
-
-        let next_page_token = if has_more {
-            encode_tree_token(self.root_digest, self.emitted_count)
-        } else {
+        let next_page_token = if self.queue.is_empty() {
             self.done = true;
             String::new()
+        } else {
+            encode_tree_token(self.root_digest, self.emitted_count)
         };
 
         self.yielded_any = true;
@@ -675,7 +736,9 @@ impl<C: ContentStore> ContentAddressableStorage for CasService<C> {
         let mut digests = Vec::with_capacity(req.digests.len());
         for proto in req.digests {
             let digest = parse_proto_digest(Some(&proto), "digests")?;
-            total_bytes = total_bytes.saturating_add(digest.size());
+            total_bytes = total_bytes
+                .checked_add(digest.size())
+                .ok_or_else(|| Status::invalid_argument("batch read size overflow"))?;
             digests.push((proto, digest));
         }
 
@@ -685,7 +748,7 @@ impl<C: ContentStore> ContentAddressableStorage for CasService<C> {
             )));
         }
 
-        let mut held_permits = Vec::with_capacity(digests.len());
+        let _permit = self.budget.acquire(total_bytes).await?;
         let mut responses = Vec::with_capacity(digests.len());
 
         for (proto, digest) in digests {
@@ -699,10 +762,8 @@ impl<C: ContentStore> ContentAddressableStorage for CasService<C> {
                 continue;
             }
 
-            let permit = self.budget.acquire(digest.size()).await?;
             match self.store.read(digest, ByteRange::FULL).await {
                 Ok(None) => {
-                    drop(permit);
                     responses.push(batch_read_blobs_response::Response {
                         digest: Some(proto),
                         data: Bytes::new(),
@@ -716,7 +777,6 @@ impl<C: ContentStore> ContentAddressableStorage for CasService<C> {
                             match compress_zstd(&raw, DEFAULT_ZSTD_LEVEL) {
                                 Ok(compressed) => (compressed, compressor::Value::Zstd as i32),
                                 Err(err) => {
-                                    drop(permit);
                                     responses.push(batch_read_blobs_response::Response {
                                         digest: Some(proto),
                                         data: Bytes::new(),
@@ -729,7 +789,6 @@ impl<C: ContentStore> ContentAddressableStorage for CasService<C> {
                         } else {
                             (raw, compressor::Value::Identity as i32)
                         };
-                        held_permits.push(permit);
                         responses.push(batch_read_blobs_response::Response {
                             digest: Some(proto),
                             data: wire_data,
@@ -738,7 +797,6 @@ impl<C: ContentStore> ContentAddressableStorage for CasService<C> {
                         });
                     }
                     Err(err) => {
-                        drop(permit);
                         responses.push(batch_read_blobs_response::Response {
                             digest: Some(proto),
                             data: Bytes::new(),
@@ -748,7 +806,6 @@ impl<C: ContentStore> ContentAddressableStorage for CasService<C> {
                     }
                 },
                 Err(err) => {
-                    drop(permit);
                     responses.push(batch_read_blobs_response::Response {
                         digest: Some(proto),
                         data: Bytes::new(),
@@ -759,9 +816,7 @@ impl<C: ContentStore> ContentAddressableStorage for CasService<C> {
             }
         }
 
-        let response = Response::new(BatchReadBlobsResponse { responses });
-        drop(held_permits);
-        Ok(response)
+        Ok(Response::new(BatchReadBlobsResponse { responses }))
     }
 
     async fn get_tree(
@@ -790,8 +845,17 @@ impl<C: ContentStore> ContentAddressableStorage for CasService<C> {
             decode_tree_token(&req.page_token, root_digest)?
         };
 
-        let Some(root_dir) = read_directory(self.store.as_ref(), &self.budget, root_digest).await?
-        else {
+        let page_byte_limit = self
+            .budget
+            .capacity()
+            .min(self.config.max_batch_total_size_bytes.as_u64());
+        if directory_entry_bytes(root_digest.size()) > page_byte_limit {
+            return Err(Status::resource_exhausted(
+                "Directory exceeds GetTree page byte limit",
+            ));
+        }
+        let root_permit = self.budget.acquire(root_digest.size()).await?;
+        let Some(root_dir) = read_directory(self.store.as_ref(), root_digest).await? else {
             return Err(Status::not_found(format!(
                 "tree root directory {root_digest} not found"
             )));
@@ -804,6 +868,8 @@ impl<C: ContentStore> ContentAddressableStorage for CasService<C> {
             budget: self.budget.clone(),
             root_digest,
             page_size,
+            page_byte_limit,
+            page_permits: Vec::new(),
             max_directories: self.config.max_tree_directories.get(),
             skip,
             emitted_count: 0,
@@ -814,7 +880,7 @@ impl<C: ContentStore> ContentAddressableStorage for CasService<C> {
             done: false,
         };
         state.enqueue_children(&root_dir)?;
-        state.lookahead = Some(root_dir);
+        state.lookahead = Some((root_dir, root_permit));
 
         let stream = stream::unfold(state, |mut state| async move {
             match state.next_page().await {
@@ -822,6 +888,8 @@ impl<C: ContentStore> ContentAddressableStorage for CasService<C> {
                 Ok(None) => None,
                 Err(status) => {
                     state.done = true;
+                    state.page_permits.clear();
+                    state.lookahead = None;
                     Some((Err(status), state))
                 }
             }
@@ -896,6 +964,52 @@ mod tests {
         let budget = InflightBlobBudget::new(cap);
         let svc = CasService::with_defaults(store, budget.clone());
         (svc, budget)
+    }
+
+    #[tokio::test]
+    async fn batch_read_reserves_the_entire_batch_before_reading() {
+        let store = Arc::new(MemoryContentStore::new());
+        let digest = store.insert(vec![42; 400]);
+        let (svc, budget) = service_with(Arc::clone(&store), 1024);
+        let held = budget.acquire(500).await.expect("reserve");
+        let request = || {
+            Request::new(BatchReadBlobsRequest {
+                digests: vec![to_proto(&digest).expect("digest"); 2],
+                digest_function: digest_function::Value::Sha256 as i32,
+                ..Default::default()
+            })
+        };
+        let first = svc.batch_read_blobs(request());
+        let second = svc.batch_read_blobs(request());
+        tokio::pin!(first, second);
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        assert_eq!(store.read_calls(), 0, "no partial batch may be read");
+        drop(held);
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.expect("first batch").into_inner().responses.len(), 2);
+        assert_eq!(
+            second.expect("second batch").into_inner().responses.len(),
+            2
+        );
+        assert_eq!(budget.available(), 1024);
+    }
+
+    #[tokio::test]
+    async fn batch_read_rejects_batch_larger_than_budget() {
+        let store = Arc::new(MemoryContentStore::new());
+        let digest = store.insert(vec![42; 600]);
+        let (svc, _) = service_with(Arc::clone(&store), 1024);
+        let error = svc
+            .batch_read_blobs(Request::new(BatchReadBlobsRequest {
+                digests: vec![to_proto(&digest).expect("digest"); 2],
+                digest_function: digest_function::Value::Sha256 as i32,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("batch exceeds budget");
+        assert_eq!(error.code(), Code::ResourceExhausted);
+        assert_eq!(store.read_calls(), 0);
     }
 
     #[tokio::test]
@@ -1125,6 +1239,176 @@ mod tests {
             .await
             .expect_err("oversized batch rejected");
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_tree_retains_bounded_pages_until_the_next_poll() {
+        for message_limit in [1024, 4096] {
+            let store = Arc::new(MemoryContentStore::new());
+            let mut children = Vec::new();
+            for index in 0..4 {
+                let leaf = Directory {
+                    files: vec![
+                        FileNode {
+                            name: format!("{index}{}", "x".repeat(220)),
+                            ..Default::default()
+                        },
+                        FileNode {
+                            name: "y".repeat(220),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                };
+                let digest = store.insert(leaf.encode_to_vec());
+                children.push(DirectoryNode {
+                    name: index.to_string(),
+                    digest: Some(to_proto(&digest).expect("digest")),
+                });
+            }
+            let root = store.insert(
+                Directory {
+                    directories: children,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            );
+            let budget = InflightBlobBudget::new(
+                NonZeroBytes::new(gang_types::Bytes::new(if message_limit == 1024 {
+                    4096
+                } else {
+                    1024
+                }))
+                .expect("budget"),
+            );
+            let service = CasService::new(
+                store,
+                budget.clone(),
+                CasConfig {
+                    max_batch_total_size_bytes: NonZeroBytes::new(gang_types::Bytes::new(
+                        message_limit,
+                    ))
+                    .expect("limit"),
+                    ..Default::default()
+                },
+            );
+            let mut pages = service
+                .get_tree(Request::new(GetTreeRequest {
+                    root_digest: Some(to_proto(&root).expect("root")),
+                    ..Default::default()
+                }))
+                .await
+                .expect("tree")
+                .into_inner();
+            let mut count = 0;
+            let mut page_count = 0;
+            while let Some(page) = tokio::time::timeout(Duration::from_secs(5), pages.next())
+                .await
+                .expect("page must not deadlock")
+            {
+                let page = page.expect("page");
+                assert!(
+                    u64::try_from(page.encoded_len()).expect("length")
+                        <= message_limit.min(budget.capacity())
+                );
+                let retained: usize = page
+                    .directories
+                    .iter()
+                    .map(prost::Message::encoded_len)
+                    .sum();
+                assert_eq!(
+                    budget.capacity() - budget.available(),
+                    u64::try_from(retained).expect("retained")
+                );
+                count += page.directories.len();
+                page_count += 1;
+            }
+            assert_eq!(count, 5);
+            assert!(page_count > 1, "tree must split at its byte limit");
+            assert_eq!(budget.available(), budget.capacity());
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_get_tree_pages_yield_instead_of_holding_and_waiting() {
+        let store = Arc::new(MemoryContentStore::new());
+        let leaf = Directory {
+            files: vec![
+                FileNode {
+                    name: "x".repeat(220),
+                    ..Default::default()
+                },
+                FileNode {
+                    name: "y".repeat(220),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let child = store.insert(leaf.encode_to_vec());
+        let root = store.insert(
+            Directory {
+                directories: (0..4)
+                    .map(|index| DirectoryNode {
+                        name: index.to_string(),
+                        digest: Some(to_proto(&child).expect("child")),
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        );
+        let (service, budget) = service_with(store, 1024);
+        let request = || {
+            Request::new(GetTreeRequest {
+                root_digest: Some(to_proto(&root).expect("root")),
+                ..Default::default()
+            })
+        };
+        let mut first = service
+            .get_tree(request())
+            .await
+            .expect("first")
+            .into_inner();
+        let mut second = service
+            .get_tree(request())
+            .await
+            .expect("second")
+            .into_inner();
+        let (first_page, second_page) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(first.next(), second.next())
+        })
+        .await
+        .expect("partial pages must yield without waiting for each other");
+        assert_eq!(
+            first_page
+                .expect("first page")
+                .expect("page")
+                .directories
+                .len(),
+            1
+        );
+        assert_eq!(
+            second_page
+                .expect("second page")
+                .expect("page")
+                .directories
+                .len(),
+            1
+        );
+        let (first_tail, second_tail) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(first.collect::<Vec<_>>(), second.collect::<Vec<_>>())
+        })
+        .await
+        .expect("both traversals finish");
+        for tail in [first_tail, second_tail] {
+            assert_eq!(tail.len(), 1);
+            assert_eq!(
+                tail[0].as_ref().expect("tail").directories,
+                vec![leaf.clone()]
+            );
+        }
+        assert_eq!(budget.available(), budget.capacity());
     }
 
     #[tokio::test]

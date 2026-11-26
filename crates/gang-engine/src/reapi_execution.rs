@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::prelude::{BASE64_STANDARD, BASE64_STANDARD_NO_PAD};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt as _;
 use futures::stream::{self, BoxStream};
 use gang_clock::{Clock, SystemClock};
 use gang_reapi::build::bazel::remote::execution::v2::execution_server::{
@@ -32,7 +33,7 @@ use gang_reapi::to_proto;
 use gang_scheduler::{
     AdmissionError, AdmissionRequest, ExecuteError, OperationUpdate, TerminalFailure,
 };
-use gang_spi::{ActionStore, Authenticated, ByteRange, ContentStore, Origin};
+use gang_spi::{ActionStore, Authenticated, BlobStream, ByteRange, ContentStore, Origin};
 use gang_types::{
     AttemptId, Digest, Identity, Mnemonic, NonZeroDuration, OperationName, SourceId, TargetLabel,
 };
@@ -54,6 +55,9 @@ const DEFAULT_KEEPALIVE_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(3
 /// Default maximum number of operation metadata entries retained for `GetOperation` /
 /// `WaitExecution` lookups after actor watch pruning.
 const DEFAULT_MAX_TRACKED_OPERATIONS: usize = 16_384;
+
+/// Maximum encoded size of either an Action or Command execution metadata protobuf.
+const MAX_EXECUTION_PROTO_BYTES: usize = 4 * 1024 * 1024;
 
 /// Standard gRPC binary metadata header carrying serialized Bazel `RequestMetadata`.
 const REQUEST_METADATA_HEADER: &str = "build.bazel.remote.execution.v2.requestmetadata-bin";
@@ -85,20 +89,13 @@ impl Default for ExecutionServiceConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-struct OperationEntry {
-    action_digest: Digest,
-    terminal: Option<OperationWatchState>,
-}
-
 #[derive(Debug, Default)]
 struct RegistryState {
-    entries: HashMap<OperationName, OperationEntry>,
+    entries: HashMap<OperationName, Digest>,
     order: VecDeque<OperationName>,
 }
 
-/// Bounded in-memory cache of operation `action_digest` and terminal `OperationWatchState` values
-/// shared between [`ExecutionService`] and [`OperationsService`].
+/// Bounded in-memory cache of operation action digests shared between [`ExecutionService`] and [`OperationsService`].
 #[derive(Debug)]
 struct OperationRegistry {
     max_entries: usize,
@@ -116,7 +113,7 @@ impl OperationRegistry {
     fn record_admitted(&self, operation: &OperationName, action_digest: Digest) {
         let mut state = self.state.lock();
         if let Some(entry) = state.entries.get_mut(operation) {
-            entry.action_digest = action_digest;
+            *entry = action_digest;
             return;
         }
         while state.entries.len() >= self.max_entries {
@@ -126,42 +123,12 @@ impl OperationRegistry {
                 break;
             }
         }
-        state.entries.insert(
-            operation.clone(),
-            OperationEntry {
-                action_digest,
-                terminal: None,
-            },
-        );
+        state.entries.insert(operation.clone(), action_digest);
         state.order.push_back(operation.clone());
     }
 
-    fn record_terminal(&self, watch_state: &OperationWatchState) {
-        if !watch_state.is_terminal() {
-            return;
-        }
-        let mut state = self.state.lock();
-        if let Some(entry) = state.entries.get_mut(&watch_state.operation)
-            && entry.terminal.is_none()
-        {
-            entry.terminal = Some(watch_state.clone());
-        }
-    }
-
     fn action_digest(&self, operation: &OperationName) -> Option<Digest> {
-        self.state
-            .lock()
-            .entries
-            .get(operation)
-            .map(|entry| entry.action_digest)
-    }
-
-    fn terminal_state(&self, operation: &OperationName) -> Option<OperationWatchState> {
-        self.state
-            .lock()
-            .entries
-            .get(operation)
-            .and_then(|entry| entry.terminal.clone())
+        self.state.lock().entries.get(operation).copied()
     }
 }
 
@@ -415,6 +382,11 @@ async fn read_cas_blob<C: ContentStore>(
     digest: Digest,
     kind: &str,
 ) -> Result<Bytes, Status> {
+    if digest.size() > MAX_EXECUTION_PROTO_BYTES as u64 {
+        return Err(Status::invalid_argument(format!(
+            "{kind} blob exceeds {MAX_EXECUTION_PROTO_BYTES} bytes"
+        )));
+    }
     if digest.is_empty() {
         return Ok(Bytes::new());
     }
@@ -429,7 +401,28 @@ async fn read_cas_blob<C: ContentStore>(
             digest.size()
         )));
     };
-    stream.collect().await.map_err(|err| map_port_error(&err))
+    collect_metadata_blob(stream, kind).await
+}
+
+async fn collect_metadata_blob(mut stream: BlobStream, kind: &str) -> Result<Bytes, Status> {
+    let too_large = || {
+        Status::resource_exhausted(format!(
+            "{kind} blob exceeds {MAX_EXECUTION_PROTO_BYTES} bytes"
+        ))
+    };
+    if stream.size > MAX_EXECUTION_PROTO_BYTES as u64 {
+        return Err(too_large());
+    }
+    let capacity = usize::try_from(stream.size).unwrap_or(0);
+    let mut bytes = BytesMut::with_capacity(capacity);
+    while let Some(chunk) = stream.chunks.next().await {
+        let chunk = chunk.map_err(|err| map_port_error(&err))?;
+        if chunk.len() > MAX_EXECUTION_PROTO_BYTES - bytes.len() {
+            return Err(too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes.freeze())
 }
 
 fn map_execute_error(error: &ControllerExecuteError) -> Status {
@@ -611,22 +604,8 @@ fn resolve_watch_state(
     watch: &mut OperationWatch,
     registry: Option<&OperationRegistry>,
 ) -> (OperationWatchState, Option<Digest>) {
-    let raw_state = watch.borrow_and_update().clone();
-    let action_digest = registry.and_then(|reg| reg.action_digest(&raw_state.operation));
-    let state = if raw_state.is_terminal()
-        && raw_state.result.is_none()
-        && raw_state.status.is_none()
-        && let Some(cached) = registry.and_then(|reg| reg.terminal_state(&raw_state.operation))
-    {
-        cached
-    } else {
-        if raw_state.is_terminal()
-            && let Some(reg) = registry
-        {
-            reg.record_terminal(&raw_state);
-        }
-        raw_state
-    };
+    let state = watch.borrow_and_update().clone();
+    let action_digest = registry.and_then(|reg| reg.action_digest(&state.operation));
     (state, action_digest)
 }
 
@@ -634,7 +613,6 @@ struct WatchStreamState {
     watch: OperationWatch,
     clock: Arc<dyn Clock>,
     handoff: Option<HandOff>,
-    registry: Arc<OperationRegistry>,
     action_digest: Option<Digest>,
     keepalive_interval: Duration,
     last_state: OperationWatchState,
@@ -654,15 +632,14 @@ fn operation_stream(
     mut watch: OperationWatch,
     clock: Arc<dyn Clock>,
     handoff: Option<HandOff>,
-    registry: Arc<OperationRegistry>,
+    registry: &OperationRegistry,
     keepalive_interval: NonZeroDuration,
 ) -> BoxStream<'static, Result<Operation, Status>> {
-    let (initial_state, action_digest) = resolve_watch_state(&mut watch, Some(&registry));
+    let (initial_state, action_digest) = resolve_watch_state(&mut watch, Some(registry));
     let state = WatchStreamState {
         watch,
         clock,
         handoff,
-        registry,
         action_digest,
         keepalive_interval: keepalive_interval.get(),
         last_state: initial_state,
@@ -692,7 +669,6 @@ fn operation_stream(
                     state.finished = true;
                     return Some((Err(handoff_unavailable()), state));
                 }
-                state.registry.record_terminal(&current);
                 state.finished = current.is_terminal();
                 state.last_state = current;
                 let item = build_operation(&state.last_state, state.action_digest);
@@ -715,7 +691,6 @@ fn operation_stream(
                         return Some((Err(handoff_unavailable()), state));
                     }
                     if current != state.last_state {
-                        state.registry.record_terminal(&current);
                         state.finished = current.is_terminal();
                         state.last_state = current;
                         let item = build_operation(&state.last_state, state.action_digest);
@@ -728,7 +703,6 @@ fn operation_stream(
                             state.finished = true;
                             return Some((Err(handoff_unavailable()), state));
                         }
-                        state.registry.record_terminal(&next_state);
                         state.finished = next_state.is_terminal();
                         state.last_state = next_state;
                         let item = build_operation(&state.last_state, state.action_digest);
@@ -737,7 +711,6 @@ fn operation_stream(
                     state.finished = true;
                     let current = state.watch.current();
                     if current.is_terminal() && current != state.last_state {
-                        state.registry.record_terminal(&current);
                         let item = build_operation(&current, state.action_digest);
                         return Some((item, state));
                     }
@@ -841,7 +814,7 @@ impl<C: ContentStore, A: ActionStore> Execution for ExecutionService<C, A> {
             watch,
             Arc::clone(&self.clock),
             self.handoff.clone(),
-            Arc::clone(&self.registry),
+            &self.registry,
             self.config.keepalive_interval,
         );
         Ok(Response::new(stream))
@@ -866,7 +839,7 @@ impl<C: ContentStore, A: ActionStore> Execution for ExecutionService<C, A> {
             watch,
             Arc::clone(&self.clock),
             self.handoff.clone(),
-            Arc::clone(&self.registry),
+            &self.registry,
             self.config.keepalive_interval,
         );
         Ok(Response::new(stream))
@@ -963,8 +936,8 @@ mod tests {
     use gang_reapi::build::bazel::remote::execution::v2::platform::Property;
     use gang_reapi::build::bazel::remote::execution::v2::{
         Action, ActionResult, Command, ExecuteOperationMetadata, ExecuteRequest, ExecuteResponse,
-        ExecutionPolicy, Platform, RequestMetadata, ToolDetails, WaitExecutionRequest,
-        digest_function, execution_stage,
+        ExecutedActionMetadata, ExecutionPolicy, OutputFile, Platform, RequestMetadata,
+        ToolDetails, WaitExecutionRequest, digest_function, execution_stage,
     };
     use gang_reapi::google::longrunning::operations_server::Operations as _;
     use gang_reapi::google::longrunning::{
@@ -978,7 +951,7 @@ mod tests {
         AttemptUsage, CompletionStatus, Learned, Scheduler, SchedulerPolicy, WorkerCompleted,
         WorkerEvent, WorkerExecuted, WorkerRegistration,
     };
-    use gang_spi::{Authenticated, Observation, ObservationSink, SchedulerSnapshot};
+    use gang_spi::{Authenticated, BlobStream, Observation, ObservationSink, SchedulerSnapshot};
     use gang_testkit::{MemoryActionStore, MemoryContentStore};
     use gang_types::{
         ActionResources, AttemptId, Bytes, CpuWeight, Digest, FleetActionPolicy, FleetCatalog,
@@ -993,7 +966,9 @@ mod tests {
         EXECUTE_OPERATION_METADATA_TYPE_URL, EXECUTE_RESPONSE_TYPE_URL, ExecutionService,
         ExecutionServiceConfig, OperationsService, REQUEST_METADATA_HEADER,
     };
-    use crate::actor::{ActorConfig, CompletionPayload, ControllerRuntime, WorkerOutbound};
+    use crate::actor::{
+        ActorConfig, CompletionPayload, ControllerRuntime, RegisteredWorker, WorkerOutbound,
+    };
     use crate::controller::{ControllerHandle, LearnedSlot, spawn_controller};
 
     fn test_catalog() -> FleetCatalog {
@@ -1216,6 +1191,257 @@ mod tests {
             )
             .await
             .expect("completed");
+    }
+
+    async fn assert_disconnected_terminal(completion: Result<ActionResult, &str>) {
+        let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(1_000)));
+        let h = setup_service(&clock, None);
+        let mut worker = h
+            .controller
+            .register_worker(worker_reg("i-reconnect", 9))
+            .await
+            .expect("register");
+        let (digest, _) = store_action_and_command(&h.content, &["build"], "x86-64", None, true);
+        let mut stream = h
+            .execution
+            .execute(Request::new(ExecuteRequest {
+                action_digest: Some(to_proto(&digest).expect("digest")),
+                skip_cache_lookup: true,
+                ..Default::default()
+            }))
+            .await
+            .expect("execute")
+            .into_inner();
+        let name = stream
+            .next()
+            .await
+            .expect("queued")
+            .expect("operation")
+            .name;
+        drop(stream);
+        // Client-lane FIFO makes this a barrier for the dropped Execute subscription.
+        let watch = h
+            .controller
+            .watch(name.parse().expect("name"))
+            .await
+            .expect("watch")
+            .expect("operation");
+        watch.close().await;
+        let attempts = complete_disconnected(&h, &clock, &mut worker, &completion).await;
+        let response = terminal_replays(&h, &name, digest).await;
+        match completion {
+            Ok(mut expected) => {
+                expected
+                    .execution_metadata
+                    .as_mut()
+                    .expect("metadata")
+                    .queued_timestamp = Some(prost_types::Timestamp {
+                    seconds: 1,
+                    nanos: 0,
+                });
+                assert_eq!(response.result, Some(expected));
+                assert_eq!(response.status, Some(super::ok_rpc_status()));
+            }
+            Err(message) => {
+                assert_eq!(
+                    response.status,
+                    Some(gang_reapi::google::rpc::Status {
+                        code: RpcCode::Internal as i32,
+                        message: format!(
+                            "action {name} failed after {} attempts: {message}",
+                            attempts - 1
+                        ),
+                        details: Vec::new(),
+                    })
+                );
+                assert!(response.result.is_none());
+            }
+        }
+        h.controller.shutdown().await.expect("shutdown");
+        h.task.await.expect("actor joined");
+    }
+
+    async fn complete_disconnected(
+        h: &TestHarness,
+        clock: &TestClock,
+        worker: &mut RegisteredWorker,
+        completion: &Result<ActionResult, &str>,
+    ) -> u32 {
+        let attempts = if completion.is_ok() {
+            1
+        } else {
+            test_policy().actions.max_job_retries.get() + 1
+        };
+        for _ in 0..attempts {
+            let Some(WorkerOutbound::Assign(assign)) = worker.outbound.recv().await else {
+                panic!("expected assignment");
+            };
+            let attempt_id: AttemptId = assign.attempt.parse().expect("attempt");
+            h.controller
+                .worker_event(
+                    worker.key,
+                    WorkerEvent::Accept {
+                        attempt_id: attempt_id.clone(),
+                    },
+                )
+                .await
+                .expect("accept");
+            h.controller
+                .worker_event(
+                    worker.key,
+                    WorkerEvent::Executed(WorkerExecuted {
+                        attempt_id: attempt_id.clone(),
+                        usage: AttemptUsage::default(),
+                        kill: None,
+                        side_channel_memory_failure: false,
+                    }),
+                )
+                .await
+                .expect("executed");
+            let status = match completion {
+                Ok(_) => CompletionStatus::Ok,
+                Err(message) => CompletionStatus::Failed {
+                    message: (*message).to_owned(),
+                },
+            };
+            h.controller
+                .worker_event_with_completion(
+                    worker.key,
+                    WorkerEvent::Completed(WorkerCompleted {
+                        attempt_id,
+                        status,
+                        execution_timestamps: Some((clock.wall(), clock.wall())),
+                    }),
+                    CompletionPayload {
+                        result: completion.as_ref().ok().cloned(),
+                        status: None,
+                        exit_code: 7,
+                        error: completion.is_err(),
+                    },
+                )
+                .await
+                .expect("completed");
+        }
+        // Worker-lane FIFO provides a deterministic barrier for every Completed event.
+        let _barrier = h
+            .controller
+            .register_worker(worker_reg("i-barrier", 10))
+            .await
+            .expect("barrier");
+        attempts
+    }
+
+    async fn terminal_replays(h: &TestHarness, name: &str, digest: Digest) -> ExecuteResponse {
+        let mut replay = h
+            .execution
+            .wait_execution(Request::new(WaitExecutionRequest {
+                name: name.to_owned(),
+            }))
+            .await
+            .expect("wait execution")
+            .into_inner();
+        let waited = replay.next().await.expect("terminal").expect("operation");
+        let got = h
+            .operations
+            .get_operation(Request::new(GetOperationRequest {
+                name: name.to_owned(),
+            }))
+            .await
+            .expect("get operation")
+            .into_inner();
+        assert!(waited.done);
+        assert!(got.done);
+        assert_eq!(waited, got);
+        assert_eq!(
+            decode_metadata(&got).action_digest,
+            Some(to_proto(&digest).expect("digest"))
+        );
+        let response = decode_response(&got);
+        assert!(replay.next().await.is_none());
+        response
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnected_execute_retains_complete_success() {
+        assert_disconnected_terminal(Ok(ActionResult {
+            exit_code: 7,
+            stdout_raw: RawBytes::from_static(b"stdout"),
+            output_files: vec![OutputFile {
+                path: "out/object".to_owned(),
+                digest: Some(to_proto(&Digest::from_bytes(b"output")).expect("digest")),
+                is_executable: true,
+                ..Default::default()
+            }],
+            execution_metadata: Some(ExecutedActionMetadata::default()),
+            ..Default::default()
+        }))
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnected_execute_retains_exact_failure() {
+        assert_disconnected_terminal(Err("upload failed permanently")).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn metadata_stream_limit_checks_actual_bytes_and_declared_size() {
+        for declared_size in [1, 4 * 1024 * 1024 + 1] {
+            let blob = BlobStream {
+                size: declared_size,
+                chunks: Box::pin(futures::stream::iter([
+                    Ok(RawBytes::from(vec![0; 4 * 1024 * 1024])),
+                    Ok(RawBytes::from_static(b"overflow")),
+                ])),
+            };
+            let error = super::collect_metadata_blob(blob, "command")
+                .await
+                .expect_err("oversized stream");
+            assert_eq!(error.code(), Code::ResourceExhausted);
+        }
+        let bytes = RawBytes::from(vec![0; 4 * 1024 * 1024]);
+        let read = super::collect_metadata_blob(BlobStream::from_bytes(bytes.clone()), "action")
+            .await
+            .expect("exactly at limit");
+        assert_eq!(read, bytes);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_action_and_command_digests_are_rejected_before_read() {
+        let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(1_000)));
+        let h = setup_service(&clock, None);
+        let oversized = Digest::new([1; 32], 4 * 1024 * 1024 + 1);
+        for kind in ["action", "command"] {
+            h.content.reset_calls();
+            let action_digest = if kind == "action" {
+                oversized
+            } else {
+                h.content.insert(RawBytes::from(
+                    Action {
+                        command_digest: Some(to_proto(&oversized).expect("digest")),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ))
+            };
+            let error = h
+                .execution
+                .execute(Request::new(ExecuteRequest {
+                    action_digest: Some(to_proto(&action_digest).expect("digest")),
+                    skip_cache_lookup: true,
+                    ..Default::default()
+                }))
+                .await
+                .err()
+                .expect("oversized metadata rejected");
+            assert_eq!(error.code(), Code::InvalidArgument, "{kind}");
+            assert_eq!(
+                h.content.read_calls(),
+                usize::from(kind == "command"),
+                "oversized {kind} must not be read"
+            );
+        }
+        h.controller.shutdown().await.expect("shutdown");
+        h.task.await.expect("actor joined");
     }
 
     #[tokio::test(flavor = "current_thread")]

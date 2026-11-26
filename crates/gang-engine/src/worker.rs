@@ -42,8 +42,8 @@ use crate::worker_runner::{
     run_attempt, start_orphan_reaper,
 };
 use crate::worker_sampling::{
-    GraveyardPending, KillTrigger, SamplingConfig, SamplingRegistry, SystemProbe, WorkerSampler,
-    kill_channel,
+    GraveyardPending, KillTrigger, KillWaiter, SamplingConfig, SamplingRegistry, SystemProbe,
+    WorkerSampler, kill_channel,
 };
 use crate::worker_session::{
     ConnectError, ConnectedChannel, SessionConfig, SessionConnector, SessionError, SessionEvent,
@@ -679,8 +679,12 @@ where
                             }
                         }
                     }
-                    SessionEvent::Disconnected { .. } => {
+                    SessionEvent::Disconnected { ack, .. } => {
                         current_outbound = None;
+                        current_worker_id = None;
+                        cancel_all_attempts(&runtime.active_kills);
+                        drain_attempts(&mut attempt_tasks).await;
+                        let _ = ack.send(());
                     }
                     SessionEvent::Assign(assign) => {
                         let Some(outbound) = current_outbound.clone() else {
@@ -723,14 +727,20 @@ where
                         }
                         let owned_reservation =
                             into_owned_reservation(reservation, &runtime.disk_reservations);
+                        let (kill_trigger, kill_waiter) = kill_channel();
+                        runtime.active_kills.lock().insert(assign.attempt.clone(), kill_trigger.clone());
+                        let active_guard = ActiveAttemptGuard { attempt: assign.attempt.clone(), active_kills: Arc::clone(&runtime.active_kills) };
                         let rt = Arc::clone(runtime);
                         attempt_tasks.spawn(async move {
+                            let _active_guard = active_guard;
                             execute_assigned_attempt(
                                 rt,
                                 *assign,
                                 worker_id,
                                 outbound,
                                 owned_reservation,
+                                kill_trigger,
+                                kill_waiter,
                             )
                             .await;
                         });
@@ -775,6 +785,8 @@ async fn execute_assigned_attempt<C, A, K>(
     worker_id: WorkerId,
     outbound: SessionOutbound,
     mut reservation: OwnedDiskReservation,
+    kill_trigger: KillTrigger,
+    kill_waiter: KillWaiter,
 ) where
     C: ContentStore,
     A: ActionStore,
@@ -790,16 +802,6 @@ async fn execute_assigned_attempt<C, A, K>(
                 .await;
             return;
         }
-    };
-
-    let (kill_trigger, kill_waiter) = kill_channel();
-    runtime
-        .active_kills
-        .lock()
-        .insert(attempt_id.as_str().to_owned(), kill_trigger.clone());
-    let _active_guard = ActiveAttemptGuard {
-        attempt: attempt_id.as_str().to_owned(),
-        active_kills: Arc::clone(&runtime.active_kills),
     };
 
     let input_fetch_start = runtime.clock.wall();
@@ -1008,10 +1010,8 @@ where
         command: staged.command(),
         work_dir: staged.work_dir(),
         working_dir: staged.working_dir(),
-        stdout: (!run_outcome.stdout.bytes.is_empty())
-            .then(|| UploadCapturedOutput::Bytes(Bytes::from(run_outcome.stdout.bytes))),
-        stderr: (!run_outcome.stderr.bytes.is_empty())
-            .then(|| UploadCapturedOutput::Bytes(Bytes::from(run_outcome.stderr.bytes))),
+        stdout: Some(captured_for_upload(run_outcome.stdout)),
+        stderr: Some(captured_for_upload(run_outcome.stderr)),
         timing: ExecutionTiming {
             worker: worker_id.as_str().to_owned(),
             queued: None,
@@ -1052,6 +1052,15 @@ where
             attempt_id.as_str().to_owned(),
             rpc_status(rpc_proto::Code::DeadlineExceeded, "output upload timed out"),
         ),
+    }
+}
+
+fn captured_for_upload(output: crate::worker_runner::CapturedOutput) -> UploadCapturedOutput {
+    match output {
+        crate::worker_runner::CapturedOutput::File(path) => UploadCapturedOutput::File(path),
+        crate::worker_runner::CapturedOutput::Bytes(bytes) => {
+            UploadCapturedOutput::Bytes(Bytes::from(bytes))
+        }
     }
 }
 
@@ -1337,6 +1346,11 @@ mod tests {
     fn write_output_child() -> Result<(), Box<dyn std::error::Error>> {
         fs::write("result.txt", b"hello-from-worker")?;
         println!("child-stdout-line");
+        if let Ok(count) = std::env::var("STDERR_BYTES") {
+            use std::io::Write as _;
+            let count: usize = count.parse()?;
+            std::io::stderr().lock().write_all(&vec![b'x'; count])?;
+        }
         WRITE_OUTPUT_CHILD.complete();
         Ok(())
     }
@@ -1346,6 +1360,10 @@ mod tests {
     fn sleep_forever_child() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(marker) = std::env::var("STARTED_MARKER_FILE") {
             fs::write(marker, b"started")?;
+        }
+        if let Ok(address) = std::env::var("STARTED_SOCKET_ADDR") {
+            use std::io::Write as _;
+            std::net::TcpStream::connect(address)?.write_all(&std::process::id().to_le_bytes())?;
         }
         std::thread::sleep(Duration::from_mins(1));
         SLEEP_FOREVER_CHILD.complete();
@@ -1785,6 +1803,147 @@ mod tests {
                 next_non_keepalive(&mut session.inbound_rx).await?,
                 WorkerKind::GoingAway(_)
             ));
+            server.abort();
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn spools_and_uploads_complete_output_beyond_old_truncation_limit() -> TestResult {
+        run_gated(async {
+            let tmp = TempDir::new()?;
+            let root = tmp.path().canonicalize()?;
+            let spec = test_spec(&root, WorkerLifetime::LongLived, false)?;
+            let content = Arc::new(MemoryContentStore::new());
+            let actions = Arc::new(MemoryActionStore::new());
+            let length = 17 * 1024 * 1024 + 7;
+            let (digest, action, command) = seed_action_in_store(
+                &content,
+                WRITE_OUTPUT_CHILD,
+                vec![reapi::command::EnvironmentVariable {
+                    name: "STDERR_BYTES".into(),
+                    value: length.to_string(),
+                }],
+                vec!["result.txt".into()],
+                Vec::new(),
+            )
+            .await?;
+            let (controller, mut sessions) = MockController::new();
+            let (addr, server) = spawn_mock_server(controller, None).await?;
+            let (stop_tx, stop_rx) = oneshot::channel();
+            let worker = spawn_direct_worker(
+                spec.clone(),
+                Arc::clone(&content),
+                Arc::clone(&actions),
+                addr,
+                stop_rx,
+            );
+            let (mut session, _) = expect_register_and_ack(
+                &mut sessions,
+                "inst-e5-00000000-0000-4000-8000-000000000021",
+            )
+            .await?;
+            let attempt = "00000000-0000-4000-8000-000000000888";
+            session
+                .outbound_tx
+                .send(Ok(assign_frame(
+                    attempt,
+                    digest,
+                    Some(action),
+                    Some(command),
+                    32 * 1024 * 1024,
+                )?))
+                .await?;
+            let result = expect_accept_executed_completed(&mut session.inbound_rx, attempt).await?;
+            let stderr = from_proto(
+                result
+                    .stderr_digest
+                    .as_ref()
+                    .ok_or("missing stderr digest")?,
+            )?;
+            let expected = Bytes::from(vec![b'x'; length]);
+            assert_eq!(stderr, Digest::from_bytes(&expected));
+            assert_eq!(content.get_bytes(stderr), Some(expected));
+            assert_output_and_cached(&content, &actions, digest, &result).await?;
+            assert!(
+                !spec.work_directory.join(attempt).exists(),
+                "attempt spool was not retired"
+            );
+            let _ = stop_tx.send(());
+            worker.await??;
+            server.abort();
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn disconnect_drains_old_process_before_replacement_registers() -> TestResult {
+        run_gated(async {
+            use tokio::io::AsyncReadExt as _;
+            let tmp = TempDir::new()?;
+            let root = tmp.path().canonicalize()?;
+            let spec = test_spec(&root, WorkerLifetime::LongLived, false)?;
+            let readiness = TcpListener::bind("127.0.0.1:0").await?;
+            let content = Arc::new(MemoryContentStore::new());
+            let actions = Arc::new(MemoryActionStore::new());
+            let (digest, action, command) = seed_action_in_store(
+                &content,
+                SLEEP_FOREVER_CHILD,
+                vec![reapi::command::EnvironmentVariable {
+                    name: "STARTED_SOCKET_ADDR".into(),
+                    value: readiness.local_addr()?.to_string(),
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .await?;
+            let (controller, mut sessions) = MockController::new();
+            let (addr, server) = spawn_mock_server(controller, None).await?;
+            let (stop_tx, stop_rx) = oneshot::channel();
+            let worker = spawn_direct_worker(spec.clone(), content, actions, addr, stop_rx);
+            let (mut first, _) = expect_register_and_ack(
+                &mut sessions,
+                "inst-e5-00000000-0000-4000-8000-000000000022",
+            )
+            .await?;
+            let attempt = "00000000-0000-4000-8000-000000000889";
+            first
+                .outbound_tx
+                .send(Ok(assign_frame(
+                    attempt,
+                    digest,
+                    Some(action),
+                    Some(command),
+                    128,
+                )?))
+                .await?;
+            assert!(matches!(
+                next_non_keepalive(&mut first.inbound_rx).await?,
+                WorkerKind::Accept(_)
+            ));
+            let (mut ready, _) = readiness.accept().await?;
+            let mut pid_bytes = [0; 4];
+            ready.read_exact(&mut pid_bytes).await?;
+            let pid = rustix::process::Pid::from_raw(i32::try_from(u32::from_le_bytes(pid_bytes))?)
+                .ok_or("invalid child pid")?;
+            drop(first);
+            let (second, _) = expect_register_and_ack(
+                &mut sessions,
+                "inst-e5-00000000-0000-4000-8000-000000000023",
+            )
+            .await?;
+            assert_eq!(
+                rustix::process::test_kill_process(pid),
+                Err(rustix::io::Errno::SRCH),
+                "old process survived replacement registration"
+            );
+            assert!(
+                !spec.work_directory.join(attempt).exists(),
+                "old attempt directory survived replacement registration"
+            );
+            let _ = stop_tx.send(());
+            worker.await??;
+            drop(second);
             server.abort();
             Ok(())
         })

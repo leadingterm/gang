@@ -1547,10 +1547,10 @@ mod tests {
             recv_event(&mut events_rx).await?,
             SessionEvent::Rehome
         ));
-        assert!(matches!(
-            recv_event(&mut events_rx).await?,
-            SessionEvent::Disconnected { .. }
-        ));
+        let SessionEvent::Disconnected { ack, .. } = recv_event(&mut events_rx).await? else {
+            return Err("expected Disconnected".into());
+        };
+        let _ = ack.send(());
 
         // Stop the worker before it keeps retrying against the handing-off controller.
         stop.notify_one();

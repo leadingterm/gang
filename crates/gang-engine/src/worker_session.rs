@@ -248,7 +248,7 @@ impl SessionOutbound {
 }
 
 /// Inbound lifecycle and controller events emitted by [`run_session`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum SessionEvent {
     /// A new session generation completed `Register` -> `Registered`.
     Registered {
@@ -273,6 +273,8 @@ pub enum SessionEvent {
     Disconnected {
         /// Diagnostic reason if the session ended with an error.
         reason: Option<String>,
+        /// Sent only after all attempts from this generation have been cancelled and drained.
+        ack: oneshot::Sender<()>,
     },
 }
 
@@ -540,6 +542,7 @@ async fn run_one_session<T: TelemetrySource, K: Clock>(
         clock,
         config.connect_timeout.get(),
         events,
+        stop.as_mut(),
     )
     .await
 }
@@ -603,6 +606,7 @@ async fn finalize_active_session<K: Clock>(
     clock: &K,
     connect_timeout: Duration,
     events: &mpsc::Sender<SessionEvent>,
+    mut stop: Pin<&mut impl Future<Output = ()>>,
 ) -> Result<LoopControl, SessionError> {
     match active_outcome {
         ActiveOutcome::Fatal(err) => {
@@ -635,12 +639,8 @@ async fn finalize_active_session<K: Clock>(
             )
             .await;
             drop(inbound);
-            if events
-                .send(SessionEvent::Disconnected { reason: None })
-                .await
-                .is_err()
-            {
-                return Err(SessionError::EventsClosed);
+            if !wait_for_attempt_drain(events, None, stop.as_mut()).await? {
+                return Ok(LoopControl::Stopped);
             }
             Ok(LoopControl::Rehome)
         }
@@ -649,15 +649,29 @@ async fn finalize_active_session<K: Clock>(
             drop(out_tx);
             let _ = tokio::time::timeout(GOING_AWAY_WIRE_GRACE, flushed_rx).await;
             drop(inbound);
-            if events
-                .send(SessionEvent::Disconnected { reason })
-                .await
-                .is_err()
-            {
-                return Err(SessionError::EventsClosed);
+            if !wait_for_attempt_drain(events, reason, stop.as_mut()).await? {
+                return Ok(LoopControl::Stopped);
             }
             Ok(LoopControl::Reconnect)
         }
+    }
+}
+
+async fn wait_for_attempt_drain(
+    events: &mpsc::Sender<SessionEvent>,
+    reason: Option<String>,
+    mut stop: Pin<&mut impl Future<Output = ()>>,
+) -> Result<bool, SessionError> {
+    let (ack, drained) = oneshot::channel();
+    tokio::select! {
+        biased;
+        () = &mut stop => return Ok(false),
+        sent = events.send(SessionEvent::Disconnected { reason, ack }) => sent.map_err(|_| SessionError::EventsClosed)?,
+    }
+    tokio::select! {
+        biased;
+        () = &mut stop => Ok(false),
+        result = drained => result.map(|()| true).map_err(|_| SessionError::EventsClosed),
     }
 }
 
@@ -1452,10 +1466,14 @@ mod tests {
             }))
             .await?;
         assert!(matches!(events_rx.recv().await, Some(SessionEvent::Rehome)));
-        assert!(matches!(
-            events_rx.recv().await,
-            Some(SessionEvent::Disconnected { reason: None })
-        ));
+        let Some(SessionEvent::Disconnected { reason: None, ack }) = events_rx.recv().await else {
+            return Err("expected disconnect drain barrier".into());
+        };
+        assert!(
+            sessions.try_recv().is_err(),
+            "session replaced before drain acknowledgement"
+        );
+        let _ = ack.send(());
 
         let mut second = sessions.recv().await.ok_or("missing session 2")?;
         let reg2 = second

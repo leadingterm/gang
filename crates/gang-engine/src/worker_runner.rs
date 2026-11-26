@@ -29,7 +29,7 @@ use gang_reapi::google::rpc as rpc_proto;
 use gang_reapi::leadingterm::gang::worker::v1 as proto;
 use gang_spi::{CPU_COUNT_ENV, MAX_RO_BINDS, MEMORY_KB_ENV, NETWORK_ENV, SIDE_CHANNEL_FILE_ENV};
 use gang_types::{AttemptId, CpuWeight, NonZeroDuration, property};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt as _};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
@@ -50,8 +50,8 @@ pub const READ_ONLY_TREES_FILE: &str = "read_only_trees";
 /// Side-channel report file written by `gang exec` after sandbox exit.
 pub const REPORT_FILE: &str = "report";
 
-/// Default per-stream stdout/stderr in-memory capture bound (16 `MiB`).
-pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+/// Default per-stream stdout/stderr in-memory capture threshold (256 `KiB`).
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// Interval between orphan-zombie scans by the worker subreaper.
 pub const ORPHAN_REAP_INTERVAL: Duration = Duration::from_secs(5);
@@ -489,15 +489,19 @@ pub fn build_action_environment<S: BuildHasher>(
     env.into_iter().collect()
 }
 
-/// Bounded stdout or stderr bytes captured from an executed attempt.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CapturedOutput {
-    /// Captured bytes up to [`RunSpec::max_output_bytes`].
-    pub bytes: Vec<u8>,
-    /// Total bytes written by the process to this stream before EOF.
-    pub total_bytes: u64,
-    /// `true` when bytes beyond [`RunSpec::max_output_bytes`] were drained and discarded.
-    pub truncated: bool,
+/// Complete stdout or stderr captured in memory or in an attempt-owned spool file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapturedOutput {
+    /// Complete output bytes retained within the in-memory threshold.
+    Bytes(Vec<u8>),
+    /// Attempt-owned file containing the complete stream after spilling from memory.
+    File(PathBuf),
+}
+
+impl Default for CapturedOutput {
+    fn default() -> Self {
+        Self::Bytes(Vec::new())
+    }
 }
 
 /// Wall-clock start and finish timestamps for one execution attempt.
@@ -589,7 +593,7 @@ pub struct RunSpec {
     pub attempt_deadline: Option<Timestamp>,
     /// Grace period between `SIGTERM` and forced `cgroup.kill` / `SIGKILL` escalation.
     pub kill_grace: NonZeroDuration,
-    /// Maximum stdout/stderr bytes retained per stream in memory (excess is drained).
+    /// Maximum stdout/stderr bytes retained per stream in memory before spilling to a file.
     pub max_output_bytes: usize,
 }
 
@@ -649,14 +653,20 @@ pub async fn run_attempt<K: Clock>(
         source,
     })?;
     let group = ProcessGroup::of(&child);
-    let stdout_task = child
-        .stdout
-        .take()
-        .map(|pipe| tokio::spawn(drain_bounded(pipe, spec.max_output_bytes)));
-    let stderr_task = child
-        .stderr
-        .take()
-        .map(|pipe| tokio::spawn(drain_bounded(pipe, spec.max_output_bytes)));
+    let stdout_task = child.stdout.take().map(|pipe| {
+        PipeTask(tokio::spawn(drain_bounded(
+            pipe,
+            spec.max_output_bytes,
+            dirs.attempt_dir.join("stdout"),
+        )))
+    });
+    let stderr_task = child.stderr.take().map(|pipe| {
+        PipeTask(tokio::spawn(drain_bounded(
+            pipe,
+            spec.max_output_bytes,
+            dirs.attempt_dir.join("stderr"),
+        )))
+    });
 
     let (status, kill_reason) = supervise_child(
         &mut child,
@@ -675,8 +685,10 @@ pub async fn run_attempt<K: Clock>(
         group.disarm();
     }
 
-    let stdout = collect_pipe(stdout_task, clock).await;
-    let stderr = collect_pipe(stderr_task, clock).await;
+    let (stdout, stderr) = tokio::join!(
+        collect_pipe(stdout_task, clock),
+        collect_pipe(stderr_task, clock)
+    );
     let (usage, kill) =
         collect_final_usage(&side_channel, sampler, &spec.attempt, tracked, kill_reason);
 
@@ -690,8 +702,8 @@ pub async fn run_attempt<K: Clock>(
 
     Ok(RunOutcome {
         exit_code: exit_code_of(status),
-        stdout,
-        stderr,
+        stdout: stdout?,
+        stderr: stderr?,
         usage,
         kill,
         started,
@@ -935,48 +947,89 @@ async fn sleep_optional<K: Clock>(clock: &K, duration: Option<Duration>) {
     }
 }
 
-async fn drain_bounded<R: AsyncRead + Unpin>(mut reader: R, limit: usize) -> CapturedOutput {
+struct PipeTask(JoinHandle<Result<CapturedOutput, RunnerError>>);
+
+impl Drop for PipeTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn drain_bounded<R: AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+    path: PathBuf,
+) -> Result<CapturedOutput, RunnerError> {
     let mut bytes = Vec::new();
-    let mut total_bytes = 0_u64;
-    let mut truncated = false;
-    let mut chunk = [0_u8; 8192];
+    let mut spool: Option<tokio::fs::File> = None;
+    let mut chunk = vec![0_u8; 16 * 1024];
     loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(count) => {
-                total_bytes = total_bytes.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
-                let remaining = limit.saturating_sub(bytes.len());
-                if remaining > 0 {
-                    let take = count.min(remaining);
-                    bytes.extend_from_slice(&chunk[..take]);
-                    if take < count {
-                        truncated = true;
-                    }
-                } else {
-                    truncated = true;
-                }
-            }
+        let count = reader
+            .read(&mut chunk)
+            .await
+            .map_err(gang_os::PathIo::at("read action output pipe", &path))?;
+        if count == 0 {
+            break;
+        }
+        if spool.is_none() && count > limit.saturating_sub(bytes.len()) {
+            // Never follow or overwrite an action-created entry at the spool location.
+            let fd = rustix::fs::open(
+                &path,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            )
+            .map_err(|source| {
+                gang_os::PathIo::new("create action output spool", &path, source.into())
+            })?;
+            let mut file = tokio::fs::File::from_std(std::fs::File::from(fd));
+            file.write_all(&bytes)
+                .await
+                .map_err(gang_os::PathIo::at("write action output spool", &path))?;
+            bytes = Vec::new();
+            spool = Some(file);
+        }
+        if let Some(file) = &mut spool {
+            file.write_all(&chunk[..count])
+                .await
+                .map_err(gang_os::PathIo::at("write action output spool", &path))?;
+        } else {
+            bytes.extend_from_slice(&chunk[..count]);
         }
     }
-    CapturedOutput {
-        bytes,
-        total_bytes,
-        truncated,
+    if let Some(mut file) = spool {
+        file.flush()
+            .await
+            .map_err(gang_os::PathIo::at("flush action output spool", &path))?;
+        Ok(CapturedOutput::File(path))
+    } else {
+        Ok(CapturedOutput::Bytes(bytes))
     }
 }
 
 async fn collect_pipe<K: Clock>(
-    task: Option<JoinHandle<CapturedOutput>>,
+    task: Option<PipeTask>,
     clock: &K,
-) -> CapturedOutput {
+) -> Result<CapturedOutput, RunnerError> {
     let Some(mut handle) = task else {
-        return CapturedOutput::default();
+        return Ok(CapturedOutput::default());
     };
-    if let Ok(Ok(output)) = clock.timeout(POST_EXIT_PIPE_DRAIN_CAP, &mut handle).await {
-        return output;
-    }
-    handle.abort();
-    CapturedOutput::default()
+    let source = match clock.timeout(POST_EXIT_PIPE_DRAIN_CAP, &mut handle.0).await {
+        Ok(Ok(output)) => return output,
+        Ok(Err(error)) => io::Error::other(error),
+        Err(_) => {
+            handle.0.abort();
+            let _ = (&mut handle.0).await;
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "action output pipe did not reach EOF",
+            )
+        }
+    };
+    Err(gang_os::PathIo::new("collect action output", Path::new("stdout/stderr"), source).into())
 }
 
 fn exit_code_of(status: ExitStatus) -> i32 {
@@ -1206,6 +1259,53 @@ mod tests {
         })
     }
 
+    struct BrokenPipeReader;
+
+    impl AsyncRead for BrokenPipeReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected pipe read failure",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_propagates_pipe_read_failure() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::TempDir::new()?;
+        let result = drain_bounded(BrokenPipeReader, 32, tmp.path().join("stdout")).await;
+        assert!(
+            matches!(result, Err(RunnerError::Io(ref error)) if error.source.kind() == io::ErrorKind::BrokenPipe)
+        );
+        let task = PipeTask(tokio::spawn(async move { result }));
+        assert!(
+            collect_pipe(Some(task), &SystemClock::new()).await.is_err(),
+            "pipe collection swallowed a capture error"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capture_spills_complete_stream_and_keeps_small_output_in_memory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::TempDir::new()?;
+        let path = tmp.path().join("stdout");
+        let small = drain_bounded(&b"small"[..], 32, path.clone()).await?;
+        assert_eq!(small, CapturedOutput::Bytes(b"small".to_vec()));
+        assert!(!path.exists());
+        let payload = vec![b'x'; 3 * 1024 * 1024 + 7];
+        let captured = drain_bounded(payload.as_slice(), 32, path.clone()).await?;
+        assert_eq!(captured, CapturedOutput::File(path.clone()));
+        assert_eq!(fs::metadata(&path)?.len(), payload.len() as u64);
+        assert_eq!(fs::read(&path)?, payload);
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+
     #[ignore = "child test helper for clean environment verification"]
     #[test]
     fn env_dump_child() -> Result<(), Box<dyn std::error::Error>> {
@@ -1424,6 +1524,18 @@ mod tests {
         Ok(())
     }
 
+    fn parse_env_dump(stdout: &str) -> BTreeMap<String, String> {
+        let mut env_map = BTreeMap::new();
+        for line in stdout.lines() {
+            if let Some(pair) = line.strip_prefix("ENV:")
+                && let Some((k, v)) = pair.split_once('=')
+            {
+                env_map.insert(k.to_owned(), v.to_owned());
+            }
+        }
+        env_map
+    }
+
     #[test]
     fn clean_environment_isolation_defaults_overrides_and_reserved_enforcement()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1458,17 +1570,13 @@ mod tests {
             assert_eq!(outcome.exit_code, 0);
             assert_eq!(outcome.kill, None);
 
-            let stdout = String::from_utf8(outcome.stdout.bytes)?;
+            let CapturedOutput::Bytes(stdout) = outcome.stdout else {
+                return Err("expected small stdout in memory".into());
+            };
+            let stdout = String::from_utf8(stdout)?;
             assert!(ENV_DUMP_CHILD.completed_in(&stdout), "{stdout}");
 
-            let mut env_map = BTreeMap::new();
-            for line in stdout.lines() {
-                if let Some(pair) = line.strip_prefix("ENV:")
-                    && let Some((k, v)) = pair.split_once('=')
-                {
-                    env_map.insert(k.to_owned(), v.to_owned());
-                }
-            }
+            let env_map = parse_env_dump(&stdout);
             let expected_cwd = canonical_work.join("env-default/work/sub/dir");
             let expected_tmp = canonical_work.join("env-default/tmp");
             let expected_sc = canonical_work.join(".side_channels/env-default/report");
@@ -1528,7 +1636,10 @@ mod tests {
             let (tx, rx) = kill_channel();
             let outcome = run_attempt(&override_spec, &clock, None, rx, tx).await?;
             assert_eq!(outcome.exit_code, 0);
-            let stdout = String::from_utf8(outcome.stdout.bytes)?;
+            let CapturedOutput::Bytes(stdout) = outcome.stdout else {
+                return Err("expected small stdout in memory".into());
+            };
+            let stdout = String::from_utf8(stdout)?;
             assert!(stdout.contains("ENV:PWD=/custom/pwd\n"), "{stdout}");
             assert!(stdout.contains("ENV:TMPDIR=/custom/tmp\n"), "{stdout}");
             assert!(stdout.contains("ENV:GANG_CPU_COUNT=4\n"), "{stdout}");

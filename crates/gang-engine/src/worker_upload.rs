@@ -13,8 +13,11 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read as _};
 use std::num::NonZeroUsize;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -27,6 +30,7 @@ use gang_reapi::to_proto;
 use gang_spi::{ActionStore, BlobStream, ContentStore, PortError};
 use gang_types::Digest;
 use prost::Message as _;
+use rustix::fs::{self as fd_fs, AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest as _, Sha256};
 
 /// Streaming read buffer size used for hashing and uploading output files.
@@ -173,8 +177,9 @@ pub enum UploadError {
     Store(#[from] PortError),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct RootContext {
+    working_fd: OwnedFd,
     canonical_work_dir: PathBuf,
     lexical_work_dir: PathBuf,
     cwd_rel_to_work: PathBuf,
@@ -187,16 +192,20 @@ impl RootContext {
             source,
         })?;
         let lexical_work_dir = make_absolute_lexical(work_dir)?;
-        let canonical_working_dir =
-            fs::canonicalize(working_dir).map_err(|source| UploadError::Io {
-                path: working_dir.to_path_buf(),
-                source,
-            })?;
-        let cwd_rel_to_work = canonical_working_dir
-            .strip_prefix(&canonical_work_dir)
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
+        // Only the trusted worker root may contain host-level aliases. Every action-controlled
+        // component below the opened work root is resolved without following symlinks.
+        let work_fd = fd_fs::open(work_dir, directory_flags(), Mode::empty())
+            .map_err(|source| output_io(work_dir, source))?;
+        let cwd_rel_to_work = working_dir
+            .strip_prefix(work_dir)
+            .map_err(|_| UploadError::InvalidPath {
+                path: working_dir.display().to_string(),
+                reason: "working directory is outside work root",
+            })?
+            .to_path_buf();
+        let working_fd = open_directory_path(&work_fd, &cwd_rel_to_work)?;
         Ok(Self {
+            working_fd,
             canonical_work_dir,
             lexical_work_dir,
             cwd_rel_to_work,
@@ -207,11 +216,8 @@ impl RootContext {
         &self,
         link_abs: &Path,
         link_rel_to_cwd: &Path,
+        raw_target: &Path,
     ) -> Result<String, UploadError> {
-        let raw_target = fs::read_link(link_abs).map_err(|source| UploadError::Io {
-            path: link_abs.to_path_buf(),
-            source,
-        })?;
         let target_str = raw_target
             .to_str()
             .ok_or_else(|| UploadError::InvalidSymlinkTarget {
@@ -251,6 +257,7 @@ impl RootContext {
 #[derive(Debug, Clone)]
 struct CollectedFile {
     abs_path: PathBuf,
+    handle: Arc<File>,
     executable: bool,
     size: u64,
     dev: u64,
@@ -309,7 +316,7 @@ enum StdioPlan {
 }
 
 enum UploadPayload {
-    File { path: PathBuf, size: u64 },
+    File { handle: Arc<File>, size: u64 },
     Bytes(Bytes),
 }
 
@@ -542,7 +549,106 @@ fn build_action_result(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+fn directory_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+fn output_io(path: &Path, source: impl Into<io::Error>) -> UploadError {
+    UploadError::Io {
+        path: path.to_path_buf(),
+        source: source.into(),
+    }
+}
+
+fn open_directory_path(root: &OwnedFd, path: &Path) -> Result<OwnedFd, UploadError> {
+    let mut directory = fd_fs::openat(root, ".", directory_flags(), Mode::empty())
+        .map_err(|source| output_io(path, source))?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            return Err(UploadError::InvalidPath {
+                path: path.display().to_string(),
+                reason: "invalid directory component",
+            });
+        };
+        directory = fd_fs::openat(&directory, name, directory_flags(), Mode::empty()).map_err(
+            |source| match source {
+                rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => UploadError::InvalidPath {
+                    path: path.display().to_string(),
+                    reason: "output ancestor is not a real directory",
+                },
+                _ => output_io(path, source),
+            },
+        )?;
+    }
+    Ok(directory)
+}
+
+enum OpenOutput {
+    Symlink(PathBuf),
+    File(File),
+    Directory(OwnedFd),
+}
+
+fn open_output(
+    directory: &OwnedFd,
+    name: &Path,
+    diagnostic: &Path,
+) -> Result<Option<OpenOutput>, UploadError> {
+    let stat = match fd_fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(source) => return Err(output_io(diagnostic, source)),
+    };
+    let output = match FileType::from_raw_mode(stat.st_mode) {
+        FileType::Symlink => {
+            let target = fd_fs::readlinkat(directory, name, Vec::new())
+                .map_err(|source| output_io(diagnostic, source))?;
+            OpenOutput::Symlink(
+                Path::new(std::ffi::OsStr::from_bytes(target.to_bytes())).to_path_buf(),
+            )
+        }
+        FileType::Directory => OpenOutput::Directory(
+            fd_fs::openat(directory, name, directory_flags(), Mode::empty())
+                .map_err(|source| output_io(diagnostic, source))?,
+        ),
+        FileType::RegularFile => {
+            // NONBLOCK prevents a concurrent replacement with a FIFO from blocking the worker.
+            let fd = fd_fs::openat(
+                directory,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .map_err(|source| output_io(diagnostic, source))?;
+            let stat = fd_fs::fstat(&fd).map_err(|source| output_io(diagnostic, source))?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                return Err(UploadError::OutputKindMismatch {
+                    path: diagnostic.display().to_string(),
+                    expected: "regular file",
+                    actual: "non-regular file",
+                });
+            }
+            OpenOutput::File(File::from(fd))
+        }
+        _ => {
+            return Err(UploadError::OutputKindMismatch {
+                path: diagnostic.display().to_string(),
+                expected: "file, directory, or symlink",
+                actual: "special file",
+            });
+        }
+    };
+    Ok(Some(output))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeclaredOutputKind {
+    Any,
+    File,
+    Directory,
+}
+
+#[allow(deprecated, clippy::too_many_arguments)]
 fn collect_declared_outputs(
     command: &reapi::Command,
     working_dir: &Path,
@@ -553,244 +659,141 @@ fn collect_declared_outputs(
     top_symlinks: &mut Vec<TopLevelSymlink>,
     top_dirs: &mut Vec<TopLevelDir>,
 ) -> Result<(), UploadError> {
-    if use_output_paths {
-        collect_v21_output_paths(
-            &command.output_paths,
-            working_dir,
-            roots,
-            files,
-            top_files,
-            top_symlinks,
-            top_dirs,
-        )
+    let declarations = if use_output_paths {
+        vec![(&command.output_paths, DeclaredOutputKind::Any)]
     } else {
-        collect_v20_outputs(
-            command,
-            working_dir,
-            roots,
-            files,
-            top_files,
-            top_symlinks,
-            top_dirs,
-        )
-    }
-}
-
-fn collect_v21_output_paths(
-    output_paths: &[String],
-    working_dir: &Path,
-    roots: &RootContext,
-    files: &mut Vec<CollectedFile>,
-    top_files: &mut Vec<TopLevelFile>,
-    top_symlinks: &mut Vec<TopLevelSymlink>,
-    top_dirs: &mut Vec<TopLevelDir>,
-) -> Result<(), UploadError> {
-    let mut seen = HashSet::new();
-    for raw in output_paths {
-        if !seen.insert(raw.as_str()) {
-            continue;
-        }
-        let rel = validate_output_path(raw, false)?;
-        let abs = working_dir.join(&rel);
-        let Some(meta) = symlink_metadata_optional(&abs)? else {
-            continue;
-        };
-        let ftype = meta.file_type();
-        if ftype.is_symlink() {
-            let target = roots.rebase_symlink_target(&abs, &rel)?;
-            top_symlinks.push(TopLevelSymlink {
-                rel_path: raw.clone(),
-                target,
-                is_dir_field: false,
-            });
-        } else if ftype.is_file() {
-            let idx = push_collected_file(files, abs, &meta);
-            top_files.push(TopLevelFile {
-                rel_path: raw.clone(),
-                file_index: idx,
-            });
-        } else if ftype.is_dir() {
-            let tree = walk_output_directory(&abs, &rel, roots, files)?;
-            top_dirs.push(TopLevelDir {
-                rel_path: raw.clone(),
-                tree,
-            });
-        } else {
-            return Err(UploadError::OutputKindMismatch {
-                path: raw.clone(),
-                expected: "file, directory, or symlink",
-                actual: "special file",
-            });
-        }
-    }
-    Ok(())
-}
-
-#[allow(deprecated)]
-fn collect_v20_outputs(
-    command: &reapi::Command,
-    working_dir: &Path,
-    roots: &RootContext,
-    files: &mut Vec<CollectedFile>,
-    top_files: &mut Vec<TopLevelFile>,
-    top_symlinks: &mut Vec<TopLevelSymlink>,
-    top_dirs: &mut Vec<TopLevelDir>,
-) -> Result<(), UploadError> {
-    let mut seen_files = HashSet::new();
-    for raw in &command.output_files {
-        if !seen_files.insert(raw.as_str()) {
-            continue;
-        }
-        let rel = validate_output_path(raw, false)?;
-        let abs = working_dir.join(&rel);
-        let Some(meta) = symlink_metadata_optional(&abs)? else {
-            continue;
-        };
-        let ftype = meta.file_type();
-        if ftype.is_symlink() {
-            let target = roots.rebase_symlink_target(&abs, &rel)?;
-            top_symlinks.push(TopLevelSymlink {
-                rel_path: raw.clone(),
-                target,
-                is_dir_field: false,
-            });
-        } else if ftype.is_file() {
-            let idx = push_collected_file(files, abs, &meta);
-            top_files.push(TopLevelFile {
-                rel_path: raw.clone(),
-                file_index: idx,
-            });
-        } else {
-            return Err(UploadError::OutputKindMismatch {
-                path: raw.clone(),
-                expected: "file",
-                actual: if ftype.is_dir() {
-                    "directory"
-                } else {
-                    "special file"
-                },
-            });
+        vec![
+            (&command.output_files, DeclaredOutputKind::File),
+            (&command.output_directories, DeclaredOutputKind::Directory),
+        ]
+    };
+    for (paths, expected) in declarations {
+        let mut seen = HashSet::new();
+        for raw in paths {
+            if !seen.insert(raw.as_str()) {
+                continue;
+            }
+            let rel = validate_output_path(raw, expected == DeclaredOutputKind::Directory)?;
+            let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+            let directory = match open_directory_path(&roots.working_fd, parent) {
+                Ok(fd) => fd,
+                Err(UploadError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let name = rel.file_name().map_or_else(|| Path::new("."), Path::new);
+            let abs = working_dir.join(&rel);
+            let Some(output) = open_output(&directory, name, &abs)? else {
+                continue;
+            };
+            match output {
+                OpenOutput::Symlink(target) => top_symlinks.push(TopLevelSymlink {
+                    rel_path: raw.clone(),
+                    target: roots.rebase_symlink_target(&abs, &rel, &target)?,
+                    is_dir_field: expected == DeclaredOutputKind::Directory,
+                }),
+                OpenOutput::File(file) if expected != DeclaredOutputKind::Directory => {
+                    let idx = push_collected_file(files, abs, file)?;
+                    top_files.push(TopLevelFile {
+                        rel_path: raw.clone(),
+                        file_index: idx,
+                    });
+                }
+                OpenOutput::Directory(fd) if expected != DeclaredOutputKind::File => {
+                    let tree = walk_output_directory(&fd, &rel, roots, files)?;
+                    top_dirs.push(TopLevelDir {
+                        rel_path: raw.clone(),
+                        tree,
+                    });
+                }
+                _ => {
+                    return Err(UploadError::OutputKindMismatch {
+                        path: raw.clone(),
+                        expected: if expected == DeclaredOutputKind::Directory {
+                            "directory"
+                        } else {
+                            "file"
+                        },
+                        actual: if expected == DeclaredOutputKind::File {
+                            "directory"
+                        } else {
+                            "file"
+                        },
+                    });
+                }
+            }
         }
     }
-
-    let mut seen_dirs = HashSet::new();
-    for raw in &command.output_directories {
-        if !seen_dirs.insert(raw.as_str()) {
-            continue;
-        }
-        let rel = validate_output_path(raw, true)?;
-        let abs = if rel.as_os_str().is_empty() {
-            working_dir.to_path_buf()
-        } else {
-            working_dir.join(&rel)
-        };
-        let Some(meta) = symlink_metadata_optional(&abs)? else {
-            continue;
-        };
-        let ftype = meta.file_type();
-        if ftype.is_symlink() {
-            let target = roots.rebase_symlink_target(&abs, &rel)?;
-            top_symlinks.push(TopLevelSymlink {
-                rel_path: raw.clone(),
-                target,
-                is_dir_field: true,
-            });
-        } else if ftype.is_dir() {
-            let tree = walk_output_directory(&abs, &rel, roots, files)?;
-            top_dirs.push(TopLevelDir {
-                rel_path: raw.clone(),
-                tree,
-            });
-        } else {
-            return Err(UploadError::OutputKindMismatch {
-                path: raw.clone(),
-                expected: "directory",
-                actual: if ftype.is_file() {
-                    "file"
-                } else {
-                    "special file"
-                },
-            });
-        }
-    }
-
     Ok(())
 }
 
 fn walk_output_directory(
-    dir_abs: &Path,
+    fd: &OwnedFd,
     dir_rel_to_cwd: &Path,
     roots: &RootContext,
     files: &mut Vec<CollectedFile>,
 ) -> Result<CollectedDirNode, UploadError> {
     let mut node = CollectedDirNode::new();
-    let mut entries: Vec<(String, PathBuf, fs::Metadata)> = Vec::new();
-
-    for entry_res in fs::read_dir(dir_abs).map_err(|source| UploadError::Io {
-        path: dir_abs.to_path_buf(),
-        source,
-    })? {
-        let entry = entry_res.map_err(|source| UploadError::Io {
-            path: dir_abs.to_path_buf(),
-            source,
+    let listing_fd = fd_fs::openat(fd, ".", directory_flags(), Mode::empty())
+        .map_err(|source| output_io(dir_rel_to_cwd, source))?;
+    let mut directory = Dir::new(listing_fd).map_err(|source| output_io(dir_rel_to_cwd, source))?;
+    let mut names = Vec::new();
+    while let Some(entry) = directory.read() {
+        let entry = entry.map_err(|source| output_io(dir_rel_to_cwd, source))?;
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        let name = name.to_str().map_err(|_| UploadError::InvalidPath {
+            path: dir_rel_to_cwd.display().to_string(),
+            reason: "output filename is not valid UTF-8",
         })?;
-        let file_name = entry.file_name();
-        let Some(name_str) = file_name.to_str() else {
-            return Err(UploadError::InvalidPath {
-                path: file_name.to_string_lossy().into_owned(),
-                reason: "output filename is not valid UTF-8",
-            });
-        };
-        let child_abs = entry.path();
-        let meta = fs::symlink_metadata(&child_abs).map_err(|source| UploadError::Io {
-            path: child_abs.clone(),
-            source,
-        })?;
-        entries.push((name_str.to_owned(), child_abs, meta));
+        names.push(name.to_owned());
     }
-
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-    for (name, child_abs, meta) in entries {
-        let child_rel = join_rel(dir_rel_to_cwd, Path::new(&name));
-        let ftype = meta.file_type();
-        if ftype.is_symlink() {
-            let target = roots.rebase_symlink_target(&child_abs, &child_rel)?;
-            node.symlinks.push(CollectedSymlink { name, target });
-        } else if ftype.is_file() {
-            let idx = push_collected_file(files, child_abs, &meta);
-            node.files.push((name, idx));
-        } else if ftype.is_dir() {
-            let child_node = walk_output_directory(&child_abs, &child_rel, roots, files)?;
-            node.subdirs.insert(name, child_node);
-        } else {
-            return Err(UploadError::OutputKindMismatch {
-                path: child_rel.to_string_lossy().into_owned(),
-                expected: "file, directory, or symlink",
-                actual: "special file",
-            });
+    names.sort();
+    for name in names {
+        let rel = dir_rel_to_cwd.join(&name);
+        let Some(output) = open_output(fd, Path::new(&name), &rel)? else {
+            continue;
+        };
+        match output {
+            OpenOutput::Symlink(target) => node.symlinks.push(CollectedSymlink {
+                target: roots.rebase_symlink_target(&rel, &rel, &target)?,
+                name,
+            }),
+            OpenOutput::File(file) => {
+                let idx = push_collected_file(files, rel, file)?;
+                node.files.push((name, idx));
+            }
+            OpenOutput::Directory(child) => {
+                node.subdirs
+                    .insert(name, walk_output_directory(&child, &rel, roots, files)?);
+            }
         }
     }
-
     Ok(node)
 }
 
 fn push_collected_file(
     files: &mut Vec<CollectedFile>,
     abs_path: PathBuf,
-    meta: &fs::Metadata,
-) -> usize {
+    handle: File,
+) -> Result<usize, UploadError> {
+    let meta = handle
+        .metadata()
+        .map_err(|source| output_io(&abs_path, source))?;
     let idx = files.len();
-    let executable = meta.permissions().mode() & 0o111 != 0;
     files.push(CollectedFile {
         abs_path,
-        executable,
+        handle: Arc::new(handle),
+        executable: meta.permissions().mode() & 0o111 != 0,
         size: meta.len(),
         dev: meta.dev(),
         ino: meta.ino(),
         digest: Digest::EMPTY,
     });
-    idx
+    Ok(idx)
 }
 
 fn plan_stdio(
@@ -815,17 +818,32 @@ fn plan_stdio(
             }
         }
         CapturedOutput::File(path) => {
-            let Some(meta) = symlink_metadata_optional(&path)? else {
-                return Ok(StdioPlan::Empty);
-            };
+            let fd = fd_fs::open(
+                &path,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .map_err(|source| output_io(&path, source))?;
+            let stat = fd_fs::fstat(&fd).map_err(|source| output_io(&path, source))?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                return Err(UploadError::OutputKindMismatch {
+                    path: path.display().to_string(),
+                    expected: "regular file",
+                    actual: "non-regular file",
+                });
+            }
+            let mut file = File::from(fd);
+            let meta = file.metadata().map_err(|source| output_io(&path, source))?;
             if meta.len() == 0 {
                 return Ok(StdioPlan::Empty);
             }
             if meta.len() <= inline_max {
-                let raw = fs::read(&path).map_err(|source| UploadError::Io { path, source })?;
+                let mut raw = Vec::new();
+                file.read_to_end(&mut raw)
+                    .map_err(|source| output_io(&path, source))?;
                 return Ok(StdioPlan::Inline(Bytes::from(raw)));
             }
-            let idx = push_collected_file(files, path, &meta);
+            let idx = push_collected_file(files, path, file)?;
             Ok(StdioPlan::UploadFile { file_index: idx })
         }
     }
@@ -850,11 +868,11 @@ async fn hash_files_parallel(
     files: &mut [CollectedFile],
     concurrency: NonZeroUsize,
 ) -> Result<(), UploadError> {
-    let jobs: Vec<(usize, PathBuf)> = files
+    let jobs: Vec<(usize, PathBuf, Arc<File>)> = files
         .iter()
         .enumerate()
         .filter(|(_, file)| file.size > 0)
-        .map(|(idx, file)| (idx, file.abs_path.clone()))
+        .map(|(idx, file)| (idx, file.abs_path.clone(), Arc::clone(&file.handle)))
         .collect();
 
     if jobs.is_empty() {
@@ -862,9 +880,9 @@ async fn hash_files_parallel(
     }
 
     let results: Vec<Result<(usize, Digest), UploadError>> = futures::stream::iter(jobs)
-        .map(|(idx, path)| async move {
+        .map(|(idx, path, handle)| async move {
             let path_for_join = path.clone();
-            let digest = tokio::task::spawn_blocking(move || hash_file_streaming(&path))
+            let digest = tokio::task::spawn_blocking(move || hash_file_streaming(&handle, &path))
                 .await
                 .map_err(|err| UploadError::Io {
                     path: path_for_join,
@@ -883,19 +901,17 @@ async fn hash_files_parallel(
     Ok(())
 }
 
-fn hash_file_streaming(path: &Path) -> Result<Digest, UploadError> {
-    let mut file = File::open(path).map_err(|source| UploadError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn hash_file_streaming(file: &File, path: &Path) -> Result<Digest, UploadError> {
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
     let mut buf = vec![0_u8; STREAM_CHUNK_BYTES];
     loop {
-        let read = file.read(&mut buf).map_err(|source| UploadError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let read = file
+            .read_at(&mut buf, total)
+            .map_err(|source| UploadError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
         if read == 0 {
             break;
         }
@@ -1032,7 +1048,7 @@ async fn insert_outputs_into_disk_cas(
         if let Some(_pin) = disk.pin_attempt(file.digest, file.executable) {
             continue;
         }
-        let stream = file_blob_stream(file.abs_path.clone(), file.size).await?;
+        let stream = file_blob_stream(Arc::clone(&file.handle), file.size);
         let _outcome: WriteOutcome = disk
             .write_with_mode(file.digest, stream, file.executable)
             .await?;
@@ -1095,7 +1111,7 @@ where
         payloads.insert(
             file.digest,
             UploadPayload::File {
-                path: file.abs_path.clone(),
+                handle: Arc::clone(&file.handle),
                 size: file.size,
             },
         );
@@ -1132,7 +1148,7 @@ where
         .map(|(digest, payload)| async move {
             let stream = match payload {
                 UploadPayload::Bytes(bytes) => BlobStream::from_bytes(bytes),
-                UploadPayload::File { path, size } => file_blob_stream(path, size).await?,
+                UploadPayload::File { handle, size } => file_blob_stream(handle, size),
             };
             slow.write(digest, stream).await?;
             Ok(())
@@ -1147,25 +1163,14 @@ where
     Ok(())
 }
 
-async fn file_blob_stream(path: PathBuf, size: u64) -> Result<BlobStream, UploadError> {
+fn file_blob_stream(file: Arc<File>, size: u64) -> BlobStream {
     if size == 0 {
-        return Ok(BlobStream::empty());
+        return BlobStream::empty();
     }
-    let path_for_err = path.clone();
-    let file = tokio::task::spawn_blocking(move || File::open(&path))
-        .await
-        .map_err(|err| UploadError::Io {
-            path: path_for_err.clone(),
-            source: io::Error::other(format!("file open task failed: {err}")),
-        })?
-        .map_err(|source| UploadError::Io {
-            path: path_for_err,
-            source,
-        })?;
-
-    let chunks: BoxStream<'static, Result<Bytes, PortError>> =
-        Box::pin(stream::unfold(Some((file, size)), |state| async move {
-            let (mut file, remaining) = state?;
+    let chunks: BoxStream<'static, Result<Bytes, PortError>> = Box::pin(stream::unfold(
+        Some((file, size)),
+        move |state| async move {
+            let (file, remaining) = state?;
             if remaining == 0 {
                 return None;
             }
@@ -1174,7 +1179,7 @@ async fn file_blob_stream(path: PathBuf, size: u64) -> Result<BlobStream, Upload
 
             let step = tokio::task::spawn_blocking(move || {
                 let mut buf = vec![0_u8; to_read];
-                let read = file.read(&mut buf)?;
+                let read = file.read_at(&mut buf, size - remaining)?;
                 buf.truncate(read);
                 Ok::<_, io::Error>((file, Bytes::from(buf)))
             })
@@ -1199,9 +1204,10 @@ async fn file_blob_stream(path: PathBuf, size: u64) -> Result<BlobStream, Upload
                 Ok(Err(error)) => Some((Err(PortError::backend(error)), None)),
                 Err(join_err) => Some((Err(PortError::backend(join_err)), None)),
             }
-        }));
+        },
+    ));
 
-    Ok(BlobStream { size, chunks })
+    BlobStream { size, chunks }
 }
 
 fn symlink_metadata_optional(path: &Path) -> Result<Option<fs::Metadata>, UploadError> {
@@ -1784,6 +1790,120 @@ mod tests {
         .await?;
         assert!(slow.max_inflight.load(Ordering::SeqCst) <= 3);
         assert_eq!(slow.inner.len(), 8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uploads_verified_handles_after_output_paths_are_replaced() -> TestResult {
+        let tmp = TempDir::new()?;
+        let work = tmp.path().join("work");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(work.join("out"))?;
+        fs::create_dir_all(&outside)?;
+        fs::write(work.join("out/data"), b"verified output")?;
+        fs::write(outside.join("data"), b"outside secret")?;
+        let roots = super::RootContext::new(&work, &work)?;
+        let command = reapi::Command {
+            output_paths: vec!["out".into()],
+            ..Default::default()
+        };
+        let mut files = Vec::new();
+        super::collect_declared_outputs(
+            &command,
+            &work,
+            &roots,
+            true,
+            &mut files,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )?;
+        fs::rename(work.join("out"), work.join("saved"))?;
+        symlink(&outside, work.join("out"))?;
+        super::hash_files_parallel(&mut files, test_config().hash_concurrency).await?;
+        assert_eq!(files[0].digest, Digest::from_bytes(b"verified output"));
+        let disk = DiskCas::open(tmp.path().join("cas"), 1024 * 1024).await?;
+        let slow = MemoryContentStore::new();
+        let tiered = Tiered::new(disk.clone(), slow.clone());
+        super::insert_outputs_into_disk_cas(&disk, &files, &[]).await?;
+        super::upload_missing_to_slow(&tiered, &files, &[], test_config().upload_concurrency)
+            .await?;
+        assert_eq!(
+            slow.get_bytes(files[0].digest),
+            Some(Bytes::from_static(b"verified output"))
+        );
+        assert!(disk.pin_attempt(files[0].digest, false).is_some());
+        assert!(
+            slow.get_bytes(Digest::from_bytes(b"outside secret"))
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[allow(deprecated)]
+    #[tokio::test]
+    async fn rejects_intermediate_output_symlinks() -> TestResult {
+        let tmp = TempDir::new()?;
+        let work = tmp.path().join("work");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&work)?;
+        fs::create_dir_all(outside.join("secret-dir"))?;
+        let secret = b"host secret must never reach CAS";
+        fs::write(outside.join("secret.txt"), secret)?;
+        fs::write(outside.join("secret-dir/secret.txt"), secret)?;
+        symlink(&outside, work.join("out"))?;
+        let slow = MemoryContentStore::new();
+        let disk = DiskCas::open(tmp.path().join("cas"), 1024 * 1024).await?;
+        let tiered = Tiered::new(disk, slow.clone());
+        let clock = TestClock::new(Timestamp::from_unix_millis(1_000));
+        for command in [
+            reapi::Command {
+                output_paths: vec!["out/secret.txt".into()],
+                ..Default::default()
+            },
+            reapi::Command {
+                output_paths: vec!["out/secret-dir".into()],
+                ..Default::default()
+            },
+            reapi::Command {
+                output_files: vec!["out/secret.txt".into()],
+                ..Default::default()
+            },
+            reapi::Command {
+                output_directories: vec!["out/secret-dir".into()],
+                ..Default::default()
+            },
+        ] {
+            let result = upload_outputs(
+                UploadInput {
+                    action_digest: Digest::EMPTY,
+                    do_not_cache: true,
+                    exit_code: 0,
+                    command: &command,
+                    work_dir: &work,
+                    working_dir: &work,
+                    stdout: None,
+                    stderr: None,
+                    timing: ExecutionTiming::default(),
+                },
+                &tiered,
+                None::<&MemoryActionStore>,
+                &clock,
+                &test_config(),
+            )
+            .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(UploadError::InvalidPath { .. } | UploadError::OutputKindMismatch { .. })
+                ),
+                "intermediate symlink accepted: {result:?}"
+            );
+            assert!(
+                slow.get_bytes(Digest::from_bytes(secret)).is_none(),
+                "outside secret was exfiltrated"
+            );
+        }
         Ok(())
     }
 
