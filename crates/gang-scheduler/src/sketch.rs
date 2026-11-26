@@ -785,6 +785,7 @@ pub struct ResourceSketch {
     policy: Policy,
     window: Duration,
     budget: Budget,
+    memory_ceiling_kb: Option<u64>,
 }
 
 impl std::fmt::Debug for ResourceSketch {
@@ -846,6 +847,26 @@ impl ResourceSketch {
             policy,
             window,
             budget,
+            memory_ceiling_kb: None,
+        }
+    }
+
+    /// Applies the current catalog ceiling to retained history and all future insertions.
+    pub(crate) fn set_memory_ceiling(&mut self, ceiling_kb: Option<u64>) {
+        let previous = self.memory_ceiling_kb;
+        self.memory_ceiling_kb = ceiling_kb;
+        let Some(ceiling) = ceiling_kb else {
+            return;
+        };
+        if previous.is_some_and(|previous| previous <= ceiling) {
+            return;
+        }
+        for inner in &mut self.shards {
+            for family in &mut inner.families {
+                for slot in family.slots.iter_mut().flatten() {
+                    slot.value.clamp_memory_ceiling(Some(ceiling));
+                }
+            }
         }
     }
 
@@ -913,6 +934,10 @@ impl ResourceSketch {
         observation: &Observation,
         memory_ceiling_kb: Option<u64>,
     ) -> bool {
+        let memory_ceiling_kb = match (memory_ceiling_kb, self.memory_ceiling_kb) {
+            (Some(observed), Some(catalog)) => Some(observed.min(catalog)),
+            (observed, catalog) => observed.or(catalog),
+        };
         let family = key.family();
         let window_s = self.window_s();
         let inner = self.shard_mut(&key);
@@ -939,7 +964,8 @@ impl ResourceSketch {
     }
 
     /// Inserts a seeded entry when `key` has no existing entry.
-    pub fn seed(&mut self, key: SketchKey, entry: Entry) -> bool {
+    pub fn seed(&mut self, key: SketchKey, mut entry: Entry) -> bool {
+        entry.clamp_memory_ceiling(self.memory_ceiling_kb);
         let family = key.family();
         let inner = self.shard_mut(&key);
         if inner.families[family.index()].contains(&key) {
@@ -977,7 +1003,11 @@ impl ResourceSketch {
     /// Shapes a reservation from `entry` using this sketch's [`Policy`].
     #[must_use]
     pub fn shape(&self, entry: &Entry) -> Shaped {
-        shape(&self.policy, entry)
+        let mut shaped = shape(&self.policy, entry);
+        if let Some(ceiling) = self.memory_ceiling_kb {
+            shaped.memory_kb = shaped.memory_kb.min(ceiling);
+        }
+        shaped
     }
 
     /// Returns aggregate occupancy, capacity, sample, and eviction counters.
@@ -1112,7 +1142,8 @@ impl ResourceSketch {
         }
         let cutoff = now_s.saturating_sub(self.window_s());
         let mut loaded = 0_usize;
-        for (key, entry) in snapshot.entries {
+        for (key, mut entry) in snapshot.entries {
+            entry.clamp_memory_ceiling(self.memory_ceiling_kb);
             if !entry.seeded && entry.last_seen_s < cutoff {
                 continue;
             }
@@ -1138,7 +1169,7 @@ impl ResourceSketch {
                 for (key, entry) in inner.families[f.index()].iter().take(limit) {
                     rows.push(HintRow {
                         key: key.clone(),
-                        shaped: shape(&self.policy, entry),
+                        shaped: self.shape(entry),
                         samples: entry.samples,
                         last_seen_s: entry.last_seen_s,
                         seeded: entry.seeded,
@@ -1175,9 +1206,13 @@ impl Entry {
         memory_ceiling_kb: Option<u64>,
     ) {
         self.record(observation, window_s);
+        self.clamp_memory_ceiling(memory_ceiling_kb);
+    }
+
+    /// Bounds both half-window maxima and the memory kill floor without altering raw histograms.
+    pub(crate) fn clamp_memory_ceiling(&mut self, memory_ceiling_kb: Option<u64>) {
         if let Some(ceiling) = memory_ceiling_kb {
-            // Restored history and observations from a formerly larger fleet must also obey
-            // the current ceiling. Histogram percentiles are bounded by these exact maxima.
+            // Histogram percentiles are bounded by these exact maxima.
             self.current.max_memory_kb = self.current.max_memory_kb.min(ceiling);
             self.previous.max_memory_kb = self.previous.max_memory_kb.min(ceiling);
             self.killed_peak_memory_kb = self.killed_peak_memory_kb.min(ceiling);

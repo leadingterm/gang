@@ -231,20 +231,6 @@ impl OperationQueue {
         }
     }
 
-    /// Resumes an ordered dispatch scan after a key that may already have been dequeued.
-    pub(crate) fn next_after(&self, previous: Option<QueueKey>) -> Option<QueueKey> {
-        use std::ops::Bound::{Excluded, Unbounded};
-
-        match previous {
-            Some(key) => self
-                .global
-                .range((Excluded(key), Unbounded))
-                .next()
-                .copied(),
-            None => self.global.first().copied(),
-        }
-    }
-
     /// Iterates over queued operations eligible for `fleet` in priority/sequence order.
     #[must_use]
     pub fn fleet_iter(&self, fleet: usize) -> Option<impl Iterator<Item = QueueKey> + '_> {

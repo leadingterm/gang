@@ -239,6 +239,8 @@ pub struct Attempt {
     pub accepted_at: Option<Now>,
     /// `true` while this attempt still owns the operation's lifecycle outcome.
     owns_operation: bool,
+    /// Whether the phase deadline already emitted its kill directive.
+    deadline_expired: bool,
 }
 
 impl Attempt {
@@ -425,7 +427,7 @@ pub enum AckTimeoutOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttemptDeadlineOutcome {
     /// Execution or completion deadline expired. Execution reservations remain until `Executed`
-    /// or worker loss; an executed attempt is retired and its disk reservation released.
+    /// or worker loss; disk remains reserved until `Completed` or worker loss.
     Expired {
         /// Attempt key.
         attempt_key: AttemptKey,
@@ -438,7 +440,7 @@ pub enum AttemptDeadlineOutcome {
         /// Terminal `DeadlineExceeded` event, only when the expired attempt owns the operation.
         publish: Option<PublishEvent>,
     },
-    /// Attempt no longer owns an active operation.
+    /// Attempt is unknown, already expired, or detached before execution finished.
     Stale,
 }
 
@@ -575,6 +577,7 @@ impl Attempts {
             deadline_wall: now.wall + attempt_budget,
             accepted_at: None,
             owns_operation: true,
+            deadline_expired: false,
         };
         let (index, generation) = self.slab.insert(attempt)?;
         let key = AttemptKey { index, generation };
@@ -940,7 +943,7 @@ impl Attempts {
         timeout: Duration,
     ) -> Option<Tick> {
         let attempt = self.slab.get_mut(key.index, key.generation)?;
-        if attempt.phase != AttemptPhase::Executed {
+        if attempt.phase != AttemptPhase::Executed || attempt.deadline_expired {
             return None;
         }
         let completion_deadline = now.tick + timeout;
@@ -952,24 +955,27 @@ impl Attempts {
     }
 
     /// Expires the current phase deadline and emits `Kill(DeadlineExceeded)`. An owning attempt
-    /// terminates its operation without retry. Executed attempts also release disk and retire,
-    /// including detached attempts whose operation was cancelled or escalated (`§5.5`).
+    /// terminates its operation without retry. Reservations remain held until worker cleanup
+    /// or loss, including detached uploads whose operation was cancelled or escalated (`§5.5`).
     pub fn on_attempt_deadline(
         &mut self,
         attempt_key: AttemptKey,
         operations: &mut Operations,
         queue: &mut OperationQueue,
-        workers: &mut WorkerRegistry,
+        _workers: &mut WorkerRegistry,
     ) -> AttemptDeadlineOutcome {
         let (worker, operation, attempt_id, owns_operation) = {
             let Some(attempt) = self.slab.get_mut(attempt_key.index, attempt_key.generation) else {
                 return AttemptDeadlineOutcome::Stale;
             };
-            if !attempt.owns_operation && attempt.phase != AttemptPhase::Executed {
+            if attempt.deadline_expired
+                || (!attempt.owns_operation && attempt.phase != AttemptPhase::Executed)
+            {
                 return AttemptDeadlineOutcome::Stale;
             }
             let owns_operation = attempt.owns_operation;
             attempt.owns_operation = false;
+            attempt.deadline_expired = true;
             (
                 attempt.worker,
                 attempt.operation,
@@ -977,13 +983,6 @@ impl Attempts {
                 owns_operation,
             )
         };
-        if self
-            .get(attempt_key)
-            .is_some_and(|attempt| attempt.phase == AttemptPhase::Executed)
-            && let Some(attempt) = self.remove_attempt(attempt_key)
-        {
-            let _ = workers.on_attempt_completed(worker, attempt.reservation.disk);
-        }
         if self.active_by_op.get(&operation) == Some(&attempt_key) {
             self.active_by_op.remove(&operation);
         }

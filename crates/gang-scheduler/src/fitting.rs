@@ -198,6 +198,30 @@ pub fn validate_properties<'a>(
     })
 }
 
+/// Original request floors and the current eligible ceiling for a learned lookup.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LearnedBounds {
+    /// Original client resource floors.
+    pub(crate) floors: ClientFloors,
+    /// Largest effective ceiling among the action's eligible fleets, when known.
+    pub(crate) memory_ceiling_kb: Option<u64>,
+}
+
+impl LearnedBounds {
+    /// Derives lookup bounds from the current catalog and validated request.
+    #[must_use]
+    pub(crate) fn for_candidates(catalog: &FleetCatalog, validated: &ValidatedProperties) -> Self {
+        Self {
+            floors: validated.floors,
+            memory_ceiling_kb: largest_eligible_memory_kb(
+                catalog,
+                validated.candidates,
+                validated.floors,
+            ),
+        }
+    }
+}
+
 /// Resolves target-bearing actions using `target+mnemonic → target`, and unlabeled actions using
 /// `mnemonic → command`. Uses `cold_start` for dimensions left untagged in `floors` when no
 /// matching history exists (`§5.3` step 4).
@@ -210,6 +234,31 @@ pub fn lookup_learned_or_cold_start(
     now_s: u64,
     cold_start: &ColdStartTuning,
     floors: ClientFloors,
+) -> ActionResources {
+    lookup_bounded_history(
+        sketch,
+        target,
+        mnemonic,
+        command_digest,
+        now_s,
+        cold_start,
+        LearnedBounds {
+            floors,
+            memory_ceiling_kb: None,
+        },
+    )
+}
+
+/// Resolves history using the current eligible ceiling without changing shared measurements.
+#[must_use]
+pub(crate) fn lookup_bounded_history(
+    sketch: &mut ResourceSketch,
+    target: Option<&str>,
+    mnemonic: Option<&str>,
+    command_digest: &str,
+    now_s: u64,
+    cold_start: &ColdStartTuning,
+    bounds: LearnedBounds,
 ) -> ActionResources {
     let target = target.filter(|s| !s.is_empty());
     let mnemonic = mnemonic.filter(|s| !s.is_empty());
@@ -234,8 +283,12 @@ pub fn lookup_learned_or_cold_start(
     }
 
     for key in &candidate_keys {
-        if let Some(entry) = sketch.lookup(key, now_s) {
-            let shaped = sketch.shape(&entry);
+        if let Some(mut entry) = sketch.lookup(key, now_s) {
+            entry.clamp_memory_ceiling(bounds.memory_ceiling_kb);
+            let mut shaped = sketch.shape(&entry);
+            if let Some(ceiling) = bounds.memory_ceiling_kb {
+                shaped.memory_kb = shaped.memory_kb.min(ceiling);
+            }
             if !shaped.is_empty() {
                 return ActionResources {
                     cpu_millicores: shaped.cpu_count,
@@ -246,6 +299,7 @@ pub fn lookup_learned_or_cold_start(
         }
     }
 
+    let floors = bounds.floors;
     if cold_start.enabled {
         ActionResources {
             cpu_millicores: if floors.cpu_millicores.is_some() {
@@ -625,6 +679,44 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn eligible_lookup_bounds_history_without_reducing_other_fleets_history() {
+        let mut sketch = test_sketch();
+        let key = SketchKey::for_attempt(Some("//pkg:bounded"), None, "");
+        let half = sketch.window().as_secs() / 2;
+        let second_half = half * 2 + 10;
+        for second in [half + 10, second_half] {
+            assert!(sketch.observe(
+                key.clone(),
+                &Observation {
+                    peak_memory_kb: 64 * 1024 * 1024,
+                    killed_peak_memory_kb: Some(64 * 1024 * 1024),
+                    killed: true,
+                    now_s: second,
+                    ..Observation::default()
+                },
+            ));
+        }
+        let memory_ceiling_kb = 4 * 1024 * 1024;
+        let learned = lookup_bounded_history(
+            &mut sketch,
+            Some("//pkg:bounded"),
+            None,
+            "",
+            second_half,
+            &ColdStartTuning::default(),
+            LearnedBounds {
+                floors: ClientFloors::default(),
+                memory_ceiling_kb: Some(memory_ceiling_kb),
+            },
+        );
+        assert_eq!(learned.memory, Bytes::gib(4));
+        let retained = sketch.lookup(&key, second_half).expect("retained history");
+        assert_eq!(retained.current.max_memory_kb, 64 * 1024 * 1024);
+        assert_eq!(retained.previous.max_memory_kb, 64 * 1024 * 1024);
+        assert_eq!(retained.killed_peak_memory_kb, 64 * 1024 * 1024);
     }
 
     #[test]

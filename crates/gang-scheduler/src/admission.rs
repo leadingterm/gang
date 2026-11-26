@@ -19,7 +19,7 @@ use thiserror::Error;
 
 use crate::capacity::CapacityCatalog;
 use crate::fitting::{
-    ClientFloors, fit_reservation, lookup_learned_or_cold_start, validate_properties,
+    ClientFloors, LearnedBounds, fit_reservation, lookup_bounded_history, validate_properties,
 };
 use crate::operations::{
     AdmitError, AdmitOutcome, NewOperation, Now, OperationKey, Operations, canonical_platform_key,
@@ -145,15 +145,14 @@ pub fn admit_action(
     .map_err(AdmissionError::Refused)?;
 
     let gate_audit = qos::gate_audit(request.source, request.priority);
-
-    let learned = lookup_learned_or_cold_start(
+    let learned = lookup_bounded_history(
         sketch,
         request.target.as_ref().map(TargetLabel::as_str),
         request.mnemonic.as_ref().map(Mnemonic::as_str),
         &request.command_digest,
         now.wall.as_unix_millis() / 1000,
         &actions.cold_start,
-        validated.floors,
+        LearnedBounds::for_candidates(catalog, &validated),
     );
 
     let fit = fit_reservation(
@@ -167,18 +166,7 @@ pub fn admit_action(
     )
     .map_err(AdmissionError::Refused)?;
 
-    let platform_key = canonical_platform_key(
-        request
-            .platform_properties
-            .iter()
-            .filter(|(k, v)| {
-                !gang_types::property::HARMLESS_PROPERTIES.contains(&k.as_str())
-                    && !(k.as_str() == gang_types::property::NETWORK
-                        && (v.is_empty()
-                            || v.as_str() == gang_types::NetworkRequest::NotRequested.as_str()))
-            })
-            .map(|(k, v)| (k.as_str(), v.as_str())),
-    );
+    let platform_key = operation_platform_key(&request.platform_properties);
 
     let profile = ActionProfile {
         command_digest: request.command_digest,
@@ -236,6 +224,20 @@ pub fn admit_action(
         }),
         AdmitOutcome::Rejected(err) => Err(AdmissionError::Registry(err)),
     }
+}
+
+fn operation_platform_key(properties: &BTreeMap<String, String>) -> String {
+    canonical_platform_key(
+        properties
+            .iter()
+            .filter(|(key, value)| {
+                !gang_types::property::HARMLESS_PROPERTIES.contains(&key.as_str())
+                    && !(key.as_str() == gang_types::property::NETWORK
+                        && (value.is_empty()
+                            || value.as_str() == gang_types::NetworkRequest::NotRequested.as_str()))
+            })
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )
 }
 
 #[cfg(test)]
