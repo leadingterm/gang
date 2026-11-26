@@ -843,7 +843,10 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let dir = tempfile::tempdir()?;
+        // Unix socket paths are short; Bazel's test temporary directory may exceed SUN_LEN.
+        let dir = tempfile::Builder::new()
+            .prefix("gang-sock")
+            .tempdir_in("/tmp")?;
         let path = dir.path().join("retained-leader.sock");
         let listener = UnixListener::bind(&path)?;
         let result = runtime.block_on(async {
@@ -924,7 +927,10 @@ mod tests {
             .enable_all()
             .build()?;
         runtime.block_on(async {
-            let dir = tempfile::tempdir()?;
+            // Unix socket paths are short; Bazel's test temporary directory may exceed SUN_LEN.
+            let dir = tempfile::Builder::new()
+                .prefix("gang-sock")
+                .tempdir_in("/tmp")?;
             let path = dir.path().join("group.sock");
             let listener = UnixListener::bind(&path)?;
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();

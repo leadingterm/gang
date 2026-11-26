@@ -799,9 +799,13 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let worker = test_worker()?;
         let layout = initialized_layout(dir.path(), &worker)?;
-        let gate_path = dir.path().join("commit-gate.sock");
-        let ready_path = dir.path().join("commit-ready.sock");
-        let witness_path = dir.path().join("commit-worker.sock");
+        // Unix socket paths are short; Bazel's test temporary directory may exceed SUN_LEN.
+        let sockets = tempfile::Builder::new()
+            .prefix("gang-sock")
+            .tempdir_in("/tmp")?;
+        let gate_path = sockets.path().join("commit-gate.sock");
+        let ready_path = sockets.path().join("commit-ready.sock");
+        let witness_path = sockets.path().join("commit-worker.sock");
         let gate_listener = tokio::net::UnixListener::bind(&gate_path)?;
         let ready_listener = tokio::net::UnixListener::bind(&ready_path)?;
         let witness = std::os::unix::net::UnixListener::bind(&witness_path)?;
@@ -1024,7 +1028,11 @@ mod tests {
                 let probe = fake_launcher()?;
                 let worker = test_worker()?;
                 let layout = initialized_layout(dir.path(), &worker)?;
-                let gate_path = dir.path().join("bootstrap.sock");
+                // Unix socket paths are short; Bazel's test temporary directory may exceed SUN_LEN.
+                let sockets = tempfile::Builder::new()
+                    .prefix("gang-sock")
+                    .tempdir_in("/tmp")?;
+                let gate_path = sockets.path().join("bootstrap.sock");
                 let listener = UnixListener::bind(&gate_path)?;
                 let mut command = WorkerCommand::gang_worker(
                     &probe,
@@ -1145,7 +1153,11 @@ mod tests {
                 let layout = initialized_layout(dir.path(), &worker)?;
                 let lock = layout.lock_path(&worker.instance);
                 let launcher = [probe.clone().into_os_string()];
-                let witness_path = dir.path().join("worker.sock");
+                // Unix socket paths are short; Bazel's test temporary directory may exceed SUN_LEN.
+                let sockets = tempfile::Builder::new()
+                    .prefix("gang-sock")
+                    .tempdir_in("/tmp")?;
+                let witness_path = sockets.path().join("worker.sock");
                 let witness = std::os::unix::net::UnixListener::bind(&witness_path)?;
                 let mut command = WorkerCommand::gang_worker(
                     &probe,

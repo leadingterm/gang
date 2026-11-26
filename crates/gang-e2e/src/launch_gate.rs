@@ -66,17 +66,31 @@ fn wait_opened(mut file: File, timeout: Duration) -> io::Result<()> {
             Err(error) => return Err(error),
         }
         let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "launch gate timed out",
+            ));
+        }
+        // On macOS, XNU's poll(2) does not wake on FIFO writer EOF when no bytes were written;
+        // cap each poll slice so the non-blocking read() probe above observes EOF promptly.
+        #[cfg(target_os = "macos")]
+        let poll_wait = remaining.min(Duration::from_millis(25));
+        #[cfg(not(target_os = "macos"))]
+        let poll_wait = remaining;
         let timespec = Timespec {
-            tv_sec: i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX),
-            tv_nsec: Nsecs::from(remaining.subsec_nanos()),
+            tv_sec: i64::try_from(poll_wait.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: Nsecs::from(poll_wait.subsec_nanos()),
         };
         let mut fds = [PollFd::new(&file, PollFlags::IN)];
         match poll(&mut fds, Some(&timespec)) {
             Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "launch gate timed out",
-                ));
+                if started.elapsed() >= timeout {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "launch gate timed out",
+                    ));
+                }
             }
             Ok(_)
                 if fds[0]
@@ -119,7 +133,11 @@ mod tests {
         let ready = Arc::new(Barrier::new(4));
         let mut readers = Vec::new();
         for _ in 0..3 {
-            let fd = open(&path, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty())?;
+            let fd = open(
+                &path,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
             let ready = Arc::clone(&ready);
             readers.push(thread::spawn(move || {
                 ready.wait();
@@ -147,5 +165,22 @@ mod tests {
     fn missing_gate_does_not_delay_launch() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
         wait(&directory.path().join("absent"), Duration::ZERO)
+    }
+
+    #[test]
+    fn release_wakes_already_waiting_reader() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("gate");
+        gang_os::fs::create_private_fifo(&path).map_err(|error| error.source)?;
+        let keeper = OpenOptions::new().read(true).write(true).open(&path)?;
+        let fd = open(
+            &path,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let reader = thread::spawn(move || wait_opened(File::from(fd), Duration::from_secs(5)));
+        thread::sleep(Duration::from_millis(50));
+        drop(keeper);
+        reader.join().expect("reader thread does not panic")
     }
 }

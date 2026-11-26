@@ -921,8 +921,12 @@ mod tests {
         runtime.block_on(async {
             let dir = TempDir::new()?;
             let layout = layout_in(dir.path());
-            let parent_path = dir.path().join("parent.sock");
-            let witness_path = dir.path().join("worker.sock");
+            // Unix socket paths are short; Bazel's test temporary directory may exceed SUN_LEN.
+            let sockets = tempfile::Builder::new()
+                .prefix("gang-sock")
+                .tempdir_in("/tmp")?;
+            let parent_path = sockets.path().join("parent.sock");
+            let witness_path = sockets.path().join("worker.sock");
             let parent_listener = UnixListener::bind(&parent_path)?;
             let witness_listener = UnixListener::bind(&witness_path)?;
             let mut parent = SPAWN_COMMIT_PARENT
