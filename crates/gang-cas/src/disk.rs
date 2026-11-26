@@ -20,7 +20,7 @@ use crate::layout::{
     self, VerifiedWriteError, VerifiedWriter, blob_path, copy_with_metadata, create_empty_file,
     hardlink_or_reflink_file,
 };
-use crate::lru::{BlobMode, CacheKey, InsertOutcome, PinKind, ShardedLru};
+use crate::lru::{BlobMode, CacheKey, InsertOutcome, PinKind, ResidencyPin, ShardedLru};
 use crate::pins::CasPin;
 use crate::stats::CasStats;
 
@@ -157,16 +157,18 @@ impl DiskCas {
         if digest.is_empty() {
             return Some(CasPin::inert(key, PinKind::Attempt, 0));
         }
-        if self.inner.lru.pin(key, PinKind::Attempt) {
-            Some(CasPin::new(
-                Arc::clone(&self.inner.lru),
-                key,
-                PinKind::Attempt,
-                digest.size(),
-            ))
-        } else {
-            None
-        }
+        self.inner
+            .lru
+            .pin_generation(key, PinKind::Attempt)
+            .map(|generation| {
+                CasPin::new(
+                    Arc::clone(&self.inner.lru),
+                    key,
+                    PinKind::Attempt,
+                    digest.size(),
+                    Some(generation),
+                )
+            })
     }
 
     /// Acquires an RAII [`PinKind::Tree`] pin for `(digest, executable)` if resident and within
@@ -184,20 +186,18 @@ impl DiskCas {
         if digest.is_empty() {
             return Some(CasPin::inert(key, PinKind::Tree, 0));
         }
-        if self
-            .inner
+        self.inner
             .lru
-            .pin_tree_within_cap(key, max_tree_pinned_bytes)
-        {
-            Some(CasPin::new(
-                Arc::clone(&self.inner.lru),
-                key,
-                PinKind::Tree,
-                digest.size(),
-            ))
-        } else {
-            None
-        }
+            .pin_tree_within_cap_generation(key, max_tree_pinned_bytes)
+            .map(|generation| {
+                CasPin::new(
+                    Arc::clone(&self.inner.lru),
+                    key,
+                    PinKind::Tree,
+                    digest.size(),
+                    Some(generation),
+                )
+            })
     }
 
     /// Streams, verifies, and either stores `body` in `DiskCas` (for `executable` mode) or reports
@@ -224,9 +224,14 @@ impl DiskCas {
         let mode = BlobMode::from_executable(executable);
         let key = CacheKey::new(digest, mode);
 
-        if self.inner.lru.contains(key) {
+        if let Some(pin) = self.inner.lru.pin_resident(key) {
             verify_stream_only(digest, body).await?;
-            let _ = self.inner.lru.touch(key);
+            if !pin.touch() {
+                return Err(PortError::backend(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "cached blob residency changed while verifying duplicate",
+                )));
+            }
             return Ok(WriteOutcome::Cached);
         }
 
@@ -331,20 +336,9 @@ impl DiskCas {
         let desired_key = CacheKey::new(digest, mode);
         let desired_path = blob_path(&self.inner.root, desired_key);
 
-        if self.inner.lru.touch(desired_key) {
-            match hardlink_or_reflink_file(&desired_path, dest, mode) {
-                Ok(()) => {
-                    self.inner.stats.record_local_read(digest.size());
-                    return Ok(true);
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    if let Some(removed_size) = self.inner.lru.remove(desired_key) {
-                        self.inner.stats.sub_size_bytes(removed_size);
-                    }
-                    return Ok(false);
-                }
-                Err(error) => return Err(PortError::backend(error)),
-            }
+        if let Some(pin) = self.inner.lru.pin_resident(desired_key) {
+            return self
+                .finish_materialization(&pin, hardlink_or_reflink_file(&desired_path, dest, mode));
         }
 
         // If the opposite mode variant is resident, materialize a separate inode for `mode`.
@@ -353,15 +347,29 @@ impl DiskCas {
             BlobMode::Executable => BlobMode::Plain,
         };
         let other_key = CacheKey::new(digest, other_mode);
-        let Some(_source_pin) = self.pin_attempt(digest, other_mode.is_executable()) else {
+        let Some(source_pin) = self.inner.lru.pin_resident(other_key) else {
             return Ok(false);
         };
-        let other_path = blob_path(&self.inner.root, other_key);
-        if !other_path.exists() {
-            if let Some(removed_size) = self.inner.lru.remove(other_key) {
-                self.inner.stats.sub_size_bytes(removed_size);
+        self.materialize_variant(&source_pin, desired_key, dest)
+    }
+
+    fn materialize_variant(
+        &self,
+        source_pin: &ResidencyPin,
+        desired_key: CacheKey,
+        dest: &Path,
+    ) -> Result<bool, PortError> {
+        let digest = desired_key.digest;
+        let mode = desired_key.mode;
+        let desired_path = blob_path(&self.inner.root, desired_key);
+        let other_path = blob_path(&self.inner.root, source_pin.key());
+        match fs::metadata(&other_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.remove_missing(source_pin);
+                return Ok(false);
             }
-            return Ok(false);
+            Err(error) => return Err(PortError::backend(error)),
         }
 
         if self.can_admit(digest.size()) {
@@ -371,28 +379,66 @@ impl DiskCas {
                 unlink_tombstones(tombstones).map_err(PortError::backend)?;
             }
             if self.inner.lru.size_bytes() <= target_after_evict {
-                let outcome =
-                    self.inner.lru.publish(
-                        desired_key,
-                        digest.size(),
-                        || match copy_with_metadata(&other_path, &desired_path, mode) {
+                let published = self
+                    .inner
+                    .lru
+                    .publish_pinned(desired_key, digest.size(), || {
+                        match copy_with_metadata(&other_path, &desired_path, mode) {
                             Ok(()) => Ok(()),
                             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-                            Err(error) => Err(PortError::backend(error)),
-                        },
-                    )?;
+                            Err(error) => Err(error),
+                        }
+                    });
+                let (outcome, desired_pin) = match published {
+                    Ok(published) => published,
+                    Err(error) => return self.finish_materialization(source_pin, Err(error)),
+                };
                 if let InsertOutcome::Inserted { size } = outcome {
                     self.inner.stats.add_size_bytes(size);
                 }
-                hardlink_or_reflink_file(&desired_path, dest, mode).map_err(PortError::backend)?;
-                self.inner.stats.record_local_read(digest.size());
-                return Ok(true);
+                return self.finish_materialization(
+                    &desired_pin,
+                    hardlink_or_reflink_file(&desired_path, dest, mode),
+                );
             }
         }
 
-        copy_with_metadata(&other_path, dest, mode).map_err(PortError::backend)?;
-        self.inner.stats.record_local_read(digest.size());
-        Ok(true)
+        self.finish_materialization(source_pin, copy_with_metadata(&other_path, dest, mode))
+    }
+
+    fn finish_materialization(
+        &self,
+        pin: &ResidencyPin,
+        result: io::Result<()>,
+    ) -> Result<bool, PortError> {
+        match result {
+            Ok(()) => {
+                self.inner.stats.record_local_read(pin.key().digest.size());
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.remove_missing(pin);
+                Ok(false)
+            }
+            Err(error) => Err(PortError::backend(error)),
+        }
+    }
+
+    fn remove_missing(&self, pin: &ResidencyPin) {
+        if let Some(removed_size) = pin.remove_missing() {
+            self.inner.stats.sub_size_bytes(removed_size);
+        }
+    }
+
+    fn open_resident(&self, pin: &ResidencyPin) -> io::Result<Option<File>> {
+        match File::open(blob_path(&self.inner.root, pin.key())) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.remove_missing(pin);
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn evict_and_unlink_until(&self, target_bytes: u64) -> Result<(), PortError> {
@@ -435,16 +481,13 @@ impl DiskCas {
         Ok(tombstones)
     }
 
-    fn find_resident_key(&self, digest: Digest) -> Option<CacheKey> {
+    fn find_resident(&self, digest: Digest) -> Option<ResidencyPin> {
         let plain = CacheKey::new(digest, BlobMode::Plain);
-        if self.inner.lru.touch(plain) {
-            return Some(plain);
-        }
         let exec = CacheKey::new(digest, BlobMode::Executable);
-        if self.inner.lru.touch(exec) {
-            return Some(exec);
-        }
-        None
+        self.inner
+            .lru
+            .pin_resident(plain)
+            .or_else(|| self.inner.lru.pin_resident(exec))
     }
 }
 
@@ -481,24 +524,17 @@ impl ContentStore for DiskCas {
             return Ok(Some(BlobStream::empty()));
         }
 
-        let Some(key) = self.find_resident_key(digest) else {
+        let Some(pin) = self.find_resident(digest) else {
             return Ok(None);
         };
 
-        let path = blob_path(&self.inner.root, key);
-        let opened = tokio::task::spawn_blocking(move || match File::open(&path) {
-            Ok(file) => Ok(Some(file)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        })
-        .await
-        .map_err(PortError::backend)?
-        .map_err(PortError::backend)?;
+        let cas = self.clone();
+        let opened = tokio::task::spawn_blocking(move || cas.open_resident(&pin))
+            .await
+            .map_err(PortError::backend)?
+            .map_err(PortError::backend)?;
 
         let Some(mut file) = opened else {
-            if let Some(removed_size) = self.inner.lru.remove(key) {
-                self.inner.stats.sub_size_bytes(removed_size);
-            }
             return Ok(None);
         };
 
@@ -694,6 +730,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use bytes::Bytes;
+    use futures::{StreamExt as _, stream};
     use gang_spi::{BlobStream, ByteRange, ContentStore, EngineStore, StoreKind};
     use gang_testkit::{TestResult, content_store_contract};
     use gang_types::Digest;
@@ -796,6 +833,125 @@ mod tests {
                 .await?,
             resident
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_write_pins_residency_until_stream_verified() -> TestResult {
+        let dir = TempDir::new()?;
+        let payload = Bytes::from_static(b"resident");
+        let digest = Digest::from_bytes(&payload);
+        let cas = DiskCas::open(dir.path(), digest.size()).await?;
+        cas.write(digest, BlobStream::from_bytes(payload.clone()))
+            .await?;
+
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let prefix = payload.slice(..4);
+        let suffix = payload.slice(4..);
+        let chunks = stream::once(async move { Ok(prefix) }).chain(stream::once(async move {
+            resumed.await.expect("resume duplicate stream");
+            Ok(suffix)
+        }));
+        let duplicate = cas.write(
+            digest,
+            BlobStream {
+                size: digest.size(),
+                chunks: Box::pin(chunks),
+            },
+        );
+        tokio::pin!(duplicate);
+        assert!(futures::poll!(duplicate.as_mut()).is_pending());
+
+        cas.evict_and_unlink_until(0).await?;
+        let pressure = Bytes::from_static(b"pressure");
+        assert_eq!(
+            cas.write_with_mode(
+                Digest::from_bytes(&pressure),
+                BlobStream::from_bytes(pressure),
+                false,
+            )
+            .await?,
+            WriteOutcome::Bypassed
+        );
+        assert_eq!(cas.inner.lru.pinned_bytes(), digest.size());
+        resume.send(()).expect("duplicate stream still waiting");
+        duplicate.await?;
+
+        assert_eq!(cas.inner.lru.pinned_bytes(), 0);
+        assert_eq!(
+            cas.read(digest, ByteRange::FULL)
+                .await?
+                .ok_or("verified duplicate must remain resident")?
+                .collect()
+                .await?,
+            payload
+        );
+        cas.evict_and_unlink_until(0).await?;
+        assert!(cas.read(digest, ByteRange::FULL).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_missing_cleanup_preserves_replacement_and_stats() -> TestResult {
+        let dir = TempDir::new()?;
+        let payload = Bytes::from_static(b"republished");
+        let digest = Digest::from_bytes(&payload);
+        let cas = DiskCas::open(dir.path(), digest.size()).await?;
+        cas.write(digest, BlobStream::from_bytes(payload.clone()))
+            .await?;
+        let observed = cas.find_resident(digest).ok_or("resident reader")?;
+        fs::remove_file(blob_path(dir.path(), observed.key()))?;
+        assert!(cas.open_resident(&observed)?.is_none());
+
+        cas.write(digest, BlobStream::from_bytes(payload.clone()))
+            .await?;
+        let replacement = cas.pin_attempt(digest, false).ok_or("replacement pin")?;
+        cas.remove_missing(&observed);
+        let stale_result = cas.finish_materialization(
+            &observed,
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        )?;
+        assert!(!stale_result);
+        drop(observed);
+        assert_eq!(cas.inner.lru.pinned_bytes(), digest.size());
+        assert_eq!(cas.stats().size_bytes(), digest.size());
+        cas.evict_and_unlink_until(0).await?;
+        assert_eq!(
+            cas.read(digest, ByteRange::FULL)
+                .await?
+                .ok_or("replacement survives stale cleanup")?
+                .collect()
+                .await?,
+            payload
+        );
+        drop(replacement);
+        cas.evict_and_unlink_until(0).await?;
+        assert!(cas.inner.lru.is_empty());
+        assert_eq!(cas.stats().size_bytes(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reader_residency_is_pinned_until_file_is_open() -> TestResult {
+        use std::io::Read as _;
+
+        let dir = TempDir::new()?;
+        let payload = Bytes::from_static(b"resident");
+        let digest = Digest::from_bytes(&payload);
+        let cas = DiskCas::open(dir.path(), digest.size()).await?;
+        cas.write(digest, BlobStream::from_bytes(payload.clone()))
+            .await?;
+        let observed = cas.find_resident(digest).ok_or("resident reader")?;
+        cas.evict_and_unlink_until(0).await?;
+        let mut file = cas.open_resident(&observed)?.ok_or("pinned file missing")?;
+        drop(observed);
+
+        cas.evict_and_unlink_until(0).await?;
+        assert_eq!(cas.inner.lru.pinned_bytes(), 0);
+        assert!(cas.inner.lru.is_empty());
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        assert_eq!(bytes.as_slice(), payload.as_ref());
         Ok(())
     }
 

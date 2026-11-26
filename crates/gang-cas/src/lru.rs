@@ -1,6 +1,7 @@
 //! Sharded O(1) intrusive-slab LRU cache index with attempt and tree pinning.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gang_types::Digest;
@@ -90,6 +91,7 @@ pub enum InsertOutcome {
 struct Node {
     key: CacheKey,
     size: u64,
+    generation: u64,
     stamp: u64,
     attempt_pins: u32,
     tree_pins: u32,
@@ -101,6 +103,38 @@ struct Node {
 impl Node {
     const fn is_pinned(&self) -> bool {
         self.attempt_pins > 0 || self.tree_pins > 0
+    }
+}
+
+/// An attempt pin bound to one residency, including after missing-file cleanup.
+#[derive(Debug)]
+pub(crate) struct ResidencyPin {
+    lru: Arc<ShardedLru>,
+    key: CacheKey,
+    generation: u64,
+}
+
+impl ResidencyPin {
+    /// Returns the key observed when this residency was pinned.
+    pub(crate) const fn key(&self) -> CacheKey {
+        self.key
+    }
+
+    /// Refreshes recency only while the observed residency still exists.
+    pub(crate) fn touch(&self) -> bool {
+        self.lru.touch_inner(self.key, Some(self.generation))
+    }
+
+    /// Removes a vanished file's residency without affecting a replacement.
+    pub(crate) fn remove_missing(&self) -> Option<u64> {
+        self.lru.remove_if_generation(self.key, self.generation)
+    }
+}
+
+impl Drop for ResidencyPin {
+    fn drop(&mut self) {
+        self.lru
+            .unpin_inner(self.key, PinKind::Attempt, Some(self.generation));
     }
 }
 
@@ -298,6 +332,7 @@ impl LruShard {
 pub struct ShardedLru {
     shards: [Mutex<LruShard>; SHARD_COUNT],
     stamp_clock: AtomicU64,
+    generation_clock: AtomicU64,
     size_bytes: AtomicU64,
     pinned_bytes: AtomicU64,
     tree_pinned_bytes: AtomicU64,
@@ -319,6 +354,7 @@ impl ShardedLru {
         Self {
             shards: std::array::from_fn(|_| Mutex::new(LruShard::default())),
             stamp_clock: AtomicU64::new(1),
+            generation_clock: AtomicU64::new(1),
             size_bytes: AtomicU64::new(0),
             pinned_bytes: AtomicU64::new(0),
             tree_pinned_bytes: AtomicU64::new(0),
@@ -382,6 +418,7 @@ impl ShardedLru {
     ) -> InsertOutcome {
         let mut shard = self.shards[Self::shard_index(&key.digest)].lock();
         self.insert_in_shard(&mut shard, key, size, explicit_stamp, initial_pin)
+            .0
     }
 
     pub(crate) fn publish<E>(
@@ -392,7 +429,28 @@ impl ShardedLru {
     ) -> Result<InsertOutcome, E> {
         let mut shard = self.shards[Self::shard_index(&key.digest)].lock();
         publish()?;
-        Ok(self.insert_in_shard(&mut shard, key, size, None, None))
+        Ok(self.insert_in_shard(&mut shard, key, size, None, None).0)
+    }
+
+    /// Publishes and pins the resulting residency under the same shard lock.
+    pub(crate) fn publish_pinned<E>(
+        self: &Arc<Self>,
+        key: CacheKey,
+        size: u64,
+        publish: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(InsertOutcome, ResidencyPin), E> {
+        let mut shard = self.shards[Self::shard_index(&key.digest)].lock();
+        publish()?;
+        let (outcome, generation) =
+            self.insert_in_shard(&mut shard, key, size, None, Some(PinKind::Attempt));
+        Ok((
+            outcome,
+            ResidencyPin {
+                lru: Arc::clone(self),
+                key,
+                generation,
+            },
+        ))
     }
 
     fn insert_in_shard(
@@ -402,13 +460,13 @@ impl ShardedLru {
         size: u64,
         explicit_stamp: Option<u64>,
         initial_pin: Option<PinKind>,
-    ) -> InsertOutcome {
+    ) -> (InsertOutcome, u64) {
         let stamp = explicit_stamp.unwrap_or_else(|| self.next_stamp());
-        if let Some(&idx) = shard.index.get(&key) {
-            let Some(node) = shard.node_mut(idx) else {
-                return InsertOutcome::AlreadyPresent;
-            };
+        if let Some(&idx) = shard.index.get(&key)
+            && let Some(node) = shard.node_mut(idx)
+        {
             let entry_size = node.size;
+            let generation = node.generation;
             let was_pinned = node.is_pinned();
             let was_tree_pinned = node.tree_pins > 0;
             node.stamp = stamp;
@@ -433,7 +491,7 @@ impl ShardedLru {
                 self.tree_pinned_bytes
                     .fetch_add(entry_size, Ordering::Relaxed);
             }
-            return InsertOutcome::AlreadyPresent;
+            return (InsertOutcome::AlreadyPresent, generation);
         }
 
         let (attempt_pins, tree_pins) = match initial_pin {
@@ -444,6 +502,7 @@ impl ShardedLru {
         let node = Node {
             key,
             size,
+            generation: self.generation_clock.fetch_add(1, Ordering::Relaxed),
             stamp,
             attempt_pins,
             tree_pins,
@@ -451,6 +510,7 @@ impl ShardedLru {
             next: None,
             in_unpinned_list: false,
         };
+        let generation = node.generation;
         let pinned = node.is_pinned();
         let idx = shard.alloc_slot(node);
         shard.index.insert(key, idx);
@@ -465,11 +525,15 @@ impl ShardedLru {
                 self.tree_pinned_bytes.fetch_add(size, Ordering::Relaxed);
             }
         }
-        InsertOutcome::Inserted { size }
+        (InsertOutcome::Inserted { size }, generation)
     }
 
     /// Marks `key` as most recently used, returning `false` if `key` is not in the index.
     pub fn touch(&self, key: CacheKey) -> bool {
+        self.touch_inner(key, None)
+    }
+
+    fn touch_inner(&self, key: CacheKey, generation: Option<u64>) -> bool {
         let stamp = self.next_stamp();
         let mut shard = self.shards[Self::shard_index(&key.digest)].lock();
         let Some(&idx) = shard.index.get(&key) else {
@@ -478,6 +542,9 @@ impl ShardedLru {
         let Some(node) = shard.node_mut(idx) else {
             return false;
         };
+        if generation.is_some_and(|expected| node.generation != expected) {
+            return false;
+        }
         node.stamp = stamp;
         if !node.is_pinned() {
             shard.move_to_front(idx);
@@ -487,14 +554,25 @@ impl ShardedLru {
 
     /// Acquires a pin of `kind` on `key`, returning `false` if `key` is absent.
     pub fn pin(&self, key: CacheKey, kind: PinKind) -> bool {
+        self.pin_generation(key, kind).is_some()
+    }
+
+    /// Atomically observes a residency and acquires its generation-bound attempt pin.
+    pub(crate) fn pin_resident(self: &Arc<Self>, key: CacheKey) -> Option<ResidencyPin> {
+        let generation = self.pin_generation(key, PinKind::Attempt)?;
+        Some(ResidencyPin {
+            lru: Arc::clone(self),
+            key,
+            generation,
+        })
+    }
+
+    pub(crate) fn pin_generation(&self, key: CacheKey, kind: PinKind) -> Option<u64> {
         let mut shard = self.shards[Self::shard_index(&key.digest)].lock();
-        let Some(&idx) = shard.index.get(&key) else {
-            return false;
-        };
-        let Some(node) = shard.node_mut(idx) else {
-            return false;
-        };
+        let &idx = shard.index.get(&key)?;
+        let node = shard.node_mut(idx)?;
         let size = node.size;
+        let generation = node.generation;
         let was_pinned = node.is_pinned();
         let was_tree_pinned = node.tree_pins > 0;
         match kind {
@@ -509,7 +587,7 @@ impl ShardedLru {
         if !was_tree_pinned && now_tree_pinned {
             self.tree_pinned_bytes.fetch_add(size, Ordering::Relaxed);
         }
-        true
+        Some(generation)
     }
 
     /// Acquires a [`PinKind::Tree`] pin on `key` only if distinct `tree_pinned_bytes` stays within
@@ -518,13 +596,18 @@ impl ShardedLru {
     /// Entries already holding at least one tree pin incur zero additional distinct bytes and
     /// therefore always succeed. Returns `false` if `key` is absent or the cap would be exceeded.
     pub fn pin_tree_within_cap(&self, key: CacheKey, max_tree_pinned_bytes: u64) -> bool {
+        self.pin_tree_within_cap_generation(key, max_tree_pinned_bytes)
+            .is_some()
+    }
+
+    pub(crate) fn pin_tree_within_cap_generation(
+        &self,
+        key: CacheKey,
+        max_tree_pinned_bytes: u64,
+    ) -> Option<u64> {
         let mut shard = self.shards[Self::shard_index(&key.digest)].lock();
-        let Some(&idx) = shard.index.get(&key) else {
-            return false;
-        };
-        let Some(node) = shard.node(idx) else {
-            return false;
-        };
+        let &idx = shard.index.get(&key)?;
+        let node = shard.node(idx)?;
         let size = node.size;
         let already_tree_pinned = node.tree_pins > 0;
 
@@ -537,25 +620,32 @@ impl ShardedLru {
                 })
                 .is_ok();
             if !reserved {
-                return false;
+                return None;
             }
         }
 
-        let Some(node) = shard.node_mut(idx) else {
-            return false;
-        };
+        let node = shard.node_mut(idx)?;
+        let generation = node.generation;
         let was_pinned = node.is_pinned();
         node.tree_pins = node.tree_pins.saturating_add(1);
         if !was_pinned {
             shard.unlink(idx);
             self.pinned_bytes.fetch_add(size, Ordering::Relaxed);
         }
-        true
+        Some(generation)
     }
 
     /// Releases one pin of `kind` from `key`, returning `false` if `key` is absent or had no pin
     /// of `kind`.
     pub fn unpin(&self, key: CacheKey, kind: PinKind) -> bool {
+        self.unpin_inner(key, kind, None)
+    }
+
+    pub(crate) fn unpin_generation(&self, key: CacheKey, kind: PinKind, generation: u64) -> bool {
+        self.unpin_inner(key, kind, Some(generation))
+    }
+
+    fn unpin_inner(&self, key: CacheKey, kind: PinKind, generation: Option<u64>) -> bool {
         let stamp = self.next_stamp();
         let mut shard = self.shards[Self::shard_index(&key.digest)].lock();
         let Some(&idx) = shard.index.get(&key) else {
@@ -564,6 +654,9 @@ impl ShardedLru {
         let Some(node) = shard.node_mut(idx) else {
             return false;
         };
+        if generation.is_some_and(|expected| node.generation != expected) {
+            return false;
+        }
         let size = node.size;
         let was_pinned = node.is_pinned();
         let was_tree_pinned = node.tree_pins > 0;
@@ -666,11 +759,23 @@ impl ShardedLru {
 
     /// Removes `key` from the index without recording an eviction (e.g., when a file vanished).
     pub fn remove(&self, key: CacheKey) -> Option<u64> {
+        self.remove_inner(key, None)
+    }
+
+    /// Removes only the observed generation, preserving replacement pins and accounting.
+    pub(crate) fn remove_if_generation(&self, key: CacheKey, generation: u64) -> Option<u64> {
+        self.remove_inner(key, Some(generation))
+    }
+
+    fn remove_inner(&self, key: CacheKey, generation: Option<u64>) -> Option<u64> {
         let mut shard = self.shards[Self::shard_index(&key.digest)].lock();
-        let idx = shard.index.remove(&key)?;
-        let (size, was_pinned, was_tree_pinned) = shard
-            .node(idx)
-            .map(|node| (node.size, node.is_pinned(), node.tree_pins > 0))?;
+        let &idx = shard.index.get(&key)?;
+        let node = shard.node(idx)?;
+        if generation.is_some_and(|expected| node.generation != expected) {
+            return None;
+        }
+        let (size, was_pinned, was_tree_pinned) = (node.size, node.is_pinned(), node.tree_pins > 0);
+        shard.index.remove(&key);
         shard.unlink(idx);
         shard.free_slot(idx);
         let _ = self
@@ -745,6 +850,8 @@ impl ShardedLru {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use gang_types::Digest;
 
     use super::{
@@ -777,6 +884,52 @@ mod tests {
         assert_eq!(lru.len(), 1);
         assert_eq!(lru.evictions(), 0);
         assert_eq!(lru.evicted_bytes(), 0);
+    }
+
+    #[test]
+    fn stale_generation_cannot_remove_republished_pins() {
+        let lru = Arc::new(ShardedLru::new());
+        let (key, size) = key(b"republished", BlobMode::Plain);
+        lru.insert(key, size);
+        let observed = lru.pin_resident(key).expect("resident entry");
+        let generation = observed.generation;
+        drop(observed);
+        assert_eq!(lru.evict_unpinned_until(0).len(), 1);
+
+        lru.insert_pinned(key, size, PinKind::Attempt);
+        assert!(lru.pin(key, PinKind::Tree));
+        assert_eq!(lru.remove_if_generation(key, generation), None);
+        assert_eq!(lru.size_bytes(), size);
+        assert_eq!(lru.len(), 1);
+        assert_eq!(lru.pinned_bytes(), size);
+        assert_eq!(lru.tree_pinned_bytes(), size);
+        assert!(lru.evict_unpinned_until(0).is_empty());
+        assert!(lru.unpin(key, PinKind::Attempt));
+        assert_eq!(lru.pinned_bytes(), size);
+        assert!(lru.unpin(key, PinKind::Tree));
+        assert_eq!(lru.pinned_bytes(), 0);
+        assert_eq!(lru.tree_pinned_bytes(), 0);
+        assert_eq!(lru.evict_unpinned_until(0).len(), 1);
+    }
+
+    #[test]
+    fn stale_residency_guard_cannot_release_replacement_pin() {
+        let lru = Arc::new(ShardedLru::new());
+        let (key, size) = key(b"externally-deleted", BlobMode::Plain);
+        lru.insert(key, size);
+        let observed = lru.pin_resident(key).expect("resident entry");
+        assert!(lru.evict_unpinned_until(0).is_empty());
+        assert_eq!(observed.remove_missing(), Some(size));
+        lru.insert_pinned(key, size, PinKind::Attempt);
+
+        assert_eq!(observed.remove_missing(), None);
+        drop(observed);
+        assert_eq!(lru.pinned_bytes(), size);
+        assert!(lru.evict_unpinned_until(0).is_empty());
+        assert!(lru.unpin(key, PinKind::Attempt));
+        assert!(!lru.unpin(key, PinKind::Attempt));
+        assert_eq!(lru.pinned_bytes(), 0);
+        assert_eq!(lru.evict_unpinned_until(0).len(), 1);
     }
 
     #[test]

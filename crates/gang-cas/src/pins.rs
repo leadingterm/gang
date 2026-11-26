@@ -16,17 +16,25 @@ pub struct CasPin {
     key: CacheKey,
     kind: PinKind,
     size: u64,
+    generation: Option<u64>,
 }
 
 impl CasPin {
     /// Creates an active [`CasPin`] whose pin was already acquired on `lru`.
     #[must_use]
-    pub(crate) fn new(lru: Arc<ShardedLru>, key: CacheKey, kind: PinKind, size: u64) -> Self {
+    pub(crate) fn new(
+        lru: Arc<ShardedLru>,
+        key: CacheKey,
+        kind: PinKind,
+        size: u64,
+        generation: Option<u64>,
+    ) -> Self {
         Self {
             lru: Some(lru),
             key,
             kind,
             size,
+            generation,
         }
     }
 
@@ -38,6 +46,7 @@ impl CasPin {
             key,
             kind,
             size,
+            generation: None,
         }
     }
 
@@ -86,7 +95,11 @@ impl CasPin {
 impl Drop for CasPin {
     fn drop(&mut self) {
         if let Some(lru) = self.lru.take() {
-            lru.unpin(self.key, self.kind);
+            if let Some(generation) = self.generation {
+                lru.unpin_generation(self.key, self.kind, generation);
+            } else {
+                lru.unpin(self.key, self.kind);
+            }
         }
     }
 }
@@ -112,11 +125,63 @@ mod tests {
             }
         );
 
-        let pin = CasPin::new(Arc::clone(&lru), key, PinKind::Attempt, digest.size());
+        let pin = CasPin::new(Arc::clone(&lru), key, PinKind::Attempt, digest.size(), None);
         assert!(pin.is_resident());
         assert!(lru.evict_unpinned_until(0).is_empty());
 
         pin.release();
+        assert_eq!(lru.pinned_bytes(), 0);
+        assert_eq!(lru.evict_unpinned_until(0).len(), 1);
+    }
+
+    #[test]
+    fn generation_bound_pin_drop_preserves_replacement_entry_pin() {
+        let lru = Arc::new(ShardedLru::new());
+        let digest = Digest::from_bytes(b"replaced-payload");
+        let key = CacheKey::new(digest, BlobMode::Plain);
+        assert_eq!(
+            lru.insert(key, digest.size()),
+            InsertOutcome::Inserted {
+                size: digest.size(),
+            }
+        );
+        let stale_gen = lru
+            .pin_generation(key, PinKind::Attempt)
+            .expect("initial residency pinned");
+        let stale_pin = CasPin::new(
+            Arc::clone(&lru),
+            key,
+            PinKind::Attempt,
+            digest.size(),
+            Some(stale_gen),
+        );
+
+        // Simulate external removal and replacement with a fresh residency + active pin.
+        assert_eq!(lru.remove(key), Some(digest.size()));
+        assert_eq!(
+            lru.insert(key, digest.size()),
+            InsertOutcome::Inserted {
+                size: digest.size(),
+            }
+        );
+        let replacement_gen = lru
+            .pin_generation(key, PinKind::Attempt)
+            .expect("replacement residency pinned");
+        assert_ne!(stale_gen, replacement_gen);
+        let replacement_pin = CasPin::new(
+            Arc::clone(&lru),
+            key,
+            PinKind::Attempt,
+            digest.size(),
+            Some(replacement_gen),
+        );
+
+        // Dropping the stale guard must not decrement the replacement's pin.
+        stale_pin.release();
+        assert_eq!(lru.pinned_bytes(), digest.size());
+        assert!(lru.evict_unpinned_until(0).is_empty());
+
+        replacement_pin.release();
         assert_eq!(lru.pinned_bytes(), 0);
         assert_eq!(lru.evict_unpinned_until(0).len(), 1);
     }
