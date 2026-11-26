@@ -4,11 +4,11 @@
 //! Every struct rejects unknown keys. Each tunable has a default, applied when its key is
 //! absent. The types of the fields enforce their bounds, so a config value that parses is valid.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 
 use gang_types::{
-    Audience, BoundedDuration, FleetName, MachineClass, NANOS_PER_SECOND, NonZeroBytes,
+    Audience, BoundedDuration, Bytes, FleetName, MachineClass, NANOS_PER_SECOND, NonZeroBytes,
     NonZeroDuration, Percent, Url,
 };
 use serde::{Deserialize, Serialize};
@@ -423,6 +423,16 @@ pub struct S3Tuning {
     /// Age after which a cached object is treated as expired. Unset, which disables the check,
     /// by default. When set, it must be a whole number of seconds, at most `4294967295`.
     pub consider_expired_after: Option<ExpiryAge>,
+    /// Maximum concurrent `HeadObject` requests issued by `ContentStore::find_missing`.
+    /// Defaults to `128`.
+    pub head_concurrency: NonZeroUsize,
+    /// Maximum blob size uploaded in a single `PutObject` request; larger blobs stream through
+    /// multipart upload. Must be at least `5MiB`. Defaults to `5MiB`.
+    pub single_put_max: SinglePutMax,
+    /// Maximum number of positive existence entries cached in memory. Defaults to `1_048_576`.
+    pub existence_cache_entries: NonZeroUsize,
+    /// Maximum duration a positive existence entry remains fresh in memory. Defaults to `1h`.
+    pub existence_ttl: NonZeroDuration,
 }
 
 impl Default for S3Tuning {
@@ -434,8 +444,81 @@ impl Default for S3Tuning {
             multipart_max_concurrent_uploads: NonZeroU32::MIN.saturating_add(9),
             retry_buffer_per_request: NonZeroBytes::mib(5),
             consider_expired_after: None,
+            head_concurrency: NonZeroUsize::MIN.saturating_add(127),
+            single_put_max: SinglePutMax::MIN,
+            existence_cache_entries: NonZeroUsize::MIN.saturating_add(1_048_575),
+            existence_ttl: NonZeroDuration::from_hours(1),
         }
     }
+}
+
+/// Maximum blob size uploaded in a single `PutObject` request, read from `single_put_max`.
+///
+/// S3 requires every non-final part of a multipart upload to be at least `5MiB`, so smaller values
+/// are rejected. Defaults to `5MiB`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Bytes", into = "Bytes")]
+pub struct SinglePutMax(Bytes);
+
+impl SinglePutMax {
+    /// Smallest accepted threshold, `5MiB` (S3's minimum non-final multipart part size).
+    pub const MIN: Self = Self(Bytes::mib(5));
+
+    /// Wraps `value` if it is at least [`Self::MIN`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinglePutMaxError::TooSmall`] when `value` is smaller than [`Self::MIN`].
+    pub const fn try_new(value: Bytes) -> Result<Self, SinglePutMaxError> {
+        if value.get() >= Self::MIN.0.get() {
+            Ok(Self(value))
+        } else {
+            Err(SinglePutMaxError::TooSmall { min: Self::MIN.0 })
+        }
+    }
+
+    /// Returns the threshold.
+    #[must_use]
+    pub const fn get(self) -> Bytes {
+        self.0
+    }
+
+    /// Returns the threshold in bytes.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl Default for SinglePutMax {
+    fn default() -> Self {
+        Self::MIN
+    }
+}
+
+impl TryFrom<Bytes> for SinglePutMax {
+    type Error = SinglePutMaxError;
+
+    fn try_from(value: Bytes) -> Result<Self, Self::Error> {
+        Self::try_new(value)
+    }
+}
+
+impl From<SinglePutMax> for Bytes {
+    fn from(value: SinglePutMax) -> Self {
+        value.0
+    }
+}
+
+/// Why a size is not a valid [`SinglePutMax`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SinglePutMaxError {
+    /// The size is below S3's `5MiB` minimum non-final multipart part size.
+    #[error("single_put_max must be at least {}", *.min)]
+    TooSmall {
+        /// Smallest accepted size.
+        min: Bytes,
+    },
 }
 
 /// Age of a cached object after which it is treated as expired, in whole seconds.
@@ -742,5 +825,48 @@ mod tests {
         assert!(
             RetrySpotAfter::try_new(Duration::from_mins(1) + Duration::from_micros(1)).is_err()
         );
+    }
+
+    #[test]
+    fn s3_tuning_defaults_match_spec() -> TestResult {
+        let tuning = super::S3Tuning::default();
+        assert_eq!(tuning.head_concurrency.get(), 128);
+        assert_eq!(tuning.single_put_max.as_u64(), 5 * 1024 * 1024);
+        assert_eq!(tuning.existence_cache_entries.get(), 1_048_576);
+        assert_eq!(tuning.existence_ttl.get(), Duration::from_hours(1));
+
+        let parsed: super::S3Tuning = serde_json::from_value(json!({}))?;
+        assert_eq!(parsed, tuning);
+        Ok(())
+    }
+
+    #[test]
+    fn single_put_max_rejects_below_five_mib_and_accepts_five_mib_or_more() -> TestResult {
+        for rejected in ["0B", "1B", "1KiB", "4MiB", "5242879B"] {
+            assert!(
+                serde_json::from_value::<super::S3Tuning>(json!({
+                    "single_put_max": rejected
+                }))
+                .is_err(),
+                "{rejected} must be rejected"
+            );
+        }
+        for (accepted, expected) in [
+            ("5MiB", 5 * 1024 * 1024_u64),
+            ("5242880B", 5 * 1024 * 1024_u64),
+            ("16MiB", 16 * 1024 * 1024_u64),
+        ] {
+            let parsed: super::S3Tuning = serde_json::from_value(json!({
+                "single_put_max": accepted
+            }))?;
+            assert_eq!(parsed.single_put_max.as_u64(), expected);
+        }
+        assert!(serde_json::from_value::<super::S3Tuning>(json!({"head_concurrency": 0})).is_err());
+        assert!(
+            serde_json::from_value::<super::S3Tuning>(json!({"existence_cache_entries": 0}))
+                .is_err()
+        );
+        assert!(serde_json::from_value::<super::S3Tuning>(json!({"existence_ttl": "0s"})).is_err());
+        Ok(())
     }
 }

@@ -1,5 +1,5 @@
 {
-  "checksum": "d4cf3e9880e508a7f76419791f262fbef0662c69dc77dfbe0acf4aee71107b2e",
+  "checksum": "9f1e3a51d1e83aa7580fa141622a177942ce4fec6b05598f1bfd46961388425d",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -13880,6 +13880,18 @@
               "target": "aws_smithy_types"
             },
             {
+              "id": "bytes 1.12.1",
+              "target": "bytes"
+            },
+            {
+              "id": "futures 0.3.34",
+              "target": "futures"
+            },
+            {
+              "id": "lru 0.18.5",
+              "target": "lru"
+            },
+            {
               "id": "num-traits 0.2.19",
               "target": "num_traits"
             },
@@ -13898,6 +13910,10 @@
             {
               "id": "serde_json 1.0.154",
               "target": "serde_json"
+            },
+            {
+              "id": "sha2 0.11.1",
+              "target": "sha2"
             },
             {
               "id": "thiserror 2.0.21",
@@ -15050,12 +15066,28 @@
               "target": "prost_types"
             },
             {
+              "id": "rustix 1.1.6",
+              "target": "rustix"
+            },
+            {
+              "id": "sha2 0.11.1",
+              "target": "sha2"
+            },
+            {
               "id": "thiserror 2.0.21",
               "target": "thiserror"
             },
             {
               "id": "tokio 1.54.1",
               "target": "tokio"
+            },
+            {
+              "id": "tokio-stream 0.1.19",
+              "target": "tokio_stream"
+            },
+            {
+              "id": "tokio-util 0.7.20",
+              "target": "tokio_util"
             },
             {
               "id": "tonic 0.14.9",
@@ -15068,6 +15100,10 @@
             {
               "id": "tracing 0.1.44",
               "target": "tracing"
+            },
+            {
+              "id": "zstd 0.14.3",
+              "target": "zstd"
             }
           ],
           "selects": {}
@@ -15081,6 +15117,10 @@
             {
               "id": "rustls 0.23.46",
               "target": "rustls"
+            },
+            {
+              "id": "tempfile 3.27.0",
+              "target": "tempfile"
             }
           ],
           "selects": {}

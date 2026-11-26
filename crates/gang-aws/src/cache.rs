@@ -21,12 +21,11 @@ use tokio::sync::OnceCell;
 
 use crate::cloudwatch::BucketMetrics;
 use crate::config::S3CacheConfig;
-
-/// Key prefix of the content-addressed store, appended to the configured `key_prefix`.
-const CONTENT_PREFIX: &str = "cas/";
-
-/// Key prefix of the action cache, appended to the configured `key_prefix`.
-const ACTION_PREFIX: &str = "ac/";
+#[cfg(test)]
+use crate::s3_existence::S3ExistenceCache;
+use crate::s3_store::{
+    S3ActionStore, S3Backend, S3ContentStore, action_key_prefix, cas_key_prefix,
+};
 
 /// The `NativeLink` store kind that reads and writes S3 objects.
 const STORE_KEY: &str = "experimental_cloud_object_store";
@@ -39,6 +38,7 @@ pub struct S3Cache {
     config: S3CacheConfig,
     /// The bucket's storage metrics; `None` for an S3-compatible endpoint.
     metrics: Option<BucketMetrics>,
+    backend: Arc<S3Backend>,
 }
 
 impl Plugin for S3Cache {
@@ -48,6 +48,7 @@ impl Plugin for S3Cache {
         Ok(Self::new(
             config,
             Arc::new(SystemClock::new()),
+            OnceCell::new(),
             OnceCell::new(),
         ))
     }
@@ -60,12 +61,30 @@ impl S3Cache {
         config: S3CacheConfig,
         clock: Arc<dyn Clock>,
         metrics_client: OnceCell<aws_sdk_cloudwatch::Client>,
+        s3_client: OnceCell<aws_sdk_s3::Client>,
     ) -> Self {
         let metrics = config
             .endpoint
             .is_none()
-            .then(|| BucketMetrics::new(&config, clock, metrics_client));
-        Self { config, metrics }
+            .then(|| BucketMetrics::new(&config, Arc::clone(&clock), metrics_client));
+        let backend = Arc::new(S3Backend::new(config.clone(), clock, s3_client));
+        Self {
+            config,
+            metrics,
+            backend,
+        }
+    }
+
+    /// Opens a [`S3ContentStore`] backed by this cache's S3 bucket and positive existence cache.
+    #[must_use]
+    pub fn s3_content_store(&self) -> S3ContentStore {
+        S3ContentStore::new(Arc::clone(&self.backend))
+    }
+
+    /// Opens an [`S3ActionStore`] scoped to `environment` in this cache's S3 bucket.
+    #[must_use]
+    pub fn s3_action_store(&self, environment: &gang_types::EnvironmentName) -> S3ActionStore {
+        S3ActionStore::new(Arc::clone(&self.backend), environment)
     }
 
     /// A cache that measures the bucket through `client` and reads `clock`.
@@ -75,13 +94,39 @@ impl S3Cache {
         clock: Arc<dyn Clock>,
         client: aws_sdk_cloudwatch::Client,
     ) -> Self {
-        Self::new(config, clock, OnceCell::new_with(Some(client)))
+        Self::new(
+            config,
+            clock,
+            OnceCell::new_with(Some(client)),
+            OnceCell::new(),
+        )
+    }
+
+    /// A cache backed by a pre-built S3 client and `clock` for unit tests.
+    #[cfg(test)]
+    pub(crate) fn with_s3_client(
+        config: S3CacheConfig,
+        clock: Arc<dyn Clock>,
+        client: aws_sdk_s3::Client,
+    ) -> Self {
+        Self::new(
+            config,
+            clock,
+            OnceCell::new(),
+            OnceCell::new_with(Some(client)),
+        )
+    }
+
+    /// Exposes the shared positive existence cache for unit tests.
+    #[cfg(test)]
+    pub(crate) fn existence_cache(&self) -> &S3ExistenceCache {
+        self.backend.existence()
     }
 }
 
 impl CacheStorePort for S3Cache {
     fn content_store(&self) -> Result<RenderedStoreSpec, PortError> {
-        Ok(store_spec(&self.config, CONTENT_PREFIX, None))
+        Ok(store_spec(&self.config, &cas_key_prefix(&self.config)))
     }
 
     fn action_store(
@@ -90,8 +135,7 @@ impl CacheStorePort for S3Cache {
     ) -> Result<RenderedStoreSpec, PortError> {
         Ok(store_spec(
             &self.config,
-            ACTION_PREFIX,
-            environment.cache_namespace(),
+            &action_key_prefix(&self.config, environment),
         ))
     }
 
@@ -110,12 +154,8 @@ impl CacheStorePort for S3Cache {
     }
 }
 
-/// Describes one store under the configured key prefix, namespaced by `prefix`.
-fn store_spec(config: &S3CacheConfig, prefix: &str, namespace: Option<&str>) -> RenderedStoreSpec {
-    let key_prefix = match namespace {
-        Some(name) => format!("{}{prefix}{name}/", config.key_prefix.as_str()),
-        None => format!("{}{prefix}", config.key_prefix.as_str()),
-    };
+/// Describes one store under the configured `key_prefix`.
+fn store_spec(config: &S3CacheConfig, key_prefix: &str) -> RenderedStoreSpec {
     let mut object = json!({
         "provider": PROVIDER,
         "region": config.region.as_str(),

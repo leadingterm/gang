@@ -46,6 +46,8 @@ mod launch_failure;
 mod lifecycle;
 mod names;
 mod plugin;
+mod s3_existence;
+mod s3_store;
 mod scratch;
 mod signer;
 
@@ -70,10 +72,12 @@ mod warm_scenarios;
 pub use cache::S3Cache;
 pub use config::{
     AwsConfig, AwsFleetOptions, Capacity, CooldownPolicy, ExpiryAge, KmsSignerConfig,
-    RetrySpotAfter, S3CacheConfig, S3Tuning, SpotFallback, UsageInterval, UsageIntervalError,
-    WorkloadTokenAlgorithm, WorkloadTokenConfig, WorkloadTokenTtl,
+    RetrySpotAfter, S3CacheConfig, S3Tuning, SinglePutMax, SinglePutMaxError, SpotFallback,
+    UsageInterval, UsageIntervalError, WorkloadTokenAlgorithm, WorkloadTokenConfig,
+    WorkloadTokenTtl,
 };
 pub use errors::{AwsError, ScratchError};
 pub use names::{AwsNameError, BucketName, FleetTagKey, KeyId, KeyPrefix, MountPoint};
 pub use plugin::Aws;
+pub use s3_store::{S3ActionStore, S3ContentStore};
 pub use signer::KmsSigner;
