@@ -5,7 +5,9 @@
 
 mod acquisition;
 mod actor;
+mod config;
 mod controller;
+mod engine;
 mod gate;
 mod handoff;
 mod observer;
@@ -33,9 +35,13 @@ pub use actor::{
     OperationWatchState, RegisteredWorker, WorkerMsg, WorkerOutbound, map_kill_reason,
     select_inline_payload,
 };
+pub use config::{EngineConfig, EngineConfigError};
 pub use controller::{
     ControllerClosed, ControllerExecuteError, ControllerHandle, ControllerRegisterError,
     LearnedSlot, spawn_controller,
+};
+pub use engine::{
+    ControllerStores, Engine, EngineControllerSpec, EngineError, TlsSessionConnector,
 };
 pub use reapi_ac::ActionCacheService;
 pub use reapi_bytestream::{ByteStreamConfig, ByteStreamService};
