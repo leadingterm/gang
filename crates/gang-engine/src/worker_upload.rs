@@ -18,6 +18,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -32,6 +33,8 @@ use gang_types::Digest;
 use prost::Message as _;
 use rustix::fs::{self as fd_fs, AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest as _, Sha256};
+
+use crate::worker_sampling::BlockingScope;
 
 /// Streaming read buffer size used for hashing and uploading output files.
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
@@ -178,6 +181,9 @@ pub enum UploadError {
     /// A CAS or `ActionCache` store operation failed.
     #[error("store failure: {0}")]
     Store(#[from] PortError),
+    /// Upload was cancelled cooperatively before completing.
+    #[error("output upload cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -276,6 +282,9 @@ struct OpenedFile {
 struct FileCollector<'a, F, S> {
     tiered: &'a Tiered<F, S>,
     config: &'a UploadConfig,
+    blocking: &'a BlockingScope,
+    #[cfg(test)]
+    before_hash: Option<Arc<dyn Fn() + Send + Sync>>,
     files: Vec<CollectedFile>,
     pending: Vec<OpenedFile>,
     counted_inodes: HashSet<(u64, u64)>,
@@ -287,10 +296,18 @@ where
     F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
     S: ContentStore,
 {
-    fn new(tiered: &'a Tiered<F, S>, config: &'a UploadConfig) -> Self {
+    fn new(
+        tiered: &'a Tiered<F, S>,
+        config: &'a UploadConfig,
+        blocking: &'a BlockingScope,
+        #[cfg(test)] before_hash: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
         Self {
             tiered,
             config,
+            blocking,
+            #[cfg(test)]
+            before_hash,
             files: Vec::new(),
             pending: Vec::with_capacity(config.hash_concurrency.get()),
             counted_inodes: HashSet::new(),
@@ -299,6 +316,9 @@ where
     }
 
     async fn push(&mut self, path: PathBuf, handle: File) -> Result<usize, UploadError> {
+        if self.blocking.is_cancelled() {
+            return Err(UploadError::Cancelled);
+        }
         let meta = handle
             .metadata()
             .map_err(|source| output_io(&path, source))?;
@@ -321,11 +341,22 @@ where
     }
 
     async fn flush(&mut self) -> Result<(), UploadError> {
-        hash_files_parallel(&mut self.pending, self.config.hash_concurrency).await?;
+        if self.blocking.is_cancelled() {
+            return Err(UploadError::Cancelled);
+        }
+        hash_files_parallel(
+            &mut self.pending,
+            self.config.hash_concurrency,
+            self.blocking,
+            #[cfg(test)]
+            self.before_hash.clone(),
+        )
+        .await?;
         let shared = insert_outputs_into_disk_cas(
             self.tiered.disk(),
             &self.pending,
             &mut self.counted_inodes,
+            self.blocking,
         )
         .await?;
         self.cas_shared_bytes = self.cas_shared_bytes.saturating_add(shared);
@@ -334,6 +365,7 @@ where
             &self.pending,
             &[],
             self.config.upload_concurrency,
+            self.blocking,
         )
         .await?;
         // Only immutable metadata survives a batch, including when DiskCas bypasses a blob.
@@ -419,11 +451,74 @@ where
     S: ContentStore,
     A: ActionStore,
 {
+    let blocking = BlockingScope::new();
+    upload_outputs_inner(
+        input,
+        tiered,
+        action_store,
+        clock,
+        config,
+        &blocking,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+/// Worker-owned upload entry point tracking all blocking hashing and file-read work in `blocking`.
+pub(crate) async fn upload_outputs_with_scope<F, S, A>(
+    input: UploadInput<'_>,
+    tiered: &Tiered<F, S>,
+    action_store: Option<&A>,
+    clock: &dyn Clock,
+    config: &UploadConfig,
+    blocking: &BlockingScope,
+) -> Result<UploadOutcome, UploadError>
+where
+    F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
+    S: ContentStore,
+    A: ActionStore,
+{
+    upload_outputs_inner(
+        input,
+        tiered,
+        action_store,
+        clock,
+        config,
+        blocking,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[allow(deprecated)]
+#[allow(clippy::too_many_arguments)]
+async fn upload_outputs_inner<F, S, A>(
+    input: UploadInput<'_>,
+    tiered: &Tiered<F, S>,
+    action_store: Option<&A>,
+    clock: &dyn Clock,
+    config: &UploadConfig,
+    blocking: &BlockingScope,
+    #[cfg(test)] before_hash: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> Result<UploadOutcome, UploadError>
+where
+    F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
+    S: ContentStore,
+    A: ActionStore,
+{
     let upload_start = clock.wall();
     let roots = RootContext::new(input.work_dir, input.working_dir)?;
     let use_output_paths = !input.command.output_paths.is_empty();
 
-    let mut collector = FileCollector::new(tiered, config);
+    let mut collector = FileCollector::new(
+        tiered,
+        config,
+        blocking,
+        #[cfg(test)]
+        before_hash,
+    );
     let mut top_files = Vec::new();
     let mut top_symlinks = Vec::new();
     let mut top_dirs = Vec::new();
@@ -460,7 +555,14 @@ where
     }
 
     insert_memory_blobs(tiered.disk(), &in_memory_blobs).await?;
-    upload_missing_to_slow(tiered, &[], &in_memory_blobs, config.upload_concurrency).await?;
+    upload_missing_to_slow(
+        tiered,
+        &[],
+        &in_memory_blobs,
+        config.upload_concurrency,
+        blocking,
+    )
+    .await?;
 
     let action_result = build_action_result(
         input.exit_code,
@@ -952,6 +1054,8 @@ fn finalize_stdio(
 async fn hash_files_parallel(
     files: &mut [OpenedFile],
     concurrency: NonZeroUsize,
+    blocking: &BlockingScope,
+    #[cfg(test)] before_hash: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<(), UploadError> {
     let jobs: Vec<(usize, PathBuf, Arc<File>)> = files
         .iter()
@@ -971,15 +1075,26 @@ async fn hash_files_parallel(
     }
 
     let results: Vec<Result<(usize, Digest), UploadError>> = futures::stream::iter(jobs)
-        .map(|(idx, path, handle)| async move {
-            let path_for_join = path.clone();
-            let digest = tokio::task::spawn_blocking(move || hash_file_streaming(&handle, &path))
-                .await
-                .map_err(|err| UploadError::Io {
-                    path: path_for_join,
-                    source: io::Error::other(format!("hash task failed: {err}")),
-                })??;
-            Ok((idx, digest))
+        .map(|(idx, path, handle)| {
+            #[cfg(test)]
+            let hook = before_hash.clone();
+            async move {
+                let path_for_join = path.clone();
+                let digest = blocking
+                    .run(move |cancelled| {
+                        #[cfg(test)]
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                        hash_file_streaming(&handle, &path, cancelled)
+                    })
+                    .await
+                    .map_err(|err| UploadError::Io {
+                        path: path_for_join,
+                        source: io::Error::other(format!("hash task failed: {err}")),
+                    })??;
+                Ok((idx, digest))
+            }
         })
         .buffer_unordered(concurrency.get())
         .collect()
@@ -992,11 +1107,18 @@ async fn hash_files_parallel(
     Ok(())
 }
 
-fn hash_file_streaming(file: &File, path: &Path) -> Result<Digest, UploadError> {
+fn hash_file_streaming(
+    file: &File,
+    path: &Path,
+    cancelled: &AtomicBool,
+) -> Result<Digest, UploadError> {
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
     let mut buf = vec![0_u8; STREAM_CHUNK_BYTES];
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(UploadError::Cancelled);
+        }
         let read = file
             .read_at(&mut buf, total)
             .map_err(|source| UploadError::Io {
@@ -1116,6 +1238,7 @@ async fn insert_outputs_into_disk_cas(
     disk: &DiskCas,
     files: &[OpenedFile],
     counted_inodes: &mut HashSet<(u64, u64)>,
+    blocking: &BlockingScope,
 ) -> Result<u64, UploadError> {
     let mut cas_shared_bytes = 0_u64;
     let mut inserted_keys: HashSet<CacheKey> = HashSet::new();
@@ -1139,7 +1262,7 @@ async fn insert_outputs_into_disk_cas(
         if let Some(_pin) = disk.pin_attempt(file.digest, file.executable) {
             continue;
         }
-        let stream = file_blob_stream(Arc::clone(&opened.handle), file.size);
+        let stream = file_blob_stream(Arc::clone(&opened.handle), file.size, blocking.clone());
         let _outcome: WriteOutcome = disk
             .write_with_mode(file.digest, stream, file.executable)
             .await?;
@@ -1194,6 +1317,7 @@ async fn upload_missing_to_slow<F, S>(
     files: &[OpenedFile],
     in_memory_blobs: &[(Digest, Bytes)],
     concurrency: NonZeroUsize,
+    blocking: &BlockingScope,
 ) -> Result<(), UploadError>
 where
     F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
@@ -1245,13 +1369,16 @@ where
 
     let slow = tiered.slow();
     let results: Vec<Result<(), UploadError>> = futures::stream::iter(jobs)
-        .map(|(digest, payload)| async move {
-            let stream = match payload {
-                UploadPayload::Bytes(bytes) => BlobStream::from_bytes(bytes),
-                UploadPayload::File { handle, size } => file_blob_stream(handle, size),
-            };
-            slow.write(digest, stream).await?;
-            Ok(())
+        .map(|(digest, payload)| {
+            let scope = blocking.clone();
+            async move {
+                let stream = match payload {
+                    UploadPayload::Bytes(bytes) => BlobStream::from_bytes(bytes),
+                    UploadPayload::File { handle, size } => file_blob_stream(handle, size, scope),
+                };
+                slow.write(digest, stream).await?;
+                Ok(())
+            }
         })
         .buffer_unordered(concurrency.get())
         .collect()
@@ -1263,27 +1390,37 @@ where
     Ok(())
 }
 
-fn file_blob_stream(file: Arc<File>, size: u64) -> BlobStream {
+fn file_blob_stream(file: Arc<File>, size: u64, blocking: BlockingScope) -> BlobStream {
     if size == 0 {
         return BlobStream::empty();
     }
     let chunks: BoxStream<'static, Result<Bytes, PortError>> = Box::pin(stream::unfold(
-        Some((file, size)),
+        Some((file, size, blocking)),
         move |state| async move {
-            let (file, remaining) = state?;
+            let (file, remaining, blocking) = state?;
             if remaining == 0 {
                 return None;
+            }
+            if blocking.is_cancelled() {
+                return Some((Err(PortError::unavailable("output upload cancelled")), None));
             }
             let to_read = usize::try_from(remaining.min(STREAM_CHUNK_BYTES as u64))
                 .unwrap_or(STREAM_CHUNK_BYTES);
 
-            let step = tokio::task::spawn_blocking(move || {
-                let mut buf = vec![0_u8; to_read];
-                let read = file.read_at(&mut buf, size - remaining)?;
-                buf.truncate(read);
-                Ok::<_, io::Error>((file, Bytes::from(buf)))
-            })
-            .await;
+            let step = blocking
+                .run(move |cancelled| {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "output upload cancelled",
+                        ));
+                    }
+                    let mut buf = vec![0_u8; to_read];
+                    let read = file.read_at(&mut buf, size - remaining)?;
+                    buf.truncate(read);
+                    Ok::<_, io::Error>((file, Bytes::from(buf)))
+                })
+                .await;
 
             match step {
                 Ok(Ok((file, bytes))) => {
@@ -1298,7 +1435,7 @@ fn file_blob_stream(file: Arc<File>, size: u64) -> BlobStream {
                     } else {
                         let read_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                         let next_remaining = remaining.saturating_sub(read_len);
-                        Some((Ok(bytes), Some((file, next_remaining))))
+                        Some((Ok(bytes), Some((file, next_remaining, blocking))))
                     }
                 }
                 Ok(Err(error)) => Some((Err(PortError::backend(error)), None)),
@@ -1474,7 +1611,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CapturedOutput, ExecutionTiming, UploadConfig, UploadError, UploadInput, upload_outputs,
+        BlockingScope, CapturedOutput, ExecutionTiming, STREAM_CHUNK_BYTES, UploadConfig,
+        UploadError, UploadInput, upload_outputs, upload_outputs_inner,
     };
 
     fn test_config() -> UploadConfig {
@@ -2062,7 +2200,8 @@ mod tests {
         let slow = MemoryContentStore::new();
         let tiered = Tiered::new(disk.clone(), slow.clone());
         let config = test_config();
-        let mut collector = super::FileCollector::new(&tiered, &config);
+        let blocking = BlockingScope::new();
+        let mut collector = super::FileCollector::new(&tiered, &config, &blocking, None);
         collector.push(work.join("out/data"), file).await?;
         collector.flush().await?;
         let files = &collector.files;
@@ -2181,6 +2320,98 @@ mod tests {
         .await
         .expect_err("directory for output_files fails");
         assert!(matches!(err, UploadError::OutputKindMismatch { .. }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_joins_blocking_hash_before_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let disk = DiskCas::open(tmp.path().join("cas"), 1024 * 1024).await?;
+        let slow = MemoryContentStore::new();
+        let tiered = Tiered::new(disk, slow.clone());
+        let work_dir = tmp.path().join("work");
+        fs::create_dir_all(&work_dir)?;
+        let payload = vec![b'h'; STREAM_CHUNK_BYTES * 2 + 13];
+        fs::write(work_dir.join("big.bin"), &payload)?;
+        let payload_digest = Digest::from_bytes(&payload);
+
+        let command = reapi::Command {
+            output_paths: vec!["big.bin".to_owned()],
+            ..Default::default()
+        };
+        let clock = gang_clock::SystemClock::new();
+        let blocking = BlockingScope::new();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let entered_hook = Arc::clone(&entered);
+        let release_hook = Arc::clone(&release);
+        let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            entered_hook.wait();
+            release_hook.wait();
+        });
+
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let trigger = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                entered.wait();
+            })
+            .await
+            .expect("barrier wait");
+            let _ = cancel_tx.send(());
+        });
+
+        let upload_cfg = test_config();
+        let upload_future = upload_outputs_inner(
+            UploadInput {
+                action_digest: Digest::from_bytes(b"cancel-hash"),
+                do_not_cache: true,
+                exit_code: 0,
+                command: &command,
+                work_dir: &work_dir,
+                working_dir: &work_dir,
+                stdout: None,
+                stderr: None,
+                timing: ExecutionTiming::default(),
+            },
+            &tiered,
+            None::<&MemoryActionStore>,
+            &clock,
+            &upload_cfg,
+            &blocking,
+            Some(hook),
+        );
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel_rx => None,
+            res = upload_future => Some(res),
+        };
+        assert!(outcome.is_none(), "cancellation must interrupt upload");
+        trigger.await?;
+
+        let blocking_for_join = blocking.clone();
+        let join_task = tokio::spawn(async move {
+            blocking_for_join.cancel_and_join().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !join_task.is_finished(),
+            "cancel_and_join must wait for in-flight blocking hash task"
+        );
+
+        tokio::task::spawn_blocking(move || {
+            release.wait();
+        })
+        .await?;
+        join_task.await?;
+
+        let mut missing = Vec::new();
+        slow.find_missing(&[payload_digest], &mut missing).await?;
+        assert_eq!(
+            missing,
+            vec![payload_digest],
+            "cancelled hash must never publish the blob"
+        );
         Ok(())
     }
 }

@@ -17,6 +17,7 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::StreamExt as _;
 use gang_cas::{BlobMode, CacheKey, CasPin, DiskCas, FetchOutcome, Tiered, TreeCache, TreeLease};
@@ -30,6 +31,8 @@ use gang_types::{AttemptId, AttemptIdError, Digest, NonZeroBytes};
 use parking_lot::Mutex;
 use prost::Message as _;
 use tonic::transport::Channel;
+
+use crate::worker_sampling::BlockingScope;
 
 /// Maximum REAPI directory tree nesting depth accepted during staging.
 const MAX_TREE_DEPTH: usize = 256;
@@ -253,6 +256,9 @@ pub enum StagingError {
     /// A store or transport operation failed.
     #[error("store failure: {0}")]
     Store(#[from] PortError),
+    /// Staging was cancelled cooperatively before completing.
+    #[error("input staging cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -456,6 +462,72 @@ where
     F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
     S: ContentStore,
 {
+    stage_attempt_with_scope(
+        assign,
+        work_root,
+        tiered,
+        tree_cache,
+        dir_cache,
+        remote_tree,
+        config,
+        None,
+        true,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+/// Worker-owned staging entry point: tracks blocking materialization in `blocking` and leaves
+/// `<work_root>/<attempt_id>` retirement solely to the worker's graveyard after blocking tasks join.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stage_attempt_in_worker<F, S>(
+    assign: &worker_proto::Assign,
+    work_root: &Path,
+    tiered: &Tiered<F, S>,
+    tree_cache: Option<&TreeCache>,
+    dir_cache: &DirectoryCache,
+    remote_tree: Option<&RemoteTreeSource>,
+    config: &StageConfig,
+    blocking: &BlockingScope,
+) -> Result<StagedAttempt, StagingError>
+where
+    F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
+    S: ContentStore,
+{
+    stage_attempt_with_scope(
+        assign,
+        work_root,
+        tiered,
+        tree_cache,
+        dir_cache,
+        remote_tree,
+        config,
+        Some(blocking),
+        false,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stage_attempt_with_scope<F, S>(
+    assign: &worker_proto::Assign,
+    work_root: &Path,
+    tiered: &Tiered<F, S>,
+    tree_cache: Option<&TreeCache>,
+    dir_cache: &DirectoryCache,
+    remote_tree: Option<&RemoteTreeSource>,
+    config: &StageConfig,
+    blocking: Option<&BlockingScope>,
+    cleanup_dir_on_drop: bool,
+    #[cfg(test)] before_materialize: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> Result<StagedAttempt, StagingError>
+where
+    F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
+    S: ContentStore,
+{
     let attempt_id = AttemptId::try_from(assign.attempt.as_str())?;
     let action = resolve_action(assign, tiered).await?;
     let command = resolve_command(assign, &action, tiered).await?;
@@ -483,7 +555,7 @@ where
     };
     let tmp_dir = attempt_dir.join("tmp");
 
-    let guard = AttemptDirGuard::new(attempt_dir.clone());
+    let guard = cleanup_dir_on_drop.then(|| AttemptDirGuard::new(attempt_dir.clone()));
 
     let (read_only_trees, tree_leases, bound_prefixes) = bind_read_only_trees(
         &inventory,
@@ -520,8 +592,15 @@ where
         &unbound_symlinks,
         &bypassed_keys,
         tiered.disk(),
+        blocking,
+        #[cfg(test)]
+        before_materialize,
     )
     .await?;
+
+    if blocking.is_some_and(BlockingScope::is_cancelled) {
+        return Err(StagingError::Cancelled);
+    }
 
     stream_bypassed_files(
         &unbound_files,
@@ -532,7 +611,9 @@ where
     )
     .await?;
 
-    guard.disarm();
+    if let Some(guard) = guard {
+        guard.disarm();
+    }
 
     Ok(StagedAttempt {
         attempt_id,
@@ -1427,6 +1508,8 @@ async fn materialize_workspace(
     unbound_symlinks: &[InputSymlink],
     bypassed_keys: &HashSet<CacheKey>,
     disk: &DiskCas,
+    blocking: Option<&BlockingScope>,
+    #[cfg(test)] before_materialize: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<(), StagingError> {
     let work_dir = work_dir.to_path_buf();
     let working_dir = working_dir.to_path_buf();
@@ -1439,22 +1522,31 @@ async fn materialize_workspace(
     let bypassed = bypassed_keys.clone();
     let disk = disk.clone();
 
-    tokio::task::spawn_blocking(move || {
+    let run_materialize = move |cancelled: &AtomicBool| -> Result<(), StagingError> {
+        #[cfg(test)]
+        if let Some(hook) = before_materialize {
+            hook();
+        }
+        check_cancelled(cancelled)?;
         create_dir(&work_dir)?;
         create_dir(&tmp_dir)?;
         create_dir(&working_dir)?;
 
         for rel_dir in &unbound_dirs {
+            check_cancelled(cancelled)?;
             create_dir(&work_dir.join(rel_dir))?;
         }
         for mount_point in &mount_points {
+            check_cancelled(cancelled)?;
             create_dir(mount_point)?;
         }
         for parent in &output_parents {
+            check_cancelled(cancelled)?;
             create_dir(parent)?;
         }
 
         for file in &files {
+            check_cancelled(cancelled)?;
             let key = CacheKey::new(file.digest, BlobMode::from_executable(file.executable));
             if !file.digest.is_empty() && bypassed.contains(&key) {
                 continue;
@@ -1470,6 +1562,7 @@ async fn materialize_workspace(
         }
 
         for sym in &symlinks {
+            check_cancelled(cancelled)?;
             let dest = work_dir.join(&sym.rel_path);
             if let Some(parent) = dest.parent() {
                 create_dir(parent)?;
@@ -1478,12 +1571,30 @@ async fn materialize_workspace(
                 .map_err(|source| StagingError::Io { path: dest, source })?;
         }
 
-        Ok::<(), StagingError>(())
-    })
-    .await
-    .map_err(|err| PortError::backend(format!("staging materialization task failed: {err}")))??;
+        Ok(())
+    };
+
+    if let Some(scope) = blocking {
+        scope.run(run_materialize).await.map_err(|err| {
+            PortError::backend(format!("staging materialization task failed: {err}"))
+        })??;
+    } else {
+        tokio::task::spawn_blocking(move || run_materialize(&AtomicBool::new(false)))
+            .await
+            .map_err(|err| {
+                PortError::backend(format!("staging materialization task failed: {err}"))
+            })??;
+    }
 
     Ok(())
+}
+
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), StagingError> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(StagingError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn create_dir(path: &Path) -> Result<(), StagingError> {
@@ -1561,7 +1672,10 @@ mod tests {
     use prost::Message as _;
     use tempfile::TempDir;
 
-    use super::{DirectoryCache, StageConfig, StagingError, stage_attempt};
+    use super::{
+        BlockingScope, DirectoryCache, StageConfig, StagingError, stage_attempt,
+        stage_attempt_with_scope,
+    };
 
     fn store_proto<M: prost::Message>(store: &MemoryContentStore, msg: &M) -> Digest {
         let bytes = Bytes::from(msg.encode_to_vec());
@@ -2328,6 +2442,99 @@ mod tests {
         assert_eq!(
             fs::read_link(staged.work_dir().join("escaping/escape"))?,
             Path::new("../outside")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_joins_blocking_materialization_before_dir_exists()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let disk = DiskCas::open(tmp.path().join("cas"), 1024 * 1024).await?;
+        let slow = MemoryContentStore::new();
+        let tiered = Tiered::new(disk, slow.clone());
+        let dir_cache = DirectoryCache::new(NonZeroBytes::mib(8));
+
+        let payload = slow.insert(Bytes::from_static(b"hello-stage"));
+        let root = make_dir(&slow, vec![("input.txt", payload, false)], vec![], vec![])?;
+        let cmd = reapi::Command {
+            arguments: vec!["/bin/true".to_owned()],
+            ..Default::default()
+        };
+        let cmd_digest = store_proto(&slow, &cmd);
+        let action = reapi::Action {
+            command_digest: Some(to_proto(&cmd_digest)?),
+            input_root_digest: Some(to_proto(&root)?),
+            ..Default::default()
+        };
+        let attempt_id = AttemptId::generate()?;
+        let assign = make_assign(
+            attempt_id.as_str(),
+            store_proto(&slow, &action),
+            Some(&action),
+            Some(&cmd),
+        )?;
+
+        let work_root = tmp.path().join("work");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let entered_hook = Arc::clone(&entered);
+        let release_hook = Arc::clone(&release);
+        let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            entered_hook.wait();
+            release_hook.wait();
+        });
+
+        let blocking = BlockingScope::new();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let stage_cfg = simple_config(64);
+        let staging_future = stage_attempt_with_scope(
+            &assign,
+            &work_root,
+            &tiered,
+            None,
+            &dir_cache,
+            None,
+            &stage_cfg,
+            Some(&blocking),
+            false,
+            Some(hook),
+        );
+        let cancelled_on_select = tokio::spawn(async move {
+            let enter_wait = tokio::task::spawn_blocking(move || {
+                entered.wait();
+            });
+            enter_wait.await.expect("barrier wait");
+            let _ = cancel_tx.send(());
+        });
+
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel_rx => None,
+            res = staging_future => Some(res),
+        };
+        assert!(outcome.is_none(), "cancellation must interrupt staging");
+        cancelled_on_select.await?;
+
+        let blocking_for_join = blocking.clone();
+        let join_task = tokio::spawn(async move {
+            blocking_for_join.cancel_and_join().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !join_task.is_finished(),
+            "cancel_and_join must wait for in-flight blocking materialization"
+        );
+
+        tokio::task::spawn_blocking(move || {
+            release.wait();
+        })
+        .await?;
+        join_task.await?;
+
+        assert!(
+            !work_root.join(attempt_id.as_str()).exists(),
+            "cancelled blocking materialization must never recreate the attempt directory"
         );
         Ok(())
     }

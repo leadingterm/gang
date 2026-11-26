@@ -12,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use gang_clock::{Clock, Tick};
@@ -25,7 +25,8 @@ use gang_scheduler::{
 };
 use gang_types::AttemptId;
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
+use tokio::task::JoinHandle;
 
 /// Filename written by `gang exec` inside `.side_channels/<attempt_id>/` carrying the absolute
 /// action `cgroup` path.
@@ -206,6 +207,91 @@ pub fn kill_channel() -> (KillTrigger, KillWaiter) {
         },
         KillWaiter { inner },
     )
+}
+
+type BlockingTaskList = Vec<(u64, JoinHandle<()>)>;
+
+/// Tracks `spawn_blocking` tasks owned by an attempt phase so cancellation signals them
+/// cooperatively and awaits every handle before retiring directories or acknowledging cleanup.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BlockingScope {
+    cancelled: Arc<AtomicBool>,
+    next_id: Arc<AtomicU64>,
+    tasks: Arc<Mutex<BlockingTaskList>>,
+}
+
+impl BlockingScope {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Runs `f` on Tokio's blocking pool, retaining its join handle even if this future is dropped
+    /// on cancellation so [`Self::cancel_and_join`] can guarantee completion before cleanup.
+    pub(crate) async fn run<F, T>(&self, f: F) -> std::io::Result<T>
+    where
+        F: FnOnce(&AtomicBool) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let cancelled = Arc::clone(&self.cancelled);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        let handle = tokio::task::spawn_blocking(move || {
+            let value = f(&cancelled);
+            let _ = tx.send(value);
+        });
+        {
+            let mut guard = self.tasks.lock();
+            guard.retain(|(_, task)| !task.is_finished());
+            guard.push((id, handle));
+        }
+        if let Ok(value) = rx.await {
+            let mut guard = self.tasks.lock();
+            if let Some(pos) = guard.iter().position(|(entry_id, _)| *entry_id == id) {
+                guard.swap_remove(pos);
+            }
+            return Ok(value);
+        }
+        let handle = {
+            let mut guard = self.tasks.lock();
+            guard
+                .iter()
+                .position(|(entry_id, _)| *entry_id == id)
+                .map(|pos| guard.swap_remove(pos).1)
+        };
+        if let Some(handle) = handle {
+            handle.await.map_err(std::io::Error::other)?;
+        }
+        Err(std::io::Error::other(
+            "blocking task exited before sending result",
+        ))
+    }
+
+    /// Signals cooperative cancellation and joins every blocking task spawned in this scope.
+    pub(crate) async fn cancel_and_join(&self) {
+        self.cancel();
+        loop {
+            let handles: Vec<JoinHandle<()>> = {
+                let mut guard = self.tasks.lock();
+                if guard.is_empty() {
+                    break;
+                }
+                guard.drain(..).map(|(_, handle)| handle).collect()
+            };
+            for handle in handles {
+                let _ = handle.await;
+            }
+        }
+    }
 }
 
 /// Tracks total reclaimable bytes currently queued or deleting in `.graveyard` (`§6.5`).

@@ -529,7 +529,7 @@ impl Engine {
         );
         term_guard.actor_task = Some(actor_task);
 
-        let (public_routes, worker_routes) =
+        let (public_routes, worker_routes, bytestream_shutdowns) =
             build_controller_routes(&self.config, spec, &handle, &handoff, connections.api);
         let limits = compute_connection_limits(self.config.http2.max_connections, spec.max_workers);
         let store_usage = make_store_usage_fn(&spec.stores);
@@ -558,6 +558,9 @@ impl Engine {
         let _ = handle.shutdown().await;
         if let Some(task) = term_guard.finish_actor() {
             let _ = task.await;
+        }
+        for bytestream in bytestream_shutdowns {
+            bytestream.shutdown().await;
         }
         spec.stores.content.shutdown().await;
         serve_result
@@ -793,7 +796,7 @@ fn shared_cache_routes<C: ContentStore, A: ActionStore>(
     cas_config: CasConfig,
     bytestream_config: ByteStreamConfig,
     limit: usize,
-) -> Routes {
+) -> (Routes, crate::reapi_bytestream::ByteStreamShutdown) {
     let action_cache = ActionCacheService::new(Arc::clone(&stores.actions))
         .into_server()
         .max_decoding_message_size(limit)
@@ -802,19 +805,22 @@ fn shared_cache_routes<C: ContentStore, A: ActionStore>(
         .into_server()
         .max_decoding_message_size(limit)
         .max_encoding_message_size(limit);
-    let bytestream = ByteStreamService::new(
+    let bytestream_service = ByteStreamService::new(
         Arc::clone(&stores.content),
         budget.clone(),
         bytestream_config,
-    )
-    .into_server()
-    .max_decoding_message_size(limit)
-    .max_encoding_message_size(limit);
-    Routes::builder()
+    );
+    let bytestream_shutdown = bytestream_service.shutdown_handle();
+    let bytestream = bytestream_service
+        .into_server()
+        .max_decoding_message_size(limit)
+        .max_encoding_message_size(limit);
+    let routes = Routes::builder()
         .routes()
         .add_service(action_cache)
         .add_service(cas)
-        .add_service(bytestream)
+        .add_service(bytestream);
+    (routes, bytestream_shutdown)
 }
 
 fn build_controller_routes<C: ContentStore, A: ActionStore, Api: ApiService>(
@@ -823,7 +829,11 @@ fn build_controller_routes<C: ContentStore, A: ActionStore, Api: ApiService>(
     handle: &ControllerHandle,
     handoff: &HandOff,
     api: Api,
-) -> (ScopedRoutes, ScopedRoutes) {
+) -> (
+    ScopedRoutes,
+    ScopedRoutes,
+    Vec<crate::reapi_bytestream::ByteStreamShutdown>,
+) {
     let limit = config.http2.max_message_size.get().as_usize();
     let budget = InflightBlobBudget::new(config.max_inflight_blob_bytes);
     let cas_config = CasConfig {
@@ -843,12 +853,13 @@ fn build_controller_routes<C: ContentStore, A: ActionStore, Api: ApiService>(
         .into_server()
         .max_decoding_message_size(limit)
         .max_encoding_message_size(limit);
-    let public_shared =
-        shared_cache_routes(&spec.stores, &budget, cas_config, bytestream_config, limit)
-            .add_service(capabilities)
-            .into_axum_router()
-            .layer(BuildObserverLayer::new(spec.observations.clone()))
-            .fallback_service(api_service(api));
+    let (public_cache_routes, public_bs_shutdown) =
+        shared_cache_routes(&spec.stores, &budget, cas_config, bytestream_config, limit);
+    let public_shared = public_cache_routes
+        .add_service(capabilities)
+        .into_axum_router()
+        .layer(BuildObserverLayer::new(spec.observations.clone()))
+        .fallback_service(api_service(api));
 
     let exec_svc = ExecutionService::new(
         handle.clone(),
@@ -875,9 +886,9 @@ fn build_controller_routes<C: ContentStore, A: ActionStore, Api: ApiService>(
         .into_axum_router()
         .layer(BuildObserverLayer::new(spec.observations.clone()));
 
-    let worker_shared =
-        shared_cache_routes(&spec.stores, &budget, cas_config, bytestream_config, limit)
-            .into_axum_router();
+    let (worker_cache_routes, worker_bs_shutdown) =
+        shared_cache_routes(&spec.stores, &budget, cas_config, bytestream_config, limit);
+    let worker_shared = worker_cache_routes.into_axum_router();
     let worker_svc = WorkerGrpcService::with_clock(
         handle.clone(),
         WorkerServiceConfig::from_worker_timeout(NonZeroDuration::from(config.worker_timeout)),
@@ -899,6 +910,7 @@ fn build_controller_routes<C: ContentStore, A: ActionStore, Api: ApiService>(
             shared: worker_shared,
             leader: worker_leader,
         },
+        vec![public_bs_shutdown, worker_bs_shutdown],
     )
 }
 

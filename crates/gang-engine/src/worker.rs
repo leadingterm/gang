@@ -42,19 +42,20 @@ use crate::worker_runner::{
     run_attempt, start_orphan_reaper,
 };
 use crate::worker_sampling::{
-    GraveyardPending, KillTrigger, KillWaiter, SamplingConfig, SamplingRegistry, SystemProbe,
-    WorkerSampler, kill_channel,
+    BlockingScope, GraveyardPending, KillTrigger, KillWaiter, SamplingConfig, SamplingRegistry,
+    SystemProbe, WorkerSampler, kill_channel,
 };
 use crate::worker_session::{
     ConnectError, ConnectedChannel, SessionConfig, SessionConnector, SessionError, SessionEvent,
     SessionOutbound, TelemetrySource, run_session,
 };
 use crate::worker_staging::{
-    DirectoryCache, RemoteTreeSource, StageConfig, StagedAttempt, StagingError, stage_attempt,
+    DirectoryCache, RemoteTreeSource, StageConfig, StagedAttempt, StagingError,
+    stage_attempt_in_worker,
 };
 use crate::worker_upload::{
     CapturedOutput as UploadCapturedOutput, ExecutionTiming, UploadConfig, UploadError,
-    UploadInput, upload_outputs,
+    UploadInput, upload_outputs_with_scope,
 };
 
 /// Default maximum `gRPC` frame size for worker session messages (16 `MiB`).
@@ -964,12 +965,16 @@ where
     };
 
     let stage_config = StageConfig::from_worker_config(&runtime.spec.worker);
+    let blocking = BlockingScope::new();
     let staged_result = tokio::select! {
         biased;
-        reason = kill_waiter.wait() => return Err(attempt_kill_status(reason)),
+        reason = kill_waiter.wait() => {
+            blocking.cancel_and_join().await;
+            return Err(attempt_kill_status(reason));
+        }
         result = runtime.clock.timeout(
             runtime.spec.worker.download_timeout.get(),
-            Box::pin(stage_attempt(
+            Box::pin(stage_attempt_in_worker(
                 assign,
                 &runtime.spec.work_directory,
                 &runtime.tiered,
@@ -977,17 +982,24 @@ where
                 &runtime.dir_cache,
                 remote_tree.as_ref(),
                 &stage_config,
+                &blocking,
             )),
         ) => result,
     };
 
     match staged_result {
         Ok(Ok(staged)) => Ok(staged),
-        Ok(Err(error)) => Err(staging_error_status(&error)),
-        Err(_elapsed) => Err(rpc_status(
-            rpc_proto::Code::DeadlineExceeded,
-            "input staging timed out",
-        )),
+        Ok(Err(error)) => {
+            blocking.cancel_and_join().await;
+            Err(staging_error_status(&error))
+        }
+        Err(_elapsed) => {
+            blocking.cancel_and_join().await;
+            Err(rpc_status(
+                rpc_proto::Code::DeadlineExceeded,
+                "input staging timed out",
+            ))
+        }
     }
 }
 
@@ -1032,19 +1044,22 @@ where
         },
     };
 
+    let blocking = BlockingScope::new();
     let upload_res = tokio::select! {
         biased;
         reason = kill_waiter.wait() => {
+            blocking.cancel_and_join().await;
             return completed_status(attempt_id.as_str().to_owned(), attempt_kill_status(reason));
         }
         result = runtime.clock.timeout(
             runtime.spec.worker.upload_timeout.get(),
-            Box::pin(upload_outputs(
+            Box::pin(upload_outputs_with_scope(
                 upload_input,
                 &runtime.tiered,
                 Some(&runtime.action_store),
                 &runtime.clock,
                 &upload_config,
+                &blocking,
             )),
         ) => result,
     };
@@ -1058,12 +1073,16 @@ where
             }
         }
         Ok(Err(error)) => {
+            blocking.cancel_and_join().await;
             completed_status(attempt_id.as_str().to_owned(), upload_error_status(&error))
         }
-        Err(_elapsed) => completed_status(
-            attempt_id.as_str().to_owned(),
-            rpc_status(rpc_proto::Code::DeadlineExceeded, "output upload timed out"),
-        ),
+        Err(_elapsed) => {
+            blocking.cancel_and_join().await;
+            completed_status(
+                attempt_id.as_str().to_owned(),
+                rpc_status(rpc_proto::Code::DeadlineExceeded, "output upload timed out"),
+            )
+        }
     }
 }
 
@@ -1306,6 +1325,7 @@ fn staging_error_status(error: &StagingError) -> rpc_proto::Status {
         | StagingError::InvalidPath { .. }
         | StagingError::InvalidTree { .. } => rpc_proto::Code::InvalidArgument,
         StagingError::MissingBlob { .. } => rpc_proto::Code::FailedPrecondition,
+        StagingError::Cancelled => rpc_proto::Code::Cancelled,
         StagingError::Io { .. } | StagingError::Store(_) => rpc_proto::Code::Internal,
     };
     rpc_status(code, gang_types::error_chain(error).to_string())
@@ -1329,6 +1349,7 @@ fn upload_error_status(error: &UploadError) -> rpc_proto::Status {
         | UploadError::InvalidSymlinkTarget { .. }
         | UploadError::DigestConversion(_) => rpc_proto::Code::InvalidArgument,
         UploadError::OutputKindMismatch { .. } => rpc_proto::Code::FailedPrecondition,
+        UploadError::Cancelled => rpc_proto::Code::Cancelled,
         UploadError::Io { .. } | UploadError::Store(_) => rpc_proto::Code::Internal,
     };
     rpc_status(code, gang_types::error_chain(error).to_string())

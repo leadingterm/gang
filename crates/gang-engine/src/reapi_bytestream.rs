@@ -120,6 +120,7 @@ impl UploadEntry {
 struct UploadRegistryState {
     entries: HashMap<UploadKey, Arc<UploadEntry>>,
     order: VecDeque<UploadKey>,
+    retired_tasks: Vec<JoinHandle<()>>,
 }
 
 struct UploadRegistry {
@@ -140,9 +141,25 @@ impl UploadRegistry {
     }
 
     fn remove(&self, key: &UploadKey) {
-        let mut state = self.state.lock();
-        state.entries.remove(key);
-        state.order.retain(|existing| existing != key);
+        let removed = {
+            let mut state = self.state.lock();
+            state.order.retain(|existing| existing != key);
+            state.entries.remove(key)
+        };
+        if let Some(entry) = removed {
+            self.retire_entry(&entry);
+        }
+    }
+
+    fn retire_entry(&self, entry: &UploadEntry) {
+        drop(entry.chunk_tx.lock().take());
+        if let Some(handle) = entry.task.lock().take()
+            && !handle.is_finished()
+        {
+            let mut state = self.state.lock();
+            state.retired_tasks.retain(|task| !task.is_finished());
+            state.retired_tasks.push(handle);
+        }
     }
 
     fn get_or_insert_with(
@@ -170,10 +187,60 @@ impl UploadRegistry {
             created
         };
         if let Some(old) = evicted {
-            // Dropping `chunk_tx` without `UploadItem::Finish` causes the writer task to abort.
-            drop(old.chunk_tx.lock().take());
+            // Dropping `chunk_tx` without `UploadItem::Finish` causes the writer task to abort;
+            // retain its handle so shutdown waits for cleanup to finish before draining S3 aborts.
+            self.retire_entry(&old);
         }
         entry
+    }
+
+    /// Cancels all pending resumable uploads and joins every active and previously retired writer
+    /// task so store-level abort cleanup observes every cancelled upload.
+    async fn shutdown(&self) {
+        loop {
+            let (entries, retired) = {
+                let mut state = self.state.lock();
+                state.order.clear();
+                let entries: Vec<Arc<UploadEntry>> =
+                    state.entries.drain().map(|(_, entry)| entry).collect();
+                let retired = std::mem::take(&mut state.retired_tasks);
+                (entries, retired)
+            };
+            if entries.is_empty() && retired.is_empty() {
+                break;
+            }
+            let mut handles = retired;
+            for entry in entries {
+                drop(entry.chunk_tx.lock().take());
+                if let Some(handle) = entry.task.lock().take() {
+                    handles.push(handle);
+                }
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
+        }
+    }
+}
+
+/// Shutdown handle for draining all pending and evicted [`ByteStreamService`] writer tasks.
+#[derive(Clone)]
+pub struct ByteStreamShutdown {
+    uploads: Arc<UploadRegistry>,
+}
+
+impl std::fmt::Debug for ByteStreamShutdown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ByteStreamShutdown")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ByteStreamShutdown {
+    /// Cancels pending resumable uploads and joins every active and retired writer task.
+    pub async fn shutdown(&self) {
+        self.uploads.shutdown().await;
     }
 }
 
@@ -212,6 +279,19 @@ impl<C: ContentStore> ByteStreamService<C> {
     #[must_use]
     pub fn with_defaults(store: Arc<C>, budget: InflightBlobBudget) -> Self {
         Self::new(store, budget, ByteStreamConfig::default())
+    }
+
+    /// Returns a handle that cancels and joins all active and retired writer tasks on shutdown.
+    #[must_use]
+    pub fn shutdown_handle(&self) -> ByteStreamShutdown {
+        ByteStreamShutdown {
+            uploads: Arc::clone(&self.uploads),
+        }
+    }
+
+    /// Cancels pending resumable uploads and joins every active and retired writer task.
+    pub async fn shutdown(&self) {
+        self.uploads.shutdown().await;
     }
 
     /// Wraps this service in a tonic [`ByteStreamServer`].
@@ -945,7 +1025,9 @@ mod tests {
     use gang_spi::{BlobStream, ByteRange, ContentStore, EngineStore, PortError};
     use gang_testkit::MemoryContentStore;
     use gang_types::{Digest, NonZeroBytes};
+    use parking_lot::Mutex;
     use tokio::net::TcpListener;
+    use tokio::sync::Notify;
     use tokio::task::JoinHandle;
     use tonic::Code;
     use tonic::transport::server::TcpIncoming;
@@ -1525,5 +1607,130 @@ mod tests {
         assert_eq!(budget.available(), 32);
 
         handle.abort();
+    }
+
+    #[derive(Debug)]
+    struct BarrierAbortStore {
+        writes_started: Arc<std::sync::atomic::AtomicUsize>,
+        aborts_registered: Arc<std::sync::atomic::AtomicUsize>,
+        aborts_finished: Arc<std::sync::atomic::AtomicUsize>,
+        release_abort: Arc<Notify>,
+        abort_tasks: Mutex<Vec<JoinHandle<()>>>,
+    }
+
+    impl BarrierAbortStore {
+        fn new() -> Self {
+            Self {
+                writes_started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                aborts_registered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                aborts_finished: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                release_abort: Arc::new(Notify::new()),
+                abort_tasks: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ContentStore for BarrierAbortStore {
+        async fn find_missing(
+            &self,
+            digests: &[Digest],
+            missing: &mut Vec<Digest>,
+        ) -> Result<(), PortError> {
+            missing.clear();
+            missing.extend_from_slice(digests);
+            Ok(())
+        }
+
+        async fn read(
+            &self,
+            _digest: Digest,
+            _range: ByteRange,
+        ) -> Result<Option<BlobStream>, PortError> {
+            Ok(None)
+        }
+
+        async fn write(&self, _digest: Digest, mut body: BlobStream) -> Result<(), PortError> {
+            self.writes_started.fetch_add(1, Ordering::AcqRel);
+            while let Some(chunk) = body.chunks.next().await {
+                if let Err(err) = chunk {
+                    // Mimic S3ContentStore's MultipartAbortGuard: spawn an async abort task
+                    // whose completion is awaited by ContentStore::shutdown().
+                    let release = Arc::clone(&self.release_abort);
+                    let finished = Arc::clone(&self.aborts_finished);
+                    self.aborts_registered.fetch_add(1, Ordering::AcqRel);
+                    self.abort_tasks.lock().push(tokio::spawn(async move {
+                        release.notified().await;
+                        finished.fetch_add(1, Ordering::AcqRel);
+                    }));
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }
+
+        fn usage(&self) -> Option<gang_spi::EngineStore> {
+            None
+        }
+
+        async fn shutdown(&self) {
+            let tasks = std::mem::take(&mut *self.abort_tasks.lock());
+            for task in tasks {
+                let _ = task.await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_unfinished_and_evicted_uploads_before_store_shutdown() {
+        let store = Arc::new(BarrierAbortStore::new());
+        let budget = InflightBlobBudget::new(NonZeroBytes::mib(1));
+        let cfg = ByteStreamConfig {
+            max_pending_uploads: NonZeroUsize::new(1).expect("1 is nonzero"),
+            ..ByteStreamConfig::default()
+        };
+        let service = ByteStreamService::new(Arc::clone(&store), budget, cfg);
+        let shutdown = service.shutdown_handle();
+        let (channel, server_task) = serve_service(service).await;
+        let mut client = ByteStreamClient::new(channel);
+
+        let d1 = Digest::from_bytes(b"unfinished-evicted-blob");
+        let d2 = Digest::from_bytes(b"unfinished-active-blob!");
+        for (uuid, digest) in [("u-evict", d1), ("u-active", d2)] {
+            let name = ResourceName::upload("", uuid, Compression::Identity, digest)
+                .expect("name")
+                .to_string();
+            let resp = client
+                .write(futures::stream::iter(vec![WriteRequest {
+                    resource_name: name,
+                    write_offset: 0,
+                    finish_write: false,
+                    data: Bytes::from_static(b"unfin"),
+                }]))
+                .await
+                .expect("partial write succeeds")
+                .into_inner();
+            assert_eq!(resp.committed_size, 5);
+        }
+        server_task.abort();
+
+        // Draining ByteStream writer tasks must join BOTH evicted and active writers so both
+        // abort tasks are registered before ContentStore::shutdown() begins.
+        shutdown.shutdown().await;
+        assert_eq!(store.writes_started.load(Ordering::Acquire), 2);
+        assert_eq!(store.aborts_registered.load(Ordering::Acquire), 2);
+        assert_eq!(store.aborts_finished.load(Ordering::Acquire), 0);
+
+        let store_for_shutdown = Arc::clone(&store);
+        let store_shutdown = tokio::spawn(async move {
+            store_for_shutdown.shutdown().await;
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !store_shutdown.is_finished(),
+            "store shutdown must wait for barrier-held multipart aborts"
+        );
+        store.release_abort.notify_waiters();
+        store_shutdown.await.expect("join store shutdown");
+        assert_eq!(store.aborts_finished.load(Ordering::Acquire), 2);
     }
 }
