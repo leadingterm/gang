@@ -1124,10 +1124,14 @@ impl ExpiringRecordPort for Memory {
 }
 
 macro_rules! sandbox_port {
-    ($plugin:ident) => {
+    ($plugin:ident, $binds_ro:expr) => {
         impl ActionIsolationPort for $plugin {
             fn environment(&self) -> &gang_types::ActionEnvironment {
                 &self.environment
+            }
+
+            fn binds_read_only(&self) -> bool {
+                $binds_ro
             }
 
             async fn start(
@@ -1190,7 +1194,7 @@ impl Plugin for Direct {
     }
 }
 
-sandbox_port!(Direct);
+sandbox_port!(Direct, false);
 
 /// The `[sandbox.boxed]` section: the number its actions exit with, and the program that runs it.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1242,7 +1246,7 @@ impl Plugin for Boxed {
     }
 }
 
-sandbox_port!(Boxed);
+sandbox_port!(Boxed, true);
 
 numbered_plugin!(Token);
 

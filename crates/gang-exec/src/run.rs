@@ -10,7 +10,7 @@ use std::process::{Command, ExitCode, Stdio};
 use gang_config::{PluginSet, SandboxFile};
 use gang_spi::{
     ActionCommand, ActionExecutionSpec, ActionIsolationPort, ActionLimitsPort, GUARD_LINK_NAME,
-    NetworkAccess, PluginContext, PortError, SIDE_CHANNEL_FILE_ENV,
+    NetworkAccess, PluginContext, PortError, ReadOnlyTree, SIDE_CHANNEL_FILE_ENV,
 };
 use gang_types::{Capability, NetworkRequest};
 
@@ -178,6 +178,7 @@ where
         }
     };
     let directory = ActionDirectory::try_new(&file.work_directory, invocation.working_directory)?;
+    let side_channel_inputs = side_channel::read_inputs(invocation.environment, &directory.path)?;
     let context = PluginContext { config_path: &path };
 
     let sandbox =
@@ -197,6 +198,16 @@ where
         .filter(|(name, _)| name != SIDE_CHANNEL_FILE_ENV)
         .cloned()
         .collect();
+    let read_only_trees: Vec<ReadOnlyTree<'_>> = side_channel_inputs
+        .read_only_trees
+        .iter()
+        .map(|tree| ReadOnlyTree {
+            source: &tree.source,
+            target: &tree.target,
+        })
+        .collect();
+    let mut action_limits = properties.limits;
+    action_limits.cpu_weight = side_channel_inputs.cpu_weight;
 
     let action = Action {
         spec: ActionExecutionSpec {
@@ -204,11 +215,12 @@ where
             environment: &environment,
             action_directory: &directory.path,
             working_directory: &directory.working_directory,
+            read_only_trees: &read_only_trees,
             network,
             memory_cgroup: None,
             launcher: &[],
         },
-        limits: properties.limits,
+        limits: action_limits,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

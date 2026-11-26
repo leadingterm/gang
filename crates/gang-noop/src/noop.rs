@@ -41,6 +41,10 @@ impl ActionIsolationPort for Noop {
         &self.environment
     }
 
+    fn binds_read_only(&self) -> bool {
+        false
+    }
+
     /// Spawns the action in the calling process's own process group, so a signal to that group
     /// reaches it. Spawning is synchronous, so this returns once the action is running. Dropping
     /// the [`SandboxedAction`] kills the action's process.

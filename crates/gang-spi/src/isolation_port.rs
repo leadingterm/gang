@@ -18,11 +18,19 @@ pub const NETWORK_ENV: &str = "GANG_NETWORK";
 /// The multicall name used to reset the signal mask before starting a sandboxed action.
 pub const RESET_LINK_NAME: &str = "gang-reset";
 
+/// Maximum number of read-only input trees mounted for a single action.
+pub const MAX_RO_BINDS: usize = 64;
+
 /// A sandbox for actions.
 #[port]
 pub trait ActionIsolationPort: Send + Sync {
     /// The environment actually provided by this sandbox.
     fn environment(&self) -> &gang_types::ActionEnvironment;
+
+    /// Whether this sandbox mounts [`ActionExecutionSpec::read_only_trees`] read-only.
+    fn binds_read_only(&self) -> bool {
+        false
+    }
 
     /// Starts the action with the caller's standard streams and returns as soon as it is running.
     ///
@@ -164,6 +172,15 @@ impl<'a> ActionCommand<'a> {
     }
 }
 
+/// A read-only directory tree bound inside an action's directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadOnlyTree<'a> {
+    /// Absolute host path to the immutable directory tree.
+    pub source: &'a Path,
+    /// Target path strictly inside [`ActionExecutionSpec::action_directory`].
+    pub target: &'a Path,
+}
+
 /// An action to run.
 #[derive(Debug, Clone, Copy)]
 pub struct ActionExecutionSpec<'a> {
@@ -177,6 +194,9 @@ pub struct ActionExecutionSpec<'a> {
     pub action_directory: &'a Path,
     /// The directory the command runs in, inside `action_directory`.
     pub working_directory: &'a Path,
+    /// Immutable input subtrees bound read-only inside `action_directory` when
+    /// [`ActionIsolationPort::binds_read_only`] is `true`.
+    pub read_only_trees: &'a [ReadOnlyTree<'a>],
     /// The selected fleet's effective network access.
     pub network: NetworkAccess<'a>,
     /// The action's memory cgroup, when limits created a scope.

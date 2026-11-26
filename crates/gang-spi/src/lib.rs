@@ -89,7 +89,8 @@ pub use infrastructure::{
 };
 pub use isolation_port::{
     ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort,
-    EXEC_LINK_NAME, NETWORK_ENV, NetworkAccess, RESET_LINK_NAME, SandboxedAction, Termination,
+    EXEC_LINK_NAME, MAX_RO_BINDS, NETWORK_ENV, NetworkAccess, RESET_LINK_NAME, ReadOnlyTree,
+    SandboxedAction, Termination,
 };
 pub use lease_port::{
     Acquisition, CandidateGeneration, ControllerId, LeaderLeasePort, Lease, LeaseCandidate,

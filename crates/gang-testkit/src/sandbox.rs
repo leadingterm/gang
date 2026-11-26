@@ -25,6 +25,8 @@ pub struct StartedAction {
     pub action_directory: PathBuf,
     /// The directory the command runs in.
     pub working_directory: PathBuf,
+    /// Read-only input trees passed to the sandbox as `(source, target)` pairs.
+    pub read_only_trees: Vec<(PathBuf, PathBuf)>,
     /// The trusted egress policy and controller endpoints, or none for offline actions.
     pub network: Option<(gang_types::PublicEgressPolicy, Box<[gang_types::Url]>)>,
     /// The command prefix the action was started through: empty when it started without a limits scope.
@@ -122,6 +124,11 @@ impl ActionIsolationPort for ScriptedSandbox {
             environment: spec.environment.to_vec(),
             action_directory: spec.action_directory.to_path_buf(),
             working_directory: spec.working_directory.to_path_buf(),
+            read_only_trees: spec
+                .read_only_trees
+                .iter()
+                .map(|tree| (tree.source.to_path_buf(), tree.target.to_path_buf()))
+                .collect(),
             network: match spec.network {
                 NetworkAccess::Offline => None,
                 NetworkAccess::PublicEgress {
@@ -181,6 +188,7 @@ mod tests {
             environment: &sample_environment(),
             action_directory: Path::new("/work"),
             working_directory: Path::new("/work"),
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
             launcher: &[],
@@ -255,6 +263,7 @@ mod tests {
             environment: &environment,
             action_directory: Path::new("/work"),
             working_directory: Path::new("/work"),
+            read_only_trees: &[],
             network: NetworkAccess::PublicEgress {
                 policy: &policy,
                 controller_endpoints: &endpoints,
@@ -281,6 +290,7 @@ mod tests {
                 environment: sample_environment(),
                 action_directory: PathBuf::from("/work"),
                 working_directory: PathBuf::from("/work"),
+                read_only_trees: Vec::new(),
                 network: None,
                 launcher: Vec::new(),
             }]

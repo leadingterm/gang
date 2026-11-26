@@ -39,6 +39,8 @@ pub(crate) const MEMORY_PEAK: &str = "memory.peak";
 pub(crate) const MEMORY_EVENTS: &str = "memory.events";
 /// Interface file holding the CPU bandwidth limit of the cgroup.
 pub(crate) const CPU_MAX: &str = "cpu.max";
+/// Interface file holding the CPU scheduling weight of the cgroup.
+pub(crate) const CPU_WEIGHT: &str = "cpu.weight";
 /// Interface file holding the CPU statistics of the cgroup.
 pub(crate) const CPU_STAT: &str = "cpu.stat";
 /// Interface file holding the process limit of the cgroup.

@@ -25,7 +25,8 @@ use gang_testkit::{
     TestLimits, TestPlugins,
 };
 use gang_types::{
-    Bytes, Capability, FleetActionPolicy, NonZeroBytes, NonZeroDuration, PublicEgressPolicy,
+    Bytes, Capability, CpuWeight, FleetActionPolicy, NonZeroBytes, NonZeroDuration,
+    PublicEgressPolicy,
 };
 use parking_lot::Mutex;
 use tempfile::TempDir;
@@ -527,6 +528,7 @@ fn limits_section_builds_the_limits_plugin_and_enter_receives_the_requested_limi
         [ActionLimits {
             cpu_count: NonZeroU32::new(2),
             memory: Some(NonZeroBytes::mib(1)),
+            cpu_weight: None,
         }]
     );
     assert_eq!(started_markers(&started), ["trusted"]);
@@ -872,5 +874,101 @@ fn refuses_planted_report_symlink_under_aliased_root() -> Result<(), Box<dyn Err
         ExitCode::SUCCESS
     );
     assert!(!target.exists());
+    Ok(())
+}
+
+#[test]
+fn forwards_side_channel_read_only_trees_and_cpu_weight_while_ignoring_client_env()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new(InputLinks::Keep)?;
+    fs::write(
+        fixture.entrypoint.with_file_name("sandbox.toml"),
+        sandbox_file(
+            &fixture.root,
+            "trusted",
+            InputLinks::Keep,
+            Some(TestLimits { max_pids: 4 }),
+        )?,
+    )?;
+    let canonical_action = fixture.root.canonicalize()?.join("a1");
+    fs::create_dir_all(canonical_action.join("work/external/toolchain"))?;
+    let channel_dir = fixture.root.join(".side_channels/a1");
+    fs::create_dir_all(&channel_dir)?;
+    fs::write(channel_dir.join("cpu_weight"), b"1000")?;
+    let mut trees = Vec::new();
+    trees.extend_from_slice(b"/fast-cas/trees/toolchain\0work/external/toolchain\0");
+    fs::write(channel_dir.join("read_only_trees"), trees)?;
+
+    let report_path = channel_dir.join("report");
+    let environment = [
+        (
+            OsString::from(SIDE_CHANNEL_FILE_ENV),
+            report_path.into_os_string(),
+        ),
+        (OsString::from("GANG_CPU_WEIGHT"), OsString::from("20")),
+    ];
+    let calls = Calls::default();
+    let started = Events::default();
+    let status = run_action_counting(
+        &argv(),
+        &fixture.entrypoint,
+        &fixture.working_directory,
+        &environment,
+        &started,
+        &calls,
+    )?;
+    assert_eq!(status, ExitCode::SUCCESS);
+    assert_eq!(
+        calls.limits.entered(),
+        [ActionLimits {
+            cpu_count: None,
+            memory: None,
+            cpu_weight: Some(CpuWeight::GATE),
+        }]
+    );
+    let sandbox = started.lock()[0].1.clone();
+    assert_eq!(
+        sandbox.started()[0].read_only_trees,
+        vec![(
+            PathBuf::from("/fast-cas/trees/toolchain"),
+            canonical_action.join("work/external/toolchain"),
+        )]
+    );
+    Ok(())
+}
+
+#[test]
+fn ignores_cpu_weight_from_client_environment_without_side_channel() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new(InputLinks::Keep)?;
+    fs::write(
+        fixture.entrypoint.with_file_name("sandbox.toml"),
+        sandbox_file(
+            &fixture.root,
+            "trusted",
+            InputLinks::Keep,
+            Some(TestLimits { max_pids: 4 }),
+        )?,
+    )?;
+    let calls = Calls::default();
+    let started = Events::default();
+    let environment = [(OsString::from("GANG_CPU_WEIGHT"), OsString::from("1000"))];
+
+    let status = run_action_counting(
+        &argv(),
+        &fixture.entrypoint,
+        &fixture.working_directory,
+        &environment,
+        &started,
+        &calls,
+    )?;
+    assert_eq!(status, ExitCode::SUCCESS);
+    assert_eq!(
+        calls.limits.entered(),
+        [ActionLimits {
+            cpu_count: None,
+            memory: None,
+            cpu_weight: None,
+        }]
+    );
     Ok(())
 }

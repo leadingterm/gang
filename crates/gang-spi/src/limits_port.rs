@@ -4,7 +4,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use gang_types::{Bytes, NonZeroBytes};
+use gang_types::{Bytes, CpuWeight, NonZeroBytes};
 
 use crate::{PortError, port};
 
@@ -98,12 +98,15 @@ pub struct ActionMemoryPool {
 }
 
 /// What an action reserves. `None`: the action did not request it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ActionLimits {
     /// The number of CPUs the action reserves.
     pub cpu_count: Option<NonZeroU32>,
     /// The memory the action reserves; `None` when it asked for none.
     pub memory: Option<NonZeroBytes>,
+    /// The `cgroup` v2 `cpu.weight` share for the action's scope; `None` leaves the parent's
+    /// default.
+    pub cpu_weight: Option<CpuWeight>,
 }
 
 /// What an action used.

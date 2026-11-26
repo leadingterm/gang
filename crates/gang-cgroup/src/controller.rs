@@ -16,14 +16,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gang_clock::{Clock, Poll};
 use gang_spi::{ActionLimits, ActionMemoryPool, ActionScope, ActionUsage};
-use gang_types::{Bytes, NonZeroBytes};
+use gang_types::{Bytes, CpuWeight, NonZeroBytes};
 
 use crate::config::{CgroupConfig, Delegation};
 use crate::errors::CgroupError;
 use crate::fs::{
-    CONTROLLERS, CPU_MAX, CPU_STAT, Cgroupfs, EVENTS, KILL, MEMBERSHIP_FILE, MEMINFO_FILE,
-    MEMORY_EVENTS, MEMORY_MAX, MEMORY_OOM_GROUP, MEMORY_PEAK, MEMORY_SWAP_MAX, PIDS_MAX, PROCS,
-    SUBTREE_CONTROL,
+    CONTROLLERS, CPU_MAX, CPU_STAT, CPU_WEIGHT, Cgroupfs, EVENTS, KILL, MEMBERSHIP_FILE,
+    MEMINFO_FILE, MEMORY_EVENTS, MEMORY_MAX, MEMORY_OOM_GROUP, MEMORY_PEAK, MEMORY_SWAP_MAX,
+    PIDS_MAX, PROCS, SUBTREE_CONTROL,
 };
 use crate::limits::KernelLimits;
 use crate::parse;
@@ -133,6 +133,9 @@ impl<F: Cgroupfs, C: Clock> Controller<F, C> {
         self.create_if_missing(&actions)?;
         self.move_here(&worker)?;
         self.write(subtree, SUBTREE_CONTROL, ENABLE_CONTROLLERS)?;
+        let sibling_weight = CpuWeight::WORKER.get().to_string();
+        self.write(&worker, CPU_WEIGHT, &sibling_weight)?;
+        self.write(&actions, CPU_WEIGHT, &sibling_weight)?;
         self.write(&actions, SUBTREE_CONTROL, ENABLE_CONTROLLERS)?;
 
         if !self.fs.has_file(&actions, KILL) {
@@ -314,6 +317,9 @@ impl<F: Cgroupfs, C: Clock> Controller<F, C> {
         self.write(cgroup, MEMORY_OOM_GROUP, "1")?;
         if let Some(cpu) = limits.cpu {
             self.write(cgroup, CPU_MAX, &cpu.to_string())?;
+        }
+        if let Some(weight) = limits.cpu_weight {
+            self.write(cgroup, CPU_WEIGHT, &weight.get().to_string())?;
         }
         self.write(cgroup, PIDS_MAX, &limits.pids.to_string())
     }

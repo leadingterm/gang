@@ -102,12 +102,66 @@ pub enum ExecError {
     /// Breaking hard links under the action directory failed.
     #[error(transparent)]
     LinkBreak(#[from] LinkBreakError),
+    /// Reading or validating the worker side-channel inputs failed.
+    #[error(transparent)]
+    SideChannel(#[from] SideChannelError),
     /// The sandbox could not be built or could not run the action.
     #[error("cannot run the action in the sandbox")]
     Sandbox(#[source] PortError),
     /// The limits plugin failed to enter or leave the action scope.
     #[error("cannot apply the action limits")]
     Limits(#[source] PortError),
+}
+
+/// Why reading or validating worker side-channel inputs failed.
+#[derive(Debug, thiserror::Error)]
+pub enum SideChannelError {
+    /// The side-channel path from `GANG_SIDE_CHANNEL_FILE` is invalid.
+    #[error("invalid action side-channel path")]
+    InvalidPath,
+    /// Reading a side-channel file failed.
+    #[error("cannot read side-channel file {file}")]
+    Read {
+        /// Side-channel file name.
+        file: &'static str,
+        /// The I/O failure.
+        #[source]
+        source: io::Error,
+    },
+    /// The `cpu_weight` side-channel file is malformed.
+    #[error("invalid side-channel cpu_weight: {reason}")]
+    InvalidCpuWeight {
+        /// Why parsing failed.
+        reason: String,
+    },
+    /// The `read_only_trees` side-channel file is malformed.
+    #[error("malformed side-channel read_only_trees")]
+    MalformedReadOnlyTrees,
+    /// More than `MAX_RO_BINDS` read-only trees were requested.
+    #[error("too many read-only input trees ({count}); at most {max} are allowed")]
+    TooManyReadOnlyTrees {
+        /// Number of requested trees.
+        count: usize,
+        /// Maximum permitted count.
+        max: usize,
+    },
+    /// A read-only tree entry has an invalid source or target path.
+    #[error("invalid read-only input tree {} -> {}", host_path.display(), target.display())]
+    InvalidReadOnlyTree {
+        /// Host source path.
+        host_path: PathBuf,
+        /// Target path relative to the action directory.
+        target: PathBuf,
+    },
+    /// Walking a read-only tree target inside the action directory failed.
+    #[error("cannot traverse read-only input tree target {}", target.display())]
+    TraverseTarget {
+        /// Target path relative to the action directory.
+        target: PathBuf,
+        /// Underlying OS error (`ELOOP`, `ENOTDIR`, `ENOENT`, ...).
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Why an action property in the environment is malformed.

@@ -71,6 +71,7 @@ fn limits() -> ActionLimits {
     ActionLimits {
         cpu_count: NonZeroU32::new(2),
         memory: Some(NonZeroBytes::kib(1)),
+        cpu_weight: None,
     }
 }
 
@@ -85,6 +86,7 @@ fn action<'a>(
             environment: &[],
             action_directory,
             working_directory,
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
             launcher: &[],

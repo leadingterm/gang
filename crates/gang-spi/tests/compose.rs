@@ -258,6 +258,7 @@ fn execute(sandbox: &Sandbox) -> Result<ActionExecutionOutcome, Box<dyn Error>> 
         environment: &[],
         action_directory: Path::new("/work"),
         working_directory: Path::new("/work"),
+        read_only_trees: &[],
         network: NetworkAccess::Offline,
         memory_cgroup: None,
     };
@@ -757,6 +758,8 @@ fn sandbox_builds_the_selected_plugin_and_dispatches_by_variant() -> Result<(), 
     assert!(matches!(boxed, Sandbox::Boxed(_)));
     assert_eq!(direct.environment().as_str(), "host:direct");
     assert_eq!(boxed.environment().as_str(), "host:test");
+    assert!(!direct.binds_read_only());
+    assert!(boxed.binds_read_only());
     assert_eq!(execute(&direct)?, ActionExecutionOutcome::Exited(5));
     assert_eq!(execute(&boxed)?, ActionExecutionOutcome::Exited(6));
     Ok(())
@@ -810,6 +813,7 @@ fn limits_port_reaches_the_selected_plugin() -> Result<(), Box<dyn Error>> {
     let requested = ActionLimits {
         cpu_count: NonZeroU32::new(2),
         memory: Some(NonZeroBytes::kib(1)),
+        cpu_weight: None,
     };
     let scope = ready(limits.enter(&requested))?;
     let expected = [OsString::from("fake-join"), OsString::from("8")];

@@ -124,6 +124,7 @@ mod tests {
                             environment: &[],
                             action_directory: directory.path(),
                             working_directory: directory.path(),
+                            read_only_trees: &[],
                             network: NetworkAccess::Offline,
                             memory_cgroup: None,
                             launcher: &[],
@@ -131,6 +132,7 @@ mod tests {
                         limits: ActionLimits {
                             cpu_count: None,
                             memory: None,
+                            cpu_weight: None,
                         },
                     };
                     let mut terminations = listen()?;

@@ -34,7 +34,7 @@ mod side_channel;
 mod terminations;
 
 pub use action_directory::ActionDirectory;
-pub use errors::{ExecError, LinkBreakError, PropertyError};
+pub use errors::{ExecError, LinkBreakError, PropertyError, SideChannelError};
 pub use execute::{Action, ExecFailure, Execution, execute, exit_status};
 pub use guard::guard;
 pub use input_links::break_hard_links;

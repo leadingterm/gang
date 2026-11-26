@@ -54,6 +54,24 @@ pub(crate) enum BwrapError {
     #[error("action directory {} overlaps a protected sandbox path", .0.display())]
     #[failure(config)]
     ActionDirectory(PathBuf),
+    /// Too many read-only input trees were requested for a single action.
+    #[error("too many read-only input trees ({count}); at most {max} are supported")]
+    #[failure(config)]
+    TooManyReadOnlyTrees {
+        /// Number of read-only input trees supplied.
+        count: usize,
+        /// Maximum permitted count.
+        max: usize,
+    },
+    /// A read-only input tree entry has an invalid source or target path.
+    #[error("invalid read-only input tree {} -> {}", host_path.display(), target.display())]
+    #[failure(config)]
+    InvalidReadOnlyTree {
+        /// Host path to the read-only tree.
+        host_path: PathBuf,
+        /// Target path inside the action directory.
+        target: PathBuf,
+    },
     /// The sandbox report could not be read from the pipe.
     #[error("cannot read the sandbox bwrap reported")]
     Info(#[source] io::Error),

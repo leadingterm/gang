@@ -2,13 +2,45 @@
 
 use std::ffi::OsStr;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::path::{Component, Path};
 use std::process::Command;
 
 use crate::bwrap::Bwrap;
-use gang_spi::ActionExecutionSpec;
+use crate::errors::BwrapError;
+use gang_spi::{ActionExecutionSpec, MAX_RO_BINDS};
 
 /// The bound multicall executable inside the sandbox.
 const RESET_PATH: &str = "/gang-reset";
+
+fn has_parent_dir(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir))
+}
+
+/// Validates `spec.read_only_trees`: at most [`MAX_RO_BINDS`] entries, each with an absolute
+/// source without `..` and a target strictly inside `spec.action_directory` without `..`.
+pub(crate) fn validate_read_only_trees(spec: &ActionExecutionSpec<'_>) -> Result<(), BwrapError> {
+    if spec.read_only_trees.len() > MAX_RO_BINDS {
+        return Err(BwrapError::TooManyReadOnlyTrees {
+            count: spec.read_only_trees.len(),
+            max: MAX_RO_BINDS,
+        });
+    }
+    for tree in spec.read_only_trees {
+        let valid_source = tree.source.is_absolute() && !has_parent_dir(tree.source);
+        let valid_target = tree.target.is_absolute()
+            && !has_parent_dir(tree.target)
+            && tree.target != spec.action_directory
+            && tree.target.starts_with(spec.action_directory);
+        if !valid_source || !valid_target {
+            return Err(BwrapError::InvalidReadOnlyTree {
+                host_path: tree.source.to_path_buf(),
+                target: tree.target.to_path_buf(),
+            });
+        }
+    }
+    Ok(())
+}
 
 impl Bwrap {
     /// Builds the `bwrap` invocation that runs `spec`.
@@ -17,7 +49,8 @@ impl Bwrap {
     /// the content store and other actions' directories are never mapped.
     /// The action directory is bound read-write, so every input resolves,
     /// including those outside the working directory (`../input`, relative symlinks); the working
-    /// directory inside it becomes the current directory. Granted actions share only pasta's
+    /// directory inside it becomes the current directory. Read-only input trees are bound
+    /// read-only after the work bind. Granted actions share only pasta's
     /// network namespace. The outer processes start with an empty environment.
     ///
     /// `info_fd` is the descriptor `bwrap` writes its `--info-fd` report to. It is passed through
@@ -26,13 +59,18 @@ impl Bwrap {
     ///
     /// With limits, the launcher starts `bwrap` itself, so the whole sandbox, `bwrap` included,
     /// starts inside the limits scope.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BwrapError::TooManyReadOnlyTrees`] if `spec.read_only_trees` exceeds
+    /// [`MAX_RO_BINDS`], or [`BwrapError::InvalidReadOnlyTree`] if an entry has an invalid path.
     pub(crate) fn command(
         &self,
         spec: &ActionExecutionSpec<'_>,
         info_fd: RawFd,
         network: Option<BorrowedFd<'_>>,
-    ) -> Command {
+    ) -> Result<Command, BwrapError> {
+        validate_read_only_trees(spec)?;
         let action_directory = spec.action_directory.as_os_str();
         let outer = network
             .and(self.egress.as_ref())
@@ -80,6 +118,9 @@ impl Bwrap {
             OsStr::new("--chdir"),
             spec.working_directory.as_os_str(),
         ]);
+        for tree in spec.read_only_trees {
+            command.arg("--ro-bind").arg(tree.source).arg(tree.target);
+        }
         if let Some(resolver) = network {
             command
                 .arg("--ro-bind-data")
@@ -101,7 +142,7 @@ impl Bwrap {
             .arg("--")
             .arg(spec.command.program())
             .args(spec.command.args());
-        command
+        Ok(command)
     }
 }
 
@@ -111,16 +152,20 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::os::fd::{AsFd, AsRawFd};
     use std::os::fd::{BorrowedFd, RawFd};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     #[cfg(target_os = "linux")]
     use gang_spi::ActionIsolationPort;
-    use gang_spi::{ActionCommand, ActionExecutionSpec, NetworkAccess, Plugin, PluginContext};
+    use gang_spi::{
+        ActionCommand, ActionExecutionSpec, MAX_RO_BINDS, NetworkAccess, Plugin, PluginContext,
+        ReadOnlyTree,
+    };
 
     use crate::Bwrap;
     use crate::BwrapConfig;
     use crate::bwrap::tests::config;
+    use crate::errors::BwrapError;
 
     /// The descriptor the tests report the sandbox on; the command line only names it.
     const INFO_FD: RawFd = 7;
@@ -158,10 +203,11 @@ mod tests {
             environment: &environment,
             action_directory,
             working_directory,
+            read_only_trees: &[],
             memory_cgroup: None,
             network,
         };
-        Ok(bwrap.command(&spec, INFO_FD, setup))
+        Ok(bwrap.command(&spec, INFO_FD, setup)?)
     }
 
     fn args(command: &Command) -> Vec<String> {
@@ -440,11 +486,12 @@ mod tests {
             environment: &[],
             action_directory: Path::new("/work/a"),
             working_directory: Path::new("/work/a"),
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
 
-        let command = bwrap.command(&spec, INFO_FD, None);
+        let command = bwrap.command(&spec, INFO_FD, None)?;
 
         assert_eq!(command.get_program(), launcher[0].as_os_str());
         let arguments: Vec<&OsStr> = command.get_args().collect();
@@ -489,6 +536,7 @@ mod tests {
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -502,6 +550,147 @@ mod tests {
             recorded.is_empty(),
             "the bwrap process environment is not empty: {recorded}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn emits_ro_bind_for_read_only_trees_after_work_bind() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let bwrap = bwrap();
+        let argv = [OsString::from("/bin/true")];
+        let trees = [
+            ReadOnlyTree {
+                source: Path::new("/fast-cas/trees/aaa"),
+                target: Path::new("/work/a/work/external/toolchain"),
+            },
+            ReadOnlyTree {
+                source: Path::new("/fast-cas/trees/bbb"),
+                target: Path::new("/work/a/work/external/sdk"),
+            },
+        ];
+        let spec = ActionExecutionSpec {
+            command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
+            launcher: &[],
+            environment: &[],
+            action_directory: Path::new("/work/a"),
+            working_directory: Path::new("/work/a/work"),
+            read_only_trees: &trees,
+            network: NetworkAccess::Offline,
+            memory_cgroup: None,
+        };
+
+        let command_args = args(&bwrap.command(&spec, INFO_FD, None)?);
+        let work_bind = position(&command_args, "--bind");
+        let first_ro = command_args
+            .windows(3)
+            .position(|window| {
+                window
+                    == [
+                        "--ro-bind",
+                        "/fast-cas/trees/aaa",
+                        "/work/a/work/external/toolchain",
+                    ]
+            })
+            .ok_or("missing first --ro-bind")?;
+        let second_ro = command_args
+            .windows(3)
+            .position(|window| {
+                window
+                    == [
+                        "--ro-bind",
+                        "/fast-cas/trees/bbb",
+                        "/work/a/work/external/sdk",
+                    ]
+            })
+            .ok_or("missing second --ro-bind")?;
+        let remount = position(&command_args, "--remount-ro");
+
+        assert!(work_bind < first_ro && first_ro < second_ro && second_ro < remount);
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_max_ro_binds_and_rejects_above_limit() -> Result<(), Box<dyn std::error::Error>> {
+        let bwrap = bwrap();
+        let argv = [OsString::from("/bin/true")];
+        let pairs: Vec<_> = (0..=MAX_RO_BINDS)
+            .map(|index| {
+                (
+                    PathBuf::from(format!("/fast-cas/trees/{index}")),
+                    PathBuf::from(format!("/work/a/work/tree-{index}")),
+                )
+            })
+            .collect();
+        let refs: Vec<_> = pairs
+            .iter()
+            .map(|(source, target)| ReadOnlyTree { source, target })
+            .collect();
+
+        let at_limit = ActionExecutionSpec {
+            command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
+            launcher: &[],
+            environment: &[],
+            action_directory: Path::new("/work/a"),
+            working_directory: Path::new("/work/a/work"),
+            read_only_trees: &refs[..MAX_RO_BINDS],
+            network: NetworkAccess::Offline,
+            memory_cgroup: None,
+        };
+        assert!(bwrap.command(&at_limit, INFO_FD, None).is_ok());
+
+        let over_limit = ActionExecutionSpec {
+            read_only_trees: &refs,
+            ..at_limit
+        };
+        let error = bwrap
+            .command(&over_limit, INFO_FD, None)
+            .expect_err("more than MAX_RO_BINDS must be rejected");
+        assert!(matches!(
+            error,
+            BwrapError::TooManyReadOnlyTrees {
+                count,
+                max: MAX_RO_BINDS,
+            } if count == MAX_RO_BINDS + 1
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_read_only_tree_paths() -> Result<(), Box<dyn std::error::Error>> {
+        let bwrap = bwrap();
+        let argv = [OsString::from("/bin/true")];
+        let bad_cases = [
+            ("/fast-cas/tree", "/work/a"),
+            ("/fast-cas/tree", "/work/ab/sub"),
+            ("/fast-cas/tree", "/etc/passwd"),
+            ("/fast-cas/tree", "work/sub"),
+            ("/fast-cas/tree", "/work/a/../b"),
+            ("relative/tree", "/work/a/sub"),
+            ("/fast-cas/../escape", "/work/a/sub"),
+        ];
+        for (source, target) in bad_cases {
+            let trees = [ReadOnlyTree {
+                source: Path::new(source),
+                target: Path::new(target),
+            }];
+            let spec = ActionExecutionSpec {
+                command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
+                launcher: &[],
+                environment: &[],
+                action_directory: Path::new("/work/a"),
+                working_directory: Path::new("/work/a"),
+                read_only_trees: &trees,
+                network: NetworkAccess::Offline,
+                memory_cgroup: None,
+            };
+            assert!(
+                matches!(
+                    bwrap.command(&spec, INFO_FD, None),
+                    Err(BwrapError::InvalidReadOnlyTree { .. })
+                ),
+                "expected InvalidReadOnlyTree for ({source}, {target})"
+            );
+        }
         Ok(())
     }
 }

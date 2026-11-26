@@ -55,6 +55,7 @@ mod tests {
             environment: &[],
             action_directory: Path::new("/work"),
             working_directory: Path::new("/work"),
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };

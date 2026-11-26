@@ -12,6 +12,7 @@ use rustix::process::Pid;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
+use crate::command_line::validate_read_only_trees;
 use crate::errors::BwrapError;
 use crate::relay::Relay;
 use crate::{BwrapConfig, EgressPrograms};
@@ -201,7 +202,7 @@ impl Bwrap {
                 .map_err(|errno| BwrapError::NetworkSetup(io::Error::from(errno)))?;
         }
         let mut command =
-            tokio::process::Command::from(self.command(spec, writer.as_raw_fd(), network));
+            tokio::process::Command::from(self.command(spec, writer.as_raw_fd(), network)?);
         command.kill_on_drop(true);
         if network.is_some() {
             command
@@ -230,6 +231,10 @@ impl ActionIsolationPort for Bwrap {
         &self.environment
     }
 
+    fn binds_read_only(&self) -> bool {
+        true
+    }
+
     async fn start(&self, spec: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
         let action = spec.action_directory;
         if !action.is_absolute()
@@ -249,6 +254,7 @@ impl ActionIsolationPort for Bwrap {
         {
             return Err(BwrapError::ActionDirectory(action.to_path_buf()).into());
         }
+        validate_read_only_trees(spec)?;
         let setup = async {
             let resolver: Option<std::fs::File> = match spec.network {
                 NetworkAccess::Offline => None,
@@ -450,6 +456,13 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn binds_read_only_is_true() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let sandbox = Bwrap::build(config(directory.path()), &context()).expect("build");
+        assert!(sandbox.binds_read_only());
+    }
+
+    #[test]
     fn rejects_missing_and_invalid_root_identity() {
         let directory = tempfile::tempdir().expect("fixture");
         let config = config(directory.path());
@@ -511,6 +524,7 @@ pub(super) mod tests {
                 environment: &[],
                 action_directory: Path::new(path),
                 working_directory: Path::new(path),
+                read_only_trees: &[],
                 network: NetworkAccess::Offline,
                 memory_cgroup: None,
                 launcher: &[],
@@ -522,6 +536,7 @@ pub(super) mod tests {
             environment: &[],
             action_directory: Path::new("/tmp/action"),
             working_directory: Path::new("/tmp/action"),
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
             launcher: &[],
@@ -656,6 +671,7 @@ pub(super) mod tests {
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
+            read_only_trees: &[],
             network: NetworkAccess::PublicEgress {
                 policy: &policy,
                 controller_endpoints: &[],
@@ -691,6 +707,7 @@ pub(super) mod tests {
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -741,6 +758,7 @@ pub(super) mod tests {
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -770,6 +788,7 @@ pub(super) mod tests {
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -805,6 +824,7 @@ pub(super) mod tests {
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -851,6 +871,7 @@ pub(super) mod tests {
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -884,6 +905,7 @@ pub(super) mod tests {
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -933,6 +955,7 @@ pub(super) mod tests {
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -972,6 +995,7 @@ pub(super) mod tests {
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
+            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };

@@ -115,6 +115,7 @@ fn host() -> Result<(), Box<dyn Error>> {
         environment: &environment,
         action_directory: &working_directory,
         working_directory: &working_directory,
+        read_only_trees: &[],
         network: NetworkAccess::Offline,
         memory_cgroup: None,
     };
@@ -141,6 +142,7 @@ fn noop() -> Result<Noop, PortError> {
 fn advertises_host_identity_and_rejects_rootfs_identity() -> Result<(), Box<dyn Error>> {
     let sandbox = noop()?;
     assert_eq!(sandbox.environment().as_str(), "host:test");
+    assert!(!sandbox.binds_read_only());
     let config = NoopConfig {
         environment: "a".repeat(64).parse()?,
         scratch_dir: None,
@@ -196,6 +198,7 @@ async fn spec_run(
         environment,
         action_directory: working_directory,
         working_directory,
+        read_only_trees: &[],
         network: NetworkAccess::Offline,
         memory_cgroup: None,
     };
@@ -373,6 +376,7 @@ async fn dropping_the_running_action_kills_it() -> Result<(), Box<dyn Error>> {
         environment: &environment,
         action_directory: dir.path(),
         working_directory: dir.path(),
+        read_only_trees: &[],
         network: NetworkAccess::Offline,
         memory_cgroup: None,
     };

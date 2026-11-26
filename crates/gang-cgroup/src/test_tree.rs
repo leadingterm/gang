@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use tempfile::TempDir;
 
 use crate::fs::{
-    CONTROLLERS, CPU_MAX, CPU_STAT, Cgroupfs, EVENTS, KILL, MEMORY_EVENTS, MEMORY_MAX,
+    CONTROLLERS, CPU_MAX, CPU_STAT, CPU_WEIGHT, Cgroupfs, EVENTS, KILL, MEMORY_EVENTS, MEMORY_MAX,
     MEMORY_OOM_GROUP, MEMORY_PEAK, MEMORY_SWAP_MAX, PIDS_MAX, PROCS, SUBTREE_CONTROL,
     child_directories,
 };
@@ -31,11 +31,12 @@ const PIDS: &str = "pids";
 pub(crate) const OWN_START: u64 = 1_000;
 
 /// Interface files that exist only while the parent delegates their controller.
-const GATED_FILES: [(&str, &str); 5] = [
+const GATED_FILES: [(&str, &str); 6] = [
     (MEMORY_MAX, MEMORY),
     (MEMORY_SWAP_MAX, MEMORY),
     (MEMORY_OOM_GROUP, MEMORY),
     (CPU_MAX, CPU),
+    (CPU_WEIGHT, CPU),
     (PIDS_MAX, PIDS),
 ];
 
