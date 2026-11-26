@@ -144,7 +144,7 @@ pub use endpoint::ListenerUrlError;
 pub use errors::{
     CaPinSettingError, ConfigError, PaybackPercentError, SourceLimitError, WaterlinePercentError,
 };
-pub use execution_config::{ExecutionConfig, InputLinks};
+pub use execution_config::{ExecutionConfig, InputLinks, InputTrees};
 pub use fleet_policy::{FleetPolicy, InstanceBounds, InstanceBoundsError, ScheduledMinimumError};
 pub use fleets::{FleetConfig, FleetMember, Fleets, RawFleet};
 pub use gang_config::{Document, GangConfig};

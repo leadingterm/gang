@@ -311,7 +311,8 @@ mod tests {
 
         let server: gang_config::ServerConfig = serde_json::from_value(serde_json::json!({
             "transport": "plaintext",
-            "http2": { "max_message_size": "1KiB" }
+            "assign_inline_max": "0B",
+            "http2": { "max_message_size": "8KiB" }
         }))
         .expect("valid server config");
         let endpoint = "grpc://127.0.0.1:9100".parse().expect("valid URL");

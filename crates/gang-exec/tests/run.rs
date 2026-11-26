@@ -86,6 +86,7 @@ fn sandbox_file(
         execution: ExecutionConfig {
             input_links,
             egress: None,
+            ..ExecutionConfig::default()
         },
         actions: FleetActionPolicy::default(),
         controller_endpoints: Box::default(),

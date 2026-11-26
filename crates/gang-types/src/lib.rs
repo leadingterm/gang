@@ -19,6 +19,7 @@ mod validated;
 mod absolute_path;
 mod action_environment;
 mod action_policy;
+mod attempt;
 mod authentication;
 mod bearer;
 mod bounded_bytes;
@@ -26,6 +27,8 @@ mod bounded_duration;
 mod build;
 mod bytes;
 mod ca_pin;
+mod cpu_weight;
+mod digest;
 mod error_chain;
 mod errors;
 mod fix;
@@ -74,6 +77,7 @@ pub use action_policy::{
     FleetActionPolicy, NetworkRequest, PUBLIC_IPV6, PublicEgressPolicy, ResourceCeilings,
     is_public_destination,
 };
+pub use attempt::{AttemptId, AttemptIdError, OperationName, OperationNameError};
 pub use authentication::AuthenticationSettings;
 pub use bearer::parse_bearer;
 pub use bounded_bytes::{BoundedBytes, BoundedBytesError};
@@ -84,6 +88,8 @@ pub use bounded_duration::{
 pub use build::{BuildId, BuildKey};
 pub use bytes::Bytes;
 pub use ca_pin::CaPin;
+pub use cpu_weight::{CpuWeight, CpuWeightError};
+pub use digest::{Digest, DigestError};
 pub use error_chain::{ErrorChain, error_chain};
 pub use errors::{
     ActionEnvironmentError, BuildIdError, CaPinError, EnvironmentNameError, FleetCountError,

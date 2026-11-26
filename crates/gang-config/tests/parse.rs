@@ -9,8 +9,8 @@ use std::time::Duration;
 use gang_config::{
     CaPinSetting, ClientSecretSource, ConfigError, Document, EndpointTrust, FleetConfig,
     FleetMember, FleetOptionsError, FleetOptionsTable, FleetPolicy, Fleets, GangConfig, InputLinks,
-    InstanceBounds, PluginSet, SandboxFile, SandboxFileError, SandboxSelection, SecretFileError,
-    ServerTransport, Transport, WorkerConfig,
+    InputTrees, InstanceBounds, PluginSet, SandboxFile, SandboxFileError, SandboxSelection,
+    SecretFileError, ServerTransport, Transport, WorkerConfig,
 };
 use gang_types::{
     AbsolutePathBuf, AuthenticationSettings, Bytes, CaPin, ClientSecret, FleetActionPolicy,
@@ -4894,4 +4894,127 @@ fn scaling_scalar_errors_provide_operator_fixes() -> Result<(), Box<dyn Error>> 
         assert!(fix.contains(bounds), "{fix}");
     }
     Ok(())
+}
+
+#[test]
+fn native_engine_defaults_apply_and_round_trip_through_gang_config() -> Result<(), Box<dyn Error>> {
+    let default = Sections::VALID.parse()?;
+    assert_eq!(default.server.scheduler_queue_depth.get(), 4096);
+    assert_eq!(default.server.scheduler_batch.get(), 64);
+    assert_eq!(default.server.worker_outbound_depth.get(), 256);
+    assert_eq!(
+        default.server.dispatch_ack_timeout,
+        NonZeroDuration::from_secs(10)
+    );
+    assert_eq!(default.server.dispatch_scan_limit.get(), 256);
+    assert_eq!(default.server.assign_inline_max, Bytes::kib(64));
+    assert_eq!(default.server.max_inflight_blob_bytes, NonZeroBytes::gib(1));
+    assert_eq!(default.server.read_chunk, NonZeroBytes::kib(64));
+
+    assert_eq!(default.worker.download_concurrency.get(), 64);
+    assert_eq!(default.worker.batch_blob_max, NonZeroBytes::mib(1));
+    assert_eq!(default.worker.hash_concurrency, None);
+    assert_eq!(default.worker.compress_min_size, Bytes::kib(4));
+    assert_eq!(default.worker.directory_cache_budget, NonZeroBytes::mib(64));
+    assert_eq!(default.worker.tree_cache_min_files.get(), 512);
+    assert_eq!(default.worker.tree_cache_max_trees.get(), 256);
+    assert_eq!(default.worker.tree_pin_percent, Percent::from_percent(50));
+    assert_eq!(default.worker.graveyard_workers.get(), 2);
+
+    assert_eq!(default.execution.input_trees, InputTrees::Bind);
+
+    let custom = Sections {
+        server: r#"
+[server]
+trust_domain = "gang.internal"
+scheduler_queue_depth = 2048
+scheduler_batch = 32
+worker_outbound_depth = 128
+dispatch_ack_timeout = "15s"
+dispatch_scan_limit = 512
+assign_inline_max = "32KiB"
+max_inflight_blob_bytes = "512MiB"
+read_chunk = "128KiB"
+"#,
+        worker: r#"
+[worker]
+download_concurrency = 32
+batch_blob_max = "2MiB"
+hash_concurrency = 3
+compress_min_size = "8KiB"
+directory_cache_budget = "128MiB"
+tree_cache_min_files = 256
+tree_cache_max_trees = 128
+tree_pin_percent = 75
+graveyard_workers = 4
+"#,
+        execution: r#"
+[execution]
+input_trees = "link"
+"#,
+        ..Sections::VALID
+    };
+    let parsed = custom.parse()?;
+    assert_eq!(parsed.server.scheduler_queue_depth.get(), 2048);
+    assert_eq!(parsed.server.scheduler_batch.get(), 32);
+    assert_eq!(parsed.server.worker_outbound_depth.get(), 128);
+    assert_eq!(
+        parsed.server.dispatch_ack_timeout,
+        NonZeroDuration::from_secs(15)
+    );
+    assert_eq!(parsed.server.dispatch_scan_limit.get(), 512);
+    assert_eq!(parsed.server.assign_inline_max, Bytes::kib(32));
+    assert_eq!(
+        parsed.server.max_inflight_blob_bytes,
+        NonZeroBytes::mib(512)
+    );
+    assert_eq!(parsed.server.read_chunk, NonZeroBytes::kib(128));
+
+    assert_eq!(parsed.worker.download_concurrency.get(), 32);
+    assert_eq!(parsed.worker.batch_blob_max, NonZeroBytes::mib(2));
+    assert_eq!(
+        parsed
+            .worker
+            .hash_concurrency
+            .map(std::num::NonZeroUsize::get),
+        Some(3)
+    );
+    assert_eq!(parsed.worker.compress_min_size, Bytes::kib(8));
+    assert_eq!(parsed.worker.directory_cache_budget, NonZeroBytes::mib(128));
+    assert_eq!(parsed.worker.tree_cache_min_files.get(), 256);
+    assert_eq!(parsed.worker.tree_cache_max_trees.get(), 128);
+    assert_eq!(parsed.worker.tree_pin_percent, Percent::from_percent(75));
+    assert_eq!(parsed.worker.graveyard_workers.get(), 4);
+
+    assert_eq!(parsed.execution.input_trees, InputTrees::Link);
+
+    let reparsed: GangConfig<Plugins> = Document::<Plugins>::parse(&custom.text())?
+        .to_toml()?
+        .parse()?;
+    assert_eq!(reparsed.server, parsed.server);
+    assert_eq!(reparsed.worker, parsed.worker);
+    assert_eq!(reparsed.execution, parsed.execution);
+    Ok(())
+}
+
+#[test]
+fn gang_config_rejects_assign_inline_max_exceeding_http2_limit() {
+    let invalid = Sections {
+        server: r#"
+[server]
+trust_domain = "gang.internal"
+assign_inline_max = "4MiB"
+"#,
+        ..Sections::VALID
+    };
+    assert!(matches!(invalid.parse(), Err(ConfigError::Gang(_))));
+
+    let invalid_input_trees = Sections {
+        execution: "[execution]\ninput_trees = \"copy\"\n",
+        ..Sections::VALID
+    };
+    assert!(matches!(
+        invalid_input_trees.parse(),
+        Err(ConfigError::Gang(_))
+    ));
 }
