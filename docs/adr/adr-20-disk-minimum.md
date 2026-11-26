@@ -1,6 +1,6 @@
 # ADR-20: Disk is a declared fleet minimum
 
-Status: Partly superseded by the disk pressure default, which kills only under worker disk pressure and requeues; see [SPECIFICATION §3.2, Disk limits](../SPECIFICATION.md#32-scheduler-gang-nativelink).
+Status: Partly superseded by the disk pressure default, which kills only under worker disk pressure and requeues; see [SPECIFICATION §3.2, Disk limits](../SPECIFICATION.md#32-execution-engine--scheduler-gang-engine-gang-scheduler-gang-cas).
 
 ## Context
 - Actions need a disk reservation for admission and packing, including before measurements exist.

@@ -1,6 +1,6 @@
 # ADR-14: Fleets are named bundles of properties; declaration order is preference
 
-Status: Accepted. Replaces placement keyed by ISA.
+Status: Accepted; NativeLink-specific matching notes and the deleted `gang-nativelink` equivalence test are superseded by [ADR-62](adr-62-native-execution-engine.md) (`FleetCatalog::accepting` and declaration-order fleet preference remain authoritative in `gang-scheduler`). Replaces placement keyed by ISA.
 
 ## Context
 - `[fleets.<isa>]` allowed one fleet per ISA and could not express spot versus on-demand or sandboxes.

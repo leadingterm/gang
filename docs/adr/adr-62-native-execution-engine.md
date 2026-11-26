@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted with revisions after architecture review. Supersedes the "NativeLink embedded as a library" decision of PLAN §3 and SPECIFICATION §3.2; keeps ADR-14 (catalog fit), ADR-54 (action termination), ADR-55 (cache facts at their owners), ADR-59 (handoff) and ADR-60 (rate-based scaling) unchanged. The build contract is [the engine design](../native-engine-design.md).
+Accepted and implemented. Supersedes [ADR-02](adr-02-embedded-nativelink.md), the NativeLink-specific clauses of [ADR-14](adr-14-fleet-bundles.md) and [ADR-54](adr-54-action-termination.md), and the "NativeLink embedded as a library" decision of PLAN §3 and SPECIFICATION §3.2; keeps the core domain decisions of ADR-14 (catalog fit and fleet preference), ADR-54 (`gang exec` termination relay), ADR-55 (cache facts at their owners), ADR-59 (handoff) and ADR-60 (rate-based scaling). The build contract is [the engine design](../native-engine-design.md).
 
 ## Context
 
