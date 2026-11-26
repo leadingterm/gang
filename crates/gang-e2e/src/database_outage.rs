@@ -6,13 +6,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gang_clock::{Clock, SystemClock};
+use gang_reapi::build::bazel::remote::execution::v2::{
+    Digest, GetActionResultRequest, RequestMetadata, digest_function,
+};
 use gang_tls::{HttpProtocol, HttpTransport, ServerTrust};
 use gang_wire::EventChange;
 use gang_wire::routes::{CREATE_CERTIFICATE, CREATE_DEVICE_AUTHORIZATION};
 use http::Method;
-use nativelink_proto::build::bazel::remote::execution::v2::{
-    Digest, GetActionResultRequest, RequestMetadata, digest_function,
-};
 
 use crate::build_output::BuildOutcome;
 use crate::check::{Check, awaited};

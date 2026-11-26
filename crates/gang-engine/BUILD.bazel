@@ -2,6 +2,7 @@ load("//bazel/rust:defs.bzl", "workspace_rust_library")
 
 workspace_rust_library(
     name = "gang_engine",
+    dev_deps = ["//crates/gang-testkit:gang_testkit"],
     deps = [
         "//crates/gang-cas:gang_cas",
         "//crates/gang-clock:gang_clock",

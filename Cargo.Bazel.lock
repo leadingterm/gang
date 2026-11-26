@@ -1,5 +1,5 @@
 {
-  "checksum": "fc60217519d0b29ee6399de7d1d26019e79141f67bf35fd845bf28b591cab38b",
+  "checksum": "d4cf3e9880e508a7f76419791f262fbef0662c69dc77dfbe0acf4aee71107b2e",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -14190,6 +14190,18 @@
               "target": "futures"
             },
             {
+              "id": "getrandom 0.4.3",
+              "target": "getrandom"
+            },
+            {
+              "id": "hex 0.4.3",
+              "target": "hex"
+            },
+            {
+              "id": "parking_lot 0.12.5",
+              "target": "parking_lot"
+            },
+            {
               "id": "prost 0.14.4",
               "target": "prost"
             },
@@ -14220,6 +14232,15 @@
             {
               "id": "zstd 0.14.3",
               "target": "zstd"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "tempfile 3.27.0",
+              "target": "tempfile"
             }
           ],
           "selects": {}
@@ -14763,10 +14784,6 @@
               "target": "hyper_util"
             },
             {
-              "id": "nativelink-proto 1.8.3",
-              "target": "nativelink_proto"
-            },
-            {
               "id": "p256 0.14.0",
               "target": "p256"
             },
@@ -14858,6 +14875,10 @@
             {
               "id": "http-body-util 0.1.5",
               "target": "http_body_util"
+            },
+            {
+              "id": "nativelink-proto 1.8.3",
+              "target": "nativelink_proto"
             },
             {
               "id": "nativelink-scheduler 1.8.3",
@@ -14977,6 +14998,58 @@
         "deps": {
           "common": [
             {
+              "id": "axum 0.8.9",
+              "target": "axum"
+            },
+            {
+              "id": "base64 0.23.1",
+              "target": "base64"
+            },
+            {
+              "id": "bytes 1.12.1",
+              "target": "bytes"
+            },
+            {
+              "id": "futures 0.3.34",
+              "target": "futures"
+            },
+            {
+              "id": "getrandom 0.4.3",
+              "target": "getrandom"
+            },
+            {
+              "id": "http 1.5.0",
+              "target": "http"
+            },
+            {
+              "id": "http-body-util 0.1.5",
+              "target": "http_body_util"
+            },
+            {
+              "id": "hyper 1.12.0",
+              "target": "hyper"
+            },
+            {
+              "id": "hyper-util 0.1.21",
+              "target": "hyper_util"
+            },
+            {
+              "id": "opentelemetry 0.32.0",
+              "target": "opentelemetry"
+            },
+            {
+              "id": "parking_lot 0.12.5",
+              "target": "parking_lot"
+            },
+            {
+              "id": "prost 0.14.4",
+              "target": "prost"
+            },
+            {
+              "id": "prost-types 0.14.4",
+              "target": "prost_types"
+            },
+            {
               "id": "thiserror 2.0.21",
               "target": "thiserror"
             },
@@ -14989,8 +15062,25 @@
               "target": "tonic"
             },
             {
+              "id": "tower 0.5.3",
+              "target": "tower"
+            },
+            {
               "id": "tracing 0.1.44",
               "target": "tracing"
+            }
+          ],
+          "selects": {}
+        },
+        "deps_dev": {
+          "common": [
+            {
+              "id": "h2 0.4.20",
+              "target": "h2"
+            },
+            {
+              "id": "rustls 0.23.46",
+              "target": "rustls"
             }
           ],
           "selects": {}

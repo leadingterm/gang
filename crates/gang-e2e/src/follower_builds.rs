@@ -3,10 +3,8 @@
 use std::sync::Arc;
 
 use gang_clock::SystemClock;
+use gang_reapi::build::bazel::remote::execution::v2::{GetActionResultRequest, RequestMetadata};
 use gang_tls::{HttpProtocol, HttpTransport, ServerTrust};
-use nativelink_proto::build::bazel::remote::execution::v2::{
-    GetActionResultRequest, RequestMetadata,
-};
 
 use crate::check::{Check, prefix_checks};
 use crate::cluster::Cluster;

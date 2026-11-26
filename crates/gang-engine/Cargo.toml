@@ -9,6 +9,10 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+axum = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
 gang-cas = { workspace = true }
 gang-clock = { workspace = true }
 gang-config = { workspace = true }
@@ -18,7 +22,22 @@ gang-scheduler = { workspace = true }
 gang-spi = { workspace = true }
 gang-tls = { workspace = true }
 gang-types = { workspace = true }
+getrandom = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+opentelemetry = { workspace = true }
+parking_lot = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+gang-testkit = { workspace = true }
+h2 = { workspace = true }
+rustls = { workspace = true }

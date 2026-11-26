@@ -24,6 +24,7 @@ gang-main = { workspace = true }
 gang-mtls = { workspace = true }
 gang-oidc = { workspace = true }
 gang-os = { workspace = true }
+gang-reapi = { workspace = true }
 gang-state = { workspace = true }
 gang-spi = { workspace = true }
 gang-tls = { workspace = true }
@@ -37,7 +38,6 @@ hex = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true, features = ["tokio"] }
-nativelink-proto = { workspace = true }
 p256 = { workspace = true }
 parking_lot = { workspace = true }
 prost = { workspace = true }
@@ -67,6 +67,7 @@ gang-nativelink = { workspace = true, features = ["test-support"] }
 gang-postgres = { workspace = true }
 gang-server = { workspace = true }
 gang-sqlite = { workspace = true }
+nativelink-proto = { workspace = true }
 nativelink-scheduler = { workspace = true }
 nativelink-util = { workspace = true }
 nativelink-worker = { workspace = true }

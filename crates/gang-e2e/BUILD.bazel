@@ -118,6 +118,7 @@ workspace_rust_library(
         "//crates/gang-mtls:gang_mtls",
         "//crates/gang-oidc:gang_oidc",
         "//crates/gang-os:gang_os",
+        "//crates/gang-reapi:gang_reapi",
         "//crates/gang-spi:gang_spi",
         "//crates/gang-state:gang_state",
         "//crates/gang-testkit:gang_testkit",

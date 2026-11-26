@@ -18,6 +18,9 @@ gang-reapi = { workspace = true }
 gang-spi = { workspace = true }
 gang-tls = { workspace = true }
 gang-types = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+parking_lot = { workspace = true }
 prost = { workspace = true }
 rustix = { workspace = true }
 sha2 = { workspace = true }
@@ -26,3 +29,7 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 zstd = { workspace = true }
+
+[dev-dependencies]
+gang-testkit = { workspace = true }
+tempfile = { workspace = true }

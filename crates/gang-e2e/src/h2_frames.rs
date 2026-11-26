@@ -7,14 +7,12 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use bytes::Bytes;
+use gang_reapi::build::bazel::remote::execution::v2::{GetActionResultRequest, RequestMetadata};
 use gang_types::Url;
 use h2::client::{self, ResponseFuture, SendRequest};
 use h2::{Ping, PingPong, SendStream};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{HeaderMap, Method, Request, Version};
-use nativelink_proto::build::bazel::remote::execution::v2::{
-    GetActionResultRequest, RequestMetadata,
-};
 use prost::Message;
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -373,12 +371,12 @@ mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD_NO_PAD;
     use gang_clock::SystemClock;
+    use gang_reapi::build::bazel::remote::execution::v2::{
+        Digest, GetActionResultRequest, RequestMetadata,
+    };
     use gang_types::Url;
     use http::HeaderMap;
     use http::HeaderValue;
-    use nativelink_proto::build::bazel::remote::execution::v2::{
-        Digest, GetActionResultRequest, RequestMetadata,
-    };
     use prost::Message;
     use tokio::io::DuplexStream;
     use tokio::runtime::{Builder, Runtime};

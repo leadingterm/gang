@@ -3,3 +3,19 @@
 //! Provides the local disk CAS (`DiskCas`), single-flight deduplication, tiered fast/slow store
 //! composition, directory tree cache, bounded zstd transport codec, and controller-backed remote
 //! CAS gRPC client.
+
+mod disk;
+mod layout;
+mod lru;
+mod pins;
+mod stats;
+
+pub use disk::{DiskCas, WriteOutcome};
+pub use layout::{
+    DETERMINISTIC_MTIME_SECS, ScanReport, ScannedEntry, TMP_DIR_NAME, blob_path,
+    deterministic_mtime, entry_file_name, file_mode, hardlink_or_reflink_file, parse_entry_name,
+    scan_cas_root, shard_dir_name,
+};
+pub use lru::{BlobMode, CacheKey, EvictedEntry, InsertOutcome, PinKind, SHARD_COUNT, ShardedLru};
+pub use pins::CasPin;
+pub use stats::CasStats;
