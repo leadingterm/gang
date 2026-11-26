@@ -1720,17 +1720,19 @@ mod tests {
         assert_eq!(store.aborts_registered.load(Ordering::Acquire), 2);
         assert_eq!(store.aborts_finished.load(Ordering::Acquire), 0);
 
-        let store_for_shutdown = Arc::clone(&store);
-        let store_shutdown = tokio::spawn(async move {
-            store_for_shutdown.shutdown().await;
-        });
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert!(
-            !store_shutdown.is_finished(),
-            "store shutdown must wait for barrier-held multipart aborts"
-        );
+        let mut shutdown_fut = std::pin::pin!(store.shutdown());
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(
+                std::future::Future::poll(shutdown_fut.as_mut(), cx).is_pending(),
+            )
+        })
+        .await;
         store.release_abort.notify_waiters();
-        store_shutdown.await.expect("join store shutdown");
+        shutdown_fut.await;
+        assert!(
+            pending,
+            "store shutdown must remain Pending while barrier-held multipart aborts are blocked"
+        );
         assert_eq!(store.aborts_finished.load(Ordering::Acquire), 2);
     }
 }

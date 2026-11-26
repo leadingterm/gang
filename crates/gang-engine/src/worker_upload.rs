@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream::{self, BoxStream};
-use gang_cas::{BlobMode, CacheKey, DiskCas, Tiered, WriteOutcome, blob_path};
+use gang_cas::{BlobMode, BlockingScope, CacheKey, DiskCas, Tiered, WriteOutcome, blob_path};
 use gang_clock::{Clock, Timestamp};
 use gang_config::WorkerConfig;
 use gang_reapi::build::bazel::remote::execution::v2 as reapi;
@@ -33,8 +33,6 @@ use gang_types::Digest;
 use prost::Message as _;
 use rustix::fs::{self as fd_fs, AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest as _, Sha256};
-
-use crate::worker_sampling::BlockingScope;
 
 /// Streaming read buffer size used for hashing and uploading output files.
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
@@ -2326,6 +2324,32 @@ mod tests {
     #[tokio::test]
     async fn cancellation_joins_blocking_hash_before_cleanup()
     -> Result<(), Box<dyn std::error::Error>> {
+        use std::future::Future as _;
+        use std::task::Poll;
+
+        struct ReleaseLatch {
+            done: parking_lot::Mutex<bool>,
+            cv: parking_lot::Condvar,
+        }
+        impl ReleaseLatch {
+            fn wait(&self) {
+                let mut guard = self.done.lock();
+                while !*guard {
+                    self.cv.wait(&mut guard);
+                }
+            }
+            fn release(&self) {
+                *self.done.lock() = true;
+                self.cv.notify_all();
+            }
+        }
+        struct LatchGuard(Arc<ReleaseLatch>);
+        impl Drop for LatchGuard {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+
         let tmp = tempfile::tempdir()?;
         let disk = DiskCas::open(tmp.path().join("cas"), 1024 * 1024).await?;
         let slow = MemoryContentStore::new();
@@ -2342,23 +2366,17 @@ mod tests {
         };
         let clock = gang_clock::SystemClock::new();
         let blocking = BlockingScope::new();
-        let entered = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
-        let entered_hook = Arc::clone(&entered);
-        let release_hook = Arc::clone(&release);
-        let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            entered_hook.wait();
-            release_hook.wait();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let latch = Arc::new(ReleaseLatch {
+            done: parking_lot::Mutex::new(false),
+            cv: parking_lot::Condvar::new(),
         });
-
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-        let trigger = tokio::spawn(async move {
-            tokio::task::spawn_blocking(move || {
-                entered.wait();
-            })
-            .await
-            .expect("barrier wait");
-            let _ = cancel_tx.send(());
+        let _guard = LatchGuard(Arc::clone(&latch));
+        let entered_hook = Arc::clone(&entered);
+        let latch_hook = Arc::clone(&latch);
+        let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            entered_hook.notify_one();
+            latch_hook.wait();
         });
 
         let upload_cfg = test_config();
@@ -2383,27 +2401,21 @@ mod tests {
         );
         let outcome = tokio::select! {
             biased;
-            _ = cancel_rx => None,
+            () = entered.notified() => None,
             res = upload_future => Some(res),
         };
         assert!(outcome.is_none(), "cancellation must interrupt upload");
-        trigger.await?;
 
-        let blocking_for_join = blocking.clone();
-        let join_task = tokio::spawn(async move {
-            blocking_for_join.cancel_and_join().await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let mut join_fut = std::pin::pin!(blocking.cancel_and_join());
+        let pending =
+            std::future::poll_fn(|cx| Poll::Ready(join_fut.as_mut().poll(cx).is_pending())).await;
+        latch.release();
+        join_fut.await;
+
         assert!(
-            !join_task.is_finished(),
-            "cancel_and_join must wait for in-flight blocking hash task"
+            pending,
+            "cancel_and_join must remain Pending while blocking hash task is held"
         );
-
-        tokio::task::spawn_blocking(move || {
-            release.wait();
-        })
-        .await?;
-        join_task.await?;
 
         let mut missing = Vec::new();
         slow.find_missing(&[payload_digest], &mut missing).await?;

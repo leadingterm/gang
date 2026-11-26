@@ -245,6 +245,44 @@ where
         Ok(true)
     }
 
+    /// Like [`Self::fetch_direct_to`], routing both the opener and writer blocking tasks through
+    /// `scope` so cancellation stops and joins them before directory cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortError::Rejected`] with [`Rejection::DigestMismatch`] if the slow stream does
+    /// not match `digest`, or [`PortError`] on cancellation, slow-store, or filesystem failure.
+    pub async fn fetch_direct_to_scoped(
+        &self,
+        digest: Digest,
+        dest: &Path,
+        executable: bool,
+        scope: &crate::BlockingScope,
+    ) -> Result<bool, PortError> {
+        if scope.is_cancelled() {
+            return Err(PortError::unavailable("direct fetch cancelled"));
+        }
+        let disk = self.disk();
+        if digest.is_empty() {
+            disk.write_verified_direct_scoped(
+                Digest::EMPTY,
+                BlobStream::empty(),
+                dest,
+                executable,
+                scope,
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        let Some(stream) = self.inner.slow.read(digest, ByteRange::FULL).await? else {
+            return Ok(false);
+        };
+        disk.write_verified_direct_scoped(digest, stream, dest, executable, scope)
+            .await?;
+        Ok(true)
+    }
+
     async fn coalesce_fetch(
         &self,
         key: CacheKey,

@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -14,7 +14,9 @@ use gang_spi::{
     WorkerCacheStats,
 };
 use gang_types::Digest;
-use tokio::sync::mpsc;
+use parking_lot::Mutex;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::layout::{
     self, VerifiedWriteError, VerifiedWriter, blob_path, copy_with_metadata, create_empty_file,
@@ -29,6 +31,112 @@ const READ_CHUNK_SIZE_U64: u64 = 64 * 1024;
 const WRITE_CHANNEL_CAPACITY: usize = 8;
 
 static EVICT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+type BlockingTaskList = Vec<(u64, JoinHandle<()>)>;
+
+/// Tracks `spawn_blocking` tasks owned by an attempt phase so cancellation signals them
+/// cooperatively and awaits every handle before retiring directories or acknowledging cleanup.
+#[derive(Debug, Default, Clone)]
+pub struct BlockingScope {
+    cancelled: Arc<AtomicBool>,
+    next_id: Arc<AtomicU64>,
+    tasks: Arc<Mutex<BlockingTaskList>>,
+}
+
+impl BlockingScope {
+    /// Creates an active, uncancelled [`BlockingScope`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Signals cooperative cancellation to every blocking task in this scope.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Returns whether cancellation has been signaled for this scope.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Spawns `f` on Tokio's blocking pool, retaining its join handle in this scope until
+    /// [`Self::finish`] or [`Self::cancel_and_join`] consumes it.
+    pub(crate) fn spawn_tracked<F, T>(&self, f: F) -> (u64, oneshot::Receiver<T>)
+    where
+        F: FnOnce(&AtomicBool) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let cancelled = Arc::clone(&self.cancelled);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        let handle = tokio::task::spawn_blocking(move || {
+            let value = f(&cancelled);
+            let _ = tx.send(value);
+        });
+        let mut guard = self.tasks.lock();
+        guard.retain(|(_, task)| !task.is_finished());
+        guard.push((id, handle));
+        (id, rx)
+    }
+
+    /// Awaits a previously spawned tracked task and removes its handle from the scope on completion.
+    pub(crate) async fn finish<T>(&self, id: u64, rx: oneshot::Receiver<T>) -> io::Result<T> {
+        if let Ok(value) = rx.await {
+            let mut guard = self.tasks.lock();
+            if let Some(pos) = guard.iter().position(|(entry_id, _)| *entry_id == id) {
+                guard.swap_remove(pos);
+            }
+            return Ok(value);
+        }
+        let handle = {
+            let mut guard = self.tasks.lock();
+            guard
+                .iter()
+                .position(|(entry_id, _)| *entry_id == id)
+                .map(|pos| guard.swap_remove(pos).1)
+        };
+        if let Some(handle) = handle {
+            handle.await.map_err(io::Error::other)?;
+        }
+        Err(io::Error::other(
+            "blocking task exited before sending result",
+        ))
+    }
+
+    /// Runs `f` on Tokio's blocking pool, retaining its join handle even if this future is dropped
+    /// on cancellation so [`Self::cancel_and_join`] can guarantee completion before cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the blocking task panics or exits without producing a value.
+    pub async fn run<F, T>(&self, f: F) -> io::Result<T>
+    where
+        F: FnOnce(&AtomicBool) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (id, rx) = self.spawn_tracked(f);
+        self.finish(id, rx).await
+    }
+
+    /// Signals cooperative cancellation and joins every blocking task spawned in this scope.
+    pub async fn cancel_and_join(&self) {
+        self.cancel();
+        loop {
+            let handles: Vec<JoinHandle<()>> = {
+                let mut guard = self.tasks.lock();
+                if guard.is_empty() {
+                    break;
+                }
+                guard.drain(..).map(|(_, handle)| handle).collect()
+            };
+            for handle in handles {
+                let _ = handle.await;
+            }
+        }
+    }
+}
 
 /// Outcome of writing a verified blob to [`DiskCas`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,7 +366,15 @@ impl DiskCas {
                 .map_err(PortError::backend)?
         };
 
-        stream_into_verified_writer(body, writer, Some((Arc::clone(&self.inner), key))).await?;
+        stream_into_verified_writer(
+            body,
+            writer,
+            Some((Arc::clone(&self.inner), key)),
+            None,
+            #[cfg(test)]
+            None,
+        )
+        .await?;
 
         if self.inner.lru.size_bytes() > self.inner.budget_bytes {
             self.evict_and_unlink_until(self.inner.budget_bytes).await?;
@@ -281,30 +397,135 @@ impl DiskCas {
         dest: &Path,
         executable: bool,
     ) -> Result<(), PortError> {
+        self.write_verified_direct_inner(
+            digest,
+            body,
+            dest,
+            executable,
+            None,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::write_verified_direct`], routing both the opener and streaming writer blocking
+    /// tasks through `scope` so cancellation stops and joins them before directory retirement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortError::Rejected`] with [`Rejection::DigestMismatch`] on mismatch, or
+    /// [`PortError::Backend`] on cancellation, filesystem, or stream failure.
+    pub async fn write_verified_direct_scoped(
+        &self,
+        digest: Digest,
+        body: BlobStream,
+        dest: &Path,
+        executable: bool,
+        scope: &BlockingScope,
+    ) -> Result<(), PortError> {
+        self.write_verified_direct_inner(
+            digest,
+            body,
+            dest,
+            executable,
+            Some(scope),
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_verified_direct_inner(
+        &self,
+        digest: Digest,
+        body: BlobStream,
+        dest: &Path,
+        executable: bool,
+        scope: Option<&BlockingScope>,
+        #[cfg(test)] on_open: Option<Arc<dyn Fn() + Send + Sync>>,
+        #[cfg(test)] on_write: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<(), PortError> {
         if body.size != digest.size() {
             return Err(PortError::refused(Rejection::DigestMismatch));
+        }
+        if scope.is_some_and(BlockingScope::is_cancelled) {
+            return Err(PortError::unavailable("direct write cancelled"));
         }
         let mode = BlobMode::from_executable(executable);
         if digest.is_empty() {
             verify_empty_stream(body).await?;
             let dest_owned = dest.to_path_buf();
-            tokio::task::spawn_blocking(move || create_empty_file(&dest_owned, mode))
-                .await
-                .map_err(PortError::backend)?
-                .map_err(PortError::backend)?;
+            let create = move |cancelled: &AtomicBool| -> io::Result<()> {
+                #[cfg(test)]
+                if let Some(hook) = on_open {
+                    hook();
+                }
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "direct write cancelled",
+                    ));
+                }
+                create_empty_file(&dest_owned, mode)
+            };
+            if let Some(scope) = scope {
+                scope
+                    .run(create)
+                    .await
+                    .map_err(PortError::backend)?
+                    .map_err(PortError::backend)?;
+            } else {
+                tokio::task::spawn_blocking(move || create(&AtomicBool::new(false)))
+                    .await
+                    .map_err(PortError::backend)?
+                    .map_err(PortError::backend)?;
+            }
             self.inner.stats.record_slow_read(0);
             return Ok(());
         }
 
         let dest_owned = dest.to_path_buf();
-        let writer = tokio::task::spawn_blocking(move || {
+        let open = move |cancelled: &AtomicBool| -> io::Result<VerifiedWriter> {
+            #[cfg(test)]
+            if let Some(hook) = on_open {
+                hook();
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "direct write cancelled",
+                ));
+            }
             VerifiedWriter::open_direct(&dest_owned, digest, mode)
-        })
-        .await
-        .map_err(PortError::backend)?
-        .map_err(PortError::backend)?;
+        };
+        let writer = if let Some(scope) = scope {
+            scope
+                .run(open)
+                .await
+                .map_err(PortError::backend)?
+                .map_err(PortError::backend)?
+        } else {
+            tokio::task::spawn_blocking(move || open(&AtomicBool::new(false)))
+                .await
+                .map_err(PortError::backend)?
+                .map_err(PortError::backend)?
+        };
 
-        stream_into_verified_writer(body, writer, None).await?;
+        stream_into_verified_writer(
+            body,
+            writer,
+            None,
+            scope,
+            #[cfg(test)]
+            on_write,
+        )
+        .await?;
         self.inner.stats.record_slow_read(digest.size());
         Ok(())
     }
@@ -666,15 +887,55 @@ async fn verify_stream_only(digest: Digest, mut body: BlobStream) -> Result<(), 
     Ok(())
 }
 
+enum WriterHandle {
+    Scoped(u64, oneshot::Receiver<Result<(), VerifiedWriteError>>),
+    Unscoped(JoinHandle<Result<(), VerifiedWriteError>>),
+}
+
+impl WriterHandle {
+    async fn join(self, scope: Option<&BlockingScope>) -> Result<(), PortError> {
+        let result = match self {
+            Self::Scoped(id, rx) => {
+                let Some(scope) = scope else {
+                    return Err(PortError::backend("missing blocking scope"));
+                };
+                scope.finish(id, rx).await.map_err(PortError::backend)?
+            }
+            Self::Unscoped(handle) => handle.await.map_err(PortError::backend)?,
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(VerifiedWriteError::DigestMismatch) => {
+                Err(PortError::refused(Rejection::DigestMismatch))
+            }
+            Err(VerifiedWriteError::Io(error)) => Err(PortError::backend(error)),
+        }
+    }
+}
+
 async fn stream_into_verified_writer(
     mut body: BlobStream,
     mut writer: VerifiedWriter,
     publication: Option<(Arc<DiskCasInner>, CacheKey)>,
+    scope: Option<&BlockingScope>,
+    #[cfg(test)] on_write: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<(), PortError> {
     let (tx, mut rx) = mpsc::channel::<WriteChunk>(WRITE_CHANNEL_CAPACITY);
 
-    let writer_task = tokio::task::spawn_blocking(move || -> Result<(), VerifiedWriteError> {
+    let run_writer = move |cancelled: &AtomicBool| -> Result<(), VerifiedWriteError> {
+        #[cfg(test)]
+        let mut hook = on_write;
         while let Some(msg) = rx.blocking_recv() {
+            #[cfg(test)]
+            if let Some(callback) = hook.take() {
+                callback();
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Err(VerifiedWriteError::Io(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "direct write cancelled",
+                )));
+            }
             match msg {
                 WriteChunk::Data(bytes) => writer.write_chunk(&bytes)?,
                 WriteChunk::Commit => {
@@ -693,14 +954,28 @@ async fn stream_into_verified_writer(
         }
         // Sender dropped before Commit (stream error or caller cancellation): drop temp without publishing.
         Ok(())
-    });
+    };
+
+    let writer_handle = if let Some(scope) = scope {
+        let (id, rx) = scope.spawn_tracked(run_writer);
+        WriterHandle::Scoped(id, rx)
+    } else {
+        WriterHandle::Unscoped(tokio::task::spawn_blocking(move || {
+            run_writer(&AtomicBool::new(false))
+        }))
+    };
 
     while let Some(chunk_res) = body.chunks.next().await {
+        if scope.is_some_and(BlockingScope::is_cancelled) {
+            drop(tx);
+            let _ = writer_handle.join(scope).await;
+            return Err(PortError::unavailable("direct write cancelled"));
+        }
         let chunk = match chunk_res {
             Ok(chunk) => chunk,
             Err(error) => {
                 drop(tx);
-                let _ = writer_task.await;
+                let _ = writer_handle.join(scope).await;
                 return Err(error);
             }
         };
@@ -709,17 +984,16 @@ async fn stream_into_verified_writer(
         }
     }
 
+    if scope.is_some_and(BlockingScope::is_cancelled) {
+        drop(tx);
+        let _ = writer_handle.join(scope).await;
+        return Err(PortError::unavailable("direct write cancelled"));
+    }
+
     let _ = tx.send(WriteChunk::Commit).await;
     drop(tx);
 
-    let result = writer_task.await.map_err(PortError::backend)?;
-    match result {
-        Ok(()) => Ok(()),
-        Err(VerifiedWriteError::DigestMismatch) => {
-            Err(PortError::refused(Rejection::DigestMismatch))
-        }
-        Err(VerifiedWriteError::Io(error)) => Err(PortError::backend(error)),
-    }
+    writer_handle.join(scope).await
 }
 
 #[cfg(test)]
@@ -727,6 +1001,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use bytes::Bytes;
@@ -735,7 +1010,7 @@ mod tests {
     use gang_testkit::{TestResult, content_store_contract};
     use gang_types::Digest;
 
-    use super::{DiskCas, WriteOutcome};
+    use super::{BlockingScope, DiskCas, WriteOutcome};
     use crate::layout::{DETERMINISTIC_MTIME_SECS, blob_path};
     use crate::lru::{BlobMode, CacheKey};
 
@@ -1185,6 +1460,150 @@ mod tests {
         assert_eq!(
             fs::metadata(&exec_dest)?.permissions().mode() & 0o777,
             0o555
+        );
+        Ok(())
+    }
+
+    struct TestLatch {
+        done: parking_lot::Mutex<bool>,
+        cv: parking_lot::Condvar,
+    }
+
+    impl TestLatch {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                done: parking_lot::Mutex::new(false),
+                cv: parking_lot::Condvar::new(),
+            })
+        }
+
+        fn wait(&self) {
+            let mut guard = self.done.lock();
+            while !*guard {
+                self.cv.wait(&mut guard);
+            }
+        }
+
+        fn release(&self) {
+            *self.done.lock() = true;
+            self.cv.notify_all();
+        }
+    }
+
+    struct LatchGuard(Arc<TestLatch>);
+
+    impl Drop for LatchGuard {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_write_cancellation_joins_opener_before_creating_parent_dir() -> TestResult {
+        use std::future::Future as _;
+        use std::task::Poll;
+
+        let dir = TempDir::new()?;
+        let cas = DiskCas::open(dir.path().join("cas"), 16).await?;
+        let payload = Bytes::from_static(b"oversized-direct-bypass-opener-payload");
+        let digest = Digest::from_bytes(&payload);
+        let dest = dir.path().join("retired-attempt/work/bypass.bin");
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let latch = TestLatch::new();
+        let _guard = LatchGuard(Arc::clone(&latch));
+        let hook_entered = Arc::clone(&entered);
+        let hook_latch = Arc::clone(&latch);
+        let on_open: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            hook_entered.notify_one();
+            hook_latch.wait();
+        });
+
+        let scope = BlockingScope::new();
+        let write_fut = cas.write_verified_direct_inner(
+            digest,
+            BlobStream::from_bytes(payload),
+            &dest,
+            false,
+            Some(&scope),
+            Some(on_open),
+            None,
+        );
+        let outcome = tokio::select! {
+            biased;
+            () = entered.notified() => None,
+            res = write_fut => Some(res),
+        };
+        assert!(outcome.is_none(), "cancellation must interrupt opener");
+
+        let mut join_fut = std::pin::pin!(scope.cancel_and_join());
+        let pending =
+            std::future::poll_fn(|cx| Poll::Ready(join_fut.as_mut().poll(cx).is_pending())).await;
+        latch.release();
+        join_fut.await;
+
+        assert!(
+            pending,
+            "cancel_and_join must remain Pending while direct-write opener is held"
+        );
+        assert!(
+            !dir.path().join("retired-attempt").exists(),
+            "cancelled opener must never recreate the retired attempt directory"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_write_cancellation_joins_writer_before_committing_file() -> TestResult {
+        use std::future::Future as _;
+        use std::task::Poll;
+
+        let dir = TempDir::new()?;
+        let cas = DiskCas::open(dir.path().join("cas"), 16).await?;
+        let payload = Bytes::from_static(b"oversized-direct-bypass-writer-payload");
+        let digest = Digest::from_bytes(&payload);
+        let dest = dir.path().join("retired-attempt/work/bypass.bin");
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let latch = TestLatch::new();
+        let _guard = LatchGuard(Arc::clone(&latch));
+        let hook_entered = Arc::clone(&entered);
+        let hook_latch = Arc::clone(&latch);
+        let on_write: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            hook_entered.notify_one();
+            hook_latch.wait();
+        });
+
+        let scope = BlockingScope::new();
+        let write_fut = cas.write_verified_direct_inner(
+            digest,
+            BlobStream::from_bytes(payload),
+            &dest,
+            false,
+            Some(&scope),
+            None,
+            Some(on_write),
+        );
+        let outcome = tokio::select! {
+            biased;
+            () = entered.notified() => None,
+            res = write_fut => Some(res),
+        };
+        assert!(outcome.is_none(), "cancellation must interrupt writer");
+
+        let mut join_fut = std::pin::pin!(scope.cancel_and_join());
+        let pending =
+            std::future::poll_fn(|cx| Poll::Ready(join_fut.as_mut().poll(cx).is_pending())).await;
+        latch.release();
+        join_fut.await;
+
+        assert!(
+            pending,
+            "cancel_and_join must remain Pending while direct-write writer is held"
+        );
+        assert!(
+            !dest.exists(),
+            "cancelled direct writer must never publish the destination file"
         );
         Ok(())
     }

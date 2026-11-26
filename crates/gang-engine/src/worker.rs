@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use gang_cas::{
-    Compression, DiskCas, RemoteCas, RemoteCasConfig, Tiered, TreeCache, TreeCacheConfig,
+    BlockingScope, Compression, DiskCas, RemoteCas, RemoteCasConfig, Tiered, TreeCache,
+    TreeCacheConfig,
 };
 use gang_clock::{Clock, Timestamp};
 use gang_config::{ActionsConfig, WorkerConfig};
@@ -42,8 +43,8 @@ use crate::worker_runner::{
     run_attempt, start_orphan_reaper,
 };
 use crate::worker_sampling::{
-    BlockingScope, GraveyardPending, KillTrigger, KillWaiter, SamplingConfig, SamplingRegistry,
-    SystemProbe, WorkerSampler, kill_channel,
+    GraveyardPending, KillTrigger, KillWaiter, SamplingConfig, SamplingRegistry, SystemProbe,
+    WorkerSampler, kill_channel,
 };
 use crate::worker_session::{
     ConnectError, ConnectedChannel, SessionConfig, SessionConnector, SessionError, SessionEvent,

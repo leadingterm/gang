@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::StreamExt as _;
-use gang_cas::{BlobMode, CacheKey, CasPin, DiskCas, FetchOutcome, Tiered, TreeCache, TreeLease};
+use gang_cas::{
+    BlobMode, BlockingScope, CacheKey, CasPin, DiskCas, FetchOutcome, Tiered, TreeCache, TreeLease,
+};
 use gang_config::WorkerConfig;
 use gang_reapi::build::bazel::remote::execution::v2 as reapi;
 use gang_reapi::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
@@ -31,8 +33,6 @@ use gang_types::{AttemptId, AttemptIdError, Digest, NonZeroBytes};
 use parking_lot::Mutex;
 use prost::Message as _;
 use tonic::transport::Channel;
-
-use crate::worker_sampling::BlockingScope;
 
 /// Maximum REAPI directory tree nesting depth accepted during staging.
 const MAX_TREE_DEPTH: usize = 256;
@@ -608,6 +608,7 @@ where
         &work_dir,
         tiered,
         config.download_concurrency,
+        blocking,
     )
     .await?;
 
@@ -1610,6 +1611,7 @@ async fn stream_bypassed_files<F, S>(
     work_dir: &Path,
     tiered: &Tiered<F, S>,
     concurrency: NonZeroUsize,
+    blocking: Option<&BlockingScope>,
 ) -> Result<(), StagingError>
 where
     F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
@@ -1617,6 +1619,9 @@ where
 {
     if bypassed_keys.is_empty() {
         return Ok(());
+    }
+    if blocking.is_some_and(BlockingScope::is_cancelled) {
+        return Err(StagingError::Cancelled);
     }
 
     let direct_jobs: Vec<(Digest, bool, PathBuf)> = files
@@ -1633,7 +1638,13 @@ where
 
     let results: Vec<Result<(), StagingError>> = futures::stream::iter(direct_jobs)
         .map(|(digest, executable, dest)| async move {
-            let found = tiered.fetch_direct_to(digest, &dest, executable).await?;
+            let found = if let Some(scope) = blocking {
+                tiered
+                    .fetch_direct_to_scoped(digest, &dest, executable, scope)
+                    .await?
+            } else {
+                tiered.fetch_direct_to(digest, &dest, executable).await?
+            };
             if !found {
                 return Err(StagingError::MissingBlob {
                     kind: "input file",
@@ -2449,6 +2460,32 @@ mod tests {
     #[tokio::test]
     async fn cancellation_joins_blocking_materialization_before_dir_exists()
     -> Result<(), Box<dyn std::error::Error>> {
+        use std::future::Future as _;
+        use std::task::Poll;
+
+        struct ReleaseLatch {
+            done: parking_lot::Mutex<bool>,
+            cv: parking_lot::Condvar,
+        }
+        impl ReleaseLatch {
+            fn wait(&self) {
+                let mut guard = self.done.lock();
+                while !*guard {
+                    self.cv.wait(&mut guard);
+                }
+            }
+            fn release(&self) {
+                *self.done.lock() = true;
+                self.cv.notify_all();
+            }
+        }
+        struct LatchGuard(Arc<ReleaseLatch>);
+        impl Drop for LatchGuard {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+
         let tmp = tempfile::tempdir()?;
         let disk = DiskCas::open(tmp.path().join("cas"), 1024 * 1024).await?;
         let slow = MemoryContentStore::new();
@@ -2476,17 +2513,20 @@ mod tests {
         )?;
 
         let work_root = tmp.path().join("work");
-        let entered = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let latch = Arc::new(ReleaseLatch {
+            done: parking_lot::Mutex::new(false),
+            cv: parking_lot::Condvar::new(),
+        });
+        let _guard = LatchGuard(Arc::clone(&latch));
         let entered_hook = Arc::clone(&entered);
-        let release_hook = Arc::clone(&release);
+        let latch_hook = Arc::clone(&latch);
         let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            entered_hook.wait();
-            release_hook.wait();
+            entered_hook.notify_one();
+            latch_hook.wait();
         });
 
         let blocking = BlockingScope::new();
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let stage_cfg = simple_config(64);
         let staging_future = stage_attempt_with_scope(
             &assign,
@@ -2500,42 +2540,111 @@ mod tests {
             false,
             Some(hook),
         );
-        let cancelled_on_select = tokio::spawn(async move {
-            let enter_wait = tokio::task::spawn_blocking(move || {
-                entered.wait();
-            });
-            enter_wait.await.expect("barrier wait");
-            let _ = cancel_tx.send(());
-        });
-
         let outcome = tokio::select! {
             biased;
-            _ = cancel_rx => None,
+            () = entered.notified() => None,
             res = staging_future => Some(res),
         };
         assert!(outcome.is_none(), "cancellation must interrupt staging");
-        cancelled_on_select.await?;
 
-        let blocking_for_join = blocking.clone();
-        let join_task = tokio::spawn(async move {
-            blocking_for_join.cancel_and_join().await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let mut join_fut = std::pin::pin!(blocking.cancel_and_join());
+        let pending =
+            std::future::poll_fn(|cx| Poll::Ready(join_fut.as_mut().poll(cx).is_pending())).await;
+        latch.release();
+        join_fut.await;
+
         assert!(
-            !join_task.is_finished(),
-            "cancel_and_join must wait for in-flight blocking materialization"
+            pending,
+            "cancel_and_join must remain Pending while blocking materialization is held"
         );
-
-        tokio::task::spawn_blocking(move || {
-            release.wait();
-        })
-        .await?;
-        join_task.await?;
-
         assert!(
             !work_root.join(attempt_id.as_str()).exists(),
             "cancelled blocking materialization must never recreate the attempt directory"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forced_bypass_cancellation_drains_direct_write_scope_before_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        // Tiny DiskCas budget forces `big.bin` onto the `stream_bypassed_files` direct-write path.
+        let disk = DiskCas::open(tmp.path().join("cas"), 16).await?;
+        let slow = MemoryContentStore::new();
+        let tiered = Tiered::new(disk, slow.clone());
+        let dir_cache = DirectoryCache::new(NonZeroBytes::mib(8));
+
+        let payload = Bytes::from(vec![b'b'; 128]);
+        let payload_digest = slow.insert(payload);
+        let root = make_dir(
+            &slow,
+            vec![("big.bin", payload_digest, false)],
+            vec![],
+            vec![],
+        )?;
+        let cmd = reapi::Command {
+            arguments: vec!["/bin/true".to_owned()],
+            ..Default::default()
+        };
+        let cmd_digest = store_proto(&slow, &cmd);
+        let action = reapi::Action {
+            command_digest: Some(to_proto(&cmd_digest)?),
+            input_root_digest: Some(to_proto(&root)?),
+            ..Default::default()
+        };
+        let attempt_id = AttemptId::generate()?;
+        let assign = make_assign(
+            attempt_id.as_str(),
+            store_proto(&slow, &action),
+            Some(&action),
+            Some(&cmd),
+        )?;
+
+        let work_root = tmp.path().join("work");
+        let blocking = BlockingScope::new();
+        let stage_cfg = simple_config(64);
+        let staged = stage_attempt_with_scope(
+            &assign,
+            &work_root,
+            &tiered,
+            None,
+            &dir_cache,
+            None,
+            &stage_cfg,
+            Some(&blocking),
+            false,
+            None,
+        )
+        .await?;
+        assert_eq!(fs::read(staged.work_dir().join("big.bin"))?.len(), 128);
+
+        // Pre-cancelled scope refuses direct-write staging cleanly and leaves no attempt dir.
+        let attempt_id2 = AttemptId::generate()?;
+        let assign2 = make_assign(
+            attempt_id2.as_str(),
+            store_proto(&slow, &action),
+            Some(&action),
+            Some(&cmd),
+        )?;
+        let cancelled = BlockingScope::new();
+        cancelled.cancel();
+        let err = stage_attempt_with_scope(
+            &assign2,
+            &work_root,
+            &tiered,
+            None,
+            &dir_cache,
+            None,
+            &stage_cfg,
+            Some(&cancelled),
+            false,
+            None,
+        )
+        .await
+        .expect_err("cancelled scope must fail closed");
+        assert!(matches!(err, StagingError::Cancelled));
+        cancelled.cancel_and_join().await;
+        assert!(!work_root.join(attempt_id2.as_str()).exists());
         Ok(())
     }
 }
