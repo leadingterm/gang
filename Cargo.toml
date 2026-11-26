@@ -64,7 +64,6 @@ unwrap_used = "deny"
 allocation-counter = "0.8.1"
 anstream = "1.0"
 anstyle = "1.0"
-async-trait = "0.1"
 aws-config = { default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",
@@ -149,6 +148,7 @@ ecdsa = { features = [
 flate2 = "1.1"
 form_urlencoded = "1.2.2"
 futures = { default-features = false, features = [
+    "async-await",
     "std",
 ], version = "0.3.31" }
 futures-core = "0.3"
@@ -172,7 +172,6 @@ gang-local = { path = "crates/gang-local" }
 gang-macros = { path = "crates/gang-macros" }
 gang-main = { path = "crates/gang-main" }
 gang-mtls = { path = "crates/gang-mtls" }
-gang-nativelink = { path = "crates/gang-nativelink" }
 gang-noop = { path = "crates/gang-noop" }
 gang-oidc = { path = "crates/gang-oidc" }
 gang-os = { path = "crates/gang-os" }
@@ -223,18 +222,6 @@ jsonwebtoken = { features = [
 libc = "0.2.191"
 lru = "0.18.5"
 mimalloc = { version = "0.1" }
-# Immutable carried fork of TraceMachina/nativelink v1.8.3; source patches are
-# recorded in docs/SPECIFICATION.md §3.2. Remove when a pinned upstream release
-# contains equivalent changes.
-nativelink-config = { git = "https://github.com/leadingterm/nativelink", rev = "aee3d6d8d7500da40864f017fa8cdf3c94da3476" }
-nativelink-error = { git = "https://github.com/leadingterm/nativelink", rev = "aee3d6d8d7500da40864f017fa8cdf3c94da3476" }
-nativelink-metric = { git = "https://github.com/leadingterm/nativelink", rev = "aee3d6d8d7500da40864f017fa8cdf3c94da3476" }
-nativelink-proto = { git = "https://github.com/leadingterm/nativelink", rev = "aee3d6d8d7500da40864f017fa8cdf3c94da3476" }
-nativelink-scheduler = { git = "https://github.com/leadingterm/nativelink", rev = "aee3d6d8d7500da40864f017fa8cdf3c94da3476" }
-nativelink-service = { git = "https://github.com/leadingterm/nativelink", rev = "aee3d6d8d7500da40864f017fa8cdf3c94da3476" }
-nativelink-store = { git = "https://github.com/leadingterm/nativelink", rev = "aee3d6d8d7500da40864f017fa8cdf3c94da3476" }
-nativelink-util = { git = "https://github.com/leadingterm/nativelink", rev = "aee3d6d8d7500da40864f017fa8cdf3c94da3476" }
-nativelink-worker = { git = "https://github.com/leadingterm/nativelink", rev = "aee3d6d8d7500da40864f017fa8cdf3c94da3476" }
 num-traits = { default-features = false, version = "0.2.19" }
 object = { default-features = false, features = [
     "elf",

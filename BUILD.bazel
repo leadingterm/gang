@@ -2,8 +2,6 @@ load("@aspect_gazelle_prebuilt//:def.bzl", "aspect_gazelle")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel/rust:defs.bzl", "workspace_rust_source_set")
 
-# gazelle:exclude crates/gang-nativelink
-
 aspect_gazelle(
     name = "gazelle",
     extensions = ["//bazel/gazelle:rust.axl"],
