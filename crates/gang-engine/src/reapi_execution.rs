@@ -1472,7 +1472,10 @@ mod tests {
             panic!("expected Assign");
         };
         assert_eq!(assign.operation, gate_queued.name);
-        assert_eq!(assign.cpu_weight, CpuWeight::GATE.get());
+        assert_eq!(
+            assign.cpu_weight,
+            CpuWeight::for_priority_and_millicores(250, 2_000).get()
+        );
         assert_eq!(assign.target, "//pkg:gate_bin");
         assert_eq!(assign.mnemonic, "Rustc");
         assert_eq!(assign.timeout.as_ref().map(|d| d.seconds), Some(42));

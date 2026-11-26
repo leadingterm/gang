@@ -1446,7 +1446,10 @@ mod tests {
             panic!("expected Assign");
         };
         assert_eq!(assign.operation, "operations/gate-e2e");
-        assert_eq!(assign.cpu_weight, CpuWeight::GATE.get());
+        assert_eq!(
+            assign.cpu_weight,
+            CpuWeight::for_priority_and_millicores(250, 2_000).get()
+        );
         assert_eq!(assign.action.as_deref(), Some(&b"action-proto"[..]));
         assert_eq!(assign.command.as_deref(), Some(&b"command-proto"[..]));
         assert_eq!(assign.timeout.as_ref().map(|d| d.seconds), Some(42));
