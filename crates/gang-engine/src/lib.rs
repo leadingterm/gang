@@ -21,6 +21,8 @@ mod worker_runner;
 mod worker_sampling;
 mod worker_service;
 mod worker_session;
+mod worker_staging;
+mod worker_upload;
 
 pub use actor::{
     ActorConfig, ClientMsg, CompletionPayload, ControlMsg, ControllerRuntime,
@@ -60,4 +62,12 @@ pub use worker_session::{
     ConnectError, ConnectedChannel, SessionConfig, SessionConnector, SessionError, SessionEvent,
     SessionOutbound, SessionSendError, TelemetrySource, backoff_delay, cache_stats_to_proto,
     generate_worker_id, run_session,
+};
+pub use worker_staging::{
+    BoundTree, DirectoryCache, RemoteTreeSource, StageConfig, StagedAttempt, StagingError,
+    stage_attempt,
+};
+pub use worker_upload::{
+    CapturedOutput, ExecutionTiming, UploadConfig, UploadError, UploadInput, UploadOutcome,
+    upload_outputs,
 };
