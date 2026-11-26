@@ -4,6 +4,8 @@
 //! and handoff transport plumbing, and the worker action execution runtime.
 
 mod acquisition;
+mod actor;
+mod controller;
 mod gate;
 mod handoff;
 mod observer;
@@ -18,6 +20,17 @@ mod worker_runner;
 mod worker_sampling;
 mod worker_session;
 
+pub use actor::{
+    ActorConfig, ClientMsg, CompletionPayload, ControlMsg, ControllerRuntime,
+    DEFAULT_ASSIGN_INLINE_MAX, DEFAULT_SCHEDULER_BATCH, DEFAULT_SCHEDULER_QUEUE_DEPTH,
+    DEFAULT_WORKER_OUTBOUND_DEPTH, ExecuteSpec, InlineActionPayload, OperationWatch,
+    OperationWatchState, RegisteredWorker, WorkerMsg, WorkerOutbound, map_kill_reason,
+    select_inline_payload,
+};
+pub use controller::{
+    ControllerClosed, ControllerExecuteError, ControllerHandle, ControllerRegisterError,
+    LearnedSlot, spawn_controller,
+};
 pub use reapi_ac::ActionCacheService;
 pub use reapi_bytestream::{ByteStreamConfig, ByteStreamService};
 pub use reapi_capabilities::{CapabilitiesConfig, CapabilitiesService};
