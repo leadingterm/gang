@@ -43,6 +43,8 @@ mod worker_identity;
 pub use config::{LocalConfig, LocalFleetOptions, LoopbackAddr, WorkerLauncher};
 pub use errors::LocalError;
 pub use file_signer::{FileSigner, FileSignerConfig};
-pub use filesystem_cache::{FilesystemCache, FilesystemCacheConfig};
+pub use filesystem_cache::{
+    FilesystemActionStore, FilesystemCache, FilesystemCacheConfig, FilesystemContentStore,
+};
 pub use plugin::Local;
 pub use processes::{INSTANCE_ENV, INSTANCE_SECRET_ENV, bootstrap_worker};

@@ -13,6 +13,8 @@ mod pins;
 mod remote;
 mod resource;
 mod stats;
+mod tiered;
+mod trees;
 
 pub use codec::{
     Compression, DEFAULT_ZSTD_LEVEL, compress_zstd, compress_zstd_stream, decompress_zstd_bounded,
@@ -30,3 +32,5 @@ pub use pins::CasPin;
 pub use remote::{RemoteCas, RemoteCasConfig};
 pub use resource::{ResourceName, ResourceNameError};
 pub use stats::CasStats;
+pub use tiered::{FetchOutcome, Tiered};
+pub use trees::{EvictedTree, TreeCache, TreeCacheConfig, TreeLease};
