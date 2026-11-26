@@ -273,6 +273,52 @@ impl fmt::Display for VictimReport {
     }
 }
 
+/// What the bound-tree poisoning probe observed when attempting to chmod and write inside a
+/// read-only bound input subtree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundTreeReport {
+    /// Whether `chmod u+w` failed with `EROFS` ("Read-only file system").
+    pub chmod_erofs: bool,
+    /// Whether opening the file for writing failed with `EROFS` ("Read-only file system").
+    pub write_erofs: bool,
+    /// Whether the file content remained unchanged.
+    pub intact: bool,
+}
+
+impl TryFrom<&ProbeReport> for BoundTreeReport {
+    type Error = E2eError;
+
+    /// Reads the typed report from the keys of `report`.
+    ///
+    /// # Errors
+    ///
+    /// [`E2eError::Parse`] when any of `chmod_erofs`, `write_erofs`, or `intact` is missing or
+    /// neither `yes` nor `no`.
+    fn try_from(report: &ProbeReport) -> Result<Self> {
+        Ok(Self {
+            chmod_erofs: report.choice("chmod_erofs", [("yes", true), ("no", false)])?,
+            write_erofs: report.choice("write_erofs", [("yes", true), ("no", false)])?,
+            intact: report.choice("intact", [("yes", true), ("no", false)])?,
+        })
+    }
+}
+
+impl fmt::Display for BoundTreeReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "chmod_erofs={}",
+            if self.chmod_erofs { "yes" } else { "no" }
+        )?;
+        writeln!(
+            f,
+            "write_erofs={}",
+            if self.write_erofs { "yes" } else { "no" }
+        )?;
+        writeln!(f, "intact={}", if self.intact { "yes" } else { "no" })
+    }
+}
+
 /// What the input root probe read directly and through a relative symlink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputRootReport {

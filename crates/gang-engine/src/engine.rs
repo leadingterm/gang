@@ -272,7 +272,6 @@ impl std::fmt::Debug for Engine {
 /// RAII guard releasing the single-controller-term claim, clearing live state, and aborting an
 /// unjoined actor task if [`Engine::run_controller`] exits early or its future is dropped.
 struct ControllerTermGuard {
-    active: Arc<AtomicBool>,
     live: Arc<Mutex<Option<LiveController>>>,
     actor_task: Option<JoinHandle<()>>,
 }
@@ -290,7 +289,6 @@ impl Drop for ControllerTermGuard {
         if let Some(task) = self.actor_task.take() {
             task.abort();
         }
-        self.active.store(false, Ordering::Release);
     }
 }
 
@@ -495,7 +493,6 @@ impl Engine {
         }
 
         let mut term_guard = ControllerTermGuard {
-            active: Arc::clone(&self.active),
             live: Arc::clone(&self.live),
             actor_task: None,
         };
@@ -533,7 +530,7 @@ impl Engine {
         term_guard.actor_task = Some(actor_task);
 
         let (public_routes, worker_routes) =
-            build_controller_routes(&self.config, spec, &handle, connections.api);
+            build_controller_routes(&self.config, spec, &handle, &handoff, connections.api);
         let limits = compute_connection_limits(self.config.http2.max_connections, spec.max_workers);
         let store_usage = make_store_usage_fn(&spec.stores);
 
@@ -803,7 +800,8 @@ fn shared_cache_routes<C: ContentStore, A: ActionStore>(
     .into_server()
     .max_decoding_message_size(limit)
     .max_encoding_message_size(limit);
-    Routes::from(Router::new())
+    Routes::builder()
+        .routes()
         .add_service(action_cache)
         .add_service(cas)
         .add_service(bytestream)
@@ -813,6 +811,7 @@ fn build_controller_routes<C: ContentStore, A: ActionStore, Api: ApiService>(
     config: &EngineConfig,
     spec: &EngineControllerSpec<'_, C, A>,
     handle: &ControllerHandle,
+    handoff: &HandOff,
     api: Api,
 ) -> (ScopedRoutes, ScopedRoutes) {
     let limit = config.http2.max_message_size.get().as_usize();
@@ -847,7 +846,8 @@ fn build_controller_routes<C: ContentStore, A: ActionStore, Api: ApiService>(
         Arc::clone(&spec.stores.actions),
         ExecutionServiceConfig::default(),
     )
-    .with_clock(Arc::clone(&spec.clock));
+    .with_clock(Arc::clone(&spec.clock))
+    .with_handoff(handoff.clone());
     let ops_svc = exec_svc.operations_service();
     let public_leader = Routes::from(Router::new())
         .add_service(

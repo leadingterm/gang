@@ -2,9 +2,10 @@
 //! against the real `gang` binary ([`Stack`](crate::Stack)) and against a simulation in tests.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use gang_config::InputLinks;
+use gang_config::{InputLinks, InputTrees};
 use gang_types::NonZeroBytes;
 use gang_wire::{Event, Frame, State};
 use tokio::sync::oneshot;
@@ -128,6 +129,10 @@ pub struct Variant {
     pub permit_network: PermitNetwork,
     /// `[execution] input_links`.
     pub input_links: InputLinks,
+    /// `[execution] input_trees`.
+    pub input_trees: InputTrees,
+    /// Optional override for `[worker] tree_cache_min_files`.
+    pub tree_cache_min_files: Option<NonZeroUsize>,
     /// Whether the workers enforce per-action limits (`[limits.cgroup]`).
     pub limits: ActionLimits,
     /// The `[[fleets]]` the deployment declares.
@@ -154,6 +159,8 @@ impl Variant {
             sandbox,
             permit_network: PermitNetwork::Denied,
             input_links: InputLinks::Break,
+            input_trees: InputTrees::Bind,
+            tree_cache_min_files: None,
             limits: ActionLimits::Absent,
             fleets: FleetLayout::Single,
             soft_memory: SoftMemory::Off,
@@ -184,6 +191,8 @@ gang_types::string_enum! {
         Poison = "poison",
         /// Runs after [`Probe::Poison`] and records whether the shared input was modified.
         Victim = "victim",
+        /// Tries to chmod and write inside a read-only bound input subtree and reports `EROFS`.
+        BoundTreePoison = "bound_tree_poison",
         /// Reads an input of an external repository from beside its working directory, directly
         /// and through a relative symlink, and records the input's link count.
         InputRoot = "input_root",

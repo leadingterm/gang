@@ -153,6 +153,7 @@ pub fn admit_action(
         &request.command_digest,
         now.wall.as_unix_millis() / 1000,
         &actions.cold_start,
+        validated.floors,
     );
 
     let fit = fit_reservation(

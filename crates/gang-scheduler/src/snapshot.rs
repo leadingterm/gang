@@ -61,7 +61,7 @@ pub fn fill_snapshot(
             reserved: Some(worker.ledger.reserved()),
             cache: worker.cache_stats,
             draining: worker.drain.is_draining(),
-            paused: worker.drain.is_paused(),
+            paused: worker.drain.is_paused() || worker.has_disk_hold(),
             last_seen: worker.last_seen.wall,
         });
     }

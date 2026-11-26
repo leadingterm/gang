@@ -415,6 +415,10 @@ impl ConfigTemplate {
                 gang_config::WholeKib::from_units(PLACEMENT_SMALL_MEMORY.as_u64() / 1024);
         }
         document.execution.input_links = variant.input_links;
+        document.execution.input_trees = variant.input_trees;
+        if let Some(min_files) = variant.tree_cache_min_files {
+            document.worker.tree_cache_min_files = min_files;
+        }
         Self::project_limits(document, variant, worker_launcher)?;
         if variant.soft_memory == SoftMemory::Enforced {
             document.actions.memory.enforcement = gang_config::MemoryEnforcement::Soft;

@@ -1,8 +1,8 @@
 //! Behaviour of the probe report parser: keys, values, blank lines, and malformed text.
 
 use gang_e2e::{
-    DiskNeighbourReport, E2eError, InputRootReport, IsolationReport, Namespaces, PoisonReport,
-    ProbeReport, VictimReport,
+    BoundTreeReport, DiskNeighbourReport, E2eError, InputRootReport, IsolationReport, Namespaces,
+    PoisonReport, ProbeReport, VictimReport,
 };
 
 fn parse_error_detail(error: &E2eError) -> Option<String> {
@@ -245,6 +245,29 @@ fn the_victim_report_names_the_missing_key() {
 
     let detail = parse_error_detail(&error).expect("a parse error on the probe report");
     assert_eq!(detail, "missing key `poisoned`");
+}
+
+#[test]
+fn the_bound_tree_report_round_trips_and_validates_keys() -> gang_e2e::Result<()> {
+    let text = "chmod_erofs=yes\nwrite_erofs=yes\nintact=yes\n";
+    let report = BoundTreeReport::try_from(&parsed(text)?).expect("valid bound-tree report");
+    assert_eq!(
+        report,
+        BoundTreeReport {
+            chmod_erofs: true,
+            write_erofs: true,
+            intact: true,
+        }
+    );
+    assert_eq!(report.to_string(), text);
+
+    let missing = BoundTreeReport::try_from(&parsed("chmod_erofs=yes\nintact=yes\n")?)
+        .expect_err("write_erofs is missing");
+    assert_eq!(
+        parse_error_detail(&missing).as_deref(),
+        Some("missing key `write_erofs`")
+    );
+    Ok(())
 }
 
 #[test]

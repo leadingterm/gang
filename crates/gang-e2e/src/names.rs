@@ -183,6 +183,9 @@ pub mod integrity {
     /// With input links kept, a later action does see the modification.
     pub const KEEP_CONTROL: &str =
         "control: with input_links = keep a modified input reaches the later action";
+    /// A read-only bound input subtree rejects chmod and writes with `EROFS`.
+    pub const BOUND_TREE_READ_ONLY: &str =
+        "a read-only bound input tree rejects chmod and writes with EROFS";
 }
 
 /// Names of the checks of the input root scenario.

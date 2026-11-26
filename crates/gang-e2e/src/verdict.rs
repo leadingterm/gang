@@ -16,7 +16,9 @@ use crate::check::Check;
 use crate::host::Host;
 use crate::mirror::follow;
 use crate::names;
-use crate::report::{InputRootReport, IsolationReport, Namespaces, PoisonReport, VictimReport};
+use crate::report::{
+    BoundTreeReport, InputRootReport, IsolationReport, Namespaces, PoisonReport, VictimReport,
+};
 use crate::system::{HOLD_CPU_COUNT, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, Sandbox, ScopeFacts};
 
 /// Whether the workers' net and mnt namespaces differ from the host's.
@@ -294,6 +296,28 @@ pub fn poison_attempted(poison: &PoisonReport) -> Check {
     Check::expect(names::integrity::POISON_ATTEMPTED, poison.modified, || {
         "the poisoning action reported `attempt = refused`".to_owned()
     })
+}
+
+/// Whether a read-only bound input subtree rejected `chmod` and writes with `EROFS` and stayed
+/// intact under `bwrap`; skipped under the `noop` sandbox.
+pub fn bound_tree_read_only(sandbox: Sandbox, report: &BoundTreeReport) -> Check {
+    const NAME: &str = names::integrity::BOUND_TREE_READ_ONLY;
+    match sandbox {
+        Sandbox::Noop => Check::skipped(
+            NAME,
+            "the noop sandbox does not mount read-only input trees",
+        ),
+        Sandbox::Bwrap => Check::expect(
+            NAME,
+            report.chmod_erofs && report.write_erofs && report.intact,
+            || {
+                format!(
+                    "expected chmod_erofs=yes, write_erofs=yes, intact=yes; got chmod_erofs={}, write_erofs={}, intact={}",
+                    report.chmod_erofs, report.write_erofs, report.intact
+                )
+            },
+        ),
+    }
 }
 
 /// Lower-case diagnostics of a build the server rejected for its identity: the gRPC

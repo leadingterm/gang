@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use gang_config::InputLinks;
+use gang_config::{InputLinks, InputTrees};
 use parking_lot::Mutex;
 
 use crate::access::{IdentityKnobs, SignIn, identity};
@@ -30,7 +30,7 @@ use crate::fhs_tools::fhs_tools;
 use crate::fleets::{run_cold_pair, run_drained_starts};
 use crate::glibc_toolchain::glibc_toolchain;
 use crate::input_root::input_root;
-use crate::integrity::input_integrity;
+use crate::integrity::{bound_tree_integrity, input_integrity};
 use crate::issuer::TestIssuer;
 use crate::launch_failure::launch_failure;
 use crate::lifecycle::lifecycle;
@@ -789,8 +789,8 @@ fn fhs_tools_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     }
 }
 
-/// The verdicts of the input integrity scenario, on one deployment that breaks input links and
-/// one that keeps them.
+/// The verdicts of the input integrity scenario, on one deployment that breaks input links, one
+/// that keeps them, and one that mounts a read-only bound input subtree under `bwrap`.
 fn input_integrity_checks(ctx: &RunContext<'_>) -> Vec<Check> {
     let mut checks = Vec::new();
     for (label, links) in [("break", InputLinks::Break), ("keep", InputLinks::Keep)] {
@@ -803,6 +803,25 @@ fn input_integrity_checks(ctx: &RunContext<'_>) -> Vec<Check> {
             || {
                 let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
                 input_integrity(&stack, &variant)
+            },
+        ));
+    }
+    if ctx.baseline.sandbox == Sandbox::Noop {
+        checks.push(Check::skipped(
+            names::integrity::BOUND_TREE_READ_ONLY,
+            "the noop sandbox does not mount read-only input trees",
+        ));
+    } else {
+        let variant = Variant {
+            input_trees: InputTrees::Bind,
+            tree_cache_min_files: NonZeroUsize::new(2),
+            ..ctx.baseline
+        };
+        checks.extend(attempt(
+            format_args!("{} bound-tree", Scenario::InputIntegrity),
+            || {
+                let stack = Stack::create(ctx.inputs, &variant, Transport::Tls, ctx.issuer)?;
+                bound_tree_integrity(&stack, &variant)
             },
         ));
     }

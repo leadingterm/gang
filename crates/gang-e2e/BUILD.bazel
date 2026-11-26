@@ -86,6 +86,8 @@ workspace_rust_library(
         "//crates/gang-postgres:gang_postgres",
         "//crates/gang-server:gang_server",
         "//crates/gang-sqlite:gang_sqlite",
+        "//crates/gang-engine:gang_engine",
+        "//crates/gang-scheduler:gang_scheduler",
     ],
     test_data = glob(
         [

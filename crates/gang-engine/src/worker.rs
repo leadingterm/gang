@@ -604,6 +604,7 @@ where
     let mut single_use_claimed = false;
     let single_use = matches!(runtime.spec.lifetime, WorkerLifetime::SingleUse);
     let mut fatal_session_error: Option<SessionError> = None;
+    let mut session_finished = false;
 
     loop {
         if single_use && single_use_claimed && attempt_tasks.is_empty() {
@@ -620,6 +621,7 @@ where
                 break;
             }
             joined = &mut session_task.0 => {
+                session_finished = true;
                 match joined {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
@@ -739,11 +741,13 @@ where
     }
 
     drain_attempts(&mut attempt_tasks).await;
-    session_stop.notify_one();
-    if let Ok(Err(err)) = (&mut session_task.0).await
-        && fatal_session_error.is_none()
-    {
-        fatal_session_error = Some(err);
+    if !session_finished {
+        session_stop.notify_one();
+        if let Ok(Err(err)) = (&mut session_task.0).await
+            && fatal_session_error.is_none()
+        {
+            fatal_session_error = Some(err);
+        }
     }
     sampler_stop.notify_one();
     let _ = (&mut sampler_task.0).await;

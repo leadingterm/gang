@@ -63,14 +63,11 @@ aws-sdk-dynamodb = { workspace = true }
 futures = { workspace = true }
 gang-aws-sdk = { workspace = true }
 gang-dynamodb = { workspace = true, features = ["test-support"] }
-gang-nativelink = { workspace = true, features = ["test-support"] }
+gang-engine = { workspace = true }
 gang-postgres = { workspace = true }
+gang-scheduler = { workspace = true }
 gang-server = { workspace = true }
 gang-sqlite = { workspace = true }
-nativelink-proto = { workspace = true }
-nativelink-scheduler = { workspace = true }
-nativelink-util = { workspace = true }
-nativelink-worker = { workspace = true }
 tonic = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 http-body-util = { workspace = true }

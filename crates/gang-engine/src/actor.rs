@@ -1213,12 +1213,35 @@ impl<C: Clock> ControllerActor<C> {
             meta.and_then(|m| m.inline.as_ref()),
             self.config.assign_inline_max,
         );
-        let platform = meta.map_or_else(HashMap::new, |m| {
+        let mut platform: HashMap<String, String> = meta.map_or_else(HashMap::new, |m| {
             m.platform
                 .iter()
+                .filter(|(k, v)| {
+                    !(k.as_str() == gang_types::property::NETWORK
+                        && (v.is_empty()
+                            || v.as_str() == gang_types::NetworkRequest::NotRequested.as_str()))
+                })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         });
+        if reservation.memory.get() > 0 {
+            platform.insert(
+                gang_types::property::MEMORY_KB.to_owned(),
+                reservation.memory.get().div_ceil(1024).to_string(),
+            );
+        }
+        if reservation.disk.get() > 0 {
+            platform.insert(
+                gang_types::property::DISK_KB.to_owned(),
+                reservation.disk.get().div_ceil(1024).to_string(),
+            );
+        }
+        if reservation.cpu_millicores > 0 {
+            platform.insert(
+                gang_types::property::CPU_MILLICORES.to_owned(),
+                reservation.cpu_millicores.to_string(),
+            );
+        }
         let timeout = meta.and_then(|m| m.timeout).map(duration_to_proto);
         Some(proto::Assign {
             attempt: attempt_id.to_string(),

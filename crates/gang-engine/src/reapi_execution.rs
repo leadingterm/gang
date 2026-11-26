@@ -44,6 +44,7 @@ use tonic::{Request, Response, Status};
 
 use crate::actor::{ExecuteSpec, InlineActionPayload, OperationWatch, OperationWatchState};
 use crate::controller::{ControllerExecuteError, ControllerHandle};
+use crate::handoff::HandOff;
 use crate::observer::{ENDUSER_ID, origin as build_origin};
 use crate::reapi_cas::{map_port_error, parse_proto_digest, validate_sha256_function};
 
@@ -172,6 +173,7 @@ pub struct ExecutionService<C, A> {
     content: Arc<C>,
     actions: Arc<A>,
     clock: Arc<dyn Clock>,
+    handoff: Option<HandOff>,
     config: ExecutionServiceConfig,
     registry: Arc<OperationRegistry>,
 }
@@ -200,6 +202,7 @@ impl<C: ContentStore, A: ActionStore> ExecutionService<C, A> {
             content,
             actions,
             clock: Arc::new(SystemClock::new()),
+            handoff: None,
             config,
             registry: Arc::new(OperationRegistry::new(DEFAULT_MAX_TRACKED_OPERATIONS)),
         }
@@ -220,6 +223,14 @@ impl<C: ContentStore, A: ActionStore> ExecutionService<C, A> {
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Attaches a controller [`HandOff`] coordinator so queued execution streams terminate with
+    /// retryable `UNAVAILABLE` once leadership handoff begins.
+    #[must_use]
+    pub(crate) fn with_handoff(mut self, handoff: HandOff) -> Self {
+        self.handoff = Some(handoff);
         self
     }
 
@@ -386,12 +397,12 @@ fn parse_action_timeout(
 fn extract_platform_properties(action: &Action, command: &Command) -> BTreeMap<String, String> {
     let mut properties = BTreeMap::new();
     #[allow(deprecated)]
-    if let Some(platform) = &command.platform {
-        for prop in &platform.properties {
-            properties.insert(prop.name.clone(), prop.value.clone());
-        }
-    }
-    if let Some(platform) = &action.platform {
+    let source = action
+        .platform
+        .as_ref()
+        .filter(|platform| !platform.properties.is_empty())
+        .or(command.platform.as_ref());
+    if let Some(platform) = source {
         for prop in &platform.properties {
             properties.insert(prop.name.clone(), prop.value.clone());
         }
@@ -622,6 +633,7 @@ fn resolve_watch_state(
 struct WatchStreamState {
     watch: OperationWatch,
     clock: Arc<dyn Clock>,
+    handoff: Option<HandOff>,
     registry: Arc<OperationRegistry>,
     action_digest: Option<Digest>,
     keepalive_interval: Duration,
@@ -630,9 +642,18 @@ struct WatchStreamState {
     finished: bool,
 }
 
+fn handoff_unavailable() -> Status {
+    Status::unavailable("the controller is handing off; submit the action again")
+}
+
+fn should_release_on_handoff(handoff: Option<&HandOff>, update: &OperationUpdate) -> bool {
+    handoff.is_some_and(HandOff::is_begun) && matches!(update, OperationUpdate::Queued)
+}
+
 fn operation_stream(
     mut watch: OperationWatch,
     clock: Arc<dyn Clock>,
+    handoff: Option<HandOff>,
     registry: Arc<OperationRegistry>,
     keepalive_interval: NonZeroDuration,
 ) -> BoxStream<'static, Result<Operation, Status>> {
@@ -640,6 +661,7 @@ fn operation_stream(
     let state = WatchStreamState {
         watch,
         clock,
+        handoff,
         registry,
         action_digest,
         keepalive_interval: keepalive_interval.get(),
@@ -654,34 +676,77 @@ fn operation_stream(
         }
         if !state.sent_initial {
             state.sent_initial = true;
+            if should_release_on_handoff(state.handoff.as_ref(), &state.last_state.update) {
+                state.finished = true;
+                return Some((Err(handoff_unavailable()), state));
+            }
             state.finished = state.last_state.is_terminal();
             let item = build_operation(&state.last_state, state.action_digest);
             return Some((item, state));
         }
 
-        tokio::select! {
-            changed = state.watch.changed() => {
-                if let Ok(next_state) = changed {
-                    state.registry.record_terminal(&next_state);
-                    state.finished = next_state.is_terminal();
-                    state.last_state = next_state;
-                    let item = build_operation(&state.last_state, state.action_digest);
-                    Some((item, state))
-                } else {
+        loop {
+            if should_release_on_handoff(state.handoff.as_ref(), &state.last_state.update) {
+                let current = state.watch.current();
+                if matches!(current.update, OperationUpdate::Queued) {
+                    state.finished = true;
+                    return Some((Err(handoff_unavailable()), state));
+                }
+                state.registry.record_terminal(&current);
+                state.finished = current.is_terminal();
+                state.last_state = current;
+                let item = build_operation(&state.last_state, state.action_digest);
+                return Some((item, state));
+            }
+
+            let wait_handoff = state.handoff.as_ref().is_some_and(|h| !h.is_begun());
+            tokio::select! {
+                biased;
+                () = async {
+                    if let Some(handoff) = &state.handoff {
+                        handoff.begun().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if wait_handoff => {
+                    let current = state.watch.current();
+                    if matches!(current.update, OperationUpdate::Queued) {
+                        state.finished = true;
+                        return Some((Err(handoff_unavailable()), state));
+                    }
+                    if current != state.last_state {
+                        state.registry.record_terminal(&current);
+                        state.finished = current.is_terminal();
+                        state.last_state = current;
+                        let item = build_operation(&state.last_state, state.action_digest);
+                        return Some((item, state));
+                    }
+                }
+                changed = state.watch.changed() => {
+                    if let Ok(next_state) = changed {
+                        if should_release_on_handoff(state.handoff.as_ref(), &next_state.update) {
+                            state.finished = true;
+                            return Some((Err(handoff_unavailable()), state));
+                        }
+                        state.registry.record_terminal(&next_state);
+                        state.finished = next_state.is_terminal();
+                        state.last_state = next_state;
+                        let item = build_operation(&state.last_state, state.action_digest);
+                        return Some((item, state));
+                    }
                     state.finished = true;
                     let current = state.watch.current();
                     if current.is_terminal() && current != state.last_state {
                         state.registry.record_terminal(&current);
                         let item = build_operation(&current, state.action_digest);
-                        Some((item, state))
-                    } else {
-                        Some((Err(Status::unavailable("controller actor closed")), state))
+                        return Some((item, state));
                     }
+                    return Some((Err(Status::unavailable("controller actor closed")), state));
                 }
-            }
-            () = state.clock.sleep(state.keepalive_interval) => {
-                let item = build_operation(&state.last_state, state.action_digest);
-                Some((item, state))
+                () = state.clock.sleep(state.keepalive_interval) => {
+                    let item = build_operation(&state.last_state, state.action_digest);
+                    return Some((item, state));
+                }
             }
         }
     }))
@@ -775,6 +840,7 @@ impl<C: ContentStore, A: ActionStore> Execution for ExecutionService<C, A> {
         let stream = operation_stream(
             watch,
             Arc::clone(&self.clock),
+            self.handoff.clone(),
             Arc::clone(&self.registry),
             self.config.keepalive_interval,
         );
@@ -799,6 +865,7 @@ impl<C: ContentStore, A: ActionStore> Execution for ExecutionService<C, A> {
         let stream = operation_stream(
             watch,
             Arc::clone(&self.clock),
+            self.handoff.clone(),
             Arc::clone(&self.registry),
             self.config.keepalive_interval,
         );

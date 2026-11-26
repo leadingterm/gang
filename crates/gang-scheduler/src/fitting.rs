@@ -198,8 +198,8 @@ pub fn validate_properties<'a>(
 }
 
 /// Resolves the learned reservation from `sketch` using the `target+mnemonic → target → mnemonic →
-/// command` fallback chain, or falls back to `cold_start` when no sketch entry exists (`§5.3`
-/// step 4).
+/// command` fallback chain, or falls back to `cold_start` for dimensions left untagged in `floors`
+/// when no sketch entry exists (`§5.3` step 4).
 #[must_use]
 pub fn lookup_learned_or_cold_start(
     sketch: &mut ResourceSketch,
@@ -208,6 +208,7 @@ pub fn lookup_learned_or_cold_start(
     command_digest: &str,
     now_s: u64,
     cold_start: &ColdStartTuning,
+    floors: ClientFloors,
 ) -> ActionResources {
     let target = target.filter(|s| !s.is_empty());
     let mnemonic = mnemonic.filter(|s| !s.is_empty());
@@ -242,9 +243,21 @@ pub fn lookup_learned_or_cold_start(
 
     if cold_start.enabled {
         ActionResources {
-            cpu_millicores: u64::from(cold_start.cpu_millicores.get()),
-            memory: Bytes::kib(cold_start.memory.as_units()),
-            disk: Bytes::kib(cold_start.disk.as_units()),
+            cpu_millicores: if floors.cpu_millicores.is_some() {
+                0
+            } else {
+                u64::from(cold_start.cpu_millicores.get())
+            },
+            memory: if floors.memory_kb.is_some() {
+                Bytes::new(0)
+            } else {
+                Bytes::kib(cold_start.memory.as_units())
+            },
+            disk: if floors.disk_kb.is_some() {
+                Bytes::new(0)
+            } else {
+                Bytes::kib(cold_start.disk.as_units())
+            },
         }
     } else {
         ActionResources::default()
@@ -603,7 +616,7 @@ mod tests {
         let mut sketch = test_sketch();
         let cold = ColdStartTuning::default();
 
-        // Cold start when nothing exists.
+        // Cold start when nothing exists and client left dimensions untagged.
         let cs = lookup_learned_or_cold_start(
             &mut sketch,
             Some("//pkg:a"),
@@ -611,6 +624,7 @@ mod tests {
             "cmd1",
             100,
             &cold,
+            ClientFloors::default(),
         );
         assert_eq!(cs.cpu_millicores, 250);
         assert_eq!(cs.memory, Bytes::gib(4));
@@ -658,6 +672,7 @@ mod tests {
             "cmd1",
             11,
             &cold,
+            ClientFloors::default(),
         );
         assert_eq!(by_target_mnemonic.memory, Bytes::kib(480_000)); // 400_000 * 1.2
 
@@ -668,6 +683,7 @@ mod tests {
             "cmd1",
             11,
             &cold,
+            ClientFloors::default(),
         );
         assert_eq!(by_target_only.memory, Bytes::kib(360_000));
 
@@ -678,6 +694,7 @@ mod tests {
             "cmd1",
             11,
             &cold,
+            ClientFloors::default(),
         );
         assert_eq!(by_mnemonic_only.memory, Bytes::kib(240_000));
 
@@ -688,6 +705,7 @@ mod tests {
             "cmd1",
             11,
             &cold,
+            ClientFloors::default(),
         );
         assert_eq!(by_command_only.memory, Bytes::kib(120_000));
     }
@@ -787,6 +805,28 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn cold_start_skips_explicitly_tagged_client_dimensions() {
+        let mut sketch = test_sketch();
+        let cold = ColdStartTuning::default();
+        let tagged = lookup_learned_or_cold_start(
+            &mut sketch,
+            Some("//pkg:a"),
+            Some("CppCompile"),
+            "cmd1",
+            100,
+            &cold,
+            ClientFloors {
+                cpu_millicores: None,
+                memory_kb: Some(252),
+                disk_kb: None,
+            },
+        );
+        assert_eq!(tagged.cpu_millicores, 250);
+        assert_eq!(tagged.memory, Bytes::new(0));
+        assert_eq!(tagged.disk, Bytes::gib(4));
     }
 
     #[test]

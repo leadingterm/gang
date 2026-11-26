@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use gang_clock::Timestamp;
 use gang_e2e::verdict;
 use gang_e2e::{
-    BuildOutcome, Check, HOLD_CPU_COUNT, Host, InputLinks, InputRootReport, IsolationReport,
-    LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, Namespaces, Outcome, PoisonReport, Sandbox,
-    ScopeFacts, VictimReport, names,
+    BoundTreeReport, BuildOutcome, Check, HOLD_CPU_COUNT, Host, InputLinks, InputRootReport,
+    IsolationReport, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS, Namespaces, Outcome, PoisonReport,
+    Sandbox, ScopeFacts, VictimReport, names,
 };
 use gang_types::{FleetName, InstanceId, WorkerId};
 use gang_wire::{Event, EventChange, name};
@@ -118,6 +118,42 @@ fn noop_namespaces_are_skipped() {
     assert_eq!(checks.len(), 1);
     assert_eq!(checks[0].name, names::isolation::NET_AND_MNT_NAMESPACES);
     assert!(checks[0].is_skipped());
+}
+
+#[test]
+fn bound_tree_read_only_verdicts_cover_bwrap_and_noop() {
+    let protected = BoundTreeReport {
+        chmod_erofs: true,
+        write_erofs: true,
+        intact: true,
+    };
+    let passed = verdict::bound_tree_read_only(Sandbox::Bwrap, &protected);
+    assert_eq!(passed.name, names::integrity::BOUND_TREE_READ_ONLY);
+    assert!(passed.is_passed());
+
+    let skipped = verdict::bound_tree_read_only(Sandbox::Noop, &protected);
+    assert_eq!(skipped.name, names::integrity::BOUND_TREE_READ_ONLY);
+    assert!(skipped.is_skipped());
+
+    for bad in [
+        BoundTreeReport {
+            chmod_erofs: false,
+            write_erofs: true,
+            intact: true,
+        },
+        BoundTreeReport {
+            chmod_erofs: true,
+            write_erofs: false,
+            intact: true,
+        },
+        BoundTreeReport {
+            chmod_erofs: true,
+            write_erofs: true,
+            intact: false,
+        },
+    ] {
+        assert!(verdict::bound_tree_read_only(Sandbox::Bwrap, &bad).is_failure());
+    }
 }
 
 #[test]

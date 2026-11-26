@@ -180,7 +180,7 @@ pub use fake_s3::FakeS3;
 pub use fhs_tools::fhs_tools;
 pub use fleets::{run_cold_pair, run_drained_starts};
 pub use gang_cli::GangCli;
-pub use gang_config::InputLinks;
+pub use gang_config::{InputLinks, InputTrees};
 pub use glibc_toolchain::glibc_toolchain;
 pub use h2_frames::H2Channel;
 pub use hold::{SIGNAL_COMMAND, Signal, Signalled};
@@ -189,7 +189,7 @@ pub use identity::{
     Admission, Channel, ChannelEvent, Credentials, Identity, Issuance, Presenting, Reply,
 };
 pub use input_root::input_root;
-pub use integrity::input_integrity;
+pub use integrity::{bound_tree_integrity, input_integrity};
 pub use issuer::{
     AUDIENCE, AuthorizationRecord, CONSENT_PROMPT, DASHBOARD_CLIENT_ID, DASHBOARD_CLIENT_SECRET,
     OFFLINE_ACCESS, ORGANIZATION, ORGANIZATION_CLAIM, RefreshOutcome, RefreshRecord, SubjectPolicy,
@@ -213,8 +213,8 @@ pub use rate_scaling::{
 };
 pub use reaper::reaped;
 pub use report::{
-    DiskNeighbourReport, InputRootReport, IsolationReport, Namespaces, PoisonReport, ProbeReport,
-    VictimReport,
+    BoundTreeReport, DiskNeighbourReport, InputRootReport, IsolationReport, Namespaces,
+    PoisonReport, ProbeReport, VictimReport,
 };
 pub use restart::restart;
 pub use revocation::revocation;

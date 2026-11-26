@@ -12,10 +12,10 @@ use std::time::Duration;
 
 use gang_clock::Timestamp;
 use gang_e2e::{
-    AUDIENCE, Admission, AttemptRecord, BuildOutcome, Channel, ChannelEvent, Control, Credentials,
-    DiskNeighbourReport, E2eError, EventStream, FleetLayout, HOLD_CPU_COUNT, Host, Identity,
-    InputLinks, IsolationReport, Issuance, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS,
-    NOOP_FLEET, Namespaces, ORGANIZATION, PermitNetwork, PoisonReport, Presenting,
+    AUDIENCE, Admission, AttemptRecord, BoundTreeReport, BuildOutcome, Channel, ChannelEvent,
+    Control, Credentials, DiskNeighbourReport, E2eError, EventStream, FleetLayout, HOLD_CPU_COUNT,
+    Host, Identity, InputLinks, IsolationReport, Issuance, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS,
+    LIMIT_MAX_PIDS, NOOP_FLEET, Namespaces, ORGANIZATION, PermitNetwork, PoisonReport, Presenting,
     PressureObservation, Probe, ProbeReport, Reply, Result, Run, SMALL_FLEET, Sandbox, ScopeFacts,
     SessionCookie, Settings, Signalled, System, TokenSpec, Variant, VictimReport,
 };
@@ -843,6 +843,17 @@ impl Simulation {
                 }
                 .to_string(),
             ),
+            Probe::BoundTreePoison => {
+                let protected = self.behaviour.integrity != Integrity::Poisoned;
+                Some(
+                    BoundTreeReport {
+                        chmod_erofs: protected,
+                        write_erofs: protected,
+                        intact: protected,
+                    }
+                    .to_string(),
+                )
+            }
             _ => Some("ran=yes\n".to_owned()),
         }
     }

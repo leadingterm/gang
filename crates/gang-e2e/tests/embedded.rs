@@ -13,15 +13,32 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, Response, StatusCode};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
-use gang_nativelink::{NativeLink, NativeLinkConfig};
-use gang_spi::{
-    Accepted, Admitted, ApiRequestBody, ApiResponseBody, ApiService, Authenticated, ClientTls,
-    ControllerConnections, ControllerReady, ControllerSpec, GateDecision, Listening,
-    ObservationSink, Peer, PortError, Rejection, RenderedStoreSpec, RequestGate, RequestScope,
-    SchedulerPort, SchedulerSnapshot, StoreAccess, StoreKind, WorkerSpec, WorkerState, WorkerTls,
-    full_body,
+use gang_engine::{Engine, EngineConfig};
+use gang_reapi::build::bazel::remote::execution::v2::action_cache_client::ActionCacheClient;
+use gang_reapi::build::bazel::remote::execution::v2::capabilities_client::CapabilitiesClient;
+use gang_reapi::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
+use gang_reapi::build::bazel::remote::execution::v2::execution_client::ExecutionClient;
+use gang_reapi::build::bazel::remote::execution::v2::{
+    Action, ActionResult, BatchUpdateBlobsRequest, Command, Digest, Directory, ExecuteRequest,
+    ExecuteResponse, ExecutedActionMetadata, ExecutionPolicy, FileNode, FindMissingBlobsRequest,
+    GetActionResultRequest, GetCapabilitiesRequest, Platform, RequestMetadata, ServerCapabilities,
+    ToolDetails, batch_update_blobs_request, command, platform,
 };
-use gang_testkit::{ChildTest, ExtendedKeyUsagePurpose, TestAuthority, TestResult};
+#[cfg(unix)]
+use gang_reapi::build::bazel::remote::execution::v2::{BatchReadBlobsRequest, Tree};
+use gang_reapi::google::longrunning::Operation;
+use gang_reapi::google::longrunning::operation::Result as OperationResult;
+use gang_spi::{
+    Accepted, ActionStore, Admitted, ApiRequestBody, ApiResponseBody, ApiService, Authenticated,
+    BlobStream, ByteRange, ClientTls, ContentStore, ControllerConnections, ControllerReady,
+    ControllerSpec, ControllerStores, EngineStore, GateDecision, Listening, ObservationSink, Peer,
+    PortError, Rejection, RequestGate, RequestScope, SchedulerPort, SchedulerSnapshot, StoreKind,
+    WorkerSpec, WorkerState, WorkerStores, WorkerTls, full_body,
+};
+use gang_testkit::{
+    ChildTest, ExtendedKeyUsagePurpose, MemoryActionStore, MemoryContentStore, TestAuthority,
+    TestResult,
+};
 use gang_tls::{
     AcceptorSettings, Alpn, CertificateRevoked, ClientAuth, IncomingSettings, RevocationSet,
     TlsAcceptor,
@@ -32,31 +49,11 @@ use gang_types::{
 };
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use nativelink_proto::build::bazel::remote::execution::v2::action_cache_client::ActionCacheClient;
-use nativelink_proto::build::bazel::remote::execution::v2::capabilities_client::CapabilitiesClient;
-use nativelink_proto::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
-use nativelink_proto::build::bazel::remote::execution::v2::execution_client::ExecutionClient;
-use nativelink_proto::build::bazel::remote::execution::v2::{
-    Action, ActionResult, BatchUpdateBlobsRequest, Command, Digest, Directory, ExecuteRequest,
-    ExecuteResponse, FileNode, FindMissingBlobsRequest, GetActionResultRequest,
-    GetCapabilitiesRequest, Platform, ServerCapabilities, batch_update_blobs_request, command,
-    platform,
-};
-#[cfg(unix)]
-use nativelink_proto::build::bazel::remote::execution::v2::{BatchReadBlobsRequest, Tree};
-#[cfg(target_os = "linux")]
-use nativelink_proto::build::bazel::remote::execution::v2::{
-    ExecuteOperationMetadata, execution_stage,
-};
-use nativelink_proto::google::longrunning::Operation;
-use nativelink_proto::google::longrunning::operation::Result as OperationResult;
 use parking_lot::Mutex;
 use prost::Message as _;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
-use tokio::io::AsyncReadExt;
-#[cfg(target_os = "linux")]
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -83,6 +80,10 @@ const ENTRYPOINT_HELPER: ChildTest = ChildTest::new("entrypoint_helper");
 const ENTRYPOINT_ENV: &str = "GANG_TEST_ENTRYPOINT";
 /// The address at which an action waits for permission to continue.
 const HOLD_ENV: &str = "GANG_TEST_HOLD";
+/// Reports `addr|tag` when an action starts, for observing dispatch order.
+const REPORT_ENV: &str = "GANG_TEST_REPORT";
+/// Reports the action's current working directory to the given TCP address.
+const WORKDIR_REPORT_ENV: &str = "GANG_TEST_WORKDIR_REPORT";
 /// The address held by both an action's entrypoint and its child.
 const GROUP_HOLD_ENV: &str = "GANG_TEST_GROUP_HOLD";
 /// The address for a helper that leaves its action group after starting a held child.
@@ -126,19 +127,75 @@ const LARGE_VCPUS: u32 = 8;
 /// Memory of the large fleet.
 const LARGE_MEMORY: u64 = 16 * GIB;
 
+/// In-memory [`ContentStore`] reporting live byte usage against [`FAST_CAS_BUDGET`].
+#[derive(Debug, Clone, Default)]
+struct TrackedContentStore(MemoryContentStore);
+
+impl ContentStore for TrackedContentStore {
+    async fn find_missing(
+        &self,
+        digests: &[gang_types::Digest],
+        missing: &mut Vec<gang_types::Digest>,
+    ) -> Result<(), PortError> {
+        self.0.find_missing(digests, missing).await
+    }
+
+    async fn read(
+        &self,
+        digest: gang_types::Digest,
+        range: ByteRange,
+    ) -> Result<Option<BlobStream>, PortError> {
+        self.0.read(digest, range).await
+    }
+
+    async fn write(&self, digest: gang_types::Digest, body: BlobStream) -> Result<(), PortError> {
+        self.0.write(digest, body).await
+    }
+
+    fn usage(&self) -> Option<EngineStore> {
+        Some(self.0.engine_store(FAST_CAS_BUDGET, 0))
+    }
+}
+
+/// In-memory [`ActionStore`] reporting live byte usage against [`FAST_CAS_BUDGET`].
+#[derive(Debug, Clone, Default)]
+struct TrackedActionStore(MemoryActionStore);
+
+impl ActionStore for TrackedActionStore {
+    async fn get(&self, action: gang_types::Digest) -> Result<Option<bytes::Bytes>, PortError> {
+        self.0.get(action).await
+    }
+
+    async fn put(&self, action: gang_types::Digest, result: bytes::Bytes) -> Result<(), PortError> {
+        self.0.put(action, result).await
+    }
+
+    fn usage(&self) -> Option<EngineStore> {
+        Some(self.0.engine_store(FAST_CAS_BUDGET, 0))
+    }
+}
+
+/// Fresh in-memory controller stores with live usage reporting.
+fn memory_stores() -> ControllerStores<TrackedContentStore, TrackedActionStore> {
+    ControllerStores {
+        content: Arc::new(TrackedContentStore::default()),
+        actions: Arc::new(TrackedActionStore::default()),
+    }
+}
+
 /// The configuration of a controller whose worker endpoint dials the given loopback port, with
 /// defaults for everything else.
-fn config(worker_port: u16) -> Result<NativeLinkConfig, Box<dyn Error>> {
+fn config(worker_port: u16) -> Result<EngineConfig, Box<dyn Error>> {
     let server = serde_json::from_value(json!({ "transport": "plaintext" }))?;
-    Ok(NativeLinkConfig::for_controller(
+    Ok(EngineConfig::for_controller(
         format!("grpc://127.0.0.1:{worker_port}").parse()?,
         &server,
     ))
 }
 
 /// Builds the scheduler adapter from its configuration.
-fn build_plugin(config: NativeLinkConfig) -> Result<NativeLink, Box<dyn Error>> {
-    Ok(NativeLink::try_new(config)?)
+fn build_plugin(config: EngineConfig) -> Result<Engine, Box<dyn Error>> {
+    Ok(Engine::try_new(config)?)
 }
 
 /// The fleet of the test worker: x86-64 with the size the test worker registers.
@@ -335,7 +392,7 @@ struct ControllerPolicy {
 /// applies `public_gate` and labels its connections with `public_peers`. The readiness receiver
 /// resolves when built; the serving receiver resolves once it polls its public connections.
 fn spawn_controller(
-    plugin: Arc<NativeLink>,
+    plugin: Arc<Engine>,
     policy: ControllerPolicy,
     listeners: (TcpListener, TcpListener),
     public_gate: TestGate,
@@ -355,15 +412,11 @@ fn spawn_controller(
             actions,
             attempt_budget,
         } = policy;
-        let content = RenderedStoreSpec(json!({"memory": {}}));
-        let action = RenderedStoreSpec(json!({"memory": {}}));
         let spec = ControllerSpec {
             actions,
             scaling: Arc::new(gang_config::ScalingConfig::default()),
             control_acquire_timeout: NonZeroDuration::from_secs(1),
             clock: Arc::new(gang_clock::SystemClock::new()),
-            content_store: &content,
-            action_store: &action,
             fleets: &fleets,
             max_workers: 8,
             observations: &observations,
@@ -381,7 +434,8 @@ fn spawn_controller(
             },
             api: TestApi,
         };
-        plugin.run_controller(&spec, connections, ready).await
+        SchedulerPort::run_controller(plugin.as_ref(), &spec, connections, memory_stores(), ready)
+            .await
     });
     (controller, serving_rx, readiness)
 }
@@ -406,15 +460,18 @@ impl WorkerPaths {
     /// Prepare the private layout normally created by the worker host.
     fn prepare(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.work)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(self.work.join(".side_channels"))?;
+        let side_channels = self.work.join(".side_channels");
+        if !side_channels.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&side_channels)?;
+            }
+            #[cfg(not(unix))]
+            std::fs::create_dir(&side_channels)?;
         }
-        #[cfg(not(unix))]
-        std::fs::create_dir(self.work.join(".side_channels"))?;
         std::fs::create_dir_all(&self.fast)
     }
 }
@@ -422,7 +479,7 @@ impl WorkerPaths {
 /// Starts a worker in a task. The task builds its own spec from owned data. The worker runs
 /// `entrypoint` for every action.
 fn spawn_worker(
-    plugin: Arc<NativeLink>,
+    plugin: Arc<Engine>,
     actions: Arc<gang_config::ActionsConfig>,
     instance: InstanceId,
     paths: WorkerPaths,
@@ -431,8 +488,6 @@ fn spawn_worker(
     stop: oneshot::Receiver<()>,
 ) -> JoinHandle<Result<(), PortError>> {
     tokio::spawn(async move {
-        let content = RenderedStoreSpec(json!({"memory": {}}));
-        let action = RenderedStoreSpec(json!({"memory": {}}));
         let spec = WorkerSpec {
             actions,
             memory_pool: None,
@@ -442,16 +497,19 @@ fn spawn_worker(
             work_directory: paths.work,
             fast_cas_directory: paths.fast,
             fast_cas_budget: Bytes::new(FAST_CAS_BUDGET),
-            content_store: content,
-            action_store: action,
-            store_access: StoreAccess::ViaController,
+            trees_directory: None,
             entrypoint,
         };
-        plugin
-            .run_worker(&spec, WorkerTls::Plain, async {
+        SchedulerPort::run_worker(
+            plugin.as_ref(),
+            &spec,
+            WorkerStores::<TrackedContentStore, TrackedActionStore>::ViaController,
+            WorkerTls::Plain,
+            async {
                 let _ = stop.await;
-            })
-            .await
+            },
+        )
+        .await
     })
 }
 
@@ -465,7 +523,7 @@ struct RunningWorker {
 
 /// A serving controller, and the workers started against it. Dropping it stops everything.
 struct Harness {
-    plugin: Arc<NativeLink>,
+    plugin: Arc<Engine>,
     actions: Arc<gang_config::ActionsConfig>,
     controller: JoinHandle<Result<(), PortError>>,
     workers: Vec<RunningWorker>,
@@ -717,15 +775,19 @@ async fn a_worker_whose_certificate_is_revoked_ends_instead_of_reconnecting() ->
         work_directory: paths.work,
         fast_cas_directory: paths.fast,
         fast_cas_budget: Bytes::new(FAST_CAS_BUDGET),
-        content_store: RenderedStoreSpec(json!({"memory": {}})),
-        action_store: RenderedStoreSpec(json!({"memory": {}})),
-        store_access: StoreAccess::Direct,
+        trees_directory: None,
         entrypoint: std::env::current_exe()?,
     };
+    let stores = memory_stores();
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        plugin.run_worker(
+        SchedulerPort::run_worker(
+            &plugin,
             &spec,
+            WorkerStores::Direct {
+                content: stores.content,
+                actions: stores.actions,
+            },
             WorkerTls::Mutual(ClientTls {
                 certificate: &certificate,
                 private_key: &private_key,
@@ -828,8 +890,6 @@ async fn snapshot_before_serving_is_unavailable() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_controller_is_refused() -> TestResult {
     let harness = Harness::start().await?;
-    let content = RenderedStoreSpec(json!({"memory": {}}));
-    let action = RenderedStoreSpec(json!({"memory": {}}));
     let fleets = FleetCatalog::try_new(vec![default_fleet()?])?;
     let (observations, _receiver) = gang_spi::ObservationSink::channel(
         std::num::NonZeroUsize::MIN,
@@ -840,8 +900,6 @@ async fn a_second_controller_is_refused() -> TestResult {
         scaling: Arc::new(gang_config::ScalingConfig::default()),
         control_acquire_timeout: NonZeroDuration::from_secs(1),
         clock: Arc::new(gang_clock::SystemClock::new()),
-        content_store: &content,
-        action_store: &action,
         fleets: &fleets,
         max_workers: 8,
         observations: &observations,
@@ -850,10 +908,14 @@ async fn a_second_controller_is_refused() -> TestResult {
             .attempt_budget(gang_config::ActionsConfig::default().timeout),
     };
     let (ready, readiness) = ControllerReady::channel();
-    let result = harness
-        .plugin
-        .run_controller(&spec, no_connections(), ready)
-        .await;
+    let result = SchedulerPort::run_controller(
+        harness.plugin.as_ref(),
+        &spec,
+        no_connections(),
+        memory_stores(),
+        ready,
+    )
+    .await;
     assert!(matches!(result, Err(PortError::Config(_))));
     assert!(readiness.await.is_err());
     Ok(())
@@ -861,8 +923,6 @@ async fn a_second_controller_is_refused() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_original_controller_drains_and_fresh_adapters_republish() -> TestResult {
-    let content = RenderedStoreSpec(json!({"memory": {}}));
-    let action = RenderedStoreSpec(json!({"memory": {}}));
     let fleets = FleetCatalog::try_new(vec![default_fleet()?])?;
     let (observations, _receiver) = ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
     let spec = ControllerSpec {
@@ -870,8 +930,6 @@ async fn one_original_controller_drains_and_fresh_adapters_republish() -> TestRe
         scaling: Arc::new(gang_config::ScalingConfig::default()),
         control_acquire_timeout: NonZeroDuration::from_secs(1),
         clock: Arc::new(gang_clock::SystemClock::new()),
-        content_store: &content,
-        action_store: &action,
         fleets: &fleets,
         max_workers: 8,
         observations: &observations,
@@ -896,7 +954,8 @@ async fn one_original_controller_drains_and_fresh_adapters_republish() -> TestRe
             api: TestApi,
         };
         let (ready, readiness) = ControllerReady::channel();
-        let run = plugin.run_controller(&spec, connections, ready);
+        let run =
+            SchedulerPort::run_controller(&plugin, &spec, connections, memory_stores(), ready);
         tokio::pin!(run);
         tokio::select! {
             result = &mut run => return Err(format!("controller stopped early: {result:?}").into()),
@@ -926,11 +985,13 @@ async fn one_original_controller_drains_and_fresh_adapters_republish() -> TestRe
 }
 
 async fn assert_controller_reuse_rejected(
-    plugin: &NativeLink,
+    plugin: &Engine,
     spec: &ControllerSpec<'_>,
 ) -> TestResult {
     let (ready, readiness) = ControllerReady::channel();
-    let Err(error) = plugin.run_controller(spec, no_connections(), ready).await else {
+    let Err(error) =
+        SchedulerPort::run_controller(plugin, spec, no_connections(), memory_stores(), ready).await
+    else {
         return Err("an adapter serves exactly one original controller".into());
     };
     assert!(matches!(&error, PortError::Config(_)));
@@ -1052,6 +1113,7 @@ fn entrypoint_helper() -> TestResult {
         let mut stream = std::net::TcpStream::connect(address.to_string_lossy().as_ref())?;
         std::io::copy(&mut stream, &mut std::io::sink())?;
     }
+    run_report_hooks()?;
     if let Some(address) = std::env::var_os(HOLD_ENV) {
         let mut stream = std::net::TcpStream::connect(address.to_string_lossy().as_ref())?;
         std::io::copy(&mut stream, &mut std::io::sink())?;
@@ -1061,6 +1123,27 @@ fn entrypoint_helper() -> TestResult {
     #[cfg(target_os = "linux")]
     if std::env::var_os(MEMORY_INVALID_OUTPUT_ENV).as_deref() == Some(std::ffi::OsStr::new("7")) {
         std::process::exit(7);
+    }
+    Ok(())
+}
+
+/// Optional TCP report hooks used by priority and retry workspace tests.
+fn run_report_hooks() -> TestResult {
+    use std::io::Write as _;
+
+    if let Some(spec) = std::env::var_os(REPORT_ENV) {
+        let spec = spec.to_string_lossy();
+        let (address, tag) = spec
+            .split_once('|')
+            .ok_or("GANG_TEST_REPORT must be `<addr>|<tag>`")?;
+        let mut stream = std::net::TcpStream::connect(address)?;
+        writeln!(stream, "{tag}")?;
+        stream.flush()?;
+    }
+    if let Some(address) = std::env::var_os(WORKDIR_REPORT_ENV) {
+        let mut stream = std::net::TcpStream::connect(address.to_string_lossy().as_ref())?;
+        writeln!(stream, "{}", std::env::current_dir()?.display())?;
+        stream.flush()?;
     }
     Ok(())
 }
@@ -1120,6 +1203,7 @@ fn build_action_with(
     build_action_platforms(Some(platform_properties), platform_properties, env)
 }
 
+#[allow(deprecated)]
 fn build_action_platforms(
     action_properties: Option<&[(&str, &str)]>,
     command_properties: &[(&str, &str)],
@@ -1216,6 +1300,7 @@ fn build_action_platforms(
     })
 }
 
+#[allow(deprecated)]
 #[test]
 fn empty_action_platform_preserves_command_fallback() -> TestResult {
     let fixture = build_action_platforms(Some(&[]), &[("cpu_count", "3")], &[])?;
@@ -1308,32 +1393,44 @@ async fn await_response(
     Err("the operation stream ended before the action was done".into())
 }
 
-/// Reads until the action goes from executing to queued `refusals` times, or errors if it completes first.
+/// Waits until the disk guard pauses the sole worker and holds the second action queued across at
+/// least two keepalive-driven re-dispatch cycles without letting it complete or fail early.
 #[cfg(target_os = "linux")]
-async fn await_refusals(
+async fn await_disk_guard_refusals(
+    harness: &Harness,
     operations: &mut Streaming<Operation>,
-    refusals: usize,
+    keepalive_cycles: u64,
 ) -> Result<(), Box<dyn Error>> {
-    let mut previous = None;
-    let mut observed = 0;
-    while observed < refusals {
-        let operation = operations
-            .message()
-            .await?
-            .ok_or("second action's stream ended before two refusals")?;
-        if operation.done {
-            return Err("second action completed before two disk-guard refusals".into());
+    let mut first_paused_seen = None;
+    loop {
+        let snapshot = read_snapshot(harness).await?;
+        let worker = sole_worker(&snapshot)?;
+        if worker.paused && snapshot.queued.len() == 1 {
+            let start = *first_paused_seen.get_or_insert(worker.last_seen);
+            if worker
+                .last_seen
+                .as_unix_millis()
+                .saturating_sub(start.as_unix_millis())
+                >= keepalive_cycles * 1_000 + 500
+            {
+                return Ok(());
+            }
         }
-        let metadata = operation.metadata.ok_or("operation has no metadata")?;
-        let stage = ExecuteOperationMetadata::decode(metadata.value.as_ref())?.stage;
-        if previous == Some(execution_stage::Value::Executing as i32)
-            && stage == execution_stage::Value::Queued as i32
-        {
-            observed += 1;
+        tokio::select! {
+            frame = operations.message() => {
+                match frame? {
+                    Some(operation) if operation.done => {
+                        return Err("second action completed before repeated disk-guard refusals".into());
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err("second action's stream ended before repeated disk-guard refusals".into());
+                    }
+                }
+            }
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
-        previous = Some(stage);
     }
-    Ok(())
 }
 
 /// Executes the action with the cache lookup skipped, and returns the response once it is done.
@@ -1616,17 +1713,35 @@ async fn stopping_a_worker_ends_every_process_of_a_running_action() -> TestResul
             result => return Err(format!("action process still sent data: {result:?}").into()),
         }
     }
-    let entries = std::fs::read_dir(&paths.work)?.collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(entries.len(), 1, "only the side-channel directory remains");
-    assert_eq!(entries[0].file_name(), ".side_channels");
-    assert_eq!(std::fs::read_dir(entries[0].path())?.count(), 0);
+    assert_work_directory_drained(&paths.work)?;
     Ok(())
 }
 
-/// `NativeLink` excludes its worker's process group when signalling action members.
+/// Asserts that `work` holds no attempt directories and that reserved directories
+/// (`.graveyard`, `.side_channels`) are empty once the worker stops.
+fn assert_work_directory_drained(work: &Path) -> TestResult {
+    for entry in std::fs::read_dir(work)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        assert!(
+            name == ".side_channels" || name == ".graveyard",
+            "unexpected leftover entry in work directory: {}",
+            name.display()
+        );
+        assert_eq!(
+            std::fs::read_dir(entry.path())?.count(),
+            0,
+            "reserved directory {} is not empty after worker stop",
+            name.display()
+        );
+    }
+    Ok(())
+}
+
+/// The native engine excludes its worker's process group when signalling action members.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nativelink_kill_never_reaches_the_workers_process_group() -> TestResult {
+async fn engine_kill_never_reaches_the_workers_process_group() -> TestResult {
     let scratch = tempfile::tempdir()?;
     let paths = WorkerPaths::new(scratch.path(), "worker");
     let mut harness = Harness::start().await?;
@@ -1830,9 +1945,8 @@ async fn an_output_upload_error_is_not_a_successful_action() -> TestResult {
             assert_ne!(status.code, 0, "exit {exit}: upload failure returned OK");
             let message = status.message;
             assert!(
-                message.contains("Error while uploading results")
-                    || message.contains("Could not convert") && message.contains("RelativePath"),
-                "exit {exit}: expected an upload or path conversion error, got {message}"
+                message.contains("invalid symlink target") || message.contains("not valid UTF-8"),
+                "exit {exit}: expected an invalid symlink upload error, got {message}"
             );
             assert!(
                 response.result.as_ref().is_none_or(|result| {
@@ -1859,9 +1973,7 @@ async fn a_disk_guard_refusal_requeues_without_spending_an_attempt() -> TestResu
         let paths = WorkerPaths::new(scratch.path(), "worker");
         std::fs::create_dir_all(&paths.work)?;
         std::fs::create_dir_all(&paths.fast)?;
-        let work_dir = paths.work.to_str().ok_or("worker path is not UTF-8")?;
-        let free_kb = nativelink_worker::running_actions_manager::free_disk_kb(work_dir)
-            .ok_or("could not read free worker disk space")?;
+        let free_kb = gang_os::fs::space(&paths.work)?.available.get() / 1024;
         let reserve_kb = free_kb / 5 * 3;
         assert!(
             reserve_kb > free_kb / 2,
@@ -1927,7 +2039,7 @@ async fn a_disk_guard_refusal_requeues_without_spending_an_attempt() -> TestResu
             })
             .await?
             .into_inner();
-        await_refusals(&mut operations, 2).await?;
+        await_disk_guard_refusals(&harness, &mut operations, 2).await?;
         drop(release_hold);
 
         waiting_for = "the second action to complete after releasing the disk reservation";
@@ -2370,7 +2482,7 @@ impl gang_server::Stack for WorkerDeployment {
 impl gang_server::Deployment for WorkerDeployment {
     type Provisioner = gang_testkit::FakeProvisioner;
     type Cache = gang_testkit::FakeCache;
-    type Scheduler = Arc<NativeLink>;
+    type Scheduler = Arc<Engine>;
     type Listener = WorkerMemoryListener;
     type Plugins = gang_testkit::TestPlugins;
 }
@@ -2501,7 +2613,7 @@ fn worker_memory_listener() -> (WorkerMemoryListener, WorkerMemoryDialer) {
 }
 
 struct WorkerServer {
-    plugin: Arc<NativeLink>,
+    plugin: Arc<Engine>,
     repository: gang_testkit::FakeRepository,
     clock: Arc<gang_clock::TestClock>,
     renew_interval: Duration,
@@ -2627,7 +2739,7 @@ impl Drop for WorkerServer {
     }
 }
 
-use nativelink_proto::com::github::trace_machina::nativelink::remote_execution as worker_wire;
+use gang_reapi::leadingterm::gang::worker::v1 as worker_wire;
 
 struct WorkerTask<T>(JoinHandle<T>);
 
@@ -2675,19 +2787,20 @@ impl WorkerConnection {
 
     async fn request(
         &mut self,
-        registration: worker_wire::ConnectWorkerRequest,
+        registration: worker_wire::Register,
         finish_request: bool,
     ) -> Result<(http::Response<h2::RecvStream>, h2::SendStream<bytes::Bytes>), Box<dyn Error>>
     {
         self.sender.clone().ready().await?;
-        let request = Request::post("http://127.0.0.1:9001/com.github.trace_machina.nativelink.remote_execution.WorkerApi/ConnectWorker")
-            .header("content-type", "application/grpc")
-            .header("te", "trailers")
-            .body(())?;
+        let request =
+            Request::post("http://127.0.0.1:9001/leadingterm.gang.worker.v1.WorkerService/Connect")
+                .header("content-type", "application/grpc")
+                .header("te", "trailers")
+                .body(())?;
         let (response, mut send) = self.sender.send_request(request, false)?;
         send_worker_message(
             &mut send,
-            worker_wire::update_for_scheduler::Update::ConnectWorkerRequest(registration),
+            worker_wire::worker_message::Kind::Register(registration),
         )?;
         if finish_request {
             send.send_data(bytes::Bytes::new(), true)?;
@@ -2705,12 +2818,10 @@ impl WorkerConnection {
 
 fn send_worker_message(
     stream: &mut h2::SendStream<bytes::Bytes>,
-    update: worker_wire::update_for_scheduler::Update,
+    kind: worker_wire::worker_message::Kind,
 ) -> Result<(), Box<dyn Error>> {
     use bytes::BufMut as _;
-    let message = worker_wire::UpdateForScheduler {
-        update: Some(update),
-    };
+    let message = worker_wire::WorkerMessage { kind: Some(kind) };
     let mut frame = bytes::BytesMut::with_capacity(5 + message.encoded_len());
     frame.put_u8(0);
     frame.put_u32(u32::try_from(message.encoded_len())?);
@@ -2720,16 +2831,13 @@ fn send_worker_message(
 }
 
 impl WorkerStream {
-    fn send(
-        &mut self,
-        update: worker_wire::update_for_scheduler::Update,
-    ) -> Result<(), Box<dyn Error>> {
-        send_worker_message(&mut self.send, update)
+    fn send(&mut self, kind: worker_wire::worker_message::Kind) -> Result<(), Box<dyn Error>> {
+        send_worker_message(&mut self.send, kind)
     }
 
     async fn next(
         &mut self,
-    ) -> Result<Option<worker_wire::update_for_worker::Update>, Box<dyn Error>> {
+    ) -> Result<Option<worker_wire::controller_message::Kind>, Box<dyn Error>> {
         use bytes::Buf as _;
         loop {
             if self.buffered.len() >= 5 {
@@ -2741,8 +2849,8 @@ impl WorkerStream {
                     self.buffered.advance(5);
                     let frame = self.buffered.split_to(length);
                     return Ok(Some(
-                        worker_wire::UpdateForWorker::decode(frame.freeze())?
-                            .update
+                        worker_wire::ControllerMessage::decode(frame.freeze())?
+                            .kind
                             .ok_or("empty worker response")?,
                     ));
                 }
@@ -2772,25 +2880,25 @@ impl WorkerStream {
         }
     }
 
-    async fn update(&mut self) -> Result<worker_wire::update_for_worker::Update, Box<dyn Error>> {
+    async fn directive(&mut self) -> Result<worker_wire::controller_message::Kind, Box<dyn Error>> {
         loop {
             match self
                 .next()
                 .await?
                 .ok_or("worker stream ended unexpectedly")?
             {
-                worker_wire::update_for_worker::Update::KeepAlive(()) => {}
-                update => return Ok(update),
+                worker_wire::controller_message::Kind::SetDraining(_) => {}
+                directive => return Ok(directive),
             }
         }
     }
 
     async fn disconnect(mut self) -> TestResult {
         assert!(matches!(
-            self.update().await?,
-            worker_wire::update_for_worker::Update::Disconnect(())
+            self.directive().await?,
+            worker_wire::controller_message::Kind::Rehome(_)
         ));
-        self.send.send_data(bytes::Bytes::new(), true)?;
+        let _ = self.send.send_data(bytes::Bytes::new(), true);
         assert!(self.next().await?.is_none());
         Ok(())
     }
@@ -2799,31 +2907,63 @@ impl WorkerStream {
 fn worker_registration(
     properties: &FleetProperties,
     instance: &str,
-    max: u64,
-) -> Result<worker_wire::ConnectWorkerRequest, Box<dyn Error>> {
-    // Manual workers need the release metadata normally added by NativeLink's worker config.
-    Ok(worker_wire::ConnectWorkerRequest {
-        properties: properties
-            .worker_properties()
-            .chain([(
-                gang_types::property::GANG_VERSION,
-                env!("CARGO_PKG_VERSION"),
-            )])
-            .map(|(name, value)| platform::Property {
-                name: name.into(),
-                value: value.into(),
-            })
-            .collect(),
-        worker_id_prefix: InstanceId::try_new(instance)?.worker_name(),
-        max_inflight_tasks: max,
-        admits_when_idle: true,
-        action_ceilings: HashMap::default(),
+    max: u32,
+) -> Result<worker_wire::Register, Box<dyn Error>> {
+    use gang_types::property;
+
+    let cpu_millicores = properties.capacity(property::CPU_MILLICORES).unwrap_or(0);
+    let memory_bytes = properties
+        .capacity(property::MEMORY_KB)
+        .unwrap_or(0)
+        .saturating_mul(1024);
+    let disk_bytes = properties
+        .capacity(property::DISK_KB)
+        .unwrap_or(0)
+        .saturating_mul(1024);
+    let ceilings = &properties.actions().resources;
+    let ceiling_cpu = ceilings.cpu_count.map_or(cpu_millicores, |count| {
+        u64::from(count.get()).saturating_mul(property::MILLICORES_PER_CORE)
+    });
+    let ceiling_mem = ceilings
+        .memory
+        .map_or(memory_bytes, gang_types::NonZeroBytes::as_u64);
+    let ceiling_disk = ceilings
+        .disk
+        .map_or(disk_bytes, gang_types::NonZeroBytes::as_u64);
+    let wire_properties: HashMap<String, String> = properties
+        .worker_properties()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+    let environment = properties
+        .get(property::ACTION_ENVIRONMENT)
+        .map(|identity| worker_wire::ActionEnvironment {
+            identity: identity.to_owned(),
+        });
+
+    Ok(worker_wire::Register {
+        instance: InstanceId::try_new(instance)?.as_str().to_owned(),
+        fleet: properties.name().to_owned(),
+        gang_version: env!("CARGO_PKG_VERSION").to_owned(),
+        properties: wire_properties,
+        capacity: Some(worker_wire::Resources {
+            cpu_millicores,
+            memory_bytes,
+            disk_bytes,
+        }),
+        ceilings: Some(worker_wire::Resources {
+            cpu_millicores: ceiling_cpu,
+            memory_bytes: ceiling_mem,
+            disk_bytes: ceiling_disk,
+        }),
+        max_inflight: max,
+        single_use: false,
+        environment,
     })
 }
 
 async fn register_worker(
     connection: &mut WorkerConnection,
-    registration: worker_wire::ConnectWorkerRequest,
+    registration: worker_wire::Register,
 ) -> Result<(WorkerStream, String), Box<dyn Error>> {
     let (response, send) = connection.request(registration, false).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -2832,12 +2972,11 @@ async fn register_worker(
         recv: response.into_body(),
         buffered: bytes::BytesMut::new(),
     };
-    let worker_wire::update_for_worker::Update::ConnectionResult(result) = stream.update().await?
+    let worker_wire::controller_message::Kind::Registered(registered) = stream.directive().await?
     else {
-        return Err("first worker response was not ConnectionResult".into());
+        return Err("first worker response was not Registered".into());
     };
-    assert!(result.dispatch_ack);
-    Ok((stream, result.worker_id))
+    Ok((stream, registered.worker_id))
 }
 
 async fn submit_wire_action(
@@ -2861,71 +3000,45 @@ async fn submit_wire_action(
 async fn wire_dispatch(
     stream: &mut WorkerStream,
     digest: &Digest,
-) -> Result<worker_wire::StartExecute, Box<dyn Error>> {
-    let worker_wire::update_for_worker::Update::StartAction(action) = stream.update().await? else {
-        return Err("expected StartAction".into());
+) -> Result<worker_wire::Assign, Box<dyn Error>> {
+    let worker_wire::controller_message::Kind::Assign(assign) = stream.directive().await? else {
+        return Err("expected Assign".into());
     };
-    assert_eq!(
-        action
-            .execute_request
-            .as_ref()
-            .and_then(|request| request.action_digest.as_ref()),
-        Some(digest)
-    );
-    Ok(action)
+    assert_eq!(assign.action_digest.as_ref(), Some(digest));
+    Ok(assign)
 }
 
-fn wire_accept(stream: &mut WorkerStream, operation: &str) -> TestResult {
-    stream.send(worker_wire::update_for_scheduler::Update::ExecuteAccepted(
-        worker_wire::ExecuteAccepted {
-            operation_id: operation.into(),
+fn wire_accept(stream: &mut WorkerStream, attempt: &str) -> TestResult {
+    stream.send(worker_wire::worker_message::Kind::Accept(
+        worker_wire::Accept {
+            attempt: attempt.into(),
         },
     ))
 }
 
-async fn wire_kill_barrier(stream: &mut WorkerStream, operation: &str) -> TestResult {
-    wire_accept(stream, operation)?;
-    let worker_wire::update_for_worker::Update::KillOperationRequest(kill) =
-        stream.update().await?
-    else {
-        return Err("expected KillOperationRequest".into());
-    };
-    assert_eq!(kill.operation_id, operation);
-    Ok(())
-}
-
-fn wire_complete(stream: &mut WorkerStream, action: &worker_wire::StartExecute) -> TestResult {
-    use nativelink_util::action_messages::{
-        ActionResult as NativeActionResult, ActionStage, ExecutionMetadata,
-    };
-
-    let response: ExecuteResponse = ActionStage::Completed(NativeActionResult {
-        exit_code: 0,
-        execution_metadata: ExecutionMetadata {
-            worker: action.worker_id.clone(),
+fn wire_complete(
+    stream: &mut WorkerStream,
+    worker_id: &str,
+    action: &worker_wire::Assign,
+) -> TestResult {
+    stream.send(worker_wire::worker_message::Kind::Executed(
+        worker_wire::Executed {
+            attempt: action.attempt.clone(),
+            exit_code: 0,
             ..Default::default()
         },
-        ..Default::default()
-    })
-    .into();
-    stream.send(worker_wire::update_for_scheduler::Update::ExecuteComplete(
-        worker_wire::ExecuteComplete {
-            operation_id: action.operation_id.clone(),
-        },
     ))?;
-    stream.send(worker_wire::update_for_scheduler::Update::ExecuteResult(
-        worker_wire::ExecuteResult {
-            instance_name: action
-                .execute_request
-                .as_ref()
-                .ok_or("dispatch missing execute request")?
-                .instance_name
-                .clone(),
-            operation_id: action.operation_id.clone(),
-            result: Some(worker_wire::execute_result::Result::ExecuteResponse(
-                response,
-            )),
-            resource_usage: None,
+    stream.send(worker_wire::worker_message::Kind::Completed(
+        worker_wire::Completed {
+            attempt: action.attempt.clone(),
+            outcome: Some(worker_wire::completed::Outcome::Result(ActionResult {
+                exit_code: 0,
+                execution_metadata: Some(ExecutedActionMetadata {
+                    worker: worker_id.to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
         },
     ))
 }
@@ -2970,7 +3083,7 @@ struct HeldWorker {
     stream: Option<WorkerStream>,
     response: Option<Streaming<Operation>>,
     id: String,
-    action: worker_wire::StartExecute,
+    action: worker_wire::Assign,
 }
 
 impl HeldWorker {
@@ -2978,7 +3091,7 @@ impl HeldWorker {
         server: &WorkerServer,
         channel: &Channel,
         instance: &str,
-        max: u64,
+        max: u32,
         action_tag: &str,
         waiting_for: &mut &'static str,
         dispatch_stage: &'static str,
@@ -2993,7 +3106,7 @@ impl HeldWorker {
         let action = build_action_with(&[("ISA", "x86-64")], &[("WIRE_ACTION", action_tag)])?;
         let (digest, response) = submit_wire_action(channel, action).await?;
         let action = wire_dispatch(&mut stream, &digest).await?;
-        wire_accept(&mut stream, &action.operation_id)?;
+        wire_accept(&mut stream, &action.attempt)?;
         Ok(Self {
             connection,
             stream: Some(stream),
@@ -3014,7 +3127,7 @@ impl HeldWorker {
             .stream
             .take()
             .ok_or("worker stream already completed")?;
-        wire_complete(&mut stream, &self.action)?;
+        wire_complete(&mut stream, &self.id, &self.action)?;
         let result = await_response(
             self.response
                 .take()
@@ -3031,7 +3144,6 @@ impl HeldWorker {
 }
 
 struct PressureProbe {
-    operation: String,
     response: Streaming<Operation>,
 }
 
@@ -3048,31 +3160,33 @@ impl PressureProbe {
         let (digest, response) = submit_wire_action(channel, action).await?;
         let stream = worker.stream()?;
         let pressure = wire_dispatch(stream, &digest).await?;
-        let memory = pressure
-            .platform
-            .as_ref()
-            .ok_or("pressure dispatch missing platform")?
-            .properties
-            .iter()
-            .find(|property| property.name == gang_types::property::MEMORY_KB)
-            .ok_or("pressure dispatch missing memory reservation")?
-            .value
-            .parse()?;
-        stream.send(worker_wire::update_for_scheduler::Update::ExecuteDeclined(
-            worker_wire::ExecuteDeclined {
-                operation_id: pressure.operation_id.clone(),
-                reason: worker_wire::execute_declined::Reason::Load as i32,
-                detail: String::new(),
-                needed_kb: memory,
-                free_kb: 0,
+        assert!(
+            pressure
+                .platform
+                .contains_key(gang_types::property::MEMORY_KB),
+            "pressure dispatch missing memory reservation"
+        );
+        stream.send(worker_wire::worker_message::Kind::Decline(
+            worker_wire::Decline {
+                attempt: pressure.attempt.clone(),
+                reason: worker_wire::DeclineReason::DiskShortage as i32,
+                free_bytes: 0,
             },
         ))?;
-        wire_kill_barrier(stream, &pressure.operation_id).await?;
+        loop {
+            let mut snapshot = SchedulerSnapshot::default();
+            server.plugin.snapshot(&mut snapshot).await?;
+            if snapshot
+                .workers
+                .iter()
+                .any(|entry| entry.id.to_string() == worker.id && entry.paused)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         wire_snapshot(server, &worker.id, true, false, 0).await?;
-        Ok(Self {
-            operation: pressure.operation_id,
-            response,
-        })
+        Ok(Self { response })
     }
 
     async fn retryable_handoff(&mut self) -> TestResult {
@@ -3172,31 +3286,36 @@ async fn refuse_worker_reconnect(server: &WorkerServer, worker: &mut HeldWorker)
     Ok(())
 }
 
-async fn observe_worker_keepalives(
-    server: &WorkerServer,
-    worker: &mut HeldWorker,
-    pressure: &PressureProbe,
-) -> TestResult {
+async fn observe_worker_keepalives(server: &WorkerServer, worker: &mut HeldWorker) -> TestResult {
+    use gang_clock::Clock as _;
+
+    let memory_capacity = server
+        .properties
+        .capacity(gang_types::property::MEMORY_KB)
+        .map(|kb| kb.saturating_mul(1024));
     for _ in 0..3 {
         server.clock.advance(Duration::from_secs(1));
         tokio::time::advance(Duration::from_secs(1)).await;
-        let operation = worker.action.operation_id.clone();
+        let expected_seen = server.clock.wall();
         let stream = worker.stream()?;
-        stream.send(worker_wire::update_for_scheduler::Update::KeepAliveRequest(
-            worker_wire::KeepAliveRequest {
-                load: Some(worker_wire::WorkerLoad {
-                    free_memory_kb: server
-                        .properties
-                        .limit(gang_types::property::MEMORY_KB)
-                        .ok_or("missing worker memory")?,
-                }),
-                running_operations: Some(worker_wire::RunningOperations {
-                    operation_ids: vec![operation],
-                }),
-                cache_stats: None,
+        stream.send(worker_wire::worker_message::Kind::KeepAlive(
+            worker_wire::KeepAlive {
+                cache: None,
+                memory_capacity,
             },
         ))?;
-        wire_kill_barrier(stream, &pressure.operation).await?;
+        loop {
+            let mut snapshot = SchedulerSnapshot::default();
+            server.plugin.snapshot(&mut snapshot).await?;
+            if snapshot
+                .workers
+                .iter()
+                .any(|entry| entry.id.to_string() == worker.id && entry.last_seen >= expected_seen)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         wire_snapshot(server, &worker.id, false, true, 1).await?;
     }
     Ok(())
@@ -3235,22 +3354,26 @@ async fn worker_wire_drain(cause: DrainCause) -> TestResult {
         trigger_worker_drain(&mut server, cause).await?;
         waiting_for = "H1 success and disconnect";
         w1.complete().await?;
-        wire_snapshot(&server, &w2.id, true, true, 1).await?;
-        let mut snapshot = SchedulerSnapshot::default();
-        server.plugin.snapshot(&mut snapshot).await?;
-        assert!(
-            !snapshot
+        loop {
+            let mut snapshot = SchedulerSnapshot::default();
+            server.plugin.snapshot(&mut snapshot).await?;
+            if !snapshot
                 .workers
                 .iter()
                 .any(|worker| worker.id.to_string() == w1.id)
-        );
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        wire_snapshot(&server, &w2.id, true, true, 1).await?;
         waiting_for = "declined pressure action retryable handoff";
         pressure.retryable_handoff().await?;
         waiting_for = "same-H2 reconnect refusal and GOAWAY";
         refuse_worker_reconnect(&server, &mut w1).await?;
         wire_snapshot(&server, &w2.id, true, true, 1).await?;
         waiting_for = "three keepalive receipt barriers";
-        observe_worker_keepalives(&server, &mut w2, &pressure).await?;
+        observe_worker_keepalives(&server, &mut w2).await?;
         waiting_for = "H2 success and disconnect";
         w2.complete().await?;
         if matches!(cause, DrainCause::Voluntary) {
@@ -3290,4 +3413,324 @@ async fn voluntary_drain_keeps_admitted_worker_bidi_alive() -> TestResult {
 #[tokio::test(start_paused = true)]
 async fn shutdown_drain_keeps_admitted_worker_bidi_alive() -> TestResult {
     worker_wire_drain(DrainCause::Shutdown).await
+}
+
+/// Higher numeric `ExecutionPolicy.priority` dispatches first (`200 > 100 > 0 > -10`) through
+/// [`Engine`] (§10.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn higher_priority_actions_dispatch_first_through_engine() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let scratch = tempfile::tempdir()?;
+        let single_slot = fleet(DEFAULT_FLEET, Isa::X86_64, 1, WORKER_MEMORY)?;
+        let mut harness = Harness::start_configured(
+            vec![single_slot.clone()],
+            TestGate::allow(),
+            Vec::new(),
+            gang_config::ActionsConfig {
+                cpu_oversubscription: NonZeroU32::MIN,
+                ..Default::default()
+            },
+            gang_config::WorkerConfig::default(),
+        )
+        .await?;
+        let channel = public_channel(harness.public_port).await?;
+
+        let report_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let report_addr = report_listener.local_addr()?.to_string();
+
+        // Submit in scrambled order before any worker connects so all four queue up.
+        let submitted = [0_i32, -10, 200, 100];
+        let mut streams = Vec::with_capacity(submitted.len());
+        for priority in submitted {
+            let report_value = format!("{report_addr}|{priority}");
+            let action = build_action_with(
+                &[("ISA", "x86-64"), ("cpu_count", "1")],
+                &[(REPORT_ENV, &report_value)],
+            )?;
+            upload_blobs(&channel, action.blobs).await?;
+            let mut ops = ExecutionClient::new(channel.clone())
+                .execute(ExecuteRequest {
+                    instance_name: String::new(),
+                    skip_cache_lookup: true,
+                    action_digest: Some(action.digest),
+                    execution_policy: Some(ExecutionPolicy { priority }),
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+            let first = ops
+                .message()
+                .await?
+                .ok_or("operation stream ended before queuing")?;
+            assert!(!first.done);
+            streams.push(ops);
+        }
+
+        let snapshot = read_snapshot(&harness).await?;
+        assert_eq!(snapshot.queued.len(), 4);
+
+        harness.add_worker(WorkerPaths::new(scratch.path(), "worker"), single_slot)?;
+
+        let mut observed = Vec::with_capacity(submitted.len());
+        for _ in 0..submitted.len() {
+            let (stream, _) = report_listener.accept().await?;
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).await?;
+            observed.push(line.trim().parse::<i32>()?);
+        }
+        for stream in streams {
+            let response = await_response(stream).await?;
+            assert_eq!(response.result.ok_or("missing result")?.exit_code, 0);
+        }
+        assert_eq!(observed, vec![200, 100, 0, -10]);
+        Ok::<(), Box<dyn Error>>(())
+    })
+    .await?
+}
+
+/// Retrying the same operation (and re-executing the same action digest) runs in a fresh
+/// `AttemptId` workspace without waiting on cleanup (§10.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_uses_fresh_attempt_workspace_without_waiting_on_cleanup() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let scratch = tempfile::tempdir()?;
+        let paths = WorkerPaths::new(scratch.path(), "worker");
+        let mut harness = Harness::start().await?;
+        harness.add_worker(paths.clone(), default_fleet()?)?;
+        let channel = public_channel(harness.public_port).await?;
+
+        let workdir_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let workdir_addr = workdir_listener.local_addr()?.to_string();
+        let hold_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let hold_addr = hold_listener.local_addr()?.to_string();
+
+        let action = build_action_with(
+            &[("ISA", "x86-64")],
+            &[(WORKDIR_REPORT_ENV, &workdir_addr), (HOLD_ENV, &hold_addr)],
+        )?;
+        upload_blobs(&channel, action.blobs).await?;
+
+        let operations = ExecutionClient::new(channel)
+            .execute(ExecuteRequest {
+                instance_name: String::new(),
+                skip_cache_lookup: true,
+                action_digest: Some(action.digest),
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+
+        let (dir_stream_1, _) = workdir_listener.accept().await?;
+        let mut dir_1 = String::new();
+        BufReader::new(dir_stream_1).read_line(&mut dir_1).await?;
+        let dir_1 = PathBuf::from(dir_1.trim());
+        let (hold_1, _) = hold_listener.accept().await?;
+
+        // Stop the first worker mid-attempt so the scheduler retries the exact same operation.
+        let first_worker = harness.workers.pop().ok_or("missing first worker")?;
+        first_worker
+            .stop
+            .send(())
+            .map_err(|()| "first worker already stopped")?;
+        first_worker.task.await??;
+        drop(hold_1);
+
+        // Start a replacement worker sharing the same work_directory.
+        harness.add_worker(paths.clone(), default_fleet()?)?;
+        let (dir_stream_2, _) = workdir_listener.accept().await?;
+        let mut dir_2 = String::new();
+        BufReader::new(dir_stream_2).read_line(&mut dir_2).await?;
+        let dir_2 = PathBuf::from(dir_2.trim());
+        let (hold_2, _) = hold_listener.accept().await?;
+        drop(hold_2);
+
+        let response = await_response(operations).await?;
+        assert_eq!(response.result.ok_or("missing result")?.exit_code, 0);
+        assert_ne!(
+            dir_1, dir_2,
+            "retry must run in a fresh AttemptId workspace, not reuse the previous attempt dir"
+        );
+        let canonical_work = std::fs::canonicalize(&paths.work)?;
+        assert!(dir_1.starts_with(&canonical_work) || dir_1.starts_with(&paths.work));
+        assert!(dir_2.starts_with(&canonical_work) || dir_2.starts_with(&paths.work));
+        Ok::<(), Box<dyn Error>>(())
+    })
+    .await?
+}
+
+/// Stopping a worker drains its graveyard and returns with an empty `work_directory` (§10.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_a_worker_drains_its_work_directory_and_graveyard() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let scratch = tempfile::tempdir()?;
+        let paths = WorkerPaths::new(scratch.path(), "worker");
+        let mut harness = Harness::start().await?;
+        harness.add_worker(paths.clone(), default_fleet()?)?;
+        let channel = public_channel(harness.public_port).await?;
+
+        // Run a completed action first so its attempt directory is retired into `.graveyard`.
+        let completed = build_action(&[("ISA", "x86-64")])?;
+        upload_blobs(&channel, completed.blobs).await?;
+        let response = run_action(&channel, &completed.digest).await?;
+        assert_eq!(response.result.ok_or("missing result")?.exit_code, 0);
+
+        let worker = harness.workers.pop().ok_or("missing worker")?;
+        worker
+            .stop
+            .send(())
+            .map_err(|()| "worker stopped before shutdown")?;
+        worker.task.await??;
+
+        assert_work_directory_drained(&paths.work)?;
+        Ok::<(), Box<dyn Error>>(())
+    })
+    .await?
+}
+
+/// Executes one action with `RequestMetadata` so the scheduler records learned duration history.
+async fn execute_with_metadata(channel: &Channel, action: TestAction) -> TestResult {
+    upload_blobs(channel, action.blobs).await?;
+    let mut request = tonic::Request::new(ExecuteRequest {
+        instance_name: String::new(),
+        skip_cache_lookup: true,
+        action_digest: Some(action.digest),
+        ..Default::default()
+    });
+    let metadata = RequestMetadata {
+        tool_details: Some(ToolDetails {
+            tool_name: "bazel".into(),
+            tool_version: "7.0.0".into(),
+        }),
+        action_id: "act-learned".into(),
+        tool_invocation_id: "inv-learned".into(),
+        correlated_invocations_id: "corr-learned".into(),
+        action_mnemonic: "Rustc".into(),
+        target_id: "//pkg:learned_target".into(),
+        configuration_id: "cfg-1".into(),
+    };
+    request.metadata_mut().insert_bin(
+        "build.bazel.remote.execution.v2.requestmetadata-bin",
+        tonic::metadata::MetadataValue::from_bytes(&metadata.encode_to_vec()),
+    );
+    let operations = ExecutionClient::new(channel.clone())
+        .execute(request)
+        .await?
+        .into_inner();
+    let response = await_response(operations).await?;
+    assert_eq!(response.result.ok_or("missing result")?.exit_code, 0);
+    Ok(())
+}
+
+/// Wraps a `TcpListener` into an `Accepted` stream that closes when `close` fires.
+fn closable_accepted(
+    listener: TcpListener,
+    close: oneshot::Receiver<()>,
+) -> BoxStream<'static, Accepted> {
+    accepted(listener, Vec::new())
+        .take_until(async move {
+            let _ = close.await;
+        })
+        .boxed()
+}
+
+/// After cooperative drain and `run_controller` exit, `learned_history()` still flushes the
+/// retained observations while `snapshot()` returns `Unavailable` (§10.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn learned_history_flushes_after_controller_drain_and_exit() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let scratch = tempfile::tempdir()?;
+        let public_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let worker_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let public_port = public_listener.local_addr()?.port();
+        let worker_port = worker_listener.local_addr()?.port();
+
+        let plugin = Arc::new(build_plugin(config(worker_port)?)?);
+        let fleets = FleetCatalog::try_new(vec![default_fleet()?])?;
+        let actions = Arc::new(gang_config::ActionsConfig::default());
+        let attempt_budget = gang_config::WorkerConfig::default().attempt_budget(actions.timeout);
+        let (observations, _rx) = ObservationSink::channel(NonZeroUsize::MIN, NonZeroUsize::MIN);
+
+        let (public_close_tx, public_close_rx) = oneshot::channel::<()>();
+        let (worker_close_tx, worker_close_rx) = oneshot::channel::<()>();
+        let (serving_tx, serving_rx) = oneshot::channel::<()>();
+        let (ready, readiness) = ControllerReady::channel();
+
+        let controller_plugin = Arc::clone(&plugin);
+        let controller_actions = Arc::clone(&actions);
+        let controller = tokio::spawn(async move {
+            let spec = ControllerSpec {
+                actions: controller_actions,
+                scaling: Arc::new(gang_config::ScalingConfig::default()),
+                control_acquire_timeout: NonZeroDuration::from_secs(1),
+                clock: Arc::new(gang_clock::SystemClock::new()),
+                fleets: &fleets,
+                max_workers: 8,
+                observations: &observations,
+                client_action_timeout: CLIENT_ACTION_TIMEOUT,
+                attempt_budget,
+            };
+            let connections = ControllerConnections {
+                public: Listening {
+                    connections: announcing(
+                        closable_accepted(public_listener, public_close_rx),
+                        serving_tx,
+                    ),
+                    gate: TestGate::allow(),
+                },
+                worker: Listening {
+                    connections: closable_accepted(worker_listener, worker_close_rx),
+                    gate: TestGate::allow(),
+                },
+                api: TestApi,
+            };
+            SchedulerPort::run_controller(
+                controller_plugin.as_ref(),
+                &spec,
+                connections,
+                memory_stores(),
+                ready,
+            )
+            .await
+        });
+        readiness.await?;
+        serving_rx.await?;
+
+        let paths = WorkerPaths::new(scratch.path(), "worker");
+        paths.prepare()?;
+        let (worker_stop_tx, worker_stop_rx) = oneshot::channel();
+        let worker_task = spawn_worker(
+            Arc::clone(&plugin),
+            Arc::clone(&actions),
+            InstanceId::try_new(WORKER_INSTANCE)?,
+            paths,
+            std::env::current_exe()?,
+            default_fleet()?,
+            worker_stop_rx,
+        );
+
+        let channel = public_channel(public_port).await?;
+        execute_with_metadata(&channel, build_action(&[("ISA", "x86-64")])?).await?;
+        drop(channel);
+
+        let _ = worker_stop_tx.send(());
+        worker_task.await??;
+        let mut drain = gang_spi::ControllerDrain::default();
+        plugin.hand_off(&mut drain).await?;
+        assert!(drain.complete);
+        let _ = public_close_tx.send(());
+        let _ = worker_close_tx.send(());
+        controller.await??;
+
+        assert!(matches!(
+            plugin.snapshot(&mut SchedulerSnapshot::default()).await,
+            Err(PortError::Unavailable(_))
+        ));
+        assert!(plugin.learned_history_byte_limit()?.get() > 0);
+        let now = gang_clock::Clock::wall(&gang_clock::SystemClock::new());
+        let mut records = Vec::new();
+        plugin.learned_history(now, &mut records).await?;
+        assert!(!records.is_empty(), "post-drain learned_history() empty");
+        Ok::<(), Box<dyn Error>>(())
+    })
+    .await?
 }
