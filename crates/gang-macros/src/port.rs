@@ -458,6 +458,25 @@ pub fn expand(attribute: &TokenStream, item: TokenStream) -> syn::Result<TokenSt
     let delegate_macro = delegate_macro(&port_name.to_string());
     let methods = delegations.iter().map(Delegation::tokens);
     let variables: Vec<Ident> = associated.iter().map(assoc_variable).collect();
+    let plain_arm = associated.is_empty().then(|| {
+        let methods = delegations.iter().map(Delegation::tokens);
+        quote! {
+            (
+                $enum:path {
+                    $($variant:ident),* $(,)?
+                }
+            ) => {
+                const _: () = {
+                    use $crate::*;
+                    use $crate::__private::*;
+
+                    impl #port_name for $enum {
+                        #(#methods)*
+                    }
+                };
+            };
+        }
+    });
     // The dispatch enums of the associated types are imported by name, so that no item of the
     // glob imports below can shadow them.
     Ok(quote! {
@@ -489,6 +508,7 @@ pub fn expand(attribute: &TokenStream, item: TokenStream) -> syn::Result<TokenSt
                     }
                 };
             };
+            #plain_arm
         }
     })
 }
@@ -628,5 +648,42 @@ mod tests {
             }
         };
         assert!(rejection(input).contains("an optional method returns"));
+    }
+
+    #[test]
+    fn emits_two_argument_arm_only_without_associated_types() {
+        let plain = expand(
+            &TokenStream::new(),
+            quote! {
+                trait PlainPort {
+                    async fn ping(&self) -> u8;
+                    fn label(&self) -> &'static str;
+                }
+            },
+        )
+        .expect("plain port expands")
+        .to_string()
+        .replace(' ', "");
+        assert!(
+            plain.contains("($enum:path{$($variant:ident),*$(,)?})"),
+            "{plain}"
+        );
+
+        let associated = expand(
+            &TokenStream::new(),
+            quote! {
+                trait AssocPort {
+                    type Scope;
+                    async fn enter(&self) -> Result<Self::Scope, PortError>;
+                }
+            },
+        )
+        .expect("associated port expands")
+        .to_string()
+        .replace(' ', "");
+        assert!(
+            !associated.contains("($enum:path{$($variant:ident),*$(,)?})"),
+            "{associated}"
+        );
     }
 }

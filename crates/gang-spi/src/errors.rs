@@ -116,6 +116,12 @@ pub enum Rejection {
     /// The request is malformed and cannot be served.
     #[error("the request is malformed")]
     MalformedRequest,
+    /// The blob's bytes did not hash to the expected digest.
+    #[error("the blob digest does not match")]
+    DigestMismatch,
+    /// The requested byte range offset exceeds the blob size.
+    #[error("the byte range offset exceeds the blob size")]
+    OutOfRange,
 }
 
 /// A plugin failed to build from its configuration. The cause is the [`PortError`] the plugin

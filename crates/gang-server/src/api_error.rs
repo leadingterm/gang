@@ -73,7 +73,7 @@ pub(crate) fn port_status(error: &PortError) -> Status {
             ..
         } => (ErrorReason::PrincipalRevoked, None),
         PortError::Rejected {
-            reason: Rejection::MalformedRequest,
+            reason: Rejection::MalformedRequest | Rejection::DigestMismatch | Rejection::OutOfRange,
             ..
         } => (ErrorReason::MalformedRequest, None),
         PortError::NotFound(Subject::Provider(provider)) => (

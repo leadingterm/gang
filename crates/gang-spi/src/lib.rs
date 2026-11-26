@@ -28,6 +28,7 @@
 //! ```
 
 mod authentication_port;
+mod blob_store;
 mod cache_port;
 mod candidate_priority;
 mod completion_rates;
@@ -60,6 +61,7 @@ pub use authentication_port::{
     CertificateIssue, CertificateTarget, ClientCertificates, CredentialLifecyclePort, Evidence,
     IssuedCertificate, IssuedToken, Peer, Scheme, TokenIssue,
 };
+pub use blob_store::{ActionStore, BlobStream, ByteRange, ContentStore};
 pub use cache_port::{CacheStorePort, MeasuredUsage, RenderedStoreSpec};
 pub use candidate_priority::{CandidatePriority, CandidatePriorityRef};
 pub use completion_rates::{CompletionRates, NonNegativeFinite, ResourceRates};
