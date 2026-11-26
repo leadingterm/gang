@@ -1152,12 +1152,10 @@ fn build_run_spec(
         .reservation
         .as_ref()
         .map_or((0, 0), |res| (res.memory_bytes, res.disk_bytes));
-    let timeout = assign
-        .timeout
-        .as_ref()
-        .and_then(proto_duration_to_std)
-        .filter(|d| !d.is_zero())
-        .or_else(|| Some(spec.actions.timeout.get()));
+    let timeout = Some(effective_action_timeout(
+        assign.timeout.as_ref(),
+        spec.actions.timeout.get(),
+    ));
     let attempt_deadline = assign
         .attempt_deadline
         .as_ref()
@@ -1182,6 +1180,16 @@ fn build_run_spec(
         kill_grace: spec.actions.kill_grace,
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
     }
+}
+
+fn effective_action_timeout(
+    assign_timeout: Option<&prost_types::Duration>,
+    max_timeout: Duration,
+) -> Duration {
+    assign_timeout
+        .and_then(proto_duration_to_std)
+        .filter(|d| !d.is_zero())
+        .map_or(max_timeout, |d| d.min(max_timeout))
 }
 
 fn resolve_action_digest(assign: &proto::Assign) -> Result<Digest, rpc_proto::Status> {
@@ -2185,5 +2193,41 @@ mod tests {
             server.abort();
             Ok(())
         })
+    }
+
+    #[test]
+    fn effective_action_timeout_honors_client_below_cap_and_clamps_above() {
+        let cap = Duration::from_hours(1);
+        assert_eq!(effective_action_timeout(None, cap), cap);
+        assert_eq!(
+            effective_action_timeout(
+                Some(&prost_types::Duration {
+                    seconds: 0,
+                    nanos: 0
+                }),
+                cap
+            ),
+            cap
+        );
+        assert_eq!(
+            effective_action_timeout(
+                Some(&prost_types::Duration {
+                    seconds: 300,
+                    nanos: 0
+                }),
+                cap
+            ),
+            Duration::from_mins(5)
+        );
+        assert_eq!(
+            effective_action_timeout(
+                Some(&prost_types::Duration {
+                    seconds: 7200,
+                    nanos: 0
+                }),
+                cap
+            ),
+            cap
+        );
     }
 }
