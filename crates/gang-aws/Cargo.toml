@@ -15,6 +15,7 @@ aws-sdk-cloudwatch = { workspace = true }
 aws-sdk-ec2 = { workspace = true }
 aws-sdk-elasticloadbalancingv2 = { workspace = true }
 aws-sdk-kms = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 aws-sdk-sqs = { workspace = true }
 aws-sdk-sts = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }

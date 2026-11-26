@@ -19,3 +19,14 @@ The dashboard bundle (`ui/`) includes Preact and @preact/signals
 License, and the fonts Atkinson Hyperlegible Next and Atkinson Hyperlegible Mono,
 Copyright 2020-2024 their Project Authors, licensed under the SIL Open Font License,
 Version 1.1 (ui/fonts/OFL-sans.txt, ui/fonts/OFL-mono.txt).
+
+The vendored REAPI v2 protobuf definitions under `third_party/remote-apis/build/`
+are from bazelbuild/remote-apis (https://github.com/bazelbuild/remote-apis,
+commit e0c0554bfc8a37abf336c3e78070684367738e1d), licensed under the Apache
+License, Version 2.0.
+
+The vendored Google API, ByteStream, LongRunning, and RPC protobuf definitions
+under `third_party/remote-apis/google/` are from googleapis/googleapis
+(https://github.com/googleapis/googleapis, commit
+25fb8ea2d4bfa8fd41e24b28029e34a4adc35db0), licensed under the Apache License,
+Version 2.0.

@@ -1,0 +1,24 @@
+[package]
+name = "gang-engine"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gang-cas = { workspace = true }
+gang-clock = { workspace = true }
+gang-config = { workspace = true }
+gang-os = { workspace = true }
+gang-reapi = { workspace = true }
+gang-scheduler = { workspace = true }
+gang-spi = { workspace = true }
+gang-tls = { workspace = true }
+gang-types = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }

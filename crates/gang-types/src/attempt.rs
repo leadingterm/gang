@@ -2,8 +2,6 @@
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
-use std::fs::File;
-use std::io::Read as _;
 
 /// Longest allowed attempt identifier, well within `NAME_MAX` (255).
 const ATTEMPT_ID_MAX_LENGTH: usize = 128;
@@ -74,20 +72,16 @@ crate::validated_string!(
 );
 
 impl AttemptId {
-    /// Generates a fresh `UUIDv4` attempt identifier using OS entropy (`/dev/urandom`).
+    /// Generates a fresh `UUIDv4` attempt identifier using OS entropy (`getrandom`).
     ///
     /// # Errors
     ///
     /// Returns [`AttemptIdError::Entropy`] if OS randomness cannot be read.
     pub fn generate() -> Result<Self, AttemptIdError> {
         let mut bytes = [0_u8; 16];
-        let mut file = File::open("/dev/urandom").map_err(|error| AttemptIdError::Entropy {
+        getrandom::fill(&mut bytes).map_err(|error| AttemptIdError::Entropy {
             message: error.to_string(),
         })?;
-        file.read_exact(&mut bytes)
-            .map_err(|error| AttemptIdError::Entropy {
-                message: error.to_string(),
-            })?;
         Ok(Self::from_random_bytes(bytes))
     }
 

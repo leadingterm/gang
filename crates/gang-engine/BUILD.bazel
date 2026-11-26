@@ -1,0 +1,16 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_library")
+
+workspace_rust_library(
+    name = "gang_engine",
+    deps = [
+        "//crates/gang-cas:gang_cas",
+        "//crates/gang-clock:gang_clock",
+        "//crates/gang-config:gang_config",
+        "//crates/gang-os:gang_os",
+        "//crates/gang-reapi:gang_reapi",
+        "//crates/gang-scheduler:gang_scheduler",
+        "//crates/gang-spi:gang_spi",
+        "//crates/gang-tls:gang_tls",
+        "//crates/gang-types:gang_types",
+    ],
+)
