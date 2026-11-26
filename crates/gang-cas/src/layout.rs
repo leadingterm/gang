@@ -317,17 +317,20 @@ fn remove_unknown_path(path: &Path) -> io::Result<()> {
 struct TempFileGuard {
     dir: rustix::fd::OwnedFd,
     name: String,
+    persisted: bool,
 }
 
 impl TempFileGuard {
-    fn persist(self) {
-        std::mem::forget(self);
+    fn persist(mut self) {
+        self.persisted = true;
     }
 }
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        let _ = unlinkat(&self.dir, self.name.as_str(), AtFlags::empty());
+        if !self.persisted {
+            let _ = unlinkat(&self.dir, self.name.as_str(), AtFlags::empty());
+        }
     }
 }
 
@@ -609,16 +612,30 @@ fn publish_target(file: File, target: WriterTarget) -> io::Result<()> {
     }
 }
 
-/// Clones or hard-links `src` to `dest` with permissions matching `mode`.
-///
-/// On Linux, tries `rustix::fs::ioctl_ficlone` first and falls back to `std::fs::hard_link` (and
-/// copy only if cross-device). On macOS, tries `fclonefileat` first and falls back to
-/// `std::fs::hard_link`.
+/// Hard-links `src` to `dest` (`§6.3`), falling back to a `CoW` reflink on `EMLINK` (Linux
+/// `ioctl_ficlone` / macOS `fclonefileat`), and finally to a metadata-preserving copy when
+/// hard-linking or reflinking is unsupported (`EXDEV`, `EMLINK` without `CoW`).
 ///
 /// # Errors
 ///
 /// Returns any filesystem error creating `dest`.
 pub fn hardlink_or_reflink_file(src: &Path, dest: &Path, mode: BlobMode) -> io::Result<()> {
+    match fs::hard_link(src, dest) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            match fs::hard_link(src, dest) {
+                Ok(()) => return Ok(()),
+                Err(retry_err) if is_hardlink_fallback_errno(&retry_err) => {}
+                Err(retry_err) => return Err(retry_err),
+            }
+        }
+        Err(error) if is_hardlink_fallback_errno(&error) => {}
+        Err(error) => return Err(error),
+    }
+
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -637,14 +654,24 @@ pub fn hardlink_or_reflink_file(src: &Path, dest: &Path, mode: BlobMode) -> io::
         }
     }
 
-    match fs::hard_link(src, dest) {
-        Ok(()) => Ok(()),
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        Err(error) if error.raw_os_error() == Some(Errno::XDEV.raw_os_error()) => {
-            copy_with_metadata(src, dest, mode)
-        }
-        Err(error) => Err(error),
-    }
+    copy_with_metadata(src, dest, mode)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_hardlink_fallback_errno(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == Errno::MLINK.raw_os_error()
+                || code == Errno::XDEV.raw_os_error()
+                || code == Errno::OPNOTSUPP.raw_os_error()
+                || code == Errno::PERM.raw_os_error()
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn is_hardlink_fallback_errno(_error: &io::Error) -> bool {
+    false
 }
 
 /// Creates an empty file at `dest` with `mode` and deterministic `mtime = 2000-01-01T00:00:00Z`.
@@ -790,10 +817,11 @@ fn create_exclusive_temp(
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
     )?;
-    let dir_dup = rustix::io::dup(dir)?;
+    let dir_dup = rustix::io::fcntl_dupfd_cloexec(dir, 0)?;
     let guard = TempFileGuard {
         dir: dir_dup,
         name: name.to_owned(),
+        persisted: false,
     };
     Ok((File::from(fd), guard))
 }
@@ -834,5 +862,33 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn temp_file_guard_persist_closes_dup_fd_without_leaking() -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+
+        let dir = tempfile::tempdir()?;
+        let root = super::open_dir(dir.path())?;
+        let probe_before = super::open_dir(dir.path())?;
+        let baseline_fd = probe_before.as_raw_fd();
+        drop(probe_before);
+
+        for i in 0..256_u32 {
+            let name = format!("tmp-{i}");
+            let (file, guard) = super::create_exclusive_temp(&root, &name)?;
+            drop(file);
+            guard.persist();
+        }
+
+        let probe_after = super::open_dir(dir.path())?;
+        let after_fd = probe_after.as_raw_fd();
+        drop(probe_after);
+
+        assert!(
+            after_fd < baseline_fd + 64,
+            "TempFileGuard::persist leaked file descriptors: baseline={baseline_fd}, after={after_fd}"
+        );
+        Ok(())
     }
 }
