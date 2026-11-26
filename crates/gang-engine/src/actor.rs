@@ -526,6 +526,7 @@ struct OperationShellMeta {
     origin: Option<Origin>,
     inline: Option<InlineActionPayload>,
     timeout: Option<Duration>,
+    queued_wall: Timestamp,
 }
 
 /// Context queued alongside `Effect::AuditGateTier` during an `Execute` admission step.
@@ -1054,6 +1055,7 @@ impl<C: Clock> ControllerActor<C> {
                                     origin,
                                     inline,
                                     timeout,
+                                    queued_wall: now.wall,
                                 },
                             );
                             rx
@@ -1295,13 +1297,20 @@ impl<C: Clock> ControllerActor<C> {
 
     fn notify_watchers(&mut self, operation: OperationKey, event: OperationUpdate) {
         let terminal = is_terminal_update(&event);
-        let (result, status) = if matches!(event, OperationUpdate::Completed) {
+        let (mut result, status) = if matches!(event, OperationUpdate::Completed) {
             self.pending_completion
                 .as_ref()
                 .map_or((None, None), |p| (p.result.clone(), p.status.clone()))
         } else {
             (None, None)
         };
+        if let Some(action_result) = result.as_mut()
+            && let Some(exec_meta) = action_result.execution_metadata.as_mut()
+            && exec_meta.queued_timestamp.is_none()
+            && let Some(op_meta) = self.op_meta.get(&operation)
+        {
+            exec_meta.queued_timestamp = Some(timestamp_to_proto(op_meta.queued_wall));
+        }
 
         if terminal {
             self.terminal_cleanup.push(operation);

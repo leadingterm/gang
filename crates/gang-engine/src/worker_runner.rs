@@ -251,14 +251,14 @@ impl SideChannelDir {
             cleaned: false,
         };
         if let Some(weight) = inputs.cpu_weight {
-            private.write_atomic(
+            private.write_ephemeral(
                 CPU_WEIGHT_FILE,
                 weight.get().to_string().as_bytes(),
                 PRIVATE_FILE,
             )?;
         }
         if let Some(bytes) = encoded_trees {
-            private.write_atomic(READ_ONLY_TREES_FILE, &bytes, PRIVATE_FILE)?;
+            private.write_ephemeral(READ_ONLY_TREES_FILE, &bytes, PRIVATE_FILE)?;
         }
         Ok(guard)
     }

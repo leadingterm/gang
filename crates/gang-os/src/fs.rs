@@ -443,6 +443,32 @@ impl PrivateDir {
             .map(|_| ())
     }
 
+    /// Writes a short-lived file in this directory without syncing the file or directory.
+    ///
+    /// Intended for ephemeral runtime files (such as per-attempt side-channel inputs) that are
+    /// read by a child process and deleted immediately after exit, where crash durability is
+    /// unnecessary and synchronous `fsync` / `F_FULLFSYNC` would stall the execution hot path.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid name or a failed filesystem operation.
+    pub fn write_ephemeral(
+        &self,
+        name: impl AsRef<OsStr>,
+        contents: &[u8],
+        mode: Mode,
+    ) -> Result<(), PathIo> {
+        let name = name.as_ref();
+        let path = self.file_path(name, "write")?;
+        let flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let fd = rustix::fs::openat(&self.directory, name, flags, mode)
+            .map_err(|error| PathIo::new("create", &path, error.into()))?;
+        let mut file = File::from(fd);
+        rustix::fs::fchmod(&file, mode)
+            .map_err(|error| PathIo::new("set permissions of", &path, error.into()))?;
+        file.write_all(contents).map_err(PathIo::at("write", &path))
+    }
+
     /// Atomically replaces a file after checking authority immediately before publication.
     ///
     /// The check runs after the temporary file is synced. If it fails, the temporary file is
@@ -2540,5 +2566,42 @@ mod tests {
         let error = create_private_fifo(path).expect_err("NUL cannot occur in a filesystem path");
         assert_eq!(error.path, path);
         assert_eq!(error.source.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn private_dir_write_ephemeral_writes_truncates_and_refuses_symlinks() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let dir = ensure_private_dir(&root.path().join("side"))?;
+        dir.write_ephemeral("cpu_weight", b"1000\n", PRIVATE_FILE)?;
+        assert_eq!(
+            dir.read_optional("cpu_weight")?.as_deref(),
+            Some(b"1000\n".as_slice())
+        );
+        let mode = fs::symlink_metadata(root.path().join("side/cpu_weight"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        dir.write_ephemeral("cpu_weight", b"20", PRIVATE_FILE)?;
+        assert_eq!(
+            dir.read_optional("cpu_weight")?.as_deref(),
+            Some(b"20".as_slice())
+        );
+
+        assert!(
+            dir.write_ephemeral("sub/file", b"bad", PRIVATE_FILE)
+                .is_err()
+        );
+
+        let target = root.path().join("outside");
+        fs::write(&target, b"keep")?;
+        std::os::unix::fs::symlink(&target, root.path().join("side/link"))?;
+        assert!(
+            dir.write_ephemeral("link", b"overwrite", PRIVATE_FILE)
+                .is_err()
+        );
+        assert_eq!(fs::read(&target)?, b"keep");
+        Ok(())
     }
 }
