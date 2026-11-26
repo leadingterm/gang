@@ -19,6 +19,7 @@ mod serve;
 mod standing;
 mod worker_runner;
 mod worker_sampling;
+mod worker_service;
 mod worker_session;
 
 pub use actor::{
@@ -50,6 +51,10 @@ pub use worker_sampling::{
     TrackedAttemptGuard, WorkerSampler, kill_channel, parse_cgroup_u64, parse_cpu_stat_usage,
     parse_memory_events_oom_kills, read_cgroup_sample, read_cgroup_side_channel,
     read_memory_pool_sample,
+};
+pub use worker_service::{
+    DEFAULT_REGISTRATION_TIMEOUT, DEFAULT_WORKER_KEEPALIVE_INTERVAL, WorkerGrpcService,
+    WorkerServiceConfig, cache_stats_from_proto,
 };
 pub use worker_session::{
     ConnectError, ConnectedChannel, SessionConfig, SessionConnector, SessionError, SessionEvent,
