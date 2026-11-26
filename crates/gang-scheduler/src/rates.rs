@@ -87,6 +87,12 @@ impl SourceRates {
         })
     }
 
+    /// Returns the number of configured fleets tracked by this rate table.
+    #[must_use]
+    pub const fn fleet_count(&self) -> usize {
+        self.fleets
+    }
+
     /// Resolves and memoizes a `provider:principal` identity string into a [`SourceId`].
     ///
     /// Holding queued or running work refreshes an existing rate slot's recency without

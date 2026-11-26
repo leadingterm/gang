@@ -518,6 +518,20 @@ impl Attempts {
         self.active_by_op.get(&op).copied()
     }
 
+    /// Iterates over all tracked non-`Completed` attempts (`Offered`, `Running`, and `Executed`).
+    pub fn iter(&self) -> impl Iterator<Item = (AttemptKey, &Attempt)> {
+        self.slab
+            .iter()
+            .map(|(index, generation, attempt)| (AttemptKey { index, generation }, attempt))
+    }
+
+    /// Iterates over `(OperationKey, AttemptKey)` pairs for operations with an active attempt.
+    pub fn active_operations(&self) -> impl Iterator<Item = (OperationKey, AttemptKey)> + '_ {
+        self.active_by_op
+            .iter()
+            .map(|(&op, &attempt)| (op, attempt))
+    }
+
     /// Returns all non-`Completed` attempts (`Offered`, `Running`, `Executed`) owned by `worker`.
     #[must_use]
     pub fn worker_attempts(&self, worker: WorkerKey) -> &[AttemptKey] {

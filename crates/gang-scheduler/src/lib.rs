@@ -13,18 +13,23 @@ mod attempts;
 mod capacity;
 mod cordons;
 mod durations;
+mod effects;
 mod escalation;
 mod fitting;
 mod handoff;
 mod history;
+mod learned;
 mod ledger;
+mod listing;
 mod operations;
 mod placement;
 mod pressure;
 mod qos;
 mod queue;
 mod rates;
+mod scheduler;
 mod sketch;
+mod snapshot;
 mod timers;
 mod workers;
 
@@ -40,6 +45,7 @@ pub use attempts::{
 pub use capacity::{CapacityCatalog, CapacityError, FleetCapacity};
 pub use cordons::{Census, CordonError, CordonRegistry};
 pub use durations::ActionDurations;
+pub use effects::{CompletedObservation, Effect, Effects, OperationUpdate};
 pub use escalation::{
     EscalationDecision, EscalationFailure, EscalationFailureReason, EscalationInput, KillCause,
     KillResource, classify_kill, evaluate_escalation,
@@ -50,7 +56,9 @@ pub use fitting::{
 };
 pub use handoff::{ControllerHandOff, HandOffEffects, HandOffError, RehomeDirective, RehomeReason};
 pub use history::{Histories, history_id, resource_key};
+pub use learned::Learned;
 pub use ledger::{LedgerError, WorkerLedger, cmp_reserved_cpu_fraction, ledger_capacity};
+pub use listing::{fill_actions, project_actions};
 pub use operations::{
     AdmitError, AdmitOutcome, ClientLessExpiry, DedupKey, NewOperation, Now, Operation,
     OperationKey, OperationStage, Operations, RetryCounts, UnwatchResult, canonical_platform_key,
@@ -72,12 +80,17 @@ pub use qos::{
 };
 pub use queue::{OperationQueue, QueueKey};
 pub use rates::{RatesError, SourceRates, execution_timing};
+pub use scheduler::{
+    ExecuteError, PolicyError, RegisterError, Scheduler, SchedulerPolicy, WorkerCompleted,
+    WorkerEvent, WorkerExecuted,
+};
 pub use sketch::{
     Budget, DEFAULT_HEADROOM_PERCENT, DEFAULT_MEMORY_BUDGET_BYTES, DEFAULT_WINDOW_DAYS,
     ENTRY_BYTES, Entry, Family, HIST_BUCKETS, Half, HintRow, Hist, Observation,
     PROBATION_ENTRY_BYTES, Policy, ResourceSketch, SAMPLER_GENERATION, SHARDS, Shaped, SizeClass,
     SketchError, SketchKey, Snapshot, Stats,
 };
+pub use snapshot::{fill_snapshot, project_snapshot};
 pub use timers::{DueTimer, TimerEffects, TimerKind, TimerQueue, TimerSubject, on_timer};
 pub use workers::{
     DrainSources, InstanceState, RegistrationError, Worker, WorkerIdError, WorkerKey,
