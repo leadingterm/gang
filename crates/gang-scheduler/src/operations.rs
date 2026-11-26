@@ -605,14 +605,13 @@ impl Operations {
     pub fn unwatch(&mut self, key: OperationKey, now: Tick) -> Option<UnwatchResult> {
         let op = self.get_mut(key)?;
         op.watchers = op.watchers.saturating_sub(1);
-        let became_client_less = if op.watchers == 0 && !op.stage.is_terminal() {
-            if op.client_less_since.is_none() {
+        let became_client_less =
+            if op.watchers == 0 && !op.stage.is_terminal() && op.client_less_since.is_none() {
                 op.client_less_since = Some(now);
-            }
-            true
-        } else {
-            false
-        };
+                true
+            } else {
+                false
+            };
         Some(UnwatchResult {
             watchers: op.watchers,
             became_client_less,

@@ -4,6 +4,7 @@
 //! placement, attempt lifecycle, escalation, timers, cordons, handoff, learning, and projections
 //! behind a pure `&mut self` API with caller-owned [`Effects`] output buffers.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -530,13 +531,7 @@ impl Scheduler {
             self.cleanup_terminal_publish(&failed);
             self.push_publish(failed, out);
         }
-        for op_key in loss.requeued {
-            out.push(Effect::NotifyWatchers {
-                operation: op_key,
-                event: OperationUpdate::Queued,
-            });
-            self.try_place_operation(op_key, now, out);
-        }
+        self.place_requeued(loss.requeued, now, out);
     }
 
     /// Fires all timers due at `now.tick` (ack timeouts, attempt deadlines, worker keepalive
@@ -576,13 +571,7 @@ impl Scheduler {
             self.cleanup_terminal_publish(&publish);
             self.push_publish(publish, out);
         }
-        for op_key in effects.requeued_operations {
-            out.push(Effect::NotifyWatchers {
-                operation: op_key,
-                event: OperationUpdate::Queued,
-            });
-            self.try_place_operation(op_key, now, out);
-        }
+        self.place_requeued(effects.requeued_operations, now, out);
         for worker in affected_workers {
             self.maybe_rehome_idle(worker, out);
         }
@@ -1003,6 +992,23 @@ impl Scheduler {
 
         self.dispatch_for_worker(worker, now, out);
         self.maybe_rehome_idle(worker, out);
+    }
+
+    fn place_requeued(&mut self, mut requeued: Vec<OperationKey>, now: Now, out: &mut Effects) {
+        requeued.sort_unstable_by_key(|&op_key| {
+            self.operations
+                .get(op_key)
+                .map_or((Reverse(i32::MIN), u64::MAX, op_key), |op| {
+                    (Reverse(op.priority), op.seq, op_key)
+                })
+        });
+        for op_key in requeued {
+            out.push(Effect::NotifyWatchers {
+                operation: op_key,
+                event: OperationUpdate::Queued,
+            });
+            self.try_place_operation(op_key, now, out);
+        }
     }
 
     fn try_place_operation(&mut self, op_key: OperationKey, now: Now, out: &mut Effects) -> bool {
