@@ -71,6 +71,7 @@ pub fn render(
         gang_types::health::CLIENT_KEEPALIVE_TIMEOUT.as_secs()
     ));
     lines.push("build --remote_download_outputs=toplevel".to_owned());
+    lines.push("build --remote_execution_priority=100".to_owned());
     if matches!(info.authentication, Authentication::Token(_)) {
         lines.push(format!(
             "# The gang that Bazel runs for credentials; run `{writer}` again if it moves."
@@ -222,6 +223,20 @@ mod tests {
                     .filter(|line| line.starts_with("build --remote_download_outputs="))
                     .collect::<Vec<_>>(),
                 ["build --remote_download_outputs=toplevel"]
+            );
+        }
+    }
+
+    #[test]
+    fn both_writers_set_interactive_execution_priority() {
+        for writer in [BazelrcWriter::Bazelrc, BazelrcWriter::Setup] {
+            let rendered = render(&info(token(), None), "host", "gang", CA_FILE_NAME, writer);
+            assert_eq!(
+                rendered
+                    .lines()
+                    .filter(|line| line.starts_with("build --remote_execution_priority="))
+                    .collect::<Vec<_>>(),
+                ["build --remote_execution_priority=100"]
             );
         }
     }

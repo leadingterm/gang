@@ -20,9 +20,9 @@ use gang_config::{ActionsConfig, OpenFileLimit, ScalingConfig};
 use gang_scheduler::{Learned, PolicyError, RatesError, Scheduler, SchedulerPolicy};
 use gang_spi::{
     ActionStore, ActionsView, ApiRequestBody, ApiService, BoxedError, ContentStore,
-    ControllerConnections, ControllerDrain, ControllerEndpoints, ControllerReady, EngineStore,
-    FleetSupply, LearnedHistory, ListingLimits, ObservationSink, PortError, RequestGate,
-    SchedulerSnapshot, WorkerTls,
+    ControllerConnections, ControllerDrain, ControllerEndpoints, ControllerReady, ControllerSpec,
+    ControllerStores, EngineStore, FleetSupply, LearnedHistory, ListingLimits, ObservationSink,
+    PortError, RequestGate, SchedulerPort, SchedulerSnapshot, WorkerSpec, WorkerStores, WorkerTls,
 };
 use gang_tls::{Alpn, ClientIdentity, ConnectorSettings, Dialer, ServerTrust, TlsConnector};
 use gang_types::{
@@ -49,7 +49,7 @@ use crate::reapi_capabilities::{CapabilitiesConfig, CapabilitiesService};
 use crate::reapi_cas::{CasConfig, CasService, InflightBlobBudget};
 use crate::reapi_execution::{ExecutionService, ExecutionServiceConfig};
 use crate::serve::{Listener, ScopedRoutes, ServeShutdown, serve};
-use crate::worker::{WorkerRuntimeSpec, WorkerStores};
+use crate::worker::{DEFAULT_WORKER_MAX_MESSAGE_SIZE, WorkerRuntimeSpec};
 use crate::worker_service::{WorkerGrpcService, WorkerServiceConfig};
 use crate::worker_session::{ConnectError, ConnectedChannel, SessionConnector};
 
@@ -64,15 +64,6 @@ const WORKER_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Poll interval used when waiting for draining workers to finish after listener streams end.
 const HANDOFF_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// Typed content and action stores passed to [`Engine::run_controller`] (`§3.1`).
-#[derive(Debug, Clone)]
-pub struct ControllerStores<C, A> {
-    /// Content-addressed blob store.
-    pub content: Arc<C>,
-    /// Action-result cache store.
-    pub actions: Arc<A>,
-}
 
 /// Inputs required to run a controller term on [`Engine`], mirroring `gang_spi::ControllerSpec`
 /// with typed [`ControllerStores`] (`§3.1`, `§6.1`).
@@ -631,6 +622,125 @@ impl Engine {
             .lock()
             .clone()
             .ok_or_else(|| PortError::unavailable(EngineError::NotServing))
+    }
+}
+
+impl SchedulerPort for Engine {
+    fn learned_history_byte_limit(&self) -> Result<NonZeroUsize, PortError> {
+        Self::learned_history_byte_limit(self)
+    }
+
+    async fn learned_history(
+        &self,
+        now: Timestamp,
+        into: &mut Vec<LearnedHistory>,
+    ) -> Result<(), PortError> {
+        Self::learned_history(self, now, into).await
+    }
+
+    async fn restore_learned_history(
+        &self,
+        now: Timestamp,
+        records: &[LearnedHistory],
+    ) -> Result<(), PortError> {
+        Self::restore_learned_history(self, now, records).await
+    }
+
+    async fn snapshot(&self, into: &mut SchedulerSnapshot) -> Result<(), PortError> {
+        Self::snapshot(self, into).await
+    }
+
+    async fn actions(
+        &self,
+        limits: ListingLimits,
+        into: &mut ActionsView,
+    ) -> Result<(), PortError> {
+        Self::actions(self, limits, into).await
+    }
+
+    async fn set_draining(
+        &self,
+        fleet: &FleetName,
+        instance: &InstanceId,
+        draining: bool,
+    ) -> Result<(), PortError> {
+        Self::set_draining(self, fleet, instance, draining).await
+    }
+
+    async fn retain_drains(
+        &self,
+        now: Tick,
+        grace: Duration,
+        live: &[(&FleetName, &FleetSupply)],
+    ) -> Result<(), PortError> {
+        Self::retain_drains(self, now, grace, live).await
+    }
+
+    fn endpoints(&self) -> ControllerEndpoints {
+        Self::endpoints(self)
+    }
+
+    async fn run_controller<
+        C: ContentStore,
+        Ac: ActionStore,
+        P: RequestGate,
+        W: RequestGate,
+        A: ApiService,
+    >(
+        &self,
+        spec: &ControllerSpec<'_>,
+        connections: ControllerConnections<P, W, A>,
+        stores: ControllerStores<C, Ac>,
+        ready: ControllerReady,
+    ) -> Result<(), PortError> {
+        let engine_spec = EngineControllerSpec {
+            actions: Arc::clone(&spec.actions),
+            scaling: Arc::clone(&spec.scaling),
+            clock: Arc::clone(&spec.clock),
+            control_acquire_timeout: spec.control_acquire_timeout,
+            stores,
+            fleets: spec.fleets,
+            max_workers: spec.max_workers,
+            client_action_timeout: spec.client_action_timeout,
+            attempt_budget: spec.attempt_budget,
+            observations: spec.observations,
+        };
+        Self::run_controller(self, &engine_spec, connections, ready).await
+    }
+
+    async fn hand_off(&self, into: &mut ControllerDrain) -> Result<(), PortError> {
+        Self::hand_off(self, into).await
+    }
+
+    async fn run_worker<C: ContentStore, Ac: ActionStore>(
+        &self,
+        spec: &WorkerSpec,
+        stores: WorkerStores<C, Ac>,
+        tls: WorkerTls<'_>,
+        stop: impl Future<Output = ()> + Send,
+    ) -> Result<(), PortError> {
+        let runtime_spec = WorkerRuntimeSpec {
+            actions: Arc::clone(&spec.actions),
+            worker: self.config.worker.clone(),
+            memory_pool: spec.memory_pool.clone(),
+            instance: spec.instance.clone(),
+            properties: spec.properties.clone(),
+            lifetime: spec.lifetime,
+            work_directory: spec.work_directory.clone(),
+            fast_cas_directory: spec.fast_cas_directory.clone(),
+            fast_cas_budget: spec.fast_cas_budget,
+            trees_directory: spec.trees_directory.clone(),
+            entrypoint: spec.entrypoint.clone(),
+            instance_name: String::new(),
+            gang_version: env!("CARGO_PKG_VERSION").to_owned(),
+            max_message_size: self
+                .config
+                .http2
+                .max_message_size
+                .max(DEFAULT_WORKER_MAX_MESSAGE_SIZE),
+            remote_compression: gang_cas::Compression::Zstd,
+        };
+        Self::run_worker(self, &runtime_spec, stores, tls, stop).await
     }
 }
 
@@ -1486,7 +1596,7 @@ mod tests {
                 },
                 api: FallbackApi,
             };
-            engine_clone.run_controller(&local_spec, conns, ready).await
+            Engine::run_controller(&engine_clone, &local_spec, conns, ready).await
         });
 
         ready_rx.await?;
@@ -1505,9 +1615,7 @@ mod tests {
             },
             api: FallbackApi,
         };
-        let second = engine
-            .run_controller(&spec, second_conns, second_ready)
-            .await;
+        let second = Engine::run_controller(&engine, &spec, second_conns, second_ready).await;
         assert!(matches!(second, Err(PortError::Config(_))));
         assert!(second_ready_rx.await.is_err());
 
@@ -1854,7 +1962,7 @@ mod tests {
                     worker: tcp_listening(worker_listener, worker_stop_rx),
                     api: FallbackApi,
                 };
-                ctrl_engine.run_controller(&spec, connections, ready).await
+                Engine::run_controller(&ctrl_engine, &spec, connections, ready).await
             });
 
             ready_rx.await?;

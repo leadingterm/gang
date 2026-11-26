@@ -98,8 +98,6 @@ pub struct WorkerConfig {
     /// keepalive interval is half this value; it must be below twice `server.worker_timeout`.
     /// Defaults to 5 seconds.
     pub connect_timeout: WholeSeconds,
-    /// Time to wait for the last action directory to be cleaned up. Defaults to 30 seconds.
-    pub cleanup_wait: WholeSeconds,
     /// Interval of HTTP/2 keepalive pings from the worker. Defaults to 30 seconds.
     pub keepalive_interval: WholeSeconds,
     /// Maximum concurrent blob downloads on the worker. Defaults to 64.
@@ -167,7 +165,6 @@ impl Default for WorkerConfig {
             upload_timeout: WholeSeconds::from_units(10 * 60),
             download_timeout: WholeSeconds::from_units(10 * 60),
             connect_timeout: WholeSeconds::from_units(5),
-            cleanup_wait: WholeSeconds::from_units(30),
             keepalive_interval: WholeSeconds::from_units(30),
             download_concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
             batch_blob_max: DEFAULT_BATCH_BLOB_MAX,
@@ -207,13 +204,12 @@ mod tests {
     #[test]
     fn worker_connection_settings_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let config: WorkerConfig = toml::from_str(
-            "max_open_files = 8192\nupload_timeout = '11s'\ndownload_timeout = '12s'\nconnect_timeout = '3s'\ncleanup_wait = '14s'\nkeepalive_interval = '15s'",
+            "max_open_files = 8192\nupload_timeout = '11s'\ndownload_timeout = '12s'\nconnect_timeout = '3s'\nkeepalive_interval = '15s'",
         )?;
         assert_eq!(config.max_open_files.get(), 8192);
         assert_eq!(config.upload_timeout, WholeSeconds::from_units(11));
         assert_eq!(config.download_timeout, WholeSeconds::from_units(12));
         assert_eq!(config.connect_timeout, WholeSeconds::from_units(3));
-        assert_eq!(config.cleanup_wait, WholeSeconds::from_units(14));
         assert_eq!(config.keepalive_interval, WholeSeconds::from_units(15));
         assert_eq!(
             toml::from_str::<WorkerConfig>(&toml::to_string(&config)?)?,
@@ -227,6 +223,7 @@ mod tests {
         assert!(toml::from_str::<WorkerConfig>("connect_timeout = '0s'").is_err());
         assert!(toml::from_str::<WorkerConfig>("upload_timeout = '1500ms'").is_err());
         assert!(toml::from_str::<WorkerConfig>("max_open_files = 7").is_err());
+        assert!(toml::from_str::<WorkerConfig>("cleanup_wait = '14s'").is_err());
         assert!(toml::from_str::<WorkerConfig>("unknown = 1").is_err());
     }
 

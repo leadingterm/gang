@@ -62,7 +62,7 @@ pub use authentication_port::{
     IssuedCertificate, IssuedToken, Peer, Scheme, TokenIssue,
 };
 pub use blob_store::{ActionStore, BlobStream, ByteRange, ContentStore};
-pub use cache_port::{CacheStorePort, MeasuredUsage, RenderedStoreSpec};
+pub use cache_port::{CacheStorePort, MeasuredUsage};
 pub use candidate_priority::{CandidatePriority, CandidatePriorityRef};
 pub use completion_rates::{CompletionRates, NonNegativeFinite, ResourceRates};
 pub use credential_port::WorkloadCredentialPort;
@@ -118,11 +118,11 @@ pub use repository_port::{
 pub use scheduler_port::{
     Accepted, ActionInfo, ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService,
     BoxedConnection, ClientTls, Connection, ControllerConnections, ControllerDrain,
-    ControllerEndpoints, ControllerReady, ControllerSpec, DrainingWorker, EngineStore,
-    ExecutingDemand, FleetMemoryCapacity, GateDecision, InstanceCordon, LeaderUnavailable,
-    LearnedHistory, Listening, ListingLimits, QueuedActionView, QueuedDemand, RequestGate,
-    RequestScope, RunningActionView, SchedulerPort, SchedulerSnapshot, StoreAccess, StoreKind,
-    WorkerCacheStats, WorkerSpec, WorkerState, WorkerTls, full_body,
+    ControllerEndpoints, ControllerReady, ControllerSpec, ControllerStores, DrainingWorker,
+    EngineStore, ExecutingDemand, FleetMemoryCapacity, GateDecision, InstanceCordon,
+    LeaderUnavailable, LearnedHistory, Listening, ListingLimits, QueuedActionView, QueuedDemand,
+    RequestGate, RequestScope, RunningActionView, SchedulerPort, SchedulerSnapshot, StoreAccess,
+    StoreKind, WorkerCacheStats, WorkerSpec, WorkerState, WorkerStores, WorkerTls, full_body,
 };
 pub use schema::SchemaMismatch;
 pub use scratch_port::{MountedScratchVolume, ScratchVolumePort};

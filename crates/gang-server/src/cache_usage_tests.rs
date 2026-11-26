@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use gang_clock::{Clock, Timestamp};
 use gang_config::{BuildsConfig, DashboardConfig};
-use gang_spi::{CacheStorePort, MeasuredUsage, PortError, RenderedStoreSpec, StoreAccess, Traffic};
+use gang_spi::{CacheStorePort, MeasuredUsage, PortError, StoreAccess, Traffic};
 use gang_state::{CacheBaseline, PassStatus};
-use gang_testkit::{FakeRepository, TestResult};
+use gang_testkit::{FakeRepository, MemoryActionStore, MemoryContentStore, TestResult};
 use gang_wire::{BucketUsage, State};
 use parking_lot::Mutex;
 
@@ -40,14 +40,17 @@ impl ScriptedCache {
 }
 
 impl CacheStorePort for ScriptedCache {
-    fn content_store(&self) -> Result<RenderedStoreSpec, PortError> {
+    type Content = MemoryContentStore;
+    type Actions = MemoryActionStore;
+
+    fn content_store(&self) -> Result<Self::Content, PortError> {
         Err(PortError::unavailable("not used"))
     }
 
     fn action_store(
         &self,
         _environment: &gang_types::EnvironmentName,
-    ) -> Result<RenderedStoreSpec, PortError> {
+    ) -> Result<Self::Actions, PortError> {
         Err(PortError::unavailable("not used"))
     }
 

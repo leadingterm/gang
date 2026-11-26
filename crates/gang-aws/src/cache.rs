@@ -1,5 +1,5 @@
-//! The cache stores on S3: the content-addressed store and the action cache, both described to the
-//! build engine as cloud object stores under one bucket and key prefix.
+//! The cache stores on S3: the content-addressed store and the action cache, both opened
+//! under one bucket and key prefix.
 //!
 //! Workers open the stores themselves with their own credentials (the instance role), so the
 //! controller never proxies blob traffic. Bucket lifecycle expiry should exceed
@@ -13,29 +13,17 @@
 use std::sync::Arc;
 
 use gang_clock::{Clock, SystemClock};
-use gang_spi::{
-    CacheStorePort, MeasuredUsage, Plugin, PluginContext, PortError, RenderedStoreSpec, StoreAccess,
-};
-use serde_json::json;
+use gang_spi::{CacheStorePort, MeasuredUsage, Plugin, PluginContext, PortError, StoreAccess};
 use tokio::sync::OnceCell;
 
 use crate::cloudwatch::BucketMetrics;
 use crate::config::S3CacheConfig;
 #[cfg(test)]
 use crate::s3_existence::S3ExistenceCache;
-use crate::s3_store::{
-    S3ActionStore, S3Backend, S3ContentStore, action_key_prefix, cas_key_prefix,
-};
-
-/// The `NativeLink` store kind that reads and writes S3 objects.
-const STORE_KEY: &str = "experimental_cloud_object_store";
-
-/// The `NativeLink` provider name for S3.
-const PROVIDER: &str = "aws";
+use crate::s3_store::{S3ActionStore, S3Backend, S3ContentStore};
 
 /// The cache stores on S3, opened by the workers directly.
 pub struct S3Cache {
-    config: S3CacheConfig,
     /// The bucket's storage metrics; `None` for an S3-compatible endpoint.
     metrics: Option<BucketMetrics>,
     backend: Arc<S3Backend>,
@@ -67,12 +55,8 @@ impl S3Cache {
             .endpoint
             .is_none()
             .then(|| BucketMetrics::new(&config, Arc::clone(&clock), metrics_client));
-        let backend = Arc::new(S3Backend::new(config.clone(), clock, s3_client));
-        Self {
-            config,
-            metrics,
-            backend,
-        }
+        let backend = Arc::new(S3Backend::new(config, clock, s3_client));
+        Self { metrics, backend }
     }
 
     /// Opens a [`S3ContentStore`] backed by this cache's S3 bucket and positive existence cache.
@@ -125,18 +109,18 @@ impl S3Cache {
 }
 
 impl CacheStorePort for S3Cache {
-    fn content_store(&self) -> Result<RenderedStoreSpec, PortError> {
-        Ok(store_spec(&self.config, &cas_key_prefix(&self.config)))
+    type Content = S3ContentStore;
+    type Actions = S3ActionStore;
+
+    fn content_store(&self) -> Result<Self::Content, PortError> {
+        Ok(self.s3_content_store())
     }
 
     fn action_store(
         &self,
         environment: &gang_types::EnvironmentName,
-    ) -> Result<RenderedStoreSpec, PortError> {
-        Ok(store_spec(
-            &self.config,
-            &action_key_prefix(&self.config, environment),
-        ))
+    ) -> Result<Self::Actions, PortError> {
+        Ok(self.s3_action_store(environment))
     }
 
     /// The workers open the S3 stores with their own credentials.
@@ -154,35 +138,6 @@ impl CacheStorePort for S3Cache {
     }
 }
 
-/// Describes one store under the configured `key_prefix`.
-fn store_spec(config: &S3CacheConfig, key_prefix: &str) -> RenderedStoreSpec {
-    let mut object = json!({
-        "provider": PROVIDER,
-        "region": config.region.as_str(),
-        "bucket": config.bucket.as_str(),
-        "force_path_style": config.force_path_style,
-        "key_prefix": key_prefix,
-        "retry": {
-            "max_retries": config.tuning.max_retries,
-            "delay": config.tuning.retry_delay.get().as_secs_f64(),
-            "jitter": f64::from(config.tuning.retry_jitter_percent.get()) / 100.0,
-        },
-        "multipart_max_concurrent_uploads": config.tuning.multipart_max_concurrent_uploads.get(),
-        "max_retry_buffer_per_request": config.tuning.retry_buffer_per_request.get(),
-    });
-    if let Some(endpoint) = &config.endpoint {
-        object["endpoint"] = json!(endpoint.as_str());
-        // NativeLink otherwise configures its S3 HTTP connector for HTTPS only.
-        if endpoint.scheme() == "http" {
-            object["insecure_allow_http"] = json!(true);
-        }
-    }
-    if let Some(expiry) = &config.tuning.consider_expired_after {
-        object["consider_expired_after_s"] = json!(expiry.as_secs());
-    }
-    RenderedStoreSpec(json!({ STORE_KEY: object }))
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::TryFromIntError;
@@ -190,8 +145,7 @@ mod tests {
 
     use aws_smithy_http_client::test_util::StaticReplayClient;
     use gang_clock::{TestClock, Timestamp};
-    use nativelink_config::stores::StoreSpec;
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::cloudwatch_replay::{
@@ -212,154 +166,12 @@ mod tests {
         json!({ "region": "us-east-1", "bucket": "example-bucket" })
     }
 
-    fn object(spec: &RenderedStoreSpec) -> &Value {
-        &spec.0[STORE_KEY]
-    }
     #[test]
-    fn environment_versions_namespace_only_action_results() -> TestResult {
+    fn cache_port_opens_typed_direct_stores() -> TestResult {
         let cache = S3Cache::build(serde_json::from_value(base_config())?, &context())?;
-        let direct_worker = S3Cache::build(serde_json::from_value(base_config())?, &context())?;
-        assert_eq!(direct_worker.worker_access(), StoreAccess::Direct);
-        let initial = gang_types::EnvironmentName::default();
-        let patched = gang_types::EnvironmentName::try_from("default/1".to_owned())?;
-        let bumped = gang_types::EnvironmentName::try_from("debian-13/2".to_owned())?;
-        assert_eq!(object(&cache.action_store(&initial)?)["key_prefix"], "ac/");
-        assert_eq!(cache.action_store(&initial)?, cache.action_store(&patched)?);
-        assert_eq!(
-            object(&cache.action_store(&bumped)?)["key_prefix"],
-            "ac/debian-13/2/"
-        );
-        assert_eq!(object(&cache.content_store()?)["key_prefix"], "cas/");
-        serde_json::from_value::<StoreSpec>(cache.action_store(&bumped)?.0)?;
-        for environment in [&initial, &bumped] {
-            assert_eq!(
-                cache.action_store(environment)?,
-                direct_worker.action_store(environment)?
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn both_stores_deserialize_into_nativelink_store_specs() -> TestResult {
-        let cache = S3Cache::build(serde_json::from_value(base_config())?, &context())?;
-
-        serde_json::from_value::<StoreSpec>(cache.content_store()?.0)?;
-        serde_json::from_value::<StoreSpec>(
-            cache
-                .action_store(&gang_types::EnvironmentName::default())?
-                .0,
-        )?;
-        Ok(())
-    }
-
-    #[test]
-    fn endpoint_and_path_style_render_for_both_stores() -> TestResult {
-        for (endpoint, path_style, allow_http) in [
-            (None, false, false),
-            (None, true, false),
-            (Some("http://127.0.0.1:9000/"), false, true),
-            (Some("http://127.0.0.1:9000/"), true, true),
-            (Some("https://s3.example.com/"), false, false),
-            (Some("https://s3.example.com/"), true, false),
-        ] {
-            let mut value = base_config();
-            if let Some(endpoint) = endpoint {
-                value["endpoint"] = json!(endpoint);
-            }
-            value["force_path_style"] = json!(path_style);
-            let cache = S3Cache::build(serde_json::from_value(value)?, &context())?;
-            for spec in [
-                cache.content_store()?,
-                cache.action_store(&gang_types::EnvironmentName::default())?,
-            ] {
-                assert_eq!(
-                    object(&spec).get("endpoint").and_then(Value::as_str),
-                    endpoint
-                );
-                assert_eq!(object(&spec)["force_path_style"], json!(path_style));
-                assert_eq!(
-                    object(&spec)
-                        .get("insecure_allow_http")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    allow_http
-                );
-                let parsed = serde_json::from_value::<StoreSpec>(spec.0)?;
-                let StoreSpec::ExperimentalCloudObjectStore(
-                    nativelink_config::stores::ExperimentalCloudObjectSpec::Aws(aws),
-                ) = parsed
-                else {
-                    return Err("expected an AWS cloud object store".into());
-                };
-                assert_eq!(aws.endpoint.as_deref(), endpoint);
-                assert_eq!(aws.force_path_style, path_style);
-                assert_eq!(aws.common.insecure_allow_http, allow_http);
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn content_and_action_keys_differ_under_the_configured_prefix() -> TestResult {
-        let mut value = base_config();
-        value["key_prefix"] = json!("gang/");
-        let cache = S3Cache::build(serde_json::from_value(value)?, &context())?;
-
-        let content = cache.content_store()?;
-        let action = cache.action_store(&gang_types::EnvironmentName::default())?;
-
-        assert_eq!(object(&content)["key_prefix"].as_str(), Some("gang/cas/"));
-        assert_eq!(object(&action)["key_prefix"].as_str(), Some("gang/ac/"));
-        Ok(())
-    }
-
-    #[test]
-    fn retry_delay_and_jitter_render_as_seconds_and_fraction() -> TestResult {
-        let mut value = base_config();
-        value["tuning"]["retry_delay"] = json!("300ms");
-        value["tuning"]["retry_jitter_percent"] = json!(50);
-        let cache = S3Cache::build(serde_json::from_value(value)?, &context())?;
-
-        let spec = cache.content_store()?;
-
-        assert_eq!(object(&spec)["retry"]["delay"], json!(0.3));
-        assert_eq!(object(&spec)["retry"]["jitter"], json!(0.5));
-        Ok(())
-    }
-
-    #[test]
-    fn expiry_is_absent_by_default_and_rendered_in_seconds_when_set() -> TestResult {
-        let default = S3Cache::build(serde_json::from_value(base_config())?, &context())?;
-        assert!(
-            object(&default.content_store()?)
-                .get("consider_expired_after_s")
-                .is_none()
-        );
-
-        let mut value = base_config();
-        value["tuning"]["consider_expired_after"] = json!("6d");
-        let expiring = S3Cache::build(serde_json::from_value(value)?, &context())?;
-        assert_eq!(
-            object(&expiring.action_store(&gang_types::EnvironmentName::default())?)["consider_expired_after_s"].as_u64(),
-            Some(518_400)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn max_expiry_renders_and_deserializes_into_nativelink() -> TestResult {
-        let mut value = base_config();
-        value["tuning"]["consider_expired_after"] = json!("4294967295s");
-        let cache = S3Cache::build(serde_json::from_value(value)?, &context())?;
-
-        let spec = cache.content_store()?;
-
-        assert_eq!(
-            object(&spec)["consider_expired_after_s"].as_u64(),
-            Some(4_294_967_295)
-        );
-        serde_json::from_value::<StoreSpec>(spec.0)?;
+        assert_eq!(cache.worker_access(), StoreAccess::Direct);
+        let _content: S3ContentStore = cache.content_store()?;
+        let _actions: S3ActionStore = cache.action_store(&gang_types::EnvironmentName::default())?;
         Ok(())
     }
 

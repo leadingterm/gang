@@ -2,16 +2,27 @@
 //! until shutdown, preemption, or the scheduler's worker returns.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gang_clock::{Clock, Timestamp};
-use gang_config::{PluginSet, SandboxFile, SandboxSelection, WorkerConfig};
+use gang_config::{InputTrees, PluginSet, SandboxFile, SandboxSelection, WorkerConfig};
 use gang_spi::{
     ActionLimitsPort, CacheStorePort, ClientTls, NodeLifecyclePort, PortError, ProvisionerPort,
-    SchedulerPort, ScratchVolumePort, WorkerSpec, WorkerTls, WorkloadCredentialPort,
+    SchedulerPort, ScratchVolumePort, StoreAccess, WorkerSpec, WorkerStores, WorkerTls,
+    WorkloadCredentialPort,
 };
 use gang_types::ActionEnvironment;
+
+/// Local sandbox identity and read-only tree capability produced by `build_sandbox`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxInfo {
+    /// Action environment identity reported by the selected sandbox.
+    pub environment: ActionEnvironment,
+    /// Whether the selected sandbox bind-mounts read-only input trees.
+    pub binds_read_only: bool,
+}
 
 use crate::credentials::Enroller;
 use crate::deployment::{WorkerDeployment, WorkerParts, WorkerSettings};
@@ -56,7 +67,7 @@ pub async fn run<D: WorkerDeployment, P: PluginSet>(
     parts: WorkerParts<D>,
     settings: WorkerSettings<P>,
     build_limits: impl FnOnce(P::Limits) -> Result<D::Limits, PortError>,
-    build_sandbox: impl FnOnce(P::SandboxKey, &mut P::Sandbox) -> Result<ActionEnvironment, PortError>,
+    build_sandbox: impl FnOnce(P::SandboxKey, &mut P::Sandbox) -> Result<SandboxInfo, PortError>,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), WorkerError> {
     let WorkerParts {
@@ -124,7 +135,7 @@ pub async fn run<D: WorkerDeployment, P: PluginSet>(
             });
         };
         scheduler
-            .run_worker(&plan.spec, tls, stop)
+            .run_worker(&plan.spec, plan.stores.clone(), tls, stop)
             .await
             .map_err(WorkerError::Scheduler)?;
         match end {
@@ -170,11 +181,17 @@ enum End {
 }
 
 /// The values of a worker that do not change between generations.
-struct Plan {
+struct Plan<C, A> {
     layout: Layout,
     worker: WorkerConfig,
     spec: WorkerSpec,
+    stores: WorkerStores<C, A>,
 }
+
+type PreparedPlan<D> = Plan<
+    <<D as WorkerDeployment>::Cache as CacheStorePort>::Content,
+    <<D as WorkerDeployment>::Cache as CacheStorePort>::Actions,
+>;
 
 /// Describes the worker: its identity and sizing, its prepared scratch volume, its rendered
 /// sandbox file, its limits and its stores.
@@ -195,8 +212,8 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
     cache: &D::Cache,
     settings: WorkerSettings<P>,
     build_limits: impl FnOnce(P::Limits) -> Result<D::Limits, PortError>,
-    build_sandbox: impl FnOnce(P::SandboxKey, &mut P::Sandbox) -> Result<ActionEnvironment, PortError>,
-) -> Result<(Plan, Option<D::Limits>), WorkerError> {
+    build_sandbox: impl FnOnce(P::SandboxKey, &mut P::Sandbox) -> Result<SandboxInfo, PortError>,
+) -> Result<(PreparedPlan<D>, Option<D::Limits>), WorkerError> {
     let WorkerSettings {
         fleets,
         actions,
@@ -217,7 +234,7 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
     let volume = provisioner.mount(&identity.instance).await?;
     let layout = Layout::new(&volume.path);
     let mut sandbox = sandbox;
-    let environment = prepare_sandbox(
+    let sandbox_info = prepare_sandbox(
         &mut sandbox,
         fleet.sandbox,
         &search_path,
@@ -225,6 +242,7 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         &fleet.policy.action_environment,
         build_sandbox,
     )?;
+    let bind_trees = sandbox_info.binds_read_only && execution.input_trees == InputTrees::Bind;
     let network_granted = fleet
         .policy
         .actions
@@ -265,9 +283,15 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
     let (memory_pool, capacity) =
         prepare_memory_pool(limits.as_ref(), reserve, actions.memory.min_reservation).await?;
     let mut properties = fleet.properties.clone();
-    properties.set_action_environment(&environment);
+    properties.set_action_environment(&sandbox_info.environment);
     properties.set_memory_capacity(capacity);
-    let action_store = cache.action_store(&actions.environment)?;
+    let stores = match cache.worker_access() {
+        StoreAccess::Direct => WorkerStores::Direct {
+            content: Arc::new(cache.content_store()?),
+            actions: Arc::new(cache.action_store(&actions.environment)?),
+        },
+        StoreAccess::ViaController => WorkerStores::ViaController,
+    };
     let spec = WorkerSpec {
         actions,
         memory_pool,
@@ -277,15 +301,14 @@ async fn describe<D: WorkerDeployment, P: PluginSet>(
         work_directory: layout.work_directory(),
         fast_cas_directory: layout.fast_cas_directory(),
         fast_cas_budget,
-        content_store: cache.content_store()?,
-        action_store,
-        store_access: cache.worker_access(),
+        trees_directory: bind_trees.then(|| layout.trees_directory()),
         entrypoint: layout.entrypoint(),
     };
     let plan = Plan {
         layout,
         worker,
         spec,
+        stores,
     };
     Ok((plan, limits))
 }
@@ -297,8 +320,8 @@ fn prepare_sandbox<S: SandboxSelection>(
     search_path: &std::ffi::OsStr,
     fleet: &gang_types::FleetName,
     configured: &ActionEnvironment,
-    build_sandbox: impl FnOnce(S::Key, &mut S) -> Result<ActionEnvironment, PortError>,
-) -> Result<ActionEnvironment, WorkerError> {
+    build_sandbox: impl FnOnce(S::Key, &mut S) -> Result<SandboxInfo, PortError>,
+) -> Result<SandboxInfo, WorkerError> {
     sandbox.try_for_each_program(key, |program| {
         *program = resolve_program(program.as_path(), search_path)?;
         Ok::<(), WorkerError>(())
@@ -311,15 +334,15 @@ fn prepare_sandbox<S: SandboxSelection>(
             .map_err(|error| WorkerError::Config(error.to_string()))?;
         Ok::<(), WorkerError>(())
     })?;
-    let environment = build_sandbox(key, sandbox)?;
-    if &environment != configured {
+    let info = build_sandbox(key, sandbox)?;
+    if &info.environment != configured {
         return Err(WorkerError::EnvironmentMismatch {
             fleet: fleet.clone(),
             configured: configured.clone(),
-            actual: environment,
+            actual: info.environment,
         });
     }
-    Ok(environment)
+    Ok(info)
 }
 
 fn check_isa(
@@ -395,7 +418,7 @@ struct Tls {
 /// Obtains the credentials of `generation`: a workload proof, enrollment, and the identity files
 /// written into that generation's own directory.
 async fn acquire<D: WorkerDeployment>(
-    plan: &Plan,
+    plan: &PreparedPlan<D>,
     provisioner: &D::Provisioner,
     enroller: &D::Enroller,
     clock: &D::Clock,
@@ -438,7 +461,7 @@ fn retry_wait(error: &WorkerError, interval: Duration) -> Duration {
 /// A refusal for now (rate limited or temporarily unavailable) is retried only if the retry can
 /// start by the enrollment deadline. Every other failure is returned at once.
 async fn first_tls<D: WorkerDeployment>(
-    plan: &Plan,
+    plan: &PreparedPlan<D>,
     provisioner: &D::Provisioner,
     enroller: &D::Enroller,
     clock: &D::Clock,
@@ -473,7 +496,7 @@ async fn first_tls<D: WorkerDeployment>(
 /// Obtains the next generation's TLS material while the current worker keeps running: waits for
 /// the refresh point, then retries failed attempts only while the wait fits before expiration.
 async fn renew<D: WorkerDeployment>(
-    plan: &Plan,
+    plan: &PreparedPlan<D>,
     provisioner: &D::Provisioner,
     enroller: &D::Enroller,
     clock: &D::Clock,
@@ -513,7 +536,11 @@ async fn poll_until<T, F: Future<Output = Option<T>>>(
 /// Completes when the provisioner's preemption notice leaves the worker its grace period.
 ///
 /// A failed check is logged and retried like a check that found no notice.
-async fn preemption<P: NodeLifecyclePort>(provisioner: &P, clock: &impl Clock, plan: &Plan) {
+async fn preemption<P: NodeLifecyclePort, C, A>(
+    provisioner: &P,
+    clock: &impl Clock,
+    plan: &Plan<C, A>,
+) {
     let notice = poll_until(
         clock,
         plan.worker.lifecycle_poll_interval.get(),
@@ -568,4 +595,165 @@ async fn wait_until_serving<P: NodeLifecyclePort>(
         }
     })
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use gang_clock::TestClock;
+    use gang_config::ExecutionConfig;
+    use gang_spi::MeasuredUsage;
+    use gang_testkit::{
+        Behaviour, FakeProvisioner, FakeScheduler, MemoryActionStore, MemoryContentStore,
+        RecordingLimits, SandboxConfig, SandboxKey, TestLimits, TestPlugins,
+    };
+    use gang_types::{Bytes, FleetName, InstanceId, Isa, WorkerLifetime};
+
+    use super::*;
+    use crate::credentials::{Credentials, EnrollError};
+    use crate::transport::ServerCaError;
+
+    struct SpyCache {
+        access: StoreAccess,
+        content_calls: AtomicUsize,
+        action_calls: AtomicUsize,
+    }
+
+    impl SpyCache {
+        fn new(access: StoreAccess) -> Self {
+            Self {
+                access,
+                content_calls: AtomicUsize::new(0),
+                action_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl CacheStorePort for SpyCache {
+        type Content = MemoryContentStore;
+        type Actions = MemoryActionStore;
+
+        fn content_store(&self) -> Result<Self::Content, PortError> {
+            self.content_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(MemoryContentStore::new())
+        }
+
+        fn action_store(
+            &self,
+            _environment: &gang_types::EnvironmentName,
+        ) -> Result<Self::Actions, PortError> {
+            self.action_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(MemoryActionStore::new())
+        }
+
+        fn worker_access(&self) -> StoreAccess {
+            self.access
+        }
+
+        async fn measured_usage(&self) -> Result<Option<MeasuredUsage>, PortError> {
+            Ok(None)
+        }
+    }
+
+    struct DummyEnroller;
+
+    impl crate::credentials::Enroller for DummyEnroller {
+        async fn enroll(&self, _proof: gang_types::Proof) -> Result<Credentials, EnrollError> {
+            unreachable!("plain transport does not enroll")
+        }
+    }
+
+    struct DummyServerCa;
+
+    impl ServerCaSource for DummyServerCa {
+        async fn server_ca(&self) -> Result<Option<gang_types::CertificatePem>, ServerCaError> {
+            Ok(None)
+        }
+    }
+
+    struct SpyDeployment;
+
+    impl WorkerDeployment for SpyDeployment {
+        type Provisioner = FakeProvisioner;
+        type Cache = Arc<SpyCache>;
+        type Scheduler = FakeScheduler;
+        type Limits = RecordingLimits;
+        type Clock = Arc<TestClock>;
+        type Enroller = DummyEnroller;
+        type ServerCa = DummyServerCa;
+    }
+
+    fn test_settings(root: &std::path::Path) -> WorkerSettings<TestPlugins> {
+        let fleets = gang_config::Fleets::try_new(vec![gang_config::FleetMember {
+            policy: gang_testkit::fleet_policy("example-fleet").expect("valid fleet policy"),
+            sandbox: SandboxKey::Noop,
+            options: gang_testkit::Opaque::default(),
+        }])
+        .expect("valid fleets");
+        let executable = root.join("gang");
+        std::fs::write(&executable, b"").expect("executable");
+        WorkerSettings {
+            fleets,
+            actions: Arc::new(gang_config::ActionsConfig::default()),
+            worker: WorkerConfig::default(),
+            sandbox: SandboxConfig {
+                noop: Some(gang_testkit::Opaque::default()),
+                boxed: None,
+                bwrap: None,
+            },
+            execution: ExecutionConfig::default(),
+            controller_endpoints: Box::default(),
+            limits: Some(TestLimits { max_pids: 512 }),
+            executable,
+            search_path: std::ffi::OsString::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn via_controller_never_opens_cache_stores() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let volume = dir.path().join("scratch");
+        std::fs::create_dir(&volume).expect("scratch");
+        let cache = Arc::new(SpyCache::new(StoreAccess::ViaController));
+        let scheduler = FakeScheduler::new().expect("fake scheduler");
+        scheduler.set_worker_scheme("grpc").expect("grpc scheme");
+        scheduler.set_behaviour(Behaviour::Finish);
+        let provisioner = FakeProvisioner::new(
+            gang_spi::InstanceIdentity {
+                instance: InstanceId::try_new("i-via").expect("instance"),
+                fleet: FleetName::try_new("example-fleet").expect("fleet"),
+                isa: Isa::X86_64,
+            },
+            WorkerLifetime::LongLived,
+            volume,
+            Bytes::new(256 * 1024 * 1024 * 1024),
+        );
+        let parts = WorkerParts::<SpyDeployment> {
+            provisioner,
+            cache: Arc::clone(&cache),
+            scheduler: scheduler.clone(),
+            clock: Arc::new(TestClock::default()),
+            transport: Transport::Plain,
+        };
+        let result = run(
+            parts,
+            test_settings(dir.path()),
+            |_| Ok(RecordingLimits::new(&gang_testkit::CallLog::default())),
+            |_, _| {
+                Ok(SandboxInfo {
+                    environment: "host:test".parse().expect("env"),
+                    binds_read_only: false,
+                })
+            },
+            std::future::pending(),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(cache.content_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.action_calls.load(Ordering::SeqCst), 0);
+        let specs = scheduler.specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].store_access, StoreAccess::ViaController);
+    }
 }

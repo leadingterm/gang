@@ -53,6 +53,12 @@ impl Layout {
         self.root.join("fast-cas")
     }
 
+    /// Returns the directory where read-only cached input trees are materialized.
+    #[must_use]
+    pub fn trees_directory(&self) -> PathBuf {
+        self.root.join("trees")
+    }
+
     /// Returns the path of the rendered sandbox configuration, beside the entrypoint link.
     #[must_use]
     pub fn sandbox_file(&self) -> PathBuf {
@@ -95,6 +101,7 @@ impl Layout {
         remove_dir_optional(&self.work_directory())?;
         create_directory(&self.work_directory())?;
         ensure_private_dir(&self.work_directory().join(".side_channels"))?;
+        remove_dir_optional(&self.trees_directory())?;
         create_directory(&self.fast_cas_directory())?;
         create_directory(&self.bin_directory())?;
         remove_dir_optional(&self.identity_directory())?;

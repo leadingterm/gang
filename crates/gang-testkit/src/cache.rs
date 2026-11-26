@@ -1,26 +1,26 @@
 //! A test double for the cache port, with in-memory stores.
 
-use gang_spi::{CacheStorePort, MeasuredUsage, PortError, RenderedStoreSpec, StoreAccess};
+use gang_spi::{CacheStorePort, MeasuredUsage, PortError, StoreAccess};
+
+use crate::{MemoryActionStore, MemoryContentStore};
 
 /// A cache whose two stores are in-memory and whose workers open them directly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FakeCache;
 
-/// The in-memory store description that both of the fake's stores report.
-fn memory_store() -> RenderedStoreSpec {
-    RenderedStoreSpec(serde_json::json!({"memory": {}}))
-}
-
 impl CacheStorePort for FakeCache {
-    fn content_store(&self) -> Result<RenderedStoreSpec, PortError> {
-        Ok(memory_store())
+    type Content = MemoryContentStore;
+    type Actions = MemoryActionStore;
+
+    fn content_store(&self) -> Result<Self::Content, PortError> {
+        Ok(MemoryContentStore::new())
     }
 
     fn action_store(
         &self,
         _environment: &gang_types::EnvironmentName,
-    ) -> Result<RenderedStoreSpec, PortError> {
-        Ok(memory_store())
+    ) -> Result<Self::Actions, PortError> {
+        Ok(MemoryActionStore::new())
     }
 
     fn worker_access(&self) -> StoreAccess {

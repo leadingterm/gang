@@ -887,7 +887,6 @@ mod tests {
     use gang_spi::{CacheStorePort as _, Plugin as _};
     use gang_testkit::{action_store_contract, content_store_contract};
     use gang_types::NonZeroDuration;
-    use nativelink_config::stores::{ExperimentalCloudObjectSpec, StoreSpec};
     use parking_lot::Mutex;
     use serde_json::{Value, json};
     use tokio::net::TcpListener;
@@ -1351,39 +1350,20 @@ mod tests {
             });
             let cache = S3Cache::build(serde_json::from_value(config_json)?, &context())?;
 
-            let cas_spec = serde_json::from_value::<StoreSpec>(cache.content_store()?.0)?;
-            let StoreSpec::ExperimentalCloudObjectStore(ExperimentalCloudObjectSpec::Aws(
-                nativelink_cas,
-            )) = cas_spec
-            else {
-                return Err("expected AWS store spec".into());
-            };
-            let cas_store = cache.s3_content_store();
+            let cas_store = cache.content_store()?;
             assert_eq!(
                 cas_store.key(digest),
-                format!(
-                    "{}{}",
-                    nativelink_cas.common.key_prefix.unwrap_or_default(),
-                    nativelink_digest_key
-                )
+                format!("{prefix}cas/{nativelink_digest_key}")
             );
 
-            for env in [&default_env, &bumped_env] {
-                let ac_spec = serde_json::from_value::<StoreSpec>(cache.action_store(env)?.0)?;
-                let StoreSpec::ExperimentalCloudObjectStore(ExperimentalCloudObjectSpec::Aws(
-                    nativelink_ac,
-                )) = ac_spec
-                else {
-                    return Err("expected AWS store spec".into());
-                };
-                let ac_store = cache.s3_action_store(env);
+            for (env, expected_ac_prefix) in [
+                (&default_env, format!("{prefix}ac/")),
+                (&bumped_env, format!("{prefix}ac/debian-13/2/")),
+            ] {
+                let ac_store = cache.action_store(env)?;
                 assert_eq!(
                     ac_store.key(digest),
-                    format!(
-                        "{}{}",
-                        nativelink_ac.common.key_prefix.unwrap_or_default(),
-                        nativelink_digest_key
-                    )
+                    format!("{expected_ac_prefix}{nativelink_digest_key}")
                 );
             }
         }

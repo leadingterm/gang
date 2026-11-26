@@ -38,6 +38,7 @@ async fn renders_the_executor_cache_and_helper_with_the_server_ca() {
              build --grpc_keepalive_time=10s\n\
              build --grpc_keepalive_timeout=30s\n\
              build --remote_download_outputs=toplevel\n\
+             build --remote_execution_priority=100\n\
              # The gang that Bazel runs for credentials; run `gang bazelrc` again if it moves.\n\
              build --credential_helper={host}={HELPER}\n\
              build --remote_default_exec_properties=ISA=x86-64\n\

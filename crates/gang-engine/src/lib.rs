@@ -40,17 +40,14 @@ pub use controller::{
     ControllerClosed, ControllerExecuteError, ControllerHandle, ControllerRegisterError,
     LearnedSlot, spawn_controller,
 };
-pub use engine::{
-    ControllerStores, Engine, EngineControllerSpec, EngineError, TlsSessionConnector,
-};
+pub use engine::{Engine, EngineControllerSpec, EngineError, TlsSessionConnector};
+pub use gang_spi::{ControllerStores, WorkerStores};
 pub use reapi_ac::ActionCacheService;
 pub use reapi_bytestream::{ByteStreamConfig, ByteStreamService};
 pub use reapi_capabilities::{CapabilitiesConfig, CapabilitiesService};
 pub use reapi_cas::{BlobPermit, CasConfig, CasService, InflightBlobBudget};
 pub use reapi_execution::{ExecutionService, ExecutionServiceConfig, OperationsService};
-pub use worker::{
-    DEFAULT_WORKER_MAX_MESSAGE_SIZE, WorkerError, WorkerRuntimeSpec, WorkerStores, run_worker,
-};
+pub use worker::{DEFAULT_WORKER_MAX_MESSAGE_SIZE, WorkerError, WorkerRuntimeSpec, run_worker};
 pub use worker_graveyard::{GRAVEYARD_DIR, Graveyard, GraveyardError};
 pub use worker_runner::{
     CPU_WEIGHT_FILE, CapturedOutput, DEFAULT_MAX_OUTPUT_BYTES, ExecutionTimestamps,

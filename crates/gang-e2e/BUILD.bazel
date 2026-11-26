@@ -83,7 +83,6 @@ workspace_rust_library(
     dev_deps = [
         "//crates/gang-aws-sdk:gang_aws_sdk",
         "//crates/gang-dynamodb:gang_dynamodb_test_support",
-        "//crates/gang-nativelink:gang_nativelink_test_support",
         "//crates/gang-postgres:gang_postgres",
         "//crates/gang-server:gang_server",
         "//crates/gang-sqlite:gang_sqlite",

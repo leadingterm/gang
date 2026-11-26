@@ -23,7 +23,6 @@ members = [
     "crates/gang-macros",
     "crates/gang-main",
     "crates/gang-mtls",
-    "crates/gang-nativelink",
     "crates/gang-noop",
     "crates/gang-oidc",
     "crates/gang-os",

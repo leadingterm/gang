@@ -25,7 +25,7 @@ use gang_reapi::google::rpc as rpc_proto;
 use gang_reapi::leadingterm::gang::worker::v1 as proto;
 use gang_spi::{
     ActionMemoryPool, ActionStore, BlobStream, ByteRange, ContentStore, EngineStore, PortError,
-    PortFailure,
+    PortFailure, WorkerStores,
 };
 use gang_types::{
     AttemptId, CpuWeight, Digest, FleetProperties, InstanceId, NonZeroBytes, NonZeroDuration,
@@ -59,20 +59,6 @@ use crate::worker_upload::{
 
 /// Default maximum `gRPC` frame size for worker session messages (16 `MiB`).
 pub const DEFAULT_WORKER_MAX_MESSAGE_SIZE: NonZeroBytes = NonZeroBytes::mib(16);
-
-/// Slow-store wiring mode for a worker (`§3.1`).
-#[derive(Debug, Clone)]
-pub enum WorkerStores<C, A> {
-    /// Worker connects directly to shared content and action stores (for example S3).
-    Direct {
-        /// Slow content-addressed blob store.
-        content: Arc<C>,
-        /// Action-result cache store.
-        actions: Arc<A>,
-    },
-    /// Worker accesses CAS and `ActionCache` through the controller's worker listener.
-    ViaController,
-}
 
 /// Runtime inputs describing one native worker (`§6.2`–`§6.5`).
 #[derive(Debug, Clone)]

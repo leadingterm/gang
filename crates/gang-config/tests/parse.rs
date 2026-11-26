@@ -1223,7 +1223,7 @@ fn nondefault_runtime_domains_round_trip() -> Result<(), Box<dyn Error>> {
         top: top.leak(),
         actions: "[actions]\nretain_completed_for = \"75s\"\n",
         server: server.leak(),
-        worker: "[worker]\nmax_open_files = 8192\nupload_timeout = \"11s\"\ndownload_timeout = \"12s\"\nconnect_timeout = \"3s\"\ncleanup_wait = \"14s\"\nkeepalive_interval = \"15s\"\n",
+        worker: "[worker]\nmax_open_files = 8192\nupload_timeout = \"11s\"\ndownload_timeout = \"12s\"\nconnect_timeout = \"3s\"\nkeepalive_interval = \"15s\"\n",
         ..Sections::VALID
     }.text();
     let original = text.parse::<GangConfig<Plugins>>()?;
@@ -1248,6 +1248,12 @@ fn nondefault_runtime_domains_round_trip() -> Result<(), Box<dyn Error>> {
         reparsed.worker.upload_timeout.get(),
         Duration::from_secs(11)
     );
+    let legacy = Sections {
+        worker: "[worker]\ncleanup_wait = \"14s\"\n",
+        ..Sections::VALID
+    }
+    .text();
+    assert!(legacy.parse::<GangConfig<Plugins>>().is_err());
     Ok(())
 }
 

@@ -21,11 +21,11 @@ gang-clock = { workspace = true }
 gang-config = { workspace = true }
 gang-deploy = { workspace = true }
 gang-dynamodb = { workspace = true }
+gang-engine = { workspace = true }
 gang-exec = { workspace = true }
 gang-local = { workspace = true }
 gang-macros = { workspace = true }
 gang-mtls = { workspace = true }
-gang-nativelink = { workspace = true }
 gang-noop = { workspace = true }
 gang-oidc = { workspace = true }
 gang-os = { workspace = true }

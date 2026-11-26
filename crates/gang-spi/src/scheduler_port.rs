@@ -19,8 +19,8 @@ use gang_types::{
 };
 
 use crate::{
-    ActionMemoryPool, Authenticated, BoxedError, CompletionRates, FleetSupply, ObservationSink,
-    Peer, PortError, RecordKey, RenderedStoreSpec, port,
+    ActionMemoryPool, ActionStore, Authenticated, BoxedError, CompletionRates, ContentStore,
+    FleetSupply, ObservationSink, Peer, PortError, RecordKey, port,
 };
 
 /// The remote execution scheduler Gang scales workers for. The scheduler runs inside the `gang`
@@ -96,7 +96,7 @@ pub trait SchedulerPort: Send + Sync {
     ///
     /// `now` uses the injected server clock. Reappearance resets the absence interval. Each
     /// supply includes every lifecycle and configuration generation. The implementation scans
-    /// the complete borrowed census synchronously after acquiring its asynchronous write lock.
+    /// the complete borrowed census synchronously.
     ///
     /// # Errors
     ///
@@ -129,10 +129,17 @@ pub trait SchedulerPort: Send + Sync {
     ///
     /// [`PortError::Config`] when the inputs cannot form a valid controller;
     /// [`PortError`] when a store cannot be started or the controller fails.
-    async fn run_controller<P: RequestGate, W: RequestGate, A: ApiService>(
+    async fn run_controller<
+        C: ContentStore,
+        Ac: ActionStore,
+        P: RequestGate,
+        W: RequestGate,
+        A: ApiService,
+    >(
         &self,
         spec: &ControllerSpec<'_>,
         connections: ControllerConnections<P, W, A>,
+        stores: ControllerStores<C, Ac>,
         ready: ControllerReady,
     ) -> Result<(), PortError>;
 
@@ -163,9 +170,10 @@ pub trait SchedulerPort: Send + Sync {
     /// scheme is not the endpoint's; [`PortError`] when the worker cannot be started or fails.
     /// [`PortError::Backend`] when the controller refuses the worker's certificate as revoked;
     /// the worker then never reconnects.
-    async fn run_worker(
+    async fn run_worker<C: ContentStore, Ac: ActionStore>(
         &self,
         spec: &WorkerSpec,
+        stores: WorkerStores<C, Ac>,
         tls: WorkerTls<'_>,
         stop: impl Future<Output = ()> + Send,
     ) -> Result<(), PortError>;
@@ -627,6 +635,50 @@ pub struct ClientTls<'a> {
     pub server_ca: &'a Path,
 }
 
+/// Typed content and action stores passed to [`SchedulerPort::run_controller`].
+#[derive(Debug)]
+pub struct ControllerStores<C, A> {
+    /// Content-addressed blob store.
+    pub content: Arc<C>,
+    /// Action-result cache store.
+    pub actions: Arc<A>,
+}
+
+impl<C, A> Clone for ControllerStores<C, A> {
+    fn clone(&self) -> Self {
+        Self {
+            content: Arc::clone(&self.content),
+            actions: Arc::clone(&self.actions),
+        }
+    }
+}
+
+/// Slow-store wiring passed to [`SchedulerPort::run_worker`].
+#[derive(Debug)]
+pub enum WorkerStores<C, A> {
+    /// Worker connects directly to shared content and action stores (for example S3).
+    Direct {
+        /// Slow content-addressed blob store.
+        content: Arc<C>,
+        /// Action-result cache store.
+        actions: Arc<A>,
+    },
+    /// Worker accesses CAS and `ActionCache` through the controller's worker listener.
+    ViaController,
+}
+
+impl<C, A> Clone for WorkerStores<C, A> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Direct { content, actions } => Self::Direct {
+                content: Arc::clone(content),
+                actions: Arc::clone(actions),
+            },
+            Self::ViaController => Self::ViaController,
+        }
+    }
+}
+
 /// Inputs of the controller.
 #[derive(Clone)]
 pub struct ControllerSpec<'a> {
@@ -639,10 +691,6 @@ pub struct ControllerSpec<'a> {
     /// Bound on control lock acquisition and read preparation, derived from the server's poll
     /// cadence. Once a control mutation begins it is not timed out or cancelled by this bound.
     pub control_acquire_timeout: NonZeroDuration,
-    /// The content-addressable store.
-    pub content_store: &'a RenderedStoreSpec,
-    /// The action store.
-    pub action_store: &'a RenderedStoreSpec,
     /// Every fleet's properties in preference order: what the scheduler declares and how
     /// queued actions are matched.
     pub fleets: &'a FleetCatalog,
@@ -664,8 +712,6 @@ impl std::fmt::Debug for ControllerSpec<'_> {
             .field("actions", &self.actions)
             .field("scaling", &self.scaling)
             .field("control_acquire_timeout", &self.control_acquire_timeout)
-            .field("content_store", &self.content_store)
-            .field("action_store", &self.action_store)
             .field("fleets", &self.fleets)
             .field("max_workers", &self.max_workers)
             .field("client_action_timeout", &self.client_action_timeout)
@@ -686,7 +732,7 @@ pub struct ControllerEndpoints {
     pub worker: Url,
 }
 
-/// How a worker reaches the stores of [`ControllerSpec`].
+/// How a worker reaches the controller's cache stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreAccess {
     /// The workers open the store themselves, as with an object store that every node can reach.
@@ -718,12 +764,8 @@ pub struct WorkerSpec {
     /// The most the fast cache may hold before it evicts; derived from the scratch volume's
     /// capacity.
     pub fast_cas_budget: Bytes,
-    /// The content-addressable store.
-    pub content_store: RenderedStoreSpec,
-    /// The action store.
-    pub action_store: RenderedStoreSpec,
-    /// How the worker reaches the two stores above.
-    pub store_access: StoreAccess,
+    /// Optional immutable input tree cache directory under the scratch volume; active iff `Some`.
+    pub trees_directory: Option<PathBuf>,
     /// The `gang-exec` link to the `gang` binary, which runs as the worker's action
     /// entrypoint (`gang exec`). The sandbox file `gang exec` reads is its sibling
     /// (`gang_config::SandboxFile::beside`); the directory is the worker's, never writable by

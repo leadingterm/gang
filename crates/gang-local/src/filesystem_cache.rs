@@ -1,9 +1,9 @@
 //! The cache stores: the content-addressed store and the action cache, both kept under one directory
-//! and described to the build engine as filesystem stores with an eviction budget.
+//! and opened as [`FilesystemContentStore`] and [`FilesystemActionStore`].
 //!
 //! The directory is created on first use, not when the plugin is built, so a node that only runs
-//! workers never creates it. The `NativeLink` filesystem store is single-process, so workers reach
-//! the stores through the controller.
+//! workers never creates it. The stores are single-process, so workers reach them through the
+//! controller.
 
 use std::collections::HashMap;
 use std::fs::{self, DirBuilder, OpenOptions};
@@ -18,7 +18,7 @@ use gang_os::PathIo;
 use gang_os::fs::{ensure_private_dir, require_private_dir, space};
 use gang_spi::{
     ActionStore, BlobStream, ByteRange, CacheStorePort, ContentStore, EngineStore, MeasuredUsage,
-    Plugin, PluginContext, PortError, RenderedStoreSpec, StoreAccess, StoreKind,
+    Plugin, PluginContext, PortError, StoreAccess, StoreKind,
 };
 use gang_types::{AbsolutePathBuf, Bytes, Digest, EnvironmentName, Percent};
 use parking_lot::Mutex;
@@ -882,26 +882,21 @@ impl ActionLru {
 }
 
 impl CacheStorePort for FilesystemCache {
-    fn content_store(&self) -> Result<RenderedStoreSpec, PortError> {
-        let (budget, _) = self.prepare().map_err(PortError::from)?;
-        content_store_spec(&self.path, budget).map_err(PortError::from)
+    type Content = FilesystemContentStore;
+    type Actions = FilesystemActionStore;
+
+    fn content_store(&self) -> Result<Self::Content, PortError> {
+        self.open_content_store()
     }
 
     fn action_store(
         &self,
         environment: &gang_types::EnvironmentName,
-    ) -> Result<RenderedStoreSpec, PortError> {
-        let (_, budget) = self.prepare().map_err(PortError::from)?;
-        let root = environment
-            .cache_namespace()
-            .map(|name| self.path.join("environments").join(name));
-        let root = root.as_deref().unwrap_or(&self.path);
-        ensure_private_dir(&action_dir(root)).map_err(LocalError::from)?;
-        ensure_private_dir(&action_temp_dir(root)).map_err(LocalError::from)?;
-        action_store_spec(root, budget).map_err(PortError::from)
+    ) -> Result<Self::Actions, PortError> {
+        self.open_action_store(environment)
     }
 
-    /// The `NativeLink` filesystem stores are single-process, so only the controller opens them.
+    /// The filesystem stores are single-process, so only the controller opens them.
     fn worker_access(&self) -> StoreAccess {
         StoreAccess::ViaController
     }
@@ -938,59 +933,14 @@ fn action_temp_dir(root: &Path) -> PathBuf {
     root.join("ac").join("tmp")
 }
 
-/// Describes the content-addressed store (CAS) under `root` as a filesystem store, evicting least
-/// recently used blobs once it holds `budget` bytes.
-fn content_store_spec(root: &Path, budget: Bytes) -> Result<RenderedStoreSpec, LocalError> {
-    filesystem_store(&content_dir(root), &content_temp_dir(root), budget)
-}
-
-/// Describes the action cache under `root` as a filesystem store, evicting entries once it holds
-/// `budget` bytes.
-fn action_store_spec(root: &Path, budget: Bytes) -> Result<RenderedStoreSpec, LocalError> {
-    filesystem_store(&action_dir(root), &action_temp_dir(root), budget)
-}
-
-fn filesystem_store(
-    content: &Path,
-    temp: &Path,
-    budget: Bytes,
-) -> Result<RenderedStoreSpec, LocalError> {
-    Ok(RenderedStoreSpec(serde_json::json!({
-        "filesystem": {
-            "content_path": utf8(content)?,
-            "temp_path": utf8(temp)?,
-            "eviction_policy": { "max_bytes": budget.get() },
-        }
-    })))
-}
-
-/// The engine's store description is JSON, so every path in it must be UTF-8.
-fn utf8(path: &Path) -> Result<&str, LocalError> {
-    path.to_str()
-        .ok_or_else(|| LocalError::NonUtf8Path(path.to_path_buf()))
-}
-
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
     use crate::test_support::plugin_context;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
-
-    const CONTENT_BUDGET: Bytes = Bytes::new(3 << 20);
-    const ACTION_BUDGET: Bytes = Bytes::new(5 << 10);
-
-    fn path_at(spec: &RenderedStoreSpec, key: &str) -> Option<String> {
-        spec.0["filesystem"][key].as_str().map(str::to_owned)
-    }
-
-    fn max_bytes(spec: &RenderedStoreSpec) -> Option<u64> {
-        spec.0["filesystem"]["eviction_policy"]["max_bytes"].as_u64()
-    }
 
     fn config(path: &Path) -> FilesystemCacheConfig {
         FilesystemCacheConfig {
@@ -1015,63 +965,6 @@ mod tests {
     }
 
     #[test]
-    fn stores_parse_back_with_their_paths_under_the_root() -> TestResult {
-        let dir = tempfile::tempdir()?;
-
-        let content = content_store_spec(dir.path(), CONTENT_BUDGET)?;
-        assert_eq!(
-            path_at(&content, "content_path"),
-            Some(dir.path().join("cas/content").display().to_string())
-        );
-        assert_eq!(
-            path_at(&content, "temp_path"),
-            Some(dir.path().join("cas/tmp").display().to_string())
-        );
-
-        let action = action_store_spec(dir.path(), ACTION_BUDGET)?;
-        assert_eq!(
-            path_at(&action, "content_path"),
-            Some(dir.path().join("ac/content").display().to_string())
-        );
-        assert_eq!(
-            path_at(&action, "temp_path"),
-            Some(dir.path().join("ac/tmp").display().to_string())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn content_and_action_stores_use_different_paths() -> TestResult {
-        let dir = tempfile::tempdir()?;
-
-        let content = content_store_spec(dir.path(), CONTENT_BUDGET)?;
-        let action = action_store_spec(dir.path(), ACTION_BUDGET)?;
-
-        assert_ne!(content, action);
-        assert_ne!(
-            path_at(&content, "content_path"),
-            path_at(&action, "content_path")
-        );
-        assert_ne!(
-            path_at(&content, "temp_path"),
-            path_at(&action, "temp_path")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn each_store_carries_the_budget_it_was_given() -> TestResult {
-        let dir = tempfile::tempdir()?;
-
-        let content = content_store_spec(dir.path(), CONTENT_BUDGET)?;
-        let action = action_store_spec(dir.path(), ACTION_BUDGET)?;
-
-        assert_eq!(max_bytes(&content), Some(CONTENT_BUDGET.get()));
-        assert_eq!(max_bytes(&action), Some(ACTION_BUDGET.get()));
-        Ok(())
-    }
-
-    #[test]
     fn budgets_are_percentages_of_the_capacity_rounded_down() {
         let (content, action) = budgets(
             Bytes::new(1 << 30),
@@ -1084,27 +977,13 @@ mod tests {
     }
 
     #[test]
-    fn non_utf8_root_is_rejected() {
-        let root = PathBuf::from(OsStr::from_bytes(b"/tmp/gang-\xff"));
-
-        assert!(matches!(
-            content_store_spec(&root, CONTENT_BUDGET),
-            Err(LocalError::NonUtf8Path(_))
-        ));
-        assert!(matches!(
-            action_store_spec(&root, ACTION_BUDGET),
-            Err(LocalError::NonUtf8Path(_))
-        ));
-    }
-
-    #[test]
     fn first_content_store_creates_the_cas_directories() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("cache");
         let cache =
             FilesystemCache::build(config(&root), &plugin_context()).expect("valid cache config");
 
-        let spec = cache.content_store().expect("content store");
+        let store = cache.content_store().expect("content store");
 
         assert!(root.join("cas").join("content").is_dir());
         assert!(root.join("cas").join("tmp").is_dir());
@@ -1114,7 +993,8 @@ mod tests {
             default_content_store_percent(),
             default_action_store_percent(),
         );
-        assert_eq!(max_bytes(&spec), Some(content_budget.get()));
+        assert_eq!(store.root(), root.join("cas").join("content"));
+        assert_eq!(store.budget_bytes(), content_budget.get());
     }
 
     #[test]
@@ -1138,25 +1018,15 @@ mod tests {
         let root = dir.path().join("cache");
         let cache = FilesystemCache::build(config(&root), &plugin_context())?;
         let initial = cache.action_store(&gang_types::EnvironmentName::default())?;
-        assert_eq!(
-            path_at(&initial, "content_path"),
-            Some(root.join("ac/content").to_string_lossy().into_owned())
-        );
+        assert_eq!(initial.root(), root.join("ac/content"));
         let bumped = gang_types::EnvironmentName::try_from("debian-13/2".to_owned())?;
-        let spec = cache.action_store(&bumped)?;
+        let store = cache.action_store(&bumped)?;
         assert_eq!(
-            path_at(&spec, "content_path"),
-            Some(
-                root.join("environments/debian-13/2/ac/content")
-                    .to_string_lossy()
-                    .into_owned()
-            )
+            store.root(),
+            root.join("environments/debian-13/2/ac/content")
         );
         assert!(root.join("environments/debian-13/2/ac/content").is_dir());
-        assert_eq!(
-            path_at(&cache.content_store()?, "content_path"),
-            Some(root.join("cas/content").to_string_lossy().into_owned())
-        );
+        assert_eq!(cache.content_store()?.root(), root.join("cas/content"));
         Ok(())
     }
 
