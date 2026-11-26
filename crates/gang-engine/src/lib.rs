@@ -13,6 +13,7 @@ mod reapi_ac;
 mod reapi_bytestream;
 mod reapi_capabilities;
 mod reapi_cas;
+mod reapi_execution;
 mod refusals;
 mod serve;
 mod standing;
@@ -35,6 +36,7 @@ pub use reapi_ac::ActionCacheService;
 pub use reapi_bytestream::{ByteStreamConfig, ByteStreamService};
 pub use reapi_capabilities::{CapabilitiesConfig, CapabilitiesService};
 pub use reapi_cas::{BlobPermit, CasConfig, CasService, InflightBlobBudget};
+pub use reapi_execution::{ExecutionService, ExecutionServiceConfig, OperationsService};
 pub use worker_runner::{
     CPU_WEIGHT_FILE, CapturedOutput, DEFAULT_MAX_OUTPUT_BYTES, ExecutionTimestamps,
     ORPHAN_REAP_INTERVAL, READ_ONLY_TREES_FILE, REPORT_FILE, ReadOnlyBind, RunOutcome, RunSpec,
