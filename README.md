@@ -41,9 +41,9 @@ nix develop -c bazel test --config=local //...
 
 Pull requests, including drafts and forks, run `.github/workflows/pr.yml` on the synthetic PR checkout. It runs portable lint, builds `//:gang`, runs all generated Clippy and rustfmt tests, and selects affected Rust `*_unit_test` targets through reverse dependencies. Uncertain ownership, deleted paths and graph-wide changes conservatively select all unit tests. Documentation-only PRs still run the real build and lint; a legitimate empty affected-unit selection is not a full test run.
 
-`.github/workflows/ci.yml` runs the full suite only for `merge_group` events, including documentation-only groups. It runs four x86 test shards, eight Gate 1 and eight Gate 2 addition shards, NativeLink memory tests, portable lint, Nix VM checks, x86 and ARM binary and harness builds, native ARM boundary tests and the ARM-to-x86 cross build. Public macOS validation is advisory on queue runs; private repositories skip it.
+`.github/workflows/ci.yml` runs the full suite only for `merge_group` events, including documentation-only groups. It runs four x86 test shards, eight Gate 1 and eight Gate 2 addition shards, portable lint, Nix VM checks, x86 and ARM binary and harness builds, native ARM boundary tests and the ARM-to-x86 cross build. Public macOS validation is advisory on queue runs; private repositories skip it.
 
-GitHub's `main` merge queue replaces up-to-date-branch rebases: it checks the combined head tree before merging, while preserving squash-only, linear, signed commits. GitHub may speculatively build queue prefixes. The six ruleset-required check names remain `lint`, `cross`, `linux-x86_64`, `linux-arm64`, `e2e-gate-1` and `e2e-gate-2`. In a PR context each means the entire real preflight succeeded, not that ARM, cross or E2E ran. In a queue context each means full required qualification succeeded through `release-validation` and its eleven direct critical dependencies. Failure, cancellation, skipped or missing producers cannot pass.
+GitHub's `main` merge queue replaces up-to-date-branch rebases: it checks the combined head tree before merging, while preserving squash-only, linear, signed commits. GitHub may speculatively build queue prefixes. The six ruleset-required check names remain `lint`, `cross`, `linux-x86_64`, `linux-arm64`, `e2e-gate-1` and `e2e-gate-2`. In a PR context each means the entire real preflight succeeded, not that ARM, cross or E2E ran. In a queue context each means full required qualification succeeded through `release-validation` and its ten direct critical dependencies. Failure, cancellation, skipped or missing producers cannot pass.
 
 After a main push, `cache-promotion.yml` validates the qualifying queue run and imports the five x86 working sets (four test shards and lint) through the bounded cache fan-in, without a Bazel build or test. `pr-conflicts.yml` checks every open PR against trusted main and reports conflicts without running PR code. Releases consume only a qualified same-repository queue run for the exact tagged main commit and tree, not PR or push CI; see [verification and releases](docs/SPECIFICATION.md#7-verification-gates). `tools/gate.sh` is a full x86 queue diagnostic, not PR parity.
 
@@ -186,5 +186,5 @@ The usual cause is a `~/.bazelrc`, an imported rc file, or a `--config` that set
 
 ## License
 
-Gang's source is licensed under the [Apache License 2.0](LICENSE). Distributed binaries include third-party code under additional licenses with use restrictions; see [NOTICE](NOTICE) for terms and attribution.
+Gang's source is licensed under the [Apache License 2.0](LICENSE). Distributed binaries include third-party components under permissive open-source licenses; see [NOTICE](NOTICE) for attribution.
 
