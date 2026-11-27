@@ -473,7 +473,7 @@ fn terminal_failure_message(failure: &TerminalFailure) -> String {
 fn terminal_failure_status(failure: &TerminalFailure) -> RpcStatus {
     let code = match failure {
         TerminalFailure::DeadlineExceeded { .. } => RpcCode::DeadlineExceeded,
-        TerminalFailure::Escalation(_) => RpcCode::ResourceExhausted,
+        TerminalFailure::Escalation(_) => RpcCode::FailedPrecondition,
         TerminalFailure::GenericRetriesExhausted { .. } => RpcCode::Internal,
         TerminalFailure::WorkerLossExhausted { .. } => RpcCode::Unavailable,
     };
@@ -923,6 +923,34 @@ impl Operations for OperationsService {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resource_escalation_is_not_retryable_by_remote_clients() {
+        use gang_scheduler::{
+            EscalationFailure, EscalationFailureReason, KillCause, KillResource, TerminalFailure,
+        };
+        let failure = TerminalFailure::Escalation(EscalationFailure {
+            action: gang_types::OperationName::try_new("operations/test").expect("operation"),
+            resource: KillResource::Disk,
+            cause: KillCause::SoftDisk,
+            measured_peak_kb: None,
+            capacity_kb: 1,
+            reason: EscalationFailureReason::SoftDiskKill,
+        });
+        let status = super::terminal_failure_status(&failure);
+        assert_eq!(status.code, tonic::Code::FailedPrecondition as i32);
+        assert!(status.message.contains("exceeded its disk reservation"));
+    }
+
+    #[test]
+    fn worker_deadline_returns_deadline_exceeded() {
+        let failure = gang_scheduler::TerminalFailure::DeadlineExceeded {
+            operation: gang_types::OperationName::try_new("operations/test").expect("operation"),
+        };
+        assert_eq!(
+            super::terminal_failure_status(&failure).code,
+            tonic::Code::DeadlineExceeded as i32
+        );
+    }
     use std::collections::BTreeMap;
     use std::num::{NonZeroU32, NonZeroUsize};
     use std::sync::Arc;
@@ -1170,6 +1198,7 @@ mod tests {
                     usage: AttemptUsage::default(),
                     kill: None,
                     side_channel_memory_failure: false,
+                    deadline_exceeded: false,
                 }),
             )
             .await
@@ -1294,6 +1323,7 @@ mod tests {
                         usage: AttemptUsage::default(),
                         kill: None,
                         side_channel_memory_failure: false,
+                        deadline_exceeded: false,
                     }),
                 )
                 .await

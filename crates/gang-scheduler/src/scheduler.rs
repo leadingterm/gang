@@ -144,6 +144,8 @@ pub struct WorkerExecuted {
     pub kill: Option<KillCause>,
     /// Side-channel `failure: memory` signal (applied only if no kill was already classified).
     pub side_channel_memory_failure: bool,
+    /// Whether the worker terminated execution at the action or attempt deadline.
+    pub deadline_exceeded: bool,
 }
 
 /// Worker `Completed` event payload passed to [`Scheduler::on_worker`].
@@ -893,6 +895,7 @@ impl Scheduler {
             usage: executed.usage,
             kill: executed.kill,
             side_channel_memory_failure: executed.side_channel_memory_failure,
+            deadline_exceeded: executed.deadline_exceeded,
             profile,
         };
 
@@ -915,7 +918,7 @@ impl Scheduler {
                     event: OperationUpdate::Queued,
                 });
             }
-            ExecutedOutcome::EscalationFailed {
+            ExecutedOutcome::Failed {
                 operation, publish, ..
             } => {
                 self.timers.disarm(TimerSubject::ClientLess(operation));
@@ -1381,6 +1384,7 @@ mod tests {
                 usage: AttemptUsage::default(),
                 kill: None,
                 side_channel_memory_failure: false,
+                deadline_exceeded: false,
             }),
             &mut out,
         );
@@ -1434,6 +1438,7 @@ mod tests {
                 },
                 kill: Some(KillCause::Oom),
                 side_channel_memory_failure: false,
+                deadline_exceeded: false,
             }),
             &mut out,
         );
@@ -1589,6 +1594,7 @@ mod tests {
                         },
                         kill: Some(cause),
                         side_channel_memory_failure: false,
+                        deadline_exceeded: false,
                     }),
                     &mut out,
                 );
@@ -1685,6 +1691,7 @@ mod tests {
                             usage: AttemptUsage::default(),
                             kill: None,
                             side_channel_memory_failure: false,
+                            deadline_exceeded: false,
                         }),
                         &mut out,
                     );
@@ -1697,6 +1704,7 @@ mod tests {
                         usage: AttemptUsage::default(),
                         kill: None,
                         side_channel_memory_failure: false,
+                        deadline_exceeded: false,
                     }),
                     &mut out,
                 );
@@ -1785,6 +1793,7 @@ mod tests {
                     usage: AttemptUsage::default(),
                     kill: Some(kill),
                     side_channel_memory_failure: false,
+                    deadline_exceeded: false,
                 }),
                 &mut out,
             );
@@ -1920,6 +1929,7 @@ mod tests {
                         usage: ok_usage(),
                         kill: None,
                         side_channel_memory_failure: false,
+                        deadline_exceeded: false,
                     }),
                     out,
                 );
@@ -1967,6 +1977,7 @@ mod tests {
                 usage: ok_usage(),
                 kill: None,
                 side_channel_memory_failure: false,
+                deadline_exceeded: false,
             }),
             &mut out,
         );
@@ -2084,6 +2095,7 @@ mod tests {
                     usage: AttemptUsage::default(),
                     kill: (!cancelled).then_some(KillCause::Oom),
                     side_channel_memory_failure: false,
+                    deadline_exceeded: false,
                 }),
                 &mut out,
             );
@@ -2178,6 +2190,7 @@ mod tests {
                 usage: AttemptUsage::default(),
                 kill: None,
                 side_channel_memory_failure: false,
+                deadline_exceeded: false,
             }),
             out,
         );
@@ -2313,6 +2326,7 @@ mod tests {
                 usage: ok_usage(),
                 kill: None,
                 side_channel_memory_failure: false,
+                deadline_exceeded: false,
             }),
             &mut out,
         );
@@ -2384,6 +2398,7 @@ mod tests {
             usage: ok_usage(),
             kill: None,
             side_channel_memory_failure: false,
+            deadline_exceeded: false,
         });
         sched.on_worker(now(6), w, executed, &mut out);
         let reserved = sched.workers().get(w).expect("worker").ledger.reserved();
@@ -2526,6 +2541,7 @@ mod tests {
                 },
                 kill: None,
                 side_channel_memory_failure: false,
+                deadline_exceeded: false,
             }),
             &mut out,
         );
@@ -2547,6 +2563,7 @@ mod tests {
                 },
                 kill: None,
                 side_channel_memory_failure: false,
+                deadline_exceeded: false,
             }),
             &mut out,
         );
@@ -2707,6 +2724,7 @@ mod tests {
                 usage: AttemptUsage::default(),
                 kill: None,
                 side_channel_memory_failure: false,
+                deadline_exceeded: false,
             }),
             &mut out,
         );

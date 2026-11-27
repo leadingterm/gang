@@ -1212,7 +1212,7 @@ fn kill_reason_status(reason: proto::KillReason) -> rpc_proto::Status {
         ),
         proto::KillReason::DiskLimit => (
             rpc_proto::Code::ResourceExhausted,
-            "action exceeded soft disk ceiling",
+            "action exceeded its disk reservation",
         ),
         proto::KillReason::Unspecified => (rpc_proto::Code::Aborted, "attempt terminated"),
     };

@@ -182,6 +182,8 @@ pub struct ExecutedReport<'a> {
     pub kill: Option<KillCause>,
     /// Side-channel `failure: memory` signal (applied only if no kill was already classified).
     pub side_channel_memory_failure: bool,
+    /// The worker stopped execution because the action or attempt deadline elapsed.
+    pub deadline_exceeded: bool,
     /// Admission profile of the operation (`command_digest`, original `floors`).
     pub profile: &'a ActionProfile,
 }
@@ -324,8 +326,8 @@ pub enum ExecutedOutcome {
         /// Escalated reservation for the next attempt.
         next_reservation: ActionResources,
     },
-    /// Resource kill could not escalate further; operation terminated.
-    EscalationFailed {
+    /// The operation terminated while the attempt retains disk until completion.
+    Failed {
         /// Executed attempt key still awaiting `Completed` for disk release.
         attempt_key: AttemptKey,
         /// Operation key.
@@ -755,6 +757,11 @@ impl Attempts {
             memory_ceiling_kb,
         );
 
+        if report.deadline_exceeded {
+            self.detach_operation(key, operation);
+            return finish_worker_deadline(key, operation, worker, operations, queue);
+        }
+
         let Some(cause) = classified_kill else {
             return ExecutedOutcome::AwaitingCompletion {
                 attempt_key: key,
@@ -1182,6 +1189,32 @@ fn operation_exec_snapshot(
     ))
 }
 
+fn finish_worker_deadline(
+    attempt_key: AttemptKey,
+    operation: OperationKey,
+    worker: WorkerKey,
+    operations: &mut Operations,
+    queue: &mut OperationQueue,
+) -> ExecutedOutcome {
+    let Some(name) = operations.get(operation).map(|op| op.name.clone()) else {
+        return ExecutedOutcome::ReleasedComputeOnly {
+            attempt_key,
+            operation,
+            worker,
+        };
+    };
+    operations.complete(operation, queue);
+    ExecutedOutcome::Failed {
+        attempt_key,
+        operation,
+        worker,
+        publish: PublishEvent::Failed {
+            operation,
+            failure: TerminalFailure::DeadlineExceeded { operation: name },
+        },
+    }
+}
+
 fn record_executed_observation(
     sketch: &mut ResourceSketch,
     sketch_key: SketchKey,
@@ -1261,7 +1294,7 @@ fn apply_escalation_decision(
         }
         EscalationDecision::Fail(failure) => {
             operations.complete(operation, queue);
-            ExecutedOutcome::EscalationFailed {
+            ExecutedOutcome::Failed {
                 attempt_key,
                 operation,
                 worker,
@@ -1614,6 +1647,101 @@ mod tests {
     }
 
     #[test]
+    fn worker_deadline_finishes_without_retry() {
+        let mut env = setup_env();
+        let resources = ActionResources {
+            cpu_millicores: 2_000,
+            memory: Bytes::gib(4),
+            disk: Bytes::gib(8),
+        };
+        let (op, profile) = admit_test_op(
+            &mut env.ops,
+            &mut env.queue,
+            "operations/timeout",
+            100,
+            resources,
+        );
+        let assigned =
+            place_operation(op, &mut env.ops, &mut env.queue, &mut env.workers).expect("place");
+        let id = AttemptId::from_random_bytes([42; 16]);
+        env.attempts
+            .dispatch(
+                assigned,
+                id.clone(),
+                now(2),
+                Duration::from_secs(10),
+                Duration::from_mins(10),
+            )
+            .expect("dispatch");
+        env.attempts.on_accept(&id, now(3), &env.ops);
+        let outcome = env.attempts.on_executed(
+            &ExecutedReport {
+                attempt_id: &id,
+                now: now(4),
+                usage: normal_usage(),
+                kill: None,
+                side_channel_memory_failure: false,
+                deadline_exceeded: true,
+                profile: &profile,
+            },
+            &env.actions,
+            &env.cap,
+            &mut env.sk,
+            &mut env.ops,
+            &mut env.queue,
+            &mut env.workers,
+        );
+        assert!(matches!(
+            outcome,
+            ExecutedOutcome::Failed {
+                publish: PublishEvent::Failed {
+                    failure: TerminalFailure::DeadlineExceeded { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(env.ops.get(op).expect("operation").retry_counts.generic, 0);
+        assert_eq!(
+            env.workers
+                .get(env.worker)
+                .expect("worker")
+                .ledger
+                .reserved()
+                .disk,
+            resources.disk
+        );
+        let completed = env.attempts.on_completed(
+            CompletedReport {
+                attempt_id: &id,
+                now: now(5),
+                status: CompletionStatus::Failed {
+                    message: "timed out".to_owned(),
+                },
+                execution_timestamps: None,
+            },
+            &env.actions,
+            &mut env.ops,
+            &mut env.queue,
+            &mut env.workers,
+            &mut env.durations,
+            &mut env.rates,
+        );
+        assert!(matches!(
+            completed,
+            CompletedOutcome::ReleasedDiskOnly { .. }
+        ));
+        assert_eq!(
+            env.workers
+                .get(env.worker)
+                .expect("worker")
+                .ledger
+                .reserved(),
+            ActionResources::default()
+        );
+    }
+
+    #[test]
     fn executed_releases_compute_early_while_holding_disk_until_completed() {
         let mut env = setup_env();
         let res = ActionResources {
@@ -1655,6 +1783,7 @@ mod tests {
                 usage: normal_usage(),
                 kill: None,
                 side_channel_memory_failure: false,
+                deadline_exceeded: false,
                 profile: &profile,
             },
             &env.actions,
@@ -1772,6 +1901,7 @@ mod tests {
                 },
                 kill: None,
                 side_channel_memory_failure: false,
+                deadline_exceeded: false,
                 profile: &profile,
             },
             &actions,

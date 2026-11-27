@@ -118,7 +118,7 @@ pub enum EscalationFailureReason {
 impl fmt::Display for EscalationFailureReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SoftDiskKill => formatter.write_str("soft disk ceiling exceeded"),
+            Self::SoftDiskKill => formatter.write_str("exceeded its disk reservation"),
             Self::PeakExceedsCapacity => {
                 formatter.write_str("measured peak exceeds maximum eligible fleet capacity")
             }

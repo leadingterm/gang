@@ -795,6 +795,7 @@ mod harness {
                 usage,
                 kill,
                 side_channel_memory_failure: side_mem,
+                deadline_exceeded: false,
             });
             self.deliver_worker_event(worker, event, "executed", true);
         }
@@ -1649,6 +1650,7 @@ mod harness {
                 },
                 kill: None,
                 side_channel_memory_failure: false,
+                deadline_exceeded: false,
             }),
             AttemptPhase::Executed => WorkerEvent::Completed(WorkerCompleted {
                 attempt_id,
@@ -1803,9 +1805,8 @@ mod harness {
                 ))
                 .expect("small");
             }
-            let initial: Vec<_> = sim
-                .scheduler
-                .attempts()
+            let attempts = sim.scheduler.attempts();
+            let initial: Vec<_> = attempts
                 .iter()
                 .map(|(_, a)| (a.worker, a.id.clone()))
                 .collect();
@@ -1826,6 +1827,7 @@ mod harness {
                         usage: AttemptUsage::default(),
                         kill: None,
                         side_channel_memory_failure: false,
+                        deadline_exceeded: false,
                     }),
                     "small finished",
                     true,
@@ -2321,6 +2323,7 @@ mod harness {
                 },
                 kill: Some(KillCause::Oom),
                 side_channel_memory_failure: false,
+                deadline_exceeded: false,
             }),
             "oom_escalate",
             true,
@@ -2531,6 +2534,7 @@ mod harness {
                 },
                 kill: None,
                 side_channel_memory_failure: false,
+                deadline_exceeded: false,
             }),
             "term1_executed",
             true,

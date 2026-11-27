@@ -472,6 +472,7 @@ async fn run_inbound_loop(
     loss.notify_lost().await;
 }
 
+#[derive(Debug)]
 enum InboundError {
     Protocol(Status),
     ControllerClosed,
@@ -701,6 +702,12 @@ fn parse_executed_frame(
         },
         kill,
         side_channel_memory_failure: false,
+        deadline_exceeded: executed.kill.as_ref().is_some_and(|kill| {
+            matches!(
+                proto::KillReason::try_from(kill.reason),
+                Ok(proto::KillReason::Timeout | proto::KillReason::DeadlineExceeded)
+            )
+        }),
     };
     let meta = ExecutedMeta {
         timestamps,
@@ -907,6 +914,26 @@ mod tests {
     use crate::worker_session::{
         ConnectError, ConnectedChannel, SessionConfig, SessionConnector, SessionEvent, run_session,
     };
+
+    #[test]
+    fn timeout_kills_are_reported_to_the_scheduler() {
+        for reason in [
+            proto::KillReason::Timeout,
+            proto::KillReason::DeadlineExceeded,
+        ] {
+            let id = AttemptId::from_random_bytes([23; 16]);
+            let (executed, _) = parse_executed_frame(proto::Executed {
+                attempt: id.as_str().to_owned(),
+                kill: Some(proto::Kill {
+                    attempt: id.as_str().to_owned(),
+                    reason: reason as i32,
+                }),
+                ..Default::default()
+            })
+            .expect("executed");
+            assert!(executed.deadline_exceeded);
+        }
+    }
 
     fn fleet_props(name: &str, mem_gib: u64) -> FleetProperties {
         FleetProperties::new(

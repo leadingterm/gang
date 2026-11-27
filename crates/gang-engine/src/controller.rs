@@ -1170,6 +1170,7 @@ mod tests {
                     },
                     kill: None,
                     side_channel_memory_failure: false,
+                    deadline_exceeded: false,
                 }),
             )
             .await
