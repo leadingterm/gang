@@ -37,10 +37,10 @@ use gang_scheduler::{
     AttemptUsage, CompletionStatus, DeclineReason, KillCause, RegisterError, RegistrationError,
     WorkerCompleted, WorkerEvent, WorkerExecuted, WorkerKey, WorkerRegistration,
 };
-use gang_spi::WorkerCacheStats;
+use gang_spi::{ContentStore, WorkerCacheStats};
 use gang_types::{
-    ActionEnvironment, ActionResources, AttemptId, Bytes, FleetName, InstanceId, NonZeroDuration,
-    WorkerId,
+    ActionEnvironment, ActionResources, AttemptId, Bytes, Digest, FleetName, InstanceId,
+    NonZeroDuration, WorkerId,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -60,6 +60,8 @@ const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Upper bound on per-session cached `Executed` metadata awaiting its paired `Completed` frame.
 const MAX_TRACKED_EXECUTED_META: usize = 4096;
+
+type ExistenceInvalidator = dyn Fn(&[Digest]) + Send + Sync;
 
 /// Configuration for [`WorkerGrpcService`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +102,7 @@ pub struct WorkerGrpcService {
     controller: ControllerHandle,
     config: WorkerServiceConfig,
     clock: Arc<dyn Clock>,
+    invalidate_existence: Arc<ExistenceInvalidator>,
 }
 
 impl fmt::Debug for WorkerGrpcService {
@@ -115,28 +118,34 @@ impl fmt::Debug for WorkerGrpcService {
 impl WorkerGrpcService {
     /// Creates a [`WorkerGrpcService`] backed by `controller` and `config` using [`SystemClock`].
     #[must_use]
-    pub fn new(controller: ControllerHandle, config: WorkerServiceConfig) -> Self {
-        Self::with_clock(controller, config, Arc::new(SystemClock::new()))
+    pub fn new<C: ContentStore>(
+        controller: ControllerHandle,
+        config: WorkerServiceConfig,
+        content: Arc<C>,
+    ) -> Self {
+        Self::with_clock(controller, config, Arc::new(SystemClock::new()), content)
     }
 
     /// Creates a [`WorkerGrpcService`] with [`WorkerServiceConfig::default`] and [`SystemClock`].
     #[must_use]
-    pub fn with_defaults(controller: ControllerHandle) -> Self {
-        Self::new(controller, WorkerServiceConfig::default())
+    pub fn with_defaults<C: ContentStore>(controller: ControllerHandle, content: Arc<C>) -> Self {
+        Self::new(controller, WorkerServiceConfig::default(), content)
     }
 
     /// Creates a [`WorkerGrpcService`] with an explicit injectable [`Clock`] (for deterministic
     /// handshake timeout testing).
     #[must_use]
-    pub fn with_clock(
+    pub fn with_clock<C: ContentStore>(
         controller: ControllerHandle,
         config: WorkerServiceConfig,
         clock: Arc<dyn Clock>,
+        content: Arc<C>,
     ) -> Self {
         Self {
             controller,
             config,
             clock,
+            invalidate_existence: Arc::new(move |digests| content.invalidate_existence(digests)),
         }
     }
 
@@ -338,6 +347,7 @@ impl WorkerService for WorkerGrpcService {
             registered.worker_id.clone(),
             Arc::clone(&loss),
             protocol_error_tx,
+            Arc::clone(&self.invalidate_existence),
         ));
 
         let initial_registered = proto::ControllerMessage {
@@ -424,6 +434,7 @@ async fn run_inbound_loop(
     worker_id: WorkerId,
     loss: Arc<WorkerLossGuard>,
     protocol_error_tx: oneshot::Sender<Status>,
+    invalidate_existence: Arc<ExistenceInvalidator>,
 ) {
     let _drop_guard = InboundDropGuard {
         loss: Arc::clone(&loss),
@@ -450,6 +461,7 @@ async fn run_inbound_loop(
             worker_key,
             &worker_id,
             &mut executed_meta,
+            &*invalidate_existence,
         )
         .await;
 
@@ -484,6 +496,7 @@ async fn dispatch_inbound_frame(
     worker_key: WorkerKey,
     worker_id: &WorkerId,
     executed_meta: &mut HashMap<AttemptId, ExecutedMeta>,
+    invalidate_existence: &(dyn Fn(&[Digest]) + Send + Sync),
 ) -> Result<(), InboundError> {
     let Some(kind) = frame.kind else {
         return Err(InboundError::Protocol(Status::invalid_argument(
@@ -531,6 +544,9 @@ async fn dispatch_inbound_frame(
         }
         WorkerKind::Completed(completed) => {
             let (worker_completed, payload) = parse_completed_frame(completed, executed_meta)?;
+            if let CompletionStatus::MissingBlobs { digests, .. } = &worker_completed.status {
+                invalidate_existence(digests);
+            }
             controller
                 .worker_event_with_completion(
                     worker_key,
@@ -801,7 +817,14 @@ fn parse_completed_frame(
             };
             let worker_completed = WorkerCompleted {
                 attempt_id,
-                status: CompletionStatus::Failed { message },
+                status: {
+                    let digests = gang_reapi::extract_missing_blobs(&rpc_status);
+                    if digests.is_empty() {
+                        CompletionStatus::Failed { message }
+                    } else {
+                        CompletionStatus::MissingBlobs { digests, message }
+                    }
+                },
                 execution_timestamps,
             };
             let payload = CompletionPayload {
@@ -914,6 +937,229 @@ mod tests {
     use crate::worker_session::{
         ConnectError, ConnectedChannel, SessionConfig, SessionConnector, SessionEvent, run_session,
     };
+
+    #[derive(Debug, Default)]
+    struct TrackingStore {
+        inner: gang_testkit::MemoryContentStore,
+        invalidated: parking_lot::Mutex<Vec<Digest>>,
+    }
+
+    impl ContentStore for TrackingStore {
+        fn invalidate_existence(&self, digests: &[Digest]) {
+            self.invalidated.lock().extend_from_slice(digests);
+        }
+        async fn find_missing(
+            &self,
+            digests: &[Digest],
+            missing: &mut Vec<Digest>,
+        ) -> Result<(), gang_spi::PortError> {
+            self.inner.find_missing(digests, missing).await
+        }
+        async fn read(
+            &self,
+            digest: Digest,
+            range: gang_spi::ByteRange,
+        ) -> Result<Option<gang_spi::BlobStream>, gang_spi::PortError> {
+            self.inner.read(digest, range).await
+        }
+        async fn write(
+            &self,
+            digest: Digest,
+            body: gang_spi::BlobStream,
+        ) -> Result<(), gang_spi::PortError> {
+            self.inner.write(digest, body).await
+        }
+        fn usage(&self) -> Option<gang_spi::EngineStore> {
+            self.inner.usage()
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_blob_completion_invalidates_and_finishes_without_retry() -> TestResult {
+        let (controller, actor_task) = spawn_controller(
+            make_scheduler(test_policy()),
+            SystemClock::new(),
+            ActorConfig::default(),
+            LearnedSlot::empty(),
+            ControllerRuntime::new(),
+        );
+        let content = Arc::new(TrackingStore::default());
+        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::with_defaults(
+            controller.clone(),
+            Arc::clone(&content),
+        ))
+        .await?;
+        let mut worker = LiveSessionClient::spawn(addr, "inst-missing");
+        let SessionEvent::Registered { outbound, .. } = recv_event(&mut worker.events).await?
+        else {
+            return Err("expected registration".into());
+        };
+        let mut watch = controller
+            .execute(exec_spec("operations/missing", b"missing-action", None))
+            .await?;
+        let SessionEvent::Assign(assign) = recv_event(&mut worker.events).await? else {
+            return Err("expected assignment".into());
+        };
+        outbound.accept(&assign.attempt).await?;
+        let digest = Digest::from_bytes(b"missing blob");
+        outbound
+            .completed(proto::Completed {
+                attempt: assign.attempt,
+                outcome: Some(CompletedOutcome::Status(
+                    gang_reapi::missing_blobs_rpc_status(&[digest], "missing"),
+                )),
+            })
+            .await?;
+        let terminal = wait_terminal(&mut watch).await?;
+        assert!(
+            matches!(terminal.update, OperationUpdate::Failed(gang_scheduler::TerminalFailure::MissingBlobs { digests, .. }) if digests == vec![digest])
+        );
+        assert_eq!(*content.invalidated.lock(), vec![digest]);
+        assert!(
+            worker.events.try_recv().is_err(),
+            "missing blobs must not be retried"
+        );
+        worker.stop_and_join().await?;
+        controller.shutdown().await?;
+        actor_task.await?;
+        server_task.abort();
+        Ok(())
+    }
+
+    fn missing_input_action(content: &TrackingStore, kind: u8) -> TestResult<(Digest, Digest)> {
+        use gang_reapi::build::bazel::remote::execution::v2 as reapi;
+        use prost::Message as _;
+        let missing_file = Digest::from_bytes(format!("absent-{kind}").as_bytes());
+        let child = reapi::Directory {
+            files: vec![reapi::FileNode {
+                name: "file".to_owned(),
+                digest: Some(gang_reapi::to_proto(&missing_file)?),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let child_digest = content.inner.insert(RawBytes::from(child.encode_to_vec()));
+        let root = match kind {
+            0 => {
+                let _ = content.inner.remove(child_digest);
+                child_digest
+            }
+            1 => content.inner.insert(RawBytes::from(
+                reapi::Directory {
+                    directories: vec![reapi::DirectoryNode {
+                        name: "sub".to_owned(),
+                        digest: Some(gang_reapi::to_proto(&child_digest)?),
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )),
+            _ => child_digest,
+        };
+        let command = reapi::Command {
+            arguments: vec!["true".to_owned()],
+            ..Default::default()
+        };
+        let command_digest = content
+            .inner
+            .insert(RawBytes::from(command.encode_to_vec()));
+        let action = reapi::Action {
+            command_digest: Some(gang_reapi::to_proto(&command_digest)?),
+            input_root_digest: Some(gang_reapi::to_proto(&root)?),
+            ..Default::default()
+        };
+        let action_digest = content.inner.insert(RawBytes::from(action.encode_to_vec()));
+        let missing = if kind == 0 {
+            child_digest
+        } else {
+            missing_file
+        };
+        Ok((action_digest, missing))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_returns_missing_precondition_from_real_worker() -> TestResult {
+        use futures::StreamExt as _;
+        use gang_reapi::build::bazel::remote::execution::v2 as reapi;
+        use gang_reapi::build::bazel::remote::execution::v2::execution_server::Execution as _;
+        use gang_reapi::google::longrunning::operation;
+        use gang_types::WorkerLifetime;
+        use prost::Message as _;
+
+        let (controller, actor_task) = spawn_controller(
+            make_scheduler(test_policy()),
+            SystemClock::new(),
+            ActorConfig::default(),
+            LearnedSlot::empty(),
+            ControllerRuntime::new(),
+        );
+        let content = Arc::new(TrackingStore::default());
+        let actions = Arc::new(gang_testkit::MemoryActionStore::new());
+        let (addr, server) = spawn_worker_server(WorkerGrpcService::with_defaults(
+            controller.clone(),
+            Arc::clone(&content),
+        ))
+        .await?;
+        let execution = crate::reapi_execution::ExecutionService::with_defaults(
+            controller.clone(),
+            Arc::clone(&content),
+            Arc::clone(&actions),
+        );
+        for kind in 0..3 {
+            let tmp = tempfile::TempDir::new()?;
+            let mut spec =
+                crate::worker::tests::test_spec(tmp.path(), WorkerLifetime::LongLived, kind == 1)?;
+            spec.properties = fleet_props("small", 8);
+            spec.instance = InstanceId::try_new(format!("inst-integrated-{kind}"))?;
+            spec.worker.tree_cache_min_files = NonZeroUsize::MIN;
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let worker = crate::worker::tests::spawn_direct_worker(
+                spec,
+                Arc::clone(&content),
+                Arc::clone(&actions),
+                addr,
+                stop_rx,
+            );
+            let _ = wait_for_snapshot(&controller, |snapshot| !snapshot.workers.is_empty()).await?;
+            let (action_digest, missing) = missing_input_action(&content, kind)?;
+            let mut stream = execution
+                .execute(tonic::Request::new(reapi::ExecuteRequest {
+                    action_digest: Some(gang_reapi::to_proto(&action_digest)?),
+                    ..Default::default()
+                }))
+                .await?
+                .into_inner();
+            let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(operation) = stream.next().await {
+                    let operation = operation?;
+                    if operation.done {
+                        return Ok::<_, tonic::Status>(Some(operation));
+                    }
+                }
+                Ok(None)
+            })
+            .await??
+            .ok_or("missing terminal operation")?;
+            let Some(operation::Result::Response(response)) = terminal.result else {
+                return Err("missing execute response".into());
+            };
+            let response = reapi::ExecuteResponse::decode(response.value.as_slice())?;
+            let status = response.status.ok_or("missing status")?;
+            assert_eq!(gang_reapi::extract_missing_blobs(&status), vec![missing]);
+            assert_eq!(
+                status.code,
+                gang_reapi::google::rpc::Code::FailedPrecondition as i32
+            );
+            assert!(content.invalidated.lock().contains(&missing));
+            let _ = stop_tx.send(());
+            worker.await??;
+            let _ = wait_for_snapshot(&controller, |snapshot| snapshot.workers.is_empty()).await?;
+        }
+        controller.shutdown().await?;
+        actor_task.await?;
+        server.abort();
+        Ok(())
+    }
 
     #[test]
     fn timeout_kills_are_reported_to_the_scheduler() {
@@ -1244,8 +1490,12 @@ mod tests {
             keepalive_interval: NonZeroDuration::from_secs(3),
             registration_timeout: NonZeroDuration::from_secs(5),
         };
-        let (addr, server_task) =
-            spawn_worker_server(WorkerGrpcService::new(controller.clone(), svc_config)).await?;
+        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::new(
+            controller.clone(),
+            svc_config,
+            Arc::new(gang_testkit::MemoryContentStore::new()),
+        ))
+        .await?;
         let mut worker = LiveSessionClient::spawn(addr, "inst-e2e");
 
         let SessionEvent::Registered {
@@ -1343,8 +1593,11 @@ mod tests {
             LearnedSlot::empty(),
             ControllerRuntime::new(),
         );
-        let (addr, server_task) =
-            spawn_worker_server(WorkerGrpcService::with_defaults(controller.clone())).await?;
+        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::with_defaults(
+            controller.clone(),
+            Arc::new(gang_testkit::MemoryContentStore::new()),
+        ))
+        .await?;
 
         // Start Worker 1.
         let (ev1_tx, mut ev1_rx) = mpsc::channel(32);
@@ -1437,8 +1690,11 @@ mod tests {
             LearnedSlot::empty(),
             ControllerRuntime::new(),
         );
-        let (addr, server_task) =
-            spawn_worker_server(WorkerGrpcService::with_defaults(controller.clone())).await?;
+        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::with_defaults(
+            controller.clone(),
+            Arc::new(gang_testkit::MemoryContentStore::new()),
+        ))
+        .await?;
 
         let fleet = FleetName::try_new("small")?;
         let instance = InstanceId::try_new("inst-cordon")?;
@@ -1505,8 +1761,11 @@ mod tests {
             LearnedSlot::empty(),
             ControllerRuntime::new(),
         );
-        let (addr, server_task) =
-            spawn_worker_server(WorkerGrpcService::with_defaults(controller.clone())).await?;
+        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::with_defaults(
+            controller.clone(),
+            Arc::new(gang_testkit::MemoryContentStore::new()),
+        ))
+        .await?;
 
         let (events_tx, mut events_rx) = mpsc::channel(32);
         let stop = Arc::new(Notify::new());
@@ -1618,8 +1877,11 @@ mod tests {
             LearnedSlot::empty(),
             ControllerRuntime::new(),
         );
-        let (addr, server_task) =
-            spawn_worker_server(WorkerGrpcService::with_defaults(controller.clone())).await?;
+        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::with_defaults(
+            controller.clone(),
+            Arc::new(gang_testkit::MemoryContentStore::new()),
+        ))
+        .await?;
 
         let mut crashed = connect_raw_worker(addr, "inst-crash").await?;
 
@@ -1724,6 +1986,7 @@ mod tests {
             controller.clone(),
             svc_config,
             dyn_clock,
+            Arc::new(gang_testkit::MemoryContentStore::new()),
         ))
         .await?;
 
@@ -1835,8 +2098,11 @@ mod tests {
             LearnedSlot::empty(),
             ControllerRuntime::new(),
         );
-        let (addr, server_task) =
-            spawn_worker_server(WorkerGrpcService::with_defaults(controller.clone())).await?;
+        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::with_defaults(
+            controller.clone(),
+            Arc::new(gang_testkit::MemoryContentStore::new()),
+        ))
+        .await?;
 
         // Connect gen1 and gen2 for the EXACT SAME (small, inst-renew) concurrently.
         let gen1 = connect_raw_worker(addr, "inst-renew").await?;

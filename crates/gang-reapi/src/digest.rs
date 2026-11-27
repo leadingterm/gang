@@ -1,8 +1,83 @@
 //! Checked conversions between [`gang_types::Digest`] and `REAPI v2` protobuf digests.
 
 use gang_types::{Digest, DigestError};
+use prost::Message as _;
 
 use crate::build::bazel::remote::execution::v2::Digest as ProtoDigest;
+use crate::google::rpc::{Code, PreconditionFailure, Status, precondition_failure::Violation};
+
+/// Type URL for a packed Google RPC precondition failure.
+pub const PRECONDITION_FAILURE_TYPE_URL: &str =
+    "type.googleapis.com/google.rpc.PreconditionFailure";
+
+/// Builds REAPI missing-blob violations, retaining first-seen digest order.
+#[must_use]
+pub fn missing_blobs_precondition_failure(digests: &[Digest]) -> PreconditionFailure {
+    let mut seen = std::collections::HashSet::new();
+    let violations = digests
+        .iter()
+        .filter(|digest| seen.insert(**digest))
+        .map(|digest| Violation {
+            r#type: "MISSING".to_owned(),
+            subject: format!("blobs/{}/{}", digest.hex(), digest.size()),
+            description: "missing CAS blob".to_owned(),
+        })
+        .collect();
+    PreconditionFailure { violations }
+}
+
+/// Builds a rich status reporting missing CAS blobs.
+#[must_use]
+pub fn missing_blobs_rpc_status(digests: &[Digest], message: impl Into<String>) -> Status {
+    Status {
+        code: Code::FailedPrecondition as i32,
+        message: message.into(),
+        details: vec![prost_types::Any {
+            type_url: PRECONDITION_FAILURE_TYPE_URL.to_owned(),
+            value: missing_blobs_precondition_failure(digests).encode_to_vec(),
+        }],
+    }
+}
+
+/// Extracts valid, unique missing blob digests from a rich RPC status.
+#[must_use]
+pub fn extract_missing_blobs(status: &Status) -> Vec<Digest> {
+    if status.code != Code::FailedPrecondition as i32 {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut digests = Vec::new();
+    for detail in &status.details {
+        if detail.type_url != PRECONDITION_FAILURE_TYPE_URL {
+            continue;
+        }
+        let Ok(failure) = PreconditionFailure::decode(detail.value.as_slice()) else {
+            continue;
+        };
+        for violation in failure.violations {
+            if violation.r#type != "MISSING" {
+                continue;
+            }
+            let parts: Vec<_> = violation.subject.split('/').collect();
+            let [.., "blobs", hash, size] = parts.as_slice() else {
+                continue;
+            };
+            let Ok(size) = size.parse::<u64>() else {
+                continue;
+            };
+            if size > i64::MAX as u64 {
+                continue;
+            }
+            let Ok(digest) = Digest::from_hex_and_size(hash, size) else {
+                continue;
+            };
+            if seen.insert(digest) {
+                digests.push(digest);
+            }
+        }
+    }
+    digests
+}
 
 /// Errors returned when converting between [`gang_types::Digest`] and [`ProtoDigest`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -91,6 +166,58 @@ mod tests {
     use super::*;
 
     const ABC_HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn missing_blob_status_round_trips_and_deduplicates() {
+        let first = Digest::from_bytes(b"first");
+        let second = Digest::from_bytes(b"second");
+        let status = crate::missing_blobs_rpc_status(&[first, second, first], "missing");
+        assert_eq!(
+            status.code,
+            crate::google::rpc::Code::FailedPrecondition as i32
+        );
+        let failure =
+            crate::google::rpc::PreconditionFailure::decode(status.details[0].value.as_slice())
+                .expect("decode precondition");
+        assert_eq!(failure.violations.len(), 2);
+        assert_eq!(failure.violations[0].r#type, "MISSING");
+        assert_eq!(
+            failure.violations[0].subject,
+            format!("blobs/{}/{}", first.hex(), first.size())
+        );
+        assert_eq!(crate::extract_missing_blobs(&status), vec![first, second]);
+    }
+
+    #[test]
+    fn missing_blob_extraction_rejects_invalid_details() {
+        let digest = Digest::from_bytes(b"valid");
+        let mut status = crate::missing_blobs_rpc_status(&[digest], "missing");
+        let mut failure =
+            crate::google::rpc::PreconditionFailure::decode(status.details[0].value.as_slice())
+                .expect("decode precondition");
+        let valid = failure.violations[0].clone();
+        failure.violations[0].subject = format!("instance/nested/{}", valid.subject);
+        failure.violations.push(valid.clone());
+        failure
+            .violations
+            .push(crate::google::rpc::precondition_failure::Violation {
+                r#type: "OTHER".to_owned(),
+                ..valid.clone()
+            });
+        failure
+            .violations
+            .push(crate::google::rpc::precondition_failure::Violation {
+                subject: "blobs/not-a-hash/2".to_owned(),
+                ..valid
+            });
+        status.details[0].value = failure.encode_to_vec();
+        assert_eq!(crate::extract_missing_blobs(&status), vec![digest]);
+        status.code = crate::google::rpc::Code::Internal as i32;
+        assert!(crate::extract_missing_blobs(&status).is_empty());
+        status.code = crate::google::rpc::Code::FailedPrecondition as i32;
+        status.details[0].value = vec![0xff];
+        assert!(crate::extract_missing_blobs(&status).is_empty());
+    }
 
     #[test]
     fn round_trips_empty_and_non_empty_digests() {

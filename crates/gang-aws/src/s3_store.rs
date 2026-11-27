@@ -522,6 +522,12 @@ async fn upload_one_part(
 }
 
 impl ContentStore for S3ContentStore {
+    fn invalidate_existence(&self, digests: &[Digest]) {
+        for digest in digests {
+            self.backend.existence.invalidate(digest);
+        }
+    }
+
     async fn find_missing(
         &self,
         digests: &[Digest],
@@ -1839,12 +1845,16 @@ mod tests {
         assert_eq!(missing, digests[5..]);
         assert_eq!(fake.state.lock().head_requests, 15);
 
-        // Removing an existing blob from S3 and reading it invalidates the existence cache.
+        // A worker observation invalidates a positive entry without a controller read.
         let key0 = content.key(digests[0]);
         fake.state.lock().objects.remove(&key0);
-        assert!(content.read(digests[0], ByteRange::FULL).await?.is_none());
+        content.find_missing(&[digests[0]], &mut missing).await?;
+        assert!(missing.is_empty());
+        let heads_before = fake.state.lock().head_requests;
+        content.invalidate_existence(&[digests[0]]);
         content.find_missing(&[digests[0]], &mut missing).await?;
         assert_eq!(missing, vec![digests[0]]);
+        assert_eq!(fake.state.lock().head_requests, heads_before + 1);
         Ok(())
     }
 

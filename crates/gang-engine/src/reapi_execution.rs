@@ -395,11 +395,18 @@ async fn read_cas_blob<C: ContentStore>(
         .await
         .map_err(|err| map_port_error(&err))?
     else {
-        return Err(Status::failed_precondition(format!(
+        content.invalidate_existence(&[digest]);
+        let message = format!(
             "missing {kind} blob blobs/{}/{}",
             digest.hex(),
             digest.size()
-        )));
+        );
+        let rpc = gang_reapi::missing_blobs_rpc_status(&[digest], &message);
+        return Err(Status::with_details(
+            tonic::Code::FailedPrecondition,
+            message,
+            Bytes::from(rpc.encode_to_vec()),
+        ));
     };
     collect_metadata_blob(stream, kind).await
 }
@@ -453,6 +460,7 @@ fn ok_rpc_status() -> RpcStatus {
 
 fn terminal_failure_message(failure: &TerminalFailure) -> String {
     match failure {
+        TerminalFailure::MissingBlobs { message, .. } => message.clone(),
         TerminalFailure::DeadlineExceeded { operation } => {
             format!("action {operation} exceeded execution deadline")
         }
@@ -471,9 +479,17 @@ fn terminal_failure_message(failure: &TerminalFailure) -> String {
 }
 
 fn terminal_failure_status(failure: &TerminalFailure) -> RpcStatus {
+    if let TerminalFailure::MissingBlobs {
+        digests, message, ..
+    } = failure
+    {
+        return gang_reapi::missing_blobs_rpc_status(digests, message.clone());
+    }
     let code = match failure {
         TerminalFailure::DeadlineExceeded { .. } => RpcCode::DeadlineExceeded,
-        TerminalFailure::Escalation(_) => RpcCode::FailedPrecondition,
+        TerminalFailure::MissingBlobs { .. } | TerminalFailure::Escalation(_) => {
+            RpcCode::FailedPrecondition
+        }
         TerminalFailure::GenericRetriesExhausted { .. } => RpcCode::Internal,
         TerminalFailure::WorkerLossExhausted { .. } => RpcCode::Unavailable,
     };
@@ -752,10 +768,15 @@ impl<C: ContentStore, A: ActionStore> Execution for ExecutionService<C, A> {
                     "corrupt cached ActionResult for {action_digest}: {err}"
                 ))
             })?;
-            let operation = build_cache_hit_operation(&op_name, action_digest, action_result)?;
-            return Ok(Response::new(Box::pin(stream::once(std::future::ready(
-                Ok(operation),
-            )))));
+            if crate::reapi_ac::action_result_is_complete(self.content.as_ref(), &action_result)
+                .await
+                .map_err(|err| map_port_error(&err))?
+            {
+                let operation = build_cache_hit_operation(&op_name, action_digest, action_result)?;
+                return Ok(Response::new(Box::pin(stream::once(std::future::ready(
+                    Ok(operation),
+                )))));
+            }
         }
 
         let action_bytes = read_cas_blob(self.content.as_ref(), action_digest, "action").await?;
@@ -1622,6 +1643,114 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn incomplete_cached_result_is_executed() {
+        let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(1_000)));
+        let h = setup_service(&clock, None);
+        let mut worker = h
+            .controller
+            .register_worker(worker_reg("i-missing-output", 1))
+            .await
+            .expect("register");
+        let (action, _) = store_action_and_command(&h.content, &["true"], "x86-64", None, false);
+        let missing = Digest::from_bytes(b"evicted output");
+        h.actions.insert(
+            action,
+            ActionResult {
+                stdout_digest: Some(to_proto(&missing).expect("digest")),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        );
+        let mut stream = h
+            .execution
+            .execute(Request::new(ExecuteRequest {
+                action_digest: Some(to_proto(&action).expect("action")),
+                ..Default::default()
+            }))
+            .await
+            .expect("execute")
+            .into_inner();
+        let queued = stream.next().await.expect("queued").expect("operation");
+        assert!(!queued.done);
+        assert!(matches!(
+            worker.outbound.recv().await,
+            Some(WorkerOutbound::Assign(_))
+        ));
+        drop(stream);
+        h.controller.shutdown().await.expect("shutdown");
+        h.task.await.expect("actor joined");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_missing_blobs_finish_execute_with_rich_status() {
+        let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(1_000)));
+        let h = setup_service(&clock, None);
+        let mut worker = h
+            .controller
+            .register_worker(worker_reg("i-missing-blob", 1))
+            .await
+            .expect("register");
+        let (action, _) = store_action_and_command(&h.content, &["true"], "x86-64", None, false);
+        let mut stream = h
+            .execution
+            .execute(Request::new(ExecuteRequest {
+                action_digest: Some(to_proto(&action).expect("action")),
+                ..Default::default()
+            }))
+            .await
+            .expect("execute")
+            .into_inner();
+        let _ = stream.next().await.expect("queued").expect("operation");
+        let Some(WorkerOutbound::Assign(assign)) = worker.outbound.recv().await else {
+            panic!("expected assignment");
+        };
+        let attempt_id: AttemptId = assign.attempt.parse().expect("attempt");
+        h.controller
+            .worker_event(
+                worker.key,
+                WorkerEvent::Accept {
+                    attempt_id: attempt_id.clone(),
+                },
+            )
+            .await
+            .expect("accept");
+        let missing = Digest::from_bytes(b"missing directory");
+        h.controller
+            .worker_event_with_completion(
+                worker.key,
+                WorkerEvent::Completed(WorkerCompleted {
+                    attempt_id,
+                    status: CompletionStatus::MissingBlobs {
+                        digests: vec![missing],
+                        message: "missing".to_owned(),
+                    },
+                    execution_timestamps: None,
+                }),
+                CompletionPayload {
+                    result: None,
+                    status: None,
+                    exit_code: 0,
+                    error: true,
+                },
+            )
+            .await
+            .expect("complete");
+        let terminal = loop {
+            let operation = stream.next().await.expect("operation").expect("ok");
+            if operation.done {
+                break operation;
+            }
+        };
+        let response = decode_response(&terminal);
+        let status = response.status.expect("status");
+        assert_eq!(status.code, RpcCode::FailedPrecondition as i32);
+        assert_eq!(gang_reapi::extract_missing_blobs(&status), vec![missing]);
+        assert!(worker.outbound.try_recv().is_err());
+        h.controller.shutdown().await.expect("shutdown");
+        h.task.await.expect("actor joined");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn missing_action_or_command_returns_failed_precondition() {
         let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(1_000)));
         let h = setup_service(&clock, None);
@@ -1638,6 +1767,11 @@ mod tests {
             .err()
             .expect("missing action error");
         assert_eq!(err.code(), Code::FailedPrecondition);
+        let status = gang_reapi::google::rpc::Status::decode(err.details()).expect("rich status");
+        assert_eq!(
+            gang_reapi::extract_missing_blobs(&status),
+            vec![missing_action]
+        );
 
         // 2. Action present, Command missing in CAS -> FAILED_PRECONDITION.
         let (action_with_missing_cmd, cmd_digest) =
@@ -1653,6 +1787,8 @@ mod tests {
             .err()
             .expect("missing command error");
         assert_eq!(err.code(), Code::FailedPrecondition);
+        let status = gang_reapi::google::rpc::Status::decode(err.details()).expect("rich status");
+        assert_eq!(gang_reapi::extract_missing_blobs(&status), vec![cmd_digest]);
 
         // 3. Malformed Action protobuf -> INVALID_ARGUMENT.
         let corrupt_action = h.content.insert(RawBytes::from_static(&[0xff, 0xff, 0xff]));
