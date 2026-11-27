@@ -2070,6 +2070,10 @@ mod tests {
             self.peak_output_fds.fetch_max(open, Ordering::SeqCst);
             self.inner.write(digest, body).await
         }
+
+        fn usage(&self) -> Option<gang_spi::EngineStore> {
+            self.inner.usage()
+        }
     }
 
     #[cfg(target_os = "linux")]

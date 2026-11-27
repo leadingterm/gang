@@ -1143,19 +1143,18 @@ fn reap_orphaned_zombies_linux(seen_last: &BTreeSet<u32>) -> (usize, BTreeSet<u3
         let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
             continue;
         };
-        let Some((state, ppid)) = parse_proc_state_and_ppid(&stat) else {
+        let Some((state, parent_pid)) = parse_proc_state_and_ppid(&stat) else {
             continue;
         };
-        if state != 'Z' || ppid != self_pid {
+        if state != 'Z' || parent_pid != self_pid {
             continue;
         }
-        if seen_last.contains(&pid) {
-            if let Some(raw_pid) = i32::try_from(pid).ok().and_then(Pid::from_raw)
-                && matches!(waitpid(Some(raw_pid), WaitOptions::NOHANG), Ok(Some(_)))
-            {
-                reaped = reaped.saturating_add(1);
-                continue;
-            }
+        if seen_last.contains(&pid)
+            && let Some(raw_pid) = i32::try_from(pid).ok().and_then(Pid::from_raw)
+            && matches!(waitpid(Some(raw_pid), WaitOptions::NOHANG), Ok(Some(_)))
+        {
+            reaped = reaped.saturating_add(1);
+            continue;
         }
         observed.insert(pid);
     }
