@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use gang_clock::SystemClock;
+use gang_reapi::build::bazel::remote::execution::v2::ServerCapabilities;
 use gang_types::Url;
 use http::{Method, Request, StatusCode, Version};
-use nativelink_proto::build::bazel::remote::execution::v2::ServerCapabilities;
 use prost::Message;
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -1164,7 +1164,7 @@ mod tests {
         assert!(decode_capabilities(&[0, 0, 0, 0, 0]).is_err());
         let capabilities = ServerCapabilities {
             execution_capabilities: Some(
-                nativelink_proto::build::bazel::remote::execution::v2::ExecutionCapabilities {
+                gang_reapi::build::bazel::remote::execution::v2::ExecutionCapabilities {
                     exec_enabled: true,
                     ..Default::default()
                 },

@@ -48,10 +48,6 @@ pub enum LocalError {
     #[error("cannot encode JSON")]
     #[failure(backend)]
     Encode(#[source] serde_json::Error),
-    /// A path has to be rendered into a UTF-8 store specification.
-    #[error("path {} is not valid UTF-8", .0.display())]
-    #[failure(backend)]
-    NonUtf8Path(PathBuf),
     /// A worker process could not be started.
     #[error(transparent)]
     #[failure(backend)]

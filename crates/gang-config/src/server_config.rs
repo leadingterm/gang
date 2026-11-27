@@ -3,7 +3,7 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use gang_types::{Bytes, NonZeroDuration, Percent, TrustDomain};
+use gang_types::{Bytes, NonZeroBytes, NonZeroDuration, Percent, TrustDomain};
 use serde::{Deserialize, Serialize};
 
 use crate::ca_pin_setting::CaPinSetting;
@@ -117,6 +117,36 @@ const DEFAULT_REVOCATION_REFRESH_INTERVAL: NonZeroDuration = NonZeroDuration::fr
 /// Default time a worker may be silent before the scheduler drops it: 10 seconds.
 pub const DEFAULT_WORKER_TIMEOUT: WholeSeconds = WholeSeconds::from_units(10);
 
+/// Default capacity of each scheduler actor inbox: 4,096 messages.
+const DEFAULT_SCHEDULER_QUEUE_DEPTH: NonZeroUsize =
+    NonZeroUsize::new(4096).expect("4096 is non-zero");
+
+/// Default worker/client messages processed per scheduler actor iteration: 64.
+const DEFAULT_SCHEDULER_BATCH: NonZeroUsize = NonZeroUsize::new(64).expect("64 is non-zero");
+
+/// Default per-worker outbound channel depth: 256 messages.
+const DEFAULT_WORKER_OUTBOUND_DEPTH: NonZeroUsize =
+    NonZeroUsize::new(256).expect("256 is non-zero");
+
+/// Default time to wait for a worker's `Accept`/`Decline` after `Assign`: 10 seconds.
+const DEFAULT_DISPATCH_ACK_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(10);
+
+/// Default maximum queued jobs inspected per scheduler dispatch scan: 256.
+const DEFAULT_DISPATCH_SCAN_LIMIT: NonZeroUsize = NonZeroUsize::new(256).expect("256 is non-zero");
+
+/// Default maximum combined `Action` + `Command` bytes inlined in `Assign`: 64 KiB.
+const DEFAULT_ASSIGN_INLINE_MAX: Bytes = Bytes::kib(64);
+
+/// Fixed `Assign` / `ControllerMessage` envelope overhead reserved inside
+/// `http2.max_message_size`: 4 KiB.
+const ASSIGN_FRAME_OVERHEAD: Bytes = Bytes::kib(4);
+
+/// Default total bytes of CAS blobs allowed in flight simultaneously: 1 GiB.
+const DEFAULT_MAX_INFLIGHT_BLOB_BYTES: NonZeroBytes = NonZeroBytes::gib(1);
+
+/// Default `ByteStream.Read` response chunk size: 64 KiB.
+const DEFAULT_READ_CHUNK: NonZeroBytes = NonZeroBytes::kib(64);
+
 /// Controller leadership lease timing settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -219,6 +249,23 @@ pub struct ServerConfig {
     pub worker_timeout: WholeSeconds,
     /// Process open-file limit. Defaults to 24,576.
     pub max_open_files: OpenFileLimit,
+    /// Capacity of each scheduler actor inbox. Defaults to 4,096.
+    pub scheduler_queue_depth: NonZeroUsize,
+    /// Worker/client messages processed per scheduler actor iteration. Defaults to 64.
+    pub scheduler_batch: NonZeroUsize,
+    /// Per-worker outbound channel capacity. Defaults to 256.
+    pub worker_outbound_depth: NonZeroUsize,
+    /// Time to wait for a worker's `Accept`/`Decline` after `Assign`. Defaults to 10 seconds.
+    pub dispatch_ack_timeout: NonZeroDuration,
+    /// Maximum queued jobs inspected per scheduler dispatch scan. Defaults to 256.
+    pub dispatch_scan_limit: NonZeroUsize,
+    /// Maximum combined `Action` + `Command` bytes inlined in `Assign`. Must be below
+    /// `http2.max_message_size` minus the fixed `Assign` frame overhead. Defaults to 64 KiB.
+    pub assign_inline_max: Bytes,
+    /// Total bytes of CAS blobs allowed in flight simultaneously. Defaults to 1 GiB.
+    pub max_inflight_blob_bytes: NonZeroBytes,
+    /// `ByteStream.Read` response chunk size. Defaults to 64 KiB.
+    pub read_chunk: NonZeroBytes,
 }
 
 /// The `[server]` table as written.
@@ -253,6 +300,14 @@ struct RawServer {
     http2: Http2Config,
     worker_timeout: WholeSeconds,
     max_open_files: OpenFileLimit,
+    scheduler_queue_depth: NonZeroUsize,
+    scheduler_batch: NonZeroUsize,
+    worker_outbound_depth: NonZeroUsize,
+    dispatch_ack_timeout: NonZeroDuration,
+    dispatch_scan_limit: NonZeroUsize,
+    assign_inline_max: Bytes,
+    max_inflight_blob_bytes: NonZeroBytes,
+    read_chunk: NonZeroBytes,
 }
 
 impl Default for RawServer {
@@ -283,6 +338,14 @@ impl Default for RawServer {
             http2: Http2Config::default(),
             worker_timeout: DEFAULT_WORKER_TIMEOUT,
             max_open_files: OpenFileLimit::default(),
+            scheduler_queue_depth: DEFAULT_SCHEDULER_QUEUE_DEPTH,
+            scheduler_batch: DEFAULT_SCHEDULER_BATCH,
+            worker_outbound_depth: DEFAULT_WORKER_OUTBOUND_DEPTH,
+            dispatch_ack_timeout: DEFAULT_DISPATCH_ACK_TIMEOUT,
+            dispatch_scan_limit: DEFAULT_DISPATCH_SCAN_LIMIT,
+            assign_inline_max: DEFAULT_ASSIGN_INLINE_MAX,
+            max_inflight_blob_bytes: DEFAULT_MAX_INFLIGHT_BLOB_BYTES,
+            read_chunk: DEFAULT_READ_CHUNK,
         }
     }
 }
@@ -300,6 +363,16 @@ pub(crate) enum InvalidServer {
         min = MIN_HEALTH_MAX_HEADER_SIZE
     )]
     HealthMaxHeaderSize(Bytes),
+    /// `assign_inline_max` does not leave room for the fixed `Assign` frame overhead inside
+    /// `http2.max_message_size`.
+    #[error(
+        "assign_inline_max ({assign_inline_max}) must be below http2.max_message_size ({max_message_size}) minus {overhead} Assign overhead"
+    )]
+    AssignInlineMaxTooLarge {
+        assign_inline_max: Bytes,
+        max_message_size: NonZeroBytes,
+        overhead: Bytes,
+    },
 }
 
 impl TryFrom<RawServer> for ServerConfig {
@@ -315,6 +388,15 @@ impl TryFrom<RawServer> for ServerConfig {
         let header_size = raw.health_max_header_size;
         if header_size < MIN_HEALTH_MAX_HEADER_SIZE || usize::try_from(header_size.get()).is_err() {
             return Err(InvalidServer::HealthMaxHeaderSize(header_size));
+        }
+        let max_message_size = raw.http2.max_message_size;
+        let max_inline = max_message_size.get().saturating_sub(ASSIGN_FRAME_OVERHEAD);
+        if raw.assign_inline_max >= max_inline {
+            return Err(InvalidServer::AssignInlineMaxTooLarge {
+                assign_inline_max: raw.assign_inline_max,
+                max_message_size,
+                overhead: ASSIGN_FRAME_OVERHEAD,
+            });
         }
         Ok(Self {
             transport,
@@ -341,6 +423,14 @@ impl TryFrom<RawServer> for ServerConfig {
             http2: raw.http2,
             worker_timeout: raw.worker_timeout,
             max_open_files: raw.max_open_files,
+            scheduler_queue_depth: raw.scheduler_queue_depth,
+            scheduler_batch: raw.scheduler_batch,
+            worker_outbound_depth: raw.worker_outbound_depth,
+            dispatch_ack_timeout: raw.dispatch_ack_timeout,
+            dispatch_scan_limit: raw.dispatch_scan_limit,
+            assign_inline_max: raw.assign_inline_max,
+            max_inflight_blob_bytes: raw.max_inflight_blob_bytes,
+            read_chunk: raw.read_chunk,
         })
     }
 }
@@ -377,13 +467,23 @@ impl From<ServerConfig> for RawServer {
             http2: config.http2,
             worker_timeout: config.worker_timeout,
             max_open_files: config.max_open_files,
+            scheduler_queue_depth: config.scheduler_queue_depth,
+            scheduler_batch: config.scheduler_batch,
+            worker_outbound_depth: config.worker_outbound_depth,
+            dispatch_ack_timeout: config.dispatch_ack_timeout,
+            dispatch_scan_limit: config.dispatch_scan_limit,
+            assign_inline_max: config.assign_inline_max,
+            max_inflight_blob_bytes: config.max_inflight_blob_bytes,
+            read_chunk: config.read_chunk,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{EndpointTrust, ServerConfig};
+    use gang_types::{Bytes, NonZeroBytes};
+
+    use super::{ASSIGN_FRAME_OVERHEAD, EndpointTrust, ServerConfig};
 
     #[test]
     fn connection_settings_round_trip() -> Result<(), Box<dyn std::error::Error>> {
@@ -467,5 +567,100 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn native_engine_settings_default_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let default: ServerConfig = toml::from_str("transport = 'plaintext'")?;
+        assert_eq!(default.scheduler_queue_depth.get(), 4096);
+        assert_eq!(default.scheduler_batch.get(), 64);
+        assert_eq!(default.worker_outbound_depth.get(), 256);
+        assert_eq!(
+            default.dispatch_ack_timeout.get(),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(default.dispatch_scan_limit.get(), 256);
+        assert_eq!(default.assign_inline_max, Bytes::kib(64));
+        assert_eq!(default.max_inflight_blob_bytes, NonZeroBytes::gib(1));
+        assert_eq!(default.read_chunk, NonZeroBytes::kib(64));
+
+        let custom: ServerConfig = toml::from_str(
+            "\
+transport = 'plaintext'
+scheduler_queue_depth = 8192
+scheduler_batch = 128
+worker_outbound_depth = 512
+dispatch_ack_timeout = '25s'
+dispatch_scan_limit = 1024
+assign_inline_max = '0B'
+max_inflight_blob_bytes = '2GiB'
+read_chunk = '128KiB'
+",
+        )?;
+        assert_eq!(custom.scheduler_queue_depth.get(), 8192);
+        assert_eq!(custom.scheduler_batch.get(), 128);
+        assert_eq!(custom.worker_outbound_depth.get(), 512);
+        assert_eq!(
+            custom.dispatch_ack_timeout.get(),
+            std::time::Duration::from_secs(25)
+        );
+        assert_eq!(custom.dispatch_scan_limit.get(), 1024);
+        assert_eq!(custom.assign_inline_max, Bytes::new(0));
+        assert_eq!(custom.max_inflight_blob_bytes, NonZeroBytes::gib(2));
+        assert_eq!(custom.read_chunk, NonZeroBytes::kib(128));
+        assert_eq!(
+            toml::from_str::<ServerConfig>(&toml::to_string(&custom)?)?,
+            custom
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_engine_settings_reject_invalid_values() {
+        for input in [
+            "transport = 'plaintext'\nscheduler_queue_depth = 0",
+            "transport = 'plaintext'\nscheduler_batch = 0",
+            "transport = 'plaintext'\nworker_outbound_depth = 0",
+            "transport = 'plaintext'\ndispatch_ack_timeout = '0s'",
+            "transport = 'plaintext'\ndispatch_scan_limit = 0",
+            "transport = 'plaintext'\nmax_inflight_blob_bytes = '0B'",
+            "transport = 'plaintext'\nread_chunk = '0B'",
+        ] {
+            assert!(
+                toml::from_str::<ServerConfig>(input).is_err(),
+                "accepted {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn assign_inline_max_must_fit_within_http2_message_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let max_msg = Bytes::kib(128);
+        let at_limit = max_msg.saturating_sub(ASSIGN_FRAME_OVERHEAD);
+        let just_below = at_limit.saturating_sub(Bytes::new(1));
+
+        let valid = format!(
+            "transport = 'plaintext'\nassign_inline_max = '{just_below}'\n[http2]\nmax_message_size = '{max_msg}'"
+        );
+        assert_eq!(
+            toml::from_str::<ServerConfig>(&valid)?.assign_inline_max,
+            just_below
+        );
+
+        let equal_limit = format!(
+            "transport = 'plaintext'\nassign_inline_max = '{at_limit}'\n[http2]\nmax_message_size = '{max_msg}'"
+        );
+        assert!(toml::from_str::<ServerConfig>(&equal_limit).is_err());
+
+        let too_small_message =
+            "transport = 'plaintext'\n[http2]\nmax_message_size = '64KiB'".to_owned();
+        assert!(toml::from_str::<ServerConfig>(&too_small_message).is_err());
+
+        let overhead_only = format!(
+            "transport = 'plaintext'\nassign_inline_max = '0B'\n[http2]\nmax_message_size = '{ASSIGN_FRAME_OVERHEAD}'"
+        );
+        assert!(toml::from_str::<ServerConfig>(&overhead_only).is_err());
+        Ok(())
     }
 }

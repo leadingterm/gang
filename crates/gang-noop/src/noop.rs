@@ -1,10 +1,11 @@
 //! The no-op sandbox: runs actions directly on the host, with a per-action `TMPDIR`.
 
 use gang_spi::{
-    ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, Plugin, PluginContext,
-    PortError, SandboxedAction,
+    ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, PortError, SandboxedAction,
 };
-use gang_types::{AbsolutePathBuf, ActionEnvironment};
+use gang_spi::{Plugin, PluginContext};
+use gang_types::AbsolutePathBuf;
+use gang_types::ActionEnvironment;
 use tempfile::TempDir;
 use tokio::process::Child;
 
@@ -60,10 +61,11 @@ impl ActionIsolationPort for Noop {
         let mut process = tokio::process::Command::from(command(spec, temporary_directory.path()));
         process.kill_on_drop(true);
         let child = process.spawn().map_err(NoopError::Spawn)?;
-        Ok(SandboxedAction::new(wait_for_end(
-            child,
-            temporary_directory,
-        )))
+        let accounting_pid = child.id();
+        Ok(
+            SandboxedAction::new(wait_for_end(child, temporary_directory))
+                .with_accounting_pid(accounting_pid),
+        )
     }
 }
 

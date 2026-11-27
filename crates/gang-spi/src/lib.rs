@@ -28,6 +28,7 @@
 //! ```
 
 mod authentication_port;
+mod blob_store;
 mod cache_port;
 mod candidate_priority;
 mod completion_rates;
@@ -60,7 +61,8 @@ pub use authentication_port::{
     CertificateIssue, CertificateTarget, ClientCertificates, CredentialLifecyclePort, Evidence,
     IssuedCertificate, IssuedToken, Peer, Scheme, TokenIssue,
 };
-pub use cache_port::{CacheStorePort, MeasuredUsage, RenderedStoreSpec};
+pub use blob_store::{ActionStore, BlobStream, ByteRange, ContentStore};
+pub use cache_port::{CacheStorePort, MeasuredUsage};
 pub use candidate_priority::{CandidatePriority, CandidatePriorityRef};
 pub use completion_rates::{CompletionRates, NonNegativeFinite, ResourceRates};
 pub use credential_port::WorkloadCredentialPort;
@@ -87,7 +89,8 @@ pub use infrastructure::{
 };
 pub use isolation_port::{
     ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort,
-    EXEC_LINK_NAME, NETWORK_ENV, NetworkAccess, RESET_LINK_NAME, SandboxedAction, Termination,
+    EXEC_LINK_NAME, MAX_EPHEMERAL_DIRS, MAX_RO_BINDS, NETWORK_ENV, NetworkAccess, RESET_LINK_NAME,
+    ReadOnlyTree, SandboxedAction, Termination,
 };
 pub use lease_port::{
     Acquisition, CandidateGeneration, ControllerId, LeaderLeasePort, Lease, LeaseCandidate,
@@ -115,11 +118,11 @@ pub use repository_port::{
 pub use scheduler_port::{
     Accepted, ActionInfo, ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService,
     BoxedConnection, ClientTls, Connection, ControllerConnections, ControllerDrain,
-    ControllerEndpoints, ControllerReady, ControllerSpec, DrainingWorker, EngineStore,
-    ExecutingDemand, FleetMemoryCapacity, GateDecision, InstanceCordon, LeaderUnavailable,
-    LearnedHistory, Listening, ListingLimits, QueuedActionView, QueuedDemand, RequestGate,
-    RequestScope, RunningActionView, SchedulerPort, SchedulerSnapshot, StoreAccess, StoreKind,
-    WorkerCacheStats, WorkerSpec, WorkerState, WorkerTls, full_body,
+    ControllerEndpoints, ControllerReady, ControllerSpec, ControllerStores, DrainingWorker,
+    EngineStore, ExecutingDemand, FleetResourceCapacity, GateDecision, InstanceCordon,
+    LeaderUnavailable, LearnedHistory, Listening, ListingLimits, QueuedActionView, QueuedDemand,
+    RequestGate, RequestScope, RunningActionView, SchedulerPort, SchedulerSnapshot, StoreAccess,
+    StoreKind, WorkerCacheStats, WorkerSpec, WorkerState, WorkerStores, WorkerTls, full_body,
 };
 pub use schema::SchemaMismatch;
 pub use scratch_port::{MountedScratchVolume, ScratchVolumePort};

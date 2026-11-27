@@ -1,6 +1,6 @@
 //! Breaking hard links in an action's work directory.
 //!
-//! `NativeLink` hard-links content-addressed inputs into the work directory. An
+//! The worker hard-links content-addressed inputs into the work directory. An
 //! action that rewrites such a file in place would also rewrite the cached
 //! blob, poisoning the cache. Each linked regular file is therefore replaced
 //! by a private copy (a reflink where the filesystem supports one) before the

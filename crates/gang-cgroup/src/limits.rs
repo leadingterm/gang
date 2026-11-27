@@ -5,6 +5,7 @@ use std::fmt;
 use std::time::Duration;
 
 use gang_spi::ActionLimits;
+use gang_types::CpuWeight;
 
 use crate::config::CgroupConfig;
 
@@ -42,6 +43,8 @@ impl fmt::Display for CpuMax {
 pub(crate) struct KernelLimits {
     /// The `cpu.max` limit; `None` leaves CPU unconstrained.
     pub(crate) cpu: Option<CpuMax>,
+    /// The `cpu.weight` share; `None` leaves the parent's default.
+    pub(crate) cpu_weight: Option<CpuWeight>,
     /// The `pids.max` ceiling.
     pub(crate) pids: u32,
 }
@@ -53,6 +56,7 @@ impl KernelLimits {
             cpu: requested
                 .cpu_count
                 .map(|cpu_count| CpuMax::new(cpu_count.get(), config.cpu_period.get())),
+            cpu_weight: requested.cpu_weight,
             pids: config.max_pids.get(),
         }
     }
@@ -64,7 +68,7 @@ mod tests {
     use std::time::Duration;
 
     use gang_spi::ActionLimits;
-    use gang_types::{Bytes, NonZeroBytes};
+    use gang_types::{Bytes, CpuWeight, NonZeroBytes};
 
     use super::KernelLimits;
     use crate::config::{CgroupConfig, CpuPeriod};
@@ -74,6 +78,7 @@ mod tests {
         ActionLimits {
             cpu_count: cpu_count.map(|count| NonZeroU32::new(count).expect("non-zero cpu count")),
             memory: memory.and_then(|bytes| NonZeroBytes::new(Bytes::new(bytes))),
+            cpu_weight: None,
         }
     }
 
@@ -81,6 +86,19 @@ mod tests {
     fn no_request_leaves_cpu_unconstrained() {
         let limits = KernelLimits::new(&CgroupConfig::default(), &requested(None, None));
         assert_eq!(limits.cpu, None);
+        assert_eq!(limits.cpu_weight, None);
+    }
+
+    #[test]
+    fn requested_cpu_weight_is_forwarded() {
+        let limits = KernelLimits::new(
+            &CgroupConfig::default(),
+            &ActionLimits {
+                cpu_weight: Some(CpuWeight::GATE),
+                ..requested(None, None)
+            },
+        );
+        assert_eq!(limits.cpu_weight, Some(CpuWeight::GATE));
     }
 
     #[test]

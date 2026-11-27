@@ -46,6 +46,26 @@ impl From<ExecError> for ExecFailure {
     }
 }
 
+/// Lifecycle callbacks invoked by [`execute`] at the trusted boundary around sandbox execution.
+pub struct ExecutionHooks<C, P, L, D> {
+    /// Publishes the entered memory cgroup path before the sandbox starts.
+    pub publish_cgroup: C,
+    /// Publishes the sandbox's trusted host accounting PID once started.
+    pub publish_pid: P,
+    /// Moves `gang exec` out of the action's process group when the action shares it.
+    pub leave_action_group: L,
+    /// Terminates and drains any surviving descendants in a shared action process group on exit.
+    pub cleanup_action_group: D,
+}
+
+impl<C, P, L, D> std::fmt::Debug for ExecutionHooks<C, P, L, D> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionHooks")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Runs `action` in `sandbox`.
 ///
 /// The steps, in order, are: break the hard links under the action directory when `input_links` is
@@ -54,7 +74,8 @@ impl From<ExecError> for ExecFailure {
 /// from its first instruction; call `leave_action_group` once an action that shares the process
 /// group of `gang exec` exists (the caller moves `gang exec` out of that group; an action in its
 /// own group, which the sandbox relays to, leaves `gang exec` where it is); wait for the action,
-/// while each termination is relayed to the action (`SandboxedAction::relay`); leave the scope.
+/// while each termination is relayed to the action (`SandboxedAction::relay`); clean up any
+/// surviving descendants in a shared action process group; leave the scope.
 /// After entering a scope, `publish_cgroup` receives its memory cgroup before the sandbox starts.
 /// A termination received before startup completes cancels startup and prevents the action from running.
 ///
@@ -69,22 +90,43 @@ impl From<ExecError> for ExecFailure {
 ///   also returned when the action succeeded but the scope cannot be left.
 /// - [`ExecError::Sandbox`] when the sandbox cannot start the action or the action fails.
 /// - [`ExecError::LeaveActionGroup`] when `leave_action_group` fails; the action is dropped.
+/// - [`ExecError::CleanupActionGroup`] when draining a shared action process group fails.
 /// - [`ExecError::Signals`] when a termination signal cannot be read.
-pub async fn execute<S: ActionIsolationPort, L: ActionLimitsPort>(
+pub async fn execute<S, L, C, P, G, D>(
     sandbox: &S,
     limits: Option<&L>,
     input_links: InputLinks,
     action: &Action<'_>,
     terminations: &mut (impl Stream<Item = io::Result<Termination>> + Unpin),
-    publish_cgroup: impl FnOnce(Option<PathBuf>),
-    leave_action_group: impl FnOnce() -> io::Result<()>,
-) -> Result<Execution, ExecFailure> {
+    hooks: ExecutionHooks<C, P, G, D>,
+) -> Result<Execution, ExecFailure>
+where
+    S: ActionIsolationPort,
+    L: ActionLimitsPort,
+    C: FnOnce(Option<PathBuf>),
+    P: FnOnce(Option<u32>),
+    G: FnOnce() -> io::Result<()>,
+    D: FnOnce() -> io::Result<()>,
+{
     if matches!(input_links, InputLinks::Break) {
         break_hard_links(action.spec.action_directory).map_err(ExecError::from)?;
     }
+    let ExecutionHooks {
+        publish_cgroup,
+        publish_pid,
+        leave_action_group,
+        cleanup_action_group,
+    } = hooks;
     let Some(port) = limits else {
-        let outcome =
-            start_and_wait(sandbox, &action.spec, terminations, leave_action_group).await?;
+        let outcome = start_and_wait(
+            sandbox,
+            &action.spec,
+            terminations,
+            publish_pid,
+            leave_action_group,
+            cleanup_action_group,
+        )
+        .await?;
         return Ok(Execution {
             outcome,
             usage: None,
@@ -101,7 +143,15 @@ pub async fn execute<S: ActionIsolationPort, L: ActionLimitsPort>(
         memory_cgroup: memory_cgroup.as_deref(),
         ..action.spec
     };
-    let outcome = start_and_wait(sandbox, &spec, terminations, leave_action_group).await;
+    let outcome = start_and_wait(
+        sandbox,
+        &spec,
+        terminations,
+        publish_pid,
+        leave_action_group,
+        cleanup_action_group,
+    )
+    .await;
     let usage = port.leave(scope).await;
     match (outcome, usage) {
         (Ok(outcome), Ok(usage)) => {
@@ -131,7 +181,9 @@ async fn start_and_wait<S: ActionIsolationPort>(
     sandbox: &S,
     spec: &ActionExecutionSpec<'_>,
     terminations: &mut (impl Stream<Item = io::Result<Termination>> + Unpin),
+    publish_pid: impl FnOnce(Option<u32>),
     leave_action_group: impl FnOnce() -> io::Result<()>,
+    cleanup_group: impl FnOnce() -> io::Result<()>,
 ) -> Result<ActionExecutionOutcome, ExecError> {
     let mut running = tokio::select! {
         biased;
@@ -142,8 +194,14 @@ async fn start_and_wait<S: ActionIsolationPort>(
         }
         started = sandbox.start(spec) => started.map_err(ExecError::Sandbox)?,
     };
+    publish_pid(running.accounting_pid());
+    let shared = running.shares_host_group();
     leave_if_shared(&running, leave_action_group)?;
-    wait_relaying(&mut running, terminations).await
+    let outcome = wait_relaying(&mut running, terminations).await;
+    if shared {
+        cleanup_group().map_err(ExecError::CleanupActionGroup)?;
+    }
+    outcome
 }
 
 /// Waits for `running` to end, passing each termination that `terminations` receives on to the
@@ -166,7 +224,7 @@ async fn wait_relaying(
 
 /// Moves `gang exec` out of the action's process group when the action shares it, so the group
 /// kill at the end of the kill grace spares `gang exec`. An action in its own process group keeps
-/// `gang exec` in the original group, which `NativeLink` signals, so every termination reaches
+/// `gang exec` in the original group, which the worker signals, so every termination reaches
 /// `gang exec` and is relayed, including one that arrives before the sandbox has started the
 /// action.
 fn leave_if_shared(

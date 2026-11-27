@@ -60,8 +60,8 @@ use gang_e2e::{
     Outcome, Probe, SMALL_FLEET, Sandbox, Settings, Signalled, SoftMemory, Variant, names,
 };
 use gang_e2e::{
-    disk, fhs_tools, glibc_toolchain, input_integrity, lifecycle, limits, memory, network,
-    plaintext, restart, revocation, run_cold_pair, run_drained_starts,
+    bound_tree_integrity, disk, fhs_tools, glibc_toolchain, input_integrity, lifecycle, limits,
+    memory, network, plaintext, restart, revocation, run_cold_pair, run_drained_starts,
 };
 use gang_wire::routes::{GET_STATE, WATCH_STATE};
 use support::{
@@ -195,7 +195,7 @@ fn baseline(sandbox: Sandbox) -> Variant {
 }
 
 /// The variant the limits scenario runs under: the workers enforce cgroup limits and
-/// `NativeLink`'s soft memory enforcement is off, so only the kernel can end the memory hog. The
+/// the worker's soft memory enforcement is off, so only the kernel can end the memory hog. The
 /// suite runs it under the no-op sandbox, because the cgroup is what ends the orphan there; under
 /// bwrap the PID namespace teardown would kill the orphan anyway.
 fn limited() -> Variant {
@@ -489,6 +489,36 @@ fn integrity_is_compliant_under_break_and_keep() {
         let system = Simulation::new(&variant, Behaviour::COMPLIANT);
         assert_compliant(&input_integrity(&system, &variant).expect("the integrity scenario runs"));
     }
+}
+
+#[test]
+fn bound_tree_integrity_passes_under_bwrap_skips_under_noop_and_fails_when_writable() {
+    let bwrap = Variant {
+        input_trees: gang_e2e::InputTrees::Bind,
+        tree_cache_min_files: std::num::NonZeroUsize::new(2),
+        ..baseline(Sandbox::Bwrap)
+    };
+    let compliant = Simulation::new(&bwrap, Behaviour::COMPLIANT);
+    assert_compliant(&bound_tree_integrity(&compliant, &bwrap).expect("bound tree runs"));
+
+    let poisoned = Simulation::new(
+        &bwrap,
+        Behaviour {
+            integrity: Integrity::Poisoned,
+            ..Behaviour::COMPLIANT
+        },
+    );
+    assert_fails(
+        &bound_tree_integrity(&poisoned, &bwrap).expect("bound tree runs"),
+        names::integrity::BOUND_TREE_READ_ONLY,
+    );
+
+    let noop = baseline(Sandbox::Noop);
+    let noop_sim = Simulation::new(&noop, Behaviour::COMPLIANT);
+    let checks = bound_tree_integrity(&noop_sim, &noop).expect("noop skips cleanly");
+    assert_eq!(checks.len(), 1);
+    assert!(checks[0].is_skipped());
+    assert_eq!(checks[0].name, names::integrity::BOUND_TREE_READ_ONLY);
 }
 
 flaw! {
@@ -940,7 +970,7 @@ fn disk_without_the_sampler_skips_the_kill_checks() -> gang_e2e::Result<()> {
 }
 
 /// The variant the memory scenario runs under: the workers enforce cgroup limits and
-/// `NativeLink`'s soft memory enforcement stays on.
+/// the worker's soft memory enforcement stays on.
 fn soft_limited() -> Variant {
     Variant {
         sandbox: Sandbox::Noop,

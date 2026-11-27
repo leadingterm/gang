@@ -10,7 +10,7 @@
 //!   and listeners of a controller.
 //! - `gang database copy --from <FILE> --to <FILE>`: copy durable state between stopped databases.
 //! - `gang worker --config <FILE>`: the worker agent on worker nodes.
-//! - `gang exec <COMMAND>...`: hidden; the `NativeLink` worker entrypoint,
+//! - `gang exec <COMMAND>...`: hidden; the worker entrypoint,
 //!   reached by argv0 multicall through the `gang-exec` link that
 //!   `gang worker` creates to this binary. It runs one action in the
 //!   configured sandbox.

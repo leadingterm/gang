@@ -14,11 +14,12 @@ use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, StreamExt};
 use gang_clock::{Clock, Tick, Timestamp};
 use gang_spi::{
-    ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService, BoxedConnection,
-    ControllerConnections, ControllerDrain, ControllerEndpoints, ControllerReady, ControllerSpec,
-    DrainingWorker, FleetSupply, GateDecision, LeaderUnavailable, LearnedHistory, Listening,
-    ListingLimits, Peer, PortError, RecordKind, Rejection, RequestGate, RequestScope,
-    SchedulerPort, SchedulerSnapshot, WorkerSpec, WorkerTls, full_body,
+    ActionStore, ActionsView, Admitted, ApiRequestBody, ApiResponseBody, ApiService,
+    BoxedConnection, ContentStore, ControllerConnections, ControllerDrain, ControllerEndpoints,
+    ControllerReady, ControllerSpec, ControllerStores, DrainingWorker, FleetSupply, GateDecision,
+    LeaderUnavailable, LearnedHistory, Listening, ListingLimits, Peer, PortError, RecordKind,
+    Rejection, RequestGate, RequestScope, SchedulerPort, SchedulerSnapshot, StoreAccess,
+    WorkerSpec, WorkerStores, WorkerTls, full_body,
 };
 use gang_types::{Bytes, FleetName, FleetProperties, InstanceId, NonZeroDuration, WorkerLifetime};
 use parking_lot::Mutex;
@@ -291,12 +292,14 @@ pub struct RecordedSpec {
     pub fast_cas_directory: PathBuf,
     /// The fast store's eviction budget.
     pub fast_cas_budget: Bytes,
+    /// Optional immutable input tree cache directory.
+    pub trees_directory: Option<PathBuf>,
     /// The transport and credential paths used by the worker.
     pub tls: RecordedTls,
     /// The number of pending workers already stopped when this worker started.
     pub stops_before_start: usize,
     /// How the worker reaches the stores.
-    pub store_access: gang_spi::StoreAccess,
+    pub store_access: StoreAccess,
     /// The `gang-exec` entrypoint.
     pub entrypoint: PathBuf,
 }
@@ -849,7 +852,8 @@ impl SchedulerPort for FakeScheduler {
         into.source_rates.clone_from(&state.snapshot.source_rates);
         into.source_rates_at = state.snapshot.source_rates_at;
         into.cordons.clone_from(&state.snapshot.cordons);
-        into.fleet_memory.clone_from(&state.snapshot.fleet_memory);
+        into.fleet_capacity
+            .clone_from(&state.snapshot.fleet_capacity);
         into.stores.clone_from(&state.snapshot.stores);
         into.workers.clone_from(&state.snapshot.workers);
         into.queued.clone_from(&state.snapshot.queued);
@@ -911,10 +915,17 @@ impl SchedulerPort for FakeScheduler {
         }
     }
 
-    async fn run_controller<P: RequestGate, W: RequestGate, A: ApiService>(
+    async fn run_controller<
+        C: ContentStore,
+        Ac: ActionStore,
+        P: RequestGate,
+        W: RequestGate,
+        A: ApiService,
+    >(
         &self,
         spec: &ControllerSpec<'_>,
         connections: ControllerConnections<P, W, A>,
+        _stores: ControllerStores<C, Ac>,
         ready: ControllerReady,
     ) -> Result<(), PortError> {
         if self.published.borrow().is_some() {
@@ -1084,12 +1095,17 @@ impl SchedulerPort for FakeScheduler {
         Ok(())
     }
 
-    async fn run_worker(
+    async fn run_worker<C: ContentStore, Ac: ActionStore>(
         &self,
         spec: &WorkerSpec,
+        stores: WorkerStores<C, Ac>,
         tls: WorkerTls<'_>,
         stop: impl Future<Output = ()> + Send,
     ) -> Result<(), PortError> {
+        let store_access = match stores {
+            WorkerStores::Direct { .. } => StoreAccess::Direct,
+            WorkerStores::ViaController => StoreAccess::ViaController,
+        };
         let behaviour = {
             let mut state = self.state.lock();
             if tls.scheme() != state.endpoint.scheme() {
@@ -1106,6 +1122,7 @@ impl SchedulerPort for FakeScheduler {
                 work_directory: spec.work_directory.clone(),
                 fast_cas_directory: spec.fast_cas_directory.clone(),
                 fast_cas_budget: spec.fast_cas_budget,
+                trees_directory: spec.trees_directory.clone(),
                 tls: match tls {
                     WorkerTls::Plain => RecordedTls::Plain,
                     WorkerTls::ServerOnly { server_ca } => {
@@ -1118,7 +1135,7 @@ impl SchedulerPort for FakeScheduler {
                     },
                 },
                 stops_before_start: self.worker_stops.get(),
-                store_access: spec.store_access,
+                store_access,
                 entrypoint: spec.entrypoint.clone(),
             });
             state.behaviour
@@ -1145,7 +1162,7 @@ mod tests {
     use gang_types::{FleetName, Identity, Isa, Principal, ProviderName, Resources};
 
     use super::*;
-    use crate::TestResult;
+    use crate::{MemoryActionStore, MemoryContentStore, TestResult};
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -1208,7 +1225,6 @@ mod tests {
     struct WorkerFixture {
         instance: InstanceId,
         properties: FleetProperties,
-        store: gang_spi::RenderedStoreSpec,
     }
 
     impl WorkerFixture {
@@ -1229,7 +1245,6 @@ mod tests {
                     &gang_types::FleetActionPolicy::default(),
                     std::iter::empty::<(&'static str, String)>(),
                 ),
-                store: gang_spi::RenderedStoreSpec(serde_json::Value::Null),
             })
         }
 
@@ -1243,11 +1258,16 @@ mod tests {
                 work_directory: PathBuf::from("/work"),
                 fast_cas_directory: PathBuf::from("/cas"),
                 fast_cas_budget: Bytes::new(GIB),
-                content_store: self.store.clone(),
-                action_store: self.store.clone(),
-                store_access: gang_spi::StoreAccess::Direct,
+                trees_directory: None,
                 entrypoint: PathBuf::from("/usr/bin/gang"),
             }
+        }
+    }
+
+    fn test_stores() -> ControllerStores<crate::MemoryContentStore, crate::MemoryActionStore> {
+        ControllerStores {
+            content: Arc::new(crate::MemoryContentStore::new()),
+            actions: Arc::new(crate::MemoryActionStore::new()),
         }
     }
 
@@ -1295,7 +1315,7 @@ mod tests {
         Ok(())
     }
 
-    fn snapshot_rate_fixture(clock: &gang_clock::TestClock) -> TestResult<SchedulerSnapshot> {
+    fn snapshot_fixture(clock: &gang_clock::TestClock) -> TestResult<SchedulerSnapshot> {
         use gang_clock::Clock;
         use gang_spi::{CompletionRates, InstanceCordon, NonNegativeFinite, ResourceRates};
         use gang_types::SourceId;
@@ -1326,6 +1346,14 @@ mod tests {
             })
             .collect::<TestResult<Vec<_>>>()?;
         Ok(SchedulerSnapshot {
+            fleet_capacity: vec![gang_spi::FleetResourceCapacity {
+                fleet: 0,
+                capacity: gang_types::Resources {
+                    vcpus: 8,
+                    memory: Bytes::gib(8),
+                    disk: Bytes::gib(100),
+                },
+            }],
             source_rates: vec![row(None, 0), row(None, 1), row(Some(source), 0)],
             source_rates_at: clock.monotonic(),
             cordons,
@@ -1446,26 +1474,22 @@ mod tests {
             snapshot.executing.capacity(),
             snapshot.source_rates.capacity(),
             snapshot.cordons.capacity(),
-            snapshot.fleet_memory.capacity(),
+            snapshot.fleet_capacity.capacity(),
         ]
     }
 
     #[tokio::test]
     async fn snapshot_sorts_workers_remaps_executions_and_reuses_buffers() -> TestResult {
         use gang_clock::{Clock, TestClock};
-        use gang_spi::{FleetMemoryCapacity, InstanceCordon};
-        use gang_types::NonZeroBytes;
+        use gang_spi::{FleetResourceCapacity, InstanceCordon};
 
         let scheduler = FakeScheduler::new()?;
         let clock = TestClock::new(Timestamp::UNIX_EPOCH);
-        let frame = snapshot_rate_fixture(&clock)?;
+        let frame = snapshot_fixture(&clock)?;
         let rates = frame.source_rates;
         let rates_at = frame.source_rates_at;
         let cordons = frame.cordons;
-        let fleet_memory = vec![FleetMemoryCapacity {
-            fleet: 0,
-            capacity: NonZeroBytes::gib(8),
-        }];
+        let fleet_capacity = frame.fleet_capacity;
         let (queued, executions) = snapshot_demand_fixture()?;
         scheduler.set_snapshot(SchedulerSnapshot {
             workers: vec![snapshot_worker("z")?, snapshot_worker("a")?],
@@ -1474,7 +1498,7 @@ mod tests {
             source_rates: rates.iter().rev().copied().collect(),
             source_rates_at: rates_at,
             cordons: cordons.iter().rev().cloned().collect(),
-            fleet_memory: fleet_memory.clone(),
+            fleet_capacity: fleet_capacity.clone(),
             ..SchedulerSnapshot::default()
         });
         let mut into = SchedulerSnapshot {
@@ -1483,7 +1507,7 @@ mod tests {
             executing: Vec::with_capacity(8),
             source_rates: Vec::with_capacity(8),
             cordons: Vec::with_capacity(8),
-            fleet_memory: Vec::with_capacity(8),
+            fleet_capacity: Vec::with_capacity(8),
             ..SchedulerSnapshot::default()
         };
         into.workers.push(snapshot_worker("stale")?);
@@ -1497,9 +1521,13 @@ mod tests {
             instance: Arc::new(InstanceId::try_new("stale")?),
             replacing: false,
         });
-        into.fleet_memory.push(FleetMemoryCapacity {
+        into.fleet_capacity.push(FleetResourceCapacity {
             fleet: 1,
-            capacity: NonZeroBytes::gib(1),
+            capacity: gang_types::Resources {
+                vcpus: 1,
+                memory: Bytes::gib(1),
+                disk: Bytes::gib(100),
+            },
         });
         let capacities = snapshot_capacities(&into);
         scheduler.snapshot(&mut into).await?;
@@ -1512,7 +1540,7 @@ mod tests {
         assert_eq!(into.source_rates, rates);
         assert_eq!(into.source_rates_at, rates_at);
         assert_eq!(into.cordons, cordons);
-        assert_eq!(into.fleet_memory, fleet_memory);
+        assert_eq!(into.fleet_capacity, fleet_capacity);
         assert!(Arc::ptr_eq(&into.cordons[0].instance, &cordons[0].instance));
         scheduler.snapshot(&mut into).await?;
         assert_eq!(
@@ -1523,14 +1551,14 @@ mod tests {
             into.cordons, cordons,
             "a repeated fill must not append intents"
         );
-        assert_eq!(into.fleet_memory, fleet_memory);
+        assert_eq!(into.fleet_capacity, fleet_capacity);
         assert_eq!(into.queued, vec![queued.clone()]);
         assert_eq!(snapshot_capacities(&into), capacities);
         scheduler.set_snapshot(SchedulerSnapshot::default());
         scheduler.snapshot(&mut into).await?;
         assert!(into.workers.is_empty() && into.queued.is_empty() && into.executing.is_empty());
         assert!(into.source_rates.is_empty() && into.cordons.is_empty());
-        assert!(into.fleet_memory.is_empty());
+        assert!(into.fleet_capacity.is_empty());
         assert_eq!(into.source_rates_at, Tick::ORIGIN);
         let mut expected = executions[1].clone();
         expected.worker = 0;
@@ -1732,7 +1760,12 @@ mod tests {
         scheduler.set_behaviour(Behaviour::Finish);
         assert!(matches!(
             scheduler
-                .run_worker(&spec, WorkerTls::Plain, std::future::pending())
+                .run_worker(
+                    &spec,
+                    WorkerStores::<MemoryContentStore, MemoryActionStore>::ViaController,
+                    WorkerTls::Plain,
+                    std::future::pending()
+                )
                 .now_or_never(),
             Some(Ok(()))
         ));
@@ -1749,7 +1782,12 @@ mod tests {
         scheduler.set_behaviour(Behaviour::Finish);
         assert!(matches!(
             scheduler
-                .run_worker(&spec, WorkerTls::Plain, std::future::pending())
+                .run_worker(
+                    &spec,
+                    WorkerStores::<MemoryContentStore, MemoryActionStore>::ViaController,
+                    WorkerTls::Plain,
+                    std::future::pending()
+                )
                 .now_or_never(),
             Some(Ok(()))
         ));
@@ -1772,7 +1810,12 @@ mod tests {
         scheduler.set_behaviour(Behaviour::Fail);
         assert!(matches!(
             scheduler
-                .run_worker(&spec, WorkerTls::Plain, std::future::pending())
+                .run_worker(
+                    &spec,
+                    WorkerStores::<MemoryContentStore, MemoryActionStore>::ViaController,
+                    WorkerTls::Plain,
+                    std::future::pending()
+                )
                 .now_or_never(),
             Some(Err(PortError::Backend(_)))
         ));
@@ -1787,7 +1830,12 @@ mod tests {
         scheduler.set_behaviour(Behaviour::Pending);
         assert!(
             scheduler
-                .run_worker(&spec, WorkerTls::Plain, std::future::pending())
+                .run_worker(
+                    &spec,
+                    WorkerStores::<MemoryContentStore, MemoryActionStore>::ViaController,
+                    WorkerTls::Plain,
+                    std::future::pending()
+                )
                 .now_or_never()
                 .is_none()
         );
@@ -1802,7 +1850,12 @@ mod tests {
         let scheduler = FakeScheduler::plain()?;
         assert!(matches!(
             scheduler
-                .run_worker(&spec, WorkerTls::Plain, std::future::ready(()))
+                .run_worker(
+                    &spec,
+                    WorkerStores::<MemoryContentStore, MemoryActionStore>::ViaController,
+                    WorkerTls::Plain,
+                    std::future::ready(())
+                )
                 .now_or_never(),
             Some(Ok(()))
         ));
@@ -1818,7 +1871,12 @@ mod tests {
         let scheduler = FakeScheduler::new()?;
         assert!(matches!(
             scheduler
-                .run_worker(&spec, WorkerTls::Plain, std::future::ready(()))
+                .run_worker(
+                    &spec,
+                    WorkerStores::<MemoryContentStore, MemoryActionStore>::ViaController,
+                    WorkerTls::Plain,
+                    std::future::ready(())
+                )
                 .now_or_never(),
             Some(Err(PortError::Config(_)))
         ));
@@ -1850,7 +1908,12 @@ mod tests {
         ] {
             assert!(matches!(
                 scheduler
-                    .run_worker(&spec, tls, std::future::pending())
+                    .run_worker(
+                        &spec,
+                        WorkerStores::<MemoryContentStore, MemoryActionStore>::ViaController,
+                        tls,
+                        std::future::pending()
+                    )
                     .now_or_never(),
                 Some(Ok(()))
             ));
@@ -2006,7 +2069,8 @@ mod tests {
                 api: EmptyApi,
             };
             let (ready, _) = ControllerReady::channel();
-            let mut run = Box::pin(scheduler.run_controller(spec, connections, ready));
+            let mut run =
+                Box::pin(scheduler.run_controller(spec, connections, test_stores(), ready));
             assert!(run.as_mut().now_or_never().is_none());
             assert!(scheduler.published.borrow().is_some());
         }
@@ -2028,7 +2092,7 @@ mod tests {
             api: EmptyApi,
         };
         let (ready, mut readiness) = ControllerReady::channel();
-        let run = scheduler.run_controller(spec, connections, ready);
+        let run = scheduler.run_controller(spec, connections, test_stores(), ready);
         futures::pin_mut!(run);
         assert!(run.as_mut().now_or_never().is_none());
         assert!(readiness.try_recv().is_ok());
@@ -2048,7 +2112,6 @@ mod tests {
     #[tokio::test]
     async fn controller_serves_all_listeners_until_each_stream_ends() -> TestResult {
         let fixture = WorkerFixture::new()?;
-        let stores = gang_spi::RenderedStoreSpec(serde_json::Value::Null);
         let catalog = gang_types::FleetCatalog::try_new(vec![fixture.properties.clone()])?;
         let (observations, _receiver) = gang_spi::ObservationSink::channel(
             std::num::NonZeroUsize::MIN,
@@ -2059,8 +2122,6 @@ mod tests {
             scaling: Arc::new(gang_config::ScalingConfig::default()),
             clock: Arc::new(gang_clock::TestClock::new(Timestamp::UNIX_EPOCH)),
             control_acquire_timeout: NonZeroDuration::from_secs(1),
-            content_store: &stores,
-            action_store: &stores,
             fleets: &catalog,
             max_workers: 8,
             client_action_timeout: std::time::Duration::from_mins(1),
@@ -2087,7 +2148,7 @@ mod tests {
                 api: EmptyApi,
             };
             let (ready, mut readiness) = ControllerReady::channel();
-            let run = scheduler.run_controller(&spec, connections, ready);
+            let run = scheduler.run_controller(&spec, connections, test_stores(), ready);
             futures::pin_mut!(run);
             assert!(run.as_mut().now_or_never().is_none());
             assert!(readiness.try_recv().is_ok());
@@ -2105,7 +2166,9 @@ mod tests {
                 api: EmptyApi,
             };
             assert!(matches!(
-                scheduler.run_controller(&spec, other, other_ready).await,
+                scheduler
+                    .run_controller(&spec, other, test_stores(), other_ready)
+                    .await,
                 Err(PortError::Config(_))
             ));
 
@@ -2172,7 +2235,7 @@ mod tests {
                 api: EmptyApi,
             };
             let (ready, mut readiness) = ControllerReady::channel();
-            let run = scheduler.run_controller(spec, connections, ready);
+            let run = scheduler.run_controller(spec, connections, test_stores(), ready);
             futures::pin_mut!(run);
             assert!(run.as_mut().now_or_never().is_none());
             let (connection, _other) = tokio::io::duplex(64);
@@ -2227,7 +2290,7 @@ mod tests {
             api: EmptyApi,
         };
         let (ready, readiness) = ControllerReady::channel();
-        let run = scheduler.run_controller(spec, connections, ready);
+        let run = scheduler.run_controller(spec, connections, test_stores(), ready);
         futures::pin_mut!(run);
         let previous_drains = scheduler.drains().get();
         assert!(run.as_mut().now_or_never().is_none());
@@ -2289,7 +2352,6 @@ mod tests {
     #[test]
     fn finish_controller_makes_run_controller_return_at_once() -> TestResult {
         let fixture = WorkerFixture::new()?;
-        let stores = gang_spi::RenderedStoreSpec(serde_json::Value::Null);
         let catalog = gang_types::FleetCatalog::try_new(vec![fixture.properties.clone()])?;
         let (observations, _receiver) = gang_spi::ObservationSink::channel(
             std::num::NonZeroUsize::MIN,
@@ -2300,8 +2362,6 @@ mod tests {
             scaling: Arc::new(gang_config::ScalingConfig::default()),
             clock: Arc::new(gang_clock::TestClock::new(Timestamp::UNIX_EPOCH)),
             control_acquire_timeout: NonZeroDuration::from_secs(1),
-            content_store: &stores,
-            action_store: &stores,
             fleets: &catalog,
             max_workers: 8,
             client_action_timeout: std::time::Duration::from_mins(1),
@@ -2326,7 +2386,7 @@ mod tests {
         };
         let (ready, mut readiness) = ControllerReady::channel();
         let outcome = scheduler
-            .run_controller(&spec, connections, ready)
+            .run_controller(&spec, connections, test_stores(), ready)
             .now_or_never();
         assert!(matches!(outcome, Some(Ok(()))));
         assert!(readiness.try_recv().is_ok());
@@ -2338,7 +2398,6 @@ mod tests {
     #[test]
     fn a_failing_controller_drops_its_ready_signal_unsent() -> TestResult {
         let fixture = WorkerFixture::new()?;
-        let stores = gang_spi::RenderedStoreSpec(serde_json::Value::Null);
         let catalog = gang_types::FleetCatalog::try_new(vec![fixture.properties.clone()])?;
         let (observations, _receiver) = gang_spi::ObservationSink::channel(
             std::num::NonZeroUsize::MIN,
@@ -2349,8 +2408,6 @@ mod tests {
             scaling: Arc::new(gang_config::ScalingConfig::default()),
             clock: Arc::new(gang_clock::TestClock::new(Timestamp::UNIX_EPOCH)),
             control_acquire_timeout: NonZeroDuration::from_secs(1),
-            content_store: &stores,
-            action_store: &stores,
             fleets: &catalog,
             max_workers: 8,
             client_action_timeout: std::time::Duration::from_mins(1),
@@ -2373,7 +2430,7 @@ mod tests {
         };
         let (ready, mut readiness) = ControllerReady::channel();
         let outcome = scheduler
-            .run_controller(&spec, connections, ready)
+            .run_controller(&spec, connections, test_stores(), ready)
             .now_or_never();
         assert!(matches!(outcome, Some(Err(_))));
         assert!(readiness.try_recv().is_err());

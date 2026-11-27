@@ -6,10 +6,10 @@ use std::sync::Arc;
 use gang_client::ClientOptions;
 use gang_clock::{Clock, SystemClock};
 use gang_config::{GangConfig, WorkerConfig};
-use gang_nativelink::{NativeLink, NativeLinkConfig};
+use gang_engine::{Engine, EngineConfig};
 use gang_spi::{ActionIsolationPort, PluginContext, SchedulerPort};
 use gang_types::{AuthenticationSettings, ProviderName, Url};
-use gang_worker::{Transport, WorkerDeployment, WorkerParts, WorkerSettings};
+use gang_worker::{SandboxInfo, Transport, WorkerDeployment, WorkerParts, WorkerSettings};
 
 use crate::cli::WorkerArgs;
 use crate::config_file::LoadedConfig;
@@ -27,7 +27,7 @@ struct GangWorker;
 impl WorkerDeployment for GangWorker {
     type Provisioner = Provisioner;
     type Cache = Cache;
-    type Scheduler = NativeLink;
+    type Scheduler = Engine;
     type Limits = Limits;
     type Clock = SystemClock;
     type Enroller = WorkloadEnroller;
@@ -74,7 +74,7 @@ async fn serve(
     let worker_endpoint = effective_endpoint(worker_endpoint_flag, worker_endpoint);
     let provisioner = Provisioner::build(provisioner, &context)?;
     let cache = Cache::build(cache, &context)?;
-    let scheduler = NativeLink::try_new(NativeLinkConfig::for_worker(worker_endpoint, &worker))
+    let scheduler = Engine::try_new(EngineConfig::for_worker(worker_endpoint, &worker))
         .map_err(MainError::Scheduler)?;
     let controller_endpoints = public_endpoint
         .into_iter()
@@ -116,7 +116,10 @@ async fn serve(
         |key, config| {
             let sandbox =
                 Sandbox::build(key, config.clone(), &context).map_err(|error| error.source)?;
-            Ok(sandbox.environment().clone())
+            Ok(SandboxInfo {
+                environment: sandbox.environment().clone(),
+                binds_read_only: sandbox.binds_read_only(),
+            })
         },
         shutdown,
     ))

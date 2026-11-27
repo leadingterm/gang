@@ -2,27 +2,32 @@
 
 use gang_clock::Timestamp;
 
-use crate::{PortError, StoreAccess, port};
+use crate::{ActionStore, ContentStore, PortError, StoreAccess, port};
 
-/// The cache stores, as `NativeLink` store specifications.
+/// The cache stores: content-addressed blobs and action results.
 #[port]
 pub trait CacheStorePort: Send + Sync {
-    /// The store that holds content-addressable blobs.
-    ///
-    /// # Errors
-    ///
-    /// The cache's own error when the store cannot be described.
-    fn content_store(&self) -> Result<RenderedStoreSpec, PortError>;
+    /// The content-addressed blob store type.
+    type Content: ContentStore;
+    /// The action-result store type.
+    type Actions: ActionStore;
 
-    /// The action-result store for the server-owned environment version.
+    /// Opens the store that holds content-addressable blobs.
     ///
     /// # Errors
     ///
-    /// The cache's own error when the store cannot be described.
+    /// The cache's own error when the store cannot be opened.
+    fn content_store(&self) -> Result<Self::Content, PortError>;
+
+    /// Opens the action-result store for the server-owned environment version.
+    ///
+    /// # Errors
+    ///
+    /// The cache's own error when the store cannot be opened.
     fn action_store(
         &self,
         environment: &gang_types::EnvironmentName,
-    ) -> Result<RenderedStoreSpec, PortError>;
+    ) -> Result<Self::Actions, PortError>;
 
     /// How workers reach the two stores: opened directly, or through the controller when only the controller can open them.
     fn worker_access(&self) -> StoreAccess;
@@ -47,8 +52,3 @@ pub struct MeasuredUsage {
     /// When the provider measured the usage.
     pub measured: Timestamp,
 }
-
-/// One `NativeLink` `StoreSpec` value, for example `{ "filesystem": { .. } }` or
-/// `{ "experimental_cloud_object_store": { .. } }`, that the scheduler plugin deserializes.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RenderedStoreSpec(pub serde_json::Value);

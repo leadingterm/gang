@@ -64,6 +64,18 @@ pub struct Domain {
 /// it also fills the `PluginSet` items that parse and render the options.
 pub const FLEET_OPTIONS: &str = "FleetOptions";
 
+/// The associated type that carries a cache's content-addressed blob store.
+pub const CACHE_CONTENT: &str = "Content";
+
+/// The associated type that carries a cache's action-result store.
+pub const CACHE_ACTIONS: &str = "Actions";
+
+/// The trait a cache's content store dispatch enum implements by delegation.
+pub const CONTENT_STORE: &str = "ContentStore";
+
+/// The trait a cache's action store dispatch enum implements by delegation.
+pub const ACTION_STORE: &str = "ActionStore";
+
 /// The associated type that carries an action's limits scope. The domain that has it also fills
 /// the scope's `ActionScope` launcher impl on the generated dispatch enum.
 pub const LIMITS_SCOPE: &str = "Scope";
@@ -98,7 +110,19 @@ pub const DOMAINS: [Domain; 9] = [
         associated_type: "Cache",
         cardinality: Cardinality::ExactlyOne,
         sandbox_selection: false,
-        ports: &[PortSpec::plain("CacheStorePort")],
+        ports: &[PortSpec {
+            name: "CacheStorePort",
+            associated: &[
+                Associated {
+                    name: CACHE_CONTENT,
+                    delegated: &[CONTENT_STORE],
+                },
+                Associated {
+                    name: CACHE_ACTIONS,
+                    delegated: &[ACTION_STORE],
+                },
+            ],
+        }],
         config_traits: &[],
     },
     Domain {
@@ -211,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn associated_types_in_the_table_are_fleet_options_and_limits_scope() {
+    fn associated_types_in_the_table_match_their_domains() {
         let associated: Vec<(&str, &str)> = DOMAINS
             .iter()
             .flat_map(Domain::associated_types)
@@ -221,13 +245,15 @@ mod tests {
             associated,
             [
                 ("ProvisionerPort", FLEET_OPTIONS),
-                ("ActionLimitsPort", LIMITS_SCOPE)
+                ("CacheStorePort", CACHE_CONTENT),
+                ("CacheStorePort", CACHE_ACTIONS),
+                ("ActionLimitsPort", LIMITS_SCOPE),
             ]
         );
     }
 
     #[test]
-    fn only_the_limits_scope_delegates_its_traits() {
+    fn cache_stores_and_limits_scope_delegate_their_traits() {
         let delegated: Vec<(&str, &[&str])> = DOMAINS
             .iter()
             .flat_map(Domain::associated_types)
@@ -237,21 +263,32 @@ mod tests {
             delegated,
             [
                 (FLEET_OPTIONS, &[][..]),
-                (LIMITS_SCOPE, &[ACTION_SCOPE][..])
+                (CACHE_CONTENT, &[CONTENT_STORE][..]),
+                (CACHE_ACTIONS, &[ACTION_STORE][..]),
+                (LIMITS_SCOPE, &[ACTION_SCOPE][..]),
             ]
         );
     }
 
     #[test]
     fn domain_without_associated_types_has_no_fleet_options() {
-        let cache: Vec<&str> = DOMAINS
+        let plain: Vec<&str> = DOMAINS
             .iter()
-            .filter(|domain| domain.key == "cache")
             .filter(|domain| domain.associated_types().next().is_none())
             .filter(|domain| !domain.has_fleet_options())
             .map(|domain| domain.key)
             .collect();
-        assert_eq!(cache, ["cache"]);
+        assert_eq!(
+            plain,
+            [
+                "signer",
+                "database",
+                "sandbox",
+                "identity_provider",
+                "client_authentication",
+                "worker_authentication",
+            ]
+        );
     }
 
     #[test]

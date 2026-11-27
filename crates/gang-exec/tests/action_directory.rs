@@ -146,3 +146,15 @@ fn reserved_side_channels_directory_is_not_an_action() -> Result<(), Box<dyn Err
     ));
     Ok(())
 }
+
+#[test]
+fn reserved_graveyard_directory_is_not_an_action() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let working = temp.path().join(".graveyard/a1/work");
+    fs::create_dir_all(&working)?;
+    assert!(matches!(
+        ActionDirectory::try_new(temp.path(), &working),
+        Err(ExecError::OutsideWorkDirectory { .. })
+    ));
+    Ok(())
+}

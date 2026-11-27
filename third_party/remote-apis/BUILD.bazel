@@ -1,0 +1,8 @@
+filegroup(
+    name = "protos",
+    srcs = glob(["**/*.proto"]),
+    visibility = [
+        "//crates/gang-protogen:__pkg__",
+        "//crates/gang-reapi:__pkg__",
+    ],
+)

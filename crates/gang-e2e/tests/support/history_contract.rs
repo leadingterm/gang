@@ -4,18 +4,116 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use gang_clock::Timestamp;
-use gang_nativelink::history_fixture::{HistoryFixture, source, source_with_cap, tiny_source};
+use gang_config::HistoryWindow;
+use gang_scheduler::{
+    ActionDurations, Budget, Histories, Observation, Policy, ResourceSketch, SketchKey, Snapshot,
+};
 use gang_server::LearnedHistoryStore;
 use gang_spi::{
     Acquisition, CandidateGeneration, CandidatePriority, ControllerId, ExpiringRecordPort,
     LeaderLeasePort, LearnedHistory, Lease, LeaseCandidate, PortError, RecordKind, Takeover,
 };
 use gang_testkit::TestResult;
-use nativelink_scheduler::resource_sketch::{Observation, SketchKey, Snapshot};
+use gang_types::Percent;
+use parking_lot::Mutex;
 use serde_json::json;
 
 const DAY: u64 = 86_400_000;
 const START: u64 = 100 * DAY;
+
+struct HistoryFixture(Mutex<Histories>);
+
+impl HistoryFixture {
+    fn observe(&self, key: &SketchKey, now: u64) {
+        let observation = Observation {
+            peak_memory_kb: 22_387,
+            cpu_millicores: Some(1500),
+            peak_disk_kb: 1536,
+            now_s: now / 1000,
+            ..Default::default()
+        };
+        let mut histories = self.0.lock();
+        if matches!(key, SketchKey::Command { .. }) {
+            assert!(!histories.resource_mut().observe(key.clone(), &observation));
+        }
+        assert!(histories.resource_mut().observe(key.clone(), &observation));
+    }
+
+    fn lookup_shape(&self, key: &SketchKey, now_s: u64) -> Option<gang_scheduler::Shaped> {
+        let mut histories = self.0.lock();
+        let entry = histories.resource_mut().lookup(key, now_s)?;
+        Some(histories.resource().shape(&entry))
+    }
+
+    fn record(&self, target: &str, mnemonic: &str, millis: u64, now: Timestamp) {
+        self.0
+            .lock()
+            .durations_mut()
+            .record(target, mnemonic, millis, now);
+    }
+
+    fn expected(&self, target: &str, mnemonic: &str, now: Timestamp) -> Option<Duration> {
+        self.0
+            .lock()
+            .durations_mut()
+            .expected(target, mnemonic, now)
+    }
+
+    fn snapshot(&self, now: Timestamp, into: &mut Vec<LearnedHistory>) {
+        self.0.lock().snapshot(now, into);
+    }
+
+    fn restore(&self, now: Timestamp, records: &[LearnedHistory]) -> Result<(), PortError> {
+        self.0
+            .lock()
+            .restore(now, records)
+            .map_err(PortError::backend)
+    }
+}
+
+fn default_policy() -> Policy {
+    Policy {
+        headroom_percent: 25,
+        cpu_reservation_percentile: Percent::from_percent(95),
+        classes: Vec::new(),
+        reserve_cpu: true,
+        reserve_memory: true,
+        reserve_disk: true,
+    }
+}
+
+fn source(days: u32) -> Result<HistoryFixture, Box<dyn std::error::Error>> {
+    source_with_cap(days, 3)
+}
+
+fn source_with_cap(days: u32, keys: usize) -> Result<HistoryFixture, Box<dyn std::error::Error>> {
+    let window = HistoryWindow::from_units(u64::from(days));
+    let resource = ResourceSketch::new(
+        default_policy(),
+        Budget::from_bytes(256 * 1024 * 1024),
+        window.get(),
+    );
+    let durations = ActionDurations::new(
+        NonZeroUsize::new(keys).ok_or("duration capacity must be nonzero")?,
+        window,
+    );
+    Ok(HistoryFixture(Mutex::new(Histories::new(
+        resource, durations,
+    ))))
+}
+
+fn tiny_source() -> HistoryFixture {
+    let window = HistoryWindow::from_units(2);
+    let budget = Budget {
+        target: 1,
+        mnemonic: 1,
+        command: 1,
+        probation: 1,
+    };
+    let resource = ResourceSketch::with_shards(default_policy(), budget, window.get(), 1);
+    let durations = ActionDurations::new(NonZeroUsize::MIN.saturating_add(2), window);
+    HistoryFixture(Mutex::new(Histories::new(resource, durations)))
+}
 
 fn at(ms: u64) -> Timestamp {
     Timestamp::from_unix_millis(ms)
@@ -54,24 +152,10 @@ async fn successor<D: LeaderLeasePort>(
     lease(db, "successor", now, now + 10 * DAY).await
 }
 
-fn observe(source: &HistoryFixture, key: &SketchKey, now: u64) {
-    let observation = Observation {
-        peak_memory_kb: 22_387,
-        cpu_millicores: Some(1500),
-        peak_disk_kb: 1536,
-        now_s: now / 1000,
-        ..Default::default()
-    };
-    if matches!(key, SketchKey::Command { .. }) {
-        assert!(!source.resource().observe(key.clone(), &observation));
-    }
-    assert!(source.resource().observe(key.clone(), &observation));
-}
-
-fn snapshot(source: &HistoryFixture, now: u64) -> Result<Vec<LearnedHistory>, PortError> {
+fn snapshot(source: &HistoryFixture, now: u64) -> Vec<LearnedHistory> {
     let mut records = Vec::new();
-    source.snapshot(at(now), &mut records)?;
-    Ok(records)
+    source.snapshot(at(now), &mut records);
+    records
 }
 
 async fn restore<D: ExpiringRecordPort>(
@@ -97,14 +181,11 @@ pub async fn history_restart<D: ExpiringRecordPort + LeaderLeasePort>(db: &D) ->
     let lease = lease(db, "first", START, START + 10 * DAY).await?;
     let first = source(2)?;
     let key = SketchKey::for_attempt(Some(&"x".repeat(410 * 1024)), None, "");
-    observe(&first, &key, START);
+    first.observe(&key, START);
     first.record("target", "compile", 1200, at(START));
-    let expected = first.resource().shape(
-        &first
-            .resource()
-            .lookup(&key, START / 1000)
-            .ok_or("restart resource was not learned")?,
-    );
+    let expected = first
+        .lookup_shape(&key, START / 1000)
+        .ok_or("restart resource was not learned")?;
     assert!(expected.memory_kb > 0 && expected.cpu_count > 0 && expected.disk_kb > 0);
     let mut writer = store();
     writer
@@ -112,17 +193,16 @@ pub async fn history_restart<D: ExpiringRecordPort + LeaderLeasePort>(db: &D) ->
             db,
             &lease,
             at(START + 1000),
-            &snapshot(&first, START + 1000)?,
+            &snapshot(&first, START + 1000),
         )
         .await?;
     let lease = successor(db, &lease, START + 2000).await?;
     let second = source(2)?;
     restore(db, &lease, &mut store(), &second, START + 2000).await?;
-    let entry = second
-        .resource()
-        .lookup(&key, (START + 2000) / 1000)
+    let restored = second
+        .lookup_shape(&key, (START + 2000) / 1000)
         .ok_or("restart resource was not restored")?;
-    assert_eq!(second.resource().shape(&entry), expected);
+    assert_eq!(restored, expected);
     assert_eq!(
         second.expected("target", "compile", at(START + 2000)),
         Some(Duration::from_millis(1200))
@@ -140,14 +220,14 @@ pub async fn history_expiry<D: ExpiringRecordPort + LeaderLeasePort>(db: &D) -> 
     let lease = lease(db, "first", START, START + 10 * DAY).await?;
     let first = source(2)?;
     let key = SketchKey::for_attempt(None, None, "expiry");
-    observe(&first, &key, START);
+    first.observe(&key, START);
     first.record("", "expiry", 900, at(START));
     store()
         .flush(
             db,
             &lease,
             at(START + 1000),
-            &snapshot(&first, START + 1000)?,
+            &snapshot(&first, START + 1000),
         )
         .await?;
     let lease = successor(db, &lease, START + 2 * DAY).await?;
@@ -155,8 +235,7 @@ pub async fn history_expiry<D: ExpiringRecordPort + LeaderLeasePort>(db: &D) -> 
     restore(db, &lease, &mut store(), &second, START + 2 * DAY).await?;
     assert!(
         second
-            .resource()
-            .lookup(&key, (START + 2 * DAY) / 1000)
+            .lookup_shape(&key, (START + 2 * DAY) / 1000)
             .is_none()
     );
     assert_eq!(second.expected("", "expiry", at(START + 2 * DAY)), None);
@@ -173,7 +252,7 @@ pub async fn history_eviction<D: ExpiringRecordPort + LeaderLeasePort>(db: &D) -
     let lease = lease(db, "first", START, START + 10 * DAY).await?;
     let first = source(2)?;
     first.record("", "old", 500, at(START));
-    let old = snapshot(&first, START)?
+    let old = snapshot(&first, START)
         .into_iter()
         .find(|r| r.key.kind == RecordKind::DurationHistory)
         .ok_or("eviction fixture has no duration")?;
@@ -189,7 +268,7 @@ pub async fn history_eviction<D: ExpiringRecordPort + LeaderLeasePort>(db: &D) -
             db,
             &lease,
             at(START + 1000),
-            &snapshot(&first, START + 1000)?,
+            &snapshot(&first, START + 1000),
         )
         .await?;
     assert!(db.get(&old.key, at(START + 1000)).await?.is_none());
@@ -211,7 +290,7 @@ pub async fn history_eviction<D: ExpiringRecordPort + LeaderLeasePort>(db: &D) -
     {
         larger.record("", name, 1000, at(START + 3000 + index as u64));
     }
-    let large_records = snapshot(&larger, START + 4000)?;
+    let large_records = snapshot(&larger, START + 4000);
     let oldest = large_records
         .first()
         .ok_or("capacity fixture has no durations")?
@@ -235,7 +314,7 @@ pub async fn history_eviction<D: ExpiringRecordPort + LeaderLeasePort>(db: &D) -
             db,
             &lease,
             at(START + 5000),
-            &snapshot(&smaller, START + 5000)?,
+            &snapshot(&smaller, START + 5000),
         )
         .await?;
     assert!(db.get(&oldest, at(START + 5000)).await?.is_none());
@@ -252,13 +331,10 @@ pub async fn history_new_leader<D: ExpiringRecordPort + LeaderLeasePort>(db: &D)
     let first_lease = lease(db, "first", START, START + 5000).await?;
     let first = source(2)?;
     let key = SketchKey::for_attempt(None, None, "leader");
-    observe(&first, &key, START);
-    let expected = first.resource().shape(
-        &first
-            .resource()
-            .lookup(&key, START / 1000)
-            .ok_or("leader resource was not learned")?,
-    );
+    first.observe(&key, START);
+    let expected = first
+        .lookup_shape(&key, START / 1000)
+        .ok_or("leader resource was not learned")?;
     assert!(expected.memory_kb > 0 && expected.cpu_count > 0 && expected.disk_kb > 0);
     first.record("", "leader", 800, at(START));
     store()
@@ -266,17 +342,16 @@ pub async fn history_new_leader<D: ExpiringRecordPort + LeaderLeasePort>(db: &D)
             db,
             &first_lease,
             at(START + 1000),
-            &snapshot(&first, START + 1000)?,
+            &snapshot(&first, START + 1000),
         )
         .await?;
     let next_lease = lease(db, "second", START + 5001, START + 3 * DAY).await?;
     let second = source(2)?;
     restore(db, &next_lease, &mut store(), &second, START + 6000).await?;
-    let entry = second
-        .resource()
-        .lookup(&key, (START + 6000) / 1000)
+    let restored = second
+        .lookup_shape(&key, (START + 6000) / 1000)
         .ok_or("successor resource was not restored")?;
-    assert_eq!(second.resource().shape(&entry), expected);
+    assert_eq!(restored, expected);
     assert_eq!(
         second.expected("", "leader", at(START + 6000)),
         Some(Duration::from_millis(800))
@@ -294,10 +369,10 @@ pub async fn history_incompatible<D: ExpiringRecordPort + LeaderLeasePort>(db: &
     let lease = lease(db, "first", START, START + 10 * DAY).await?;
     let first = source(2)?;
     for name in ["format", "window", "sampler"] {
-        observe(&first, &SketchKey::for_attempt(None, None, name), START);
+        first.observe(&SketchKey::for_attempt(None, None, name), START);
         first.record("", name, 500, at(START));
     }
-    let mut records = snapshot(&first, START)?;
+    let mut records = snapshot(&first, START);
     for record in &mut records {
         match record.key.kind {
             RecordKind::ResourceHistory => {
@@ -344,8 +419,7 @@ pub async fn history_incompatible<D: ExpiringRecordPort + LeaderLeasePort>(db: &
     for name in ["format", "window", "sampler"] {
         assert!(
             second
-                .resource()
-                .lookup(
+                .lookup_shape(
                     &SketchKey::for_attempt(None, None, name),
                     (START + 1000) / 1000
                 )
@@ -358,7 +432,7 @@ pub async fn history_incompatible<D: ExpiringRecordPort + LeaderLeasePort>(db: &
             db,
             &lease,
             at(START + 1000),
-            &snapshot(&second, START + 1000)?,
+            &snapshot(&second, START + 1000),
         )
         .await?;
     for record in records {
@@ -380,48 +454,34 @@ pub async fn history_resource_eviction<D: ExpiringRecordPort + LeaderLeasePort>(
     let first = tiny_source();
     let old = SketchKey::for_attempt(Some("old-target"), None, "");
     let new = SketchKey::for_attempt(Some("new-target"), None, "");
-    observe(&first, &old, START);
-    let records = snapshot(&first, START)?;
+    first.observe(&old, START);
+    let records = snapshot(&first, START);
     assert_eq!(records.len(), 1);
     let old_head = records[0].key;
     let mut writer = store();
     writer.flush(db, &lease, at(START), &records).await?;
-    observe(&first, &new, START + 1000);
-    assert!(
-        first
-            .resource()
-            .lookup(&old, (START + 1000) / 1000)
-            .is_none()
-    );
-    let expected = first.resource().shape(
-        &first
-            .resource()
-            .lookup(&new, (START + 1000) / 1000)
-            .ok_or("replacement resource was not learned")?,
-    );
+    first.observe(&new, START + 1000);
+    assert!(first.lookup_shape(&old, (START + 1000) / 1000).is_none());
+    let expected = first
+        .lookup_shape(&new, (START + 1000) / 1000)
+        .ok_or("replacement resource was not learned")?;
     assert!(expected.memory_kb > 0 && expected.cpu_count > 0 && expected.disk_kb > 0);
     writer
         .flush(
             db,
             &lease,
             at(START + 1000),
-            &snapshot(&first, START + 1000)?,
+            &snapshot(&first, START + 1000),
         )
         .await?;
     assert!(db.get(&old_head, at(START + 1000)).await?.is_none());
     let lease = successor(db, &lease, START + 2000).await?;
     let second = tiny_source();
     restore(db, &lease, &mut store(), &second, START + 2000).await?;
-    assert!(
-        second
-            .resource()
-            .lookup(&old, (START + 2000) / 1000)
-            .is_none()
-    );
+    assert!(second.lookup_shape(&old, (START + 2000) / 1000).is_none());
     let restored = second
-        .resource()
-        .lookup(&new, (START + 2000) / 1000)
+        .lookup_shape(&new, (START + 2000) / 1000)
         .ok_or("replacement resource was not restored")?;
-    assert_eq!(second.resource().shape(&restored), expected);
+    assert_eq!(restored, expected);
     Ok(())
 }

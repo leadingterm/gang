@@ -94,9 +94,8 @@ impl Plugin for Provider {
     }
 }
 
-/// `jsonwebtoken` cannot choose between its backends when another crate in the build enables the
-/// second one (the `NativeLink` crates enable `aws_lc_rs`), so Gang installs the pure Rust one once
-/// per process; installing twice is harmless.
+/// Select the `jsonwebtoken` Rust crypto provider once per process so token verification uses
+/// an explicit provider; installing it again is harmless.
 fn select_crypto_provider() {
     match jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default() {
         Ok(()) | Err(_) => {}

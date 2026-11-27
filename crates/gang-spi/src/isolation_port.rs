@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::Path;
 use std::pin::Pin;
 
-use crate::{PortError, port};
+use crate::PortError;
 
 /// The file name of the `gang-exec` entrypoint link used to run an action.
 pub const EXEC_LINK_NAME: &str = "gang-exec";
@@ -18,11 +18,22 @@ pub const NETWORK_ENV: &str = "GANG_NETWORK";
 /// The multicall name used to reset the signal mask before starting a sandboxed action.
 pub const RESET_LINK_NAME: &str = "gang-reset";
 
+/// Maximum number of read-only input trees mounted for a single action.
+pub const MAX_RO_BINDS: usize = 64;
+
+/// Maximum number of action-local scratch directories mounted as ephemeral memory.
+pub const MAX_EPHEMERAL_DIRS: usize = 16;
+
 /// A sandbox for actions.
-#[port]
+#[crate::port]
 pub trait ActionIsolationPort: Send + Sync {
     /// The environment actually provided by this sandbox.
     fn environment(&self) -> &gang_types::ActionEnvironment;
+
+    /// Whether this sandbox mounts [`ActionExecutionSpec::read_only_trees`] read-only.
+    fn binds_read_only(&self) -> bool {
+        false
+    }
 
     /// Starts the action with the caller's standard streams and returns as soon as it is running.
     ///
@@ -34,7 +45,7 @@ pub trait ActionIsolationPort: Send + Sync {
 
 /// A termination request the process hosting an action received: `SIGTERM` or `SIGINT`.
 ///
-/// `NativeLink` sends one to the host's process group when an action times out or is cancelled,
+/// The worker sends one to the host's process group when an action times out or is cancelled,
 /// and kills the group once its kill grace has passed. The host stays alive for that grace and
 /// passes the request on with [`SandboxedAction::relay`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +77,7 @@ pub struct SandboxedAction {
     wait: Pin<Box<dyn Future<Output = Result<ActionExecutionOutcome, PortError>> + Send>>,
     /// `None` when the action shares its host's process group.
     relay: Option<Relay>,
+    accounting_pid: Option<u32>,
 }
 
 impl SandboxedAction {
@@ -79,6 +91,7 @@ impl SandboxedAction {
         Self {
             wait: Box::pin(wait),
             relay: None,
+            accounting_pid: None,
         }
     }
 
@@ -91,7 +104,20 @@ impl SandboxedAction {
         Self {
             wait: Box::pin(wait),
             relay: Some(Box::new(relay)),
+            accounting_pid: None,
         }
+    }
+
+    /// Sets the trusted host PID identifying the sandbox for resource accounting.
+    pub fn with_accounting_pid(mut self, pid: Option<u32>) -> Self {
+        self.accounting_pid = pid;
+        self
+    }
+
+    /// Returns the trusted host PID identifying the sandbox, when available.
+    #[must_use]
+    pub const fn accounting_pid(&self) -> Option<u32> {
+        self.accounting_pid
     }
 
     /// Passes `termination` on to the action. An action that shares its host's process group
@@ -164,6 +190,15 @@ impl<'a> ActionCommand<'a> {
     }
 }
 
+/// A read-only directory tree bound inside an action's directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadOnlyTree<'a> {
+    /// Absolute host path to the immutable directory tree.
+    pub source: &'a Path,
+    /// Target path strictly inside [`ActionExecutionSpec::action_directory`].
+    pub target: &'a Path,
+}
+
 /// An action to run.
 #[derive(Debug, Clone, Copy)]
 pub struct ActionExecutionSpec<'a> {
@@ -177,6 +212,13 @@ pub struct ActionExecutionSpec<'a> {
     pub action_directory: &'a Path,
     /// The directory the command runs in, inside `action_directory`.
     pub working_directory: &'a Path,
+    /// Immutable input subtrees bound read-only inside `action_directory` when
+    /// [`ActionIsolationPort::binds_read_only`] is `true`; at most [`MAX_RO_BINDS`].
+    pub read_only_trees: &'a [ReadOnlyTree<'a>],
+    /// Action-local scratch directories strictly inside `action_directory`, such as
+    /// `TEST_TMPDIR`, that a sandbox may mount as ephemeral in-memory tmpfs.
+    /// Contains at most [`MAX_EPHEMERAL_DIRS`] entries.
+    pub ephemeral_dirs: &'a [&'a Path],
     /// The selected fleet's effective network access.
     pub network: NetworkAccess<'a>,
     /// The action's memory cgroup, when limits created a scope.
@@ -243,8 +285,7 @@ mod tests {
     use super::{ActionCommand, ActionExecutionOutcome, PortError, SandboxedAction, Termination};
 
     #[test]
-    fn command_requires_a_program_and_preserves_arguments() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn command_requires_a_program_and_preserves_arguments() -> Result<(), Box<dyn Error>> {
         assert!(ActionCommand::from_argv(&[]).is_none());
 
         let argv = [OsString::from("program"), OsString::from("argument")];

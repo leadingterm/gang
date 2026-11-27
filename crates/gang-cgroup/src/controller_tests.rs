@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use gang_clock::{Clock, TestClock};
 use gang_spi::{ActionLimits, ActionScope};
-use gang_types::{Bytes, NonZeroBytes, NonZeroDuration};
+use gang_types::{Bytes, CpuWeight, NonZeroBytes, NonZeroDuration};
 
 use crate::config::{CgroupConfig, CpuPeriod, Delegation};
 use crate::controller::{CgroupScope, Controller};
@@ -86,6 +86,7 @@ fn limits(cpu_count: Option<u32>, memory: Option<u64>) -> ActionLimits {
     ActionLimits {
         cpu_count: cpu_count.map(|count| NonZeroU32::new(count).expect("non-zero cpu count")),
         memory: memory.and_then(|bytes| NonZeroBytes::new(Bytes::new(bytes))),
+        cpu_weight: None,
     }
 }
 
@@ -112,6 +113,14 @@ async fn prepare_moves_process_into_worker_leaf_and_enables_controllers() {
     assert!(controller.fs.exists(&actions()));
     assert_eq!(controller.fs.enabled(&subtree()), ENABLED);
     assert_eq!(controller.fs.enabled(&actions()), ENABLED);
+    assert_eq!(
+        trimmed(&controller.fs, &worker(), "cpu.weight").as_deref(),
+        Some("1000")
+    );
+    assert_eq!(
+        trimmed(&controller.fs, &actions(), "cpu.weight").as_deref(),
+        Some("1000")
+    );
 }
 #[tokio::test]
 async fn prepare_configures_pool_and_returns_page_rounded_capacity() {
@@ -1189,4 +1198,47 @@ async fn leave_right_after_enter_removes_the_scope() {
 
     assert!(!controller.fs.exists(&cgroup));
     assert_eq!(controller.fs.member(), worker());
+}
+
+#[tokio::test]
+async fn prepare_fails_if_sibling_cpu_weight_cannot_be_written() {
+    let controller = controller(delegated().reject_writes_of("cpu.weight"));
+
+    let error = controller.prepare(Bytes::new(RESERVE)).await.unwrap_err();
+
+    assert!(matches!(error, CgroupError::Io { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn enter_writes_cpu_weight_only_when_requested() {
+    let controller = controller(delegated());
+    controller
+        .prepare(Bytes::new(RESERVE))
+        .await
+        .expect("prepare");
+
+    let unconstrained = controller.enter(&limits(None, None)).expect("enter");
+    assert_eq!(
+        trimmed(&controller.fs, &scope_path(&unconstrained), "cpu.weight"),
+        None
+    );
+    controller.leave(unconstrained).await.expect("leave");
+
+    for (weight, expected) in [
+        (CpuWeight::GATE, "1000"),
+        (CpuWeight::INTERACTIVE, "100"),
+        (CpuWeight::BACKGROUND, "20"),
+    ] {
+        let scope = controller
+            .enter(&ActionLimits {
+                cpu_weight: Some(weight),
+                ..limits(None, None)
+            })
+            .expect("enter");
+        assert_eq!(
+            trimmed(&controller.fs, &scope_path(&scope), "cpu.weight").as_deref(),
+            Some(expected)
+        );
+        controller.leave(scope).await.expect("leave");
+    }
 }

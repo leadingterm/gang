@@ -97,21 +97,21 @@ http_file(
 )
 
 http_file(
-    name = "gang_v038_linux_x86_64",
+    name = "gang_v039_linux_x86_64",
     dev_dependency = True,
     downloaded_file_path = "gang",
     executable = True,
-    sha256 = "8259514ad693ddd84f6b06ac530445ae5f91055fd0568a85496f56049040c1f7",
-    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.8/gang-x86_64-unknown-linux-musl"],
+    sha256 = "3e1f96bb5eb5a358f537ec6ad23f9446e71a26590944537004f614af85fd341b",
+    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.9/gang-x86_64-unknown-linux-musl"],
 )
 
 http_file(
-    name = "gang_v038_linux_arm64",
+    name = "gang_v039_linux_arm64",
     dev_dependency = True,
     downloaded_file_path = "gang",
     executable = True,
-    sha256 = "1bdbe3fbb9d59e5527931ba9c656383f907962a07ec35431d5ff6dd410c906ce",
-    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.8/gang-aarch64-unknown-linux-musl"],
+    sha256 = "b59102a33a76d5cf68f48551e23d4b7495b87557cd023fc8ec8390110902ae3a",
+    urls = ["https://github.com/leadingterm/gang/releases/download/v0.3.9/gang-aarch64-unknown-linux-musl"],
 )
 
 # Remove archive package boundaries so the generated root filegroup sees every source.
@@ -138,14 +138,14 @@ http_archive(
 )
 
 http_archive(
-    name = "gang_v038_source",
+    name = "gang_v039_source",
     build_file_content = UPGRADE_SOURCE_BUILD,
     dev_dependency = True,
     patch_cmds = [UPGRADE_SOURCE_PATCH],
-    sha256 = "ddd6ed3d602ad919ffaa10c3d61057651d5eaef118d55811d2c962828790e47a",
-    strip_prefix = "gang-0.3.8",
+    sha256 = "92eac4ce6142ac3f9b9d50fc03e3e603706b15dd54343f7e469b66c8edbdd79a",
+    strip_prefix = "gang-0.3.9",
     type = "tar.gz",
-    urls = ["https://codeload.github.com/leadingterm/gang/tar.gz/refs/tags/v0.3.8"],
+    urls = ["https://codeload.github.com/leadingterm/gang/tar.gz/refs/tags/v0.3.9"],
 )
 
 # The Bazel the e2e harness drives in its sample workspace (crates/gang-e2e); each download below is pinned by checksum.

@@ -41,22 +41,22 @@ upgrade_fixture(
 alias(
     name = "previous_gang",
     actual = select({
-        "//bazel/platforms:linux_x86_64": "@gang_v038_linux_x86_64//file:gang",
-        "//bazel/platforms:linux_arm64": "@gang_v038_linux_arm64//file:gang",
+        "//bazel/platforms:linux_x86_64": "@gang_v039_linux_x86_64//file:gang",
+        "//bazel/platforms:linux_arm64": "@gang_v039_linux_arm64//file:gang",
     }),
     target_compatible_with = ["@platforms//os:linux"],
 )
 
 upgrade_fixture(
-    name = "v038_fixture",
-    srcs = ["@gang_v038_source//:sources"],
-    source_root = "@gang_v038_source//:Cargo.toml",
+    name = "v039_fixture",
+    srcs = ["@gang_v039_source//:sources"],
+    source_root = "@gang_v039_source//:Cargo.toml",
     target_compatible_with = ["@platforms//os:linux"],
 )
 
 alias(
     name = "previous_fixture",
-    actual = ":v038_fixture",
+    actual = ":v039_fixture",
     target_compatible_with = ["@platforms//os:linux"],
 )
 
@@ -83,10 +83,11 @@ workspace_rust_library(
     dev_deps = [
         "//crates/gang-aws-sdk:gang_aws_sdk",
         "//crates/gang-dynamodb:gang_dynamodb_test_support",
-        "//crates/gang-nativelink:gang_nativelink_test_support",
         "//crates/gang-postgres:gang_postgres",
         "//crates/gang-server:gang_server",
         "//crates/gang-sqlite:gang_sqlite",
+        "//crates/gang-engine:gang_engine",
+        "//crates/gang-scheduler:gang_scheduler",
     ],
     test_data = glob(
         [
@@ -97,11 +98,15 @@ workspace_rust_library(
         allow_empty = True,
     ) + ["//:e2e/sample/BUILD.bazel"],
     test_env = {
+        "FAKE_BWRAP": "$(rootpath //crates/gang-bwrap:fake_bwrap)",
+        "GANG_E2E_GANG": "$(rootpath //crates/gang-main:gang)",
         "GANG_E2E_BASE_CONFIG": "$(rootpath //configs:gang.local.toml)",
         "GANG_E2E_TEST_BASH": "$(rootpath :test_bash)",
         "GANG_TEST_POSTGRES": "$(rootpath //crates/gang-testkit:postgresql_archive)",
     },
     test_runtime_data = [
+        "//crates/gang-bwrap:fake_bwrap",
+        "//crates/gang-main:gang",
         ":test_bash",
         "//configs:gang.local.toml",
         "//crates/gang-testkit:postgresql_archive",
@@ -118,6 +123,7 @@ workspace_rust_library(
         "//crates/gang-mtls:gang_mtls",
         "//crates/gang-oidc:gang_oidc",
         "//crates/gang-os:gang_os",
+        "//crates/gang-reapi:gang_reapi",
         "//crates/gang-spi:gang_spi",
         "//crates/gang-state:gang_state",
         "//crates/gang-testkit:gang_testkit",

@@ -1,7 +1,7 @@
 //! The single `gang` binary: forwards argv to the `gang-main` facade.
 use mimalloc::MiMalloc;
 
-/// musl's allocator serializes threads under contention; mimalloc is `NativeLink`'s own choice.
+/// musl's allocator serializes threads under contention, so Gang uses mimalloc.
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 

@@ -12,10 +12,10 @@ use std::time::Duration;
 
 use gang_clock::Timestamp;
 use gang_e2e::{
-    AUDIENCE, Admission, AttemptRecord, BuildOutcome, Channel, ChannelEvent, Control, Credentials,
-    DiskNeighbourReport, E2eError, EventStream, FleetLayout, HOLD_CPU_COUNT, Host, Identity,
-    InputLinks, IsolationReport, Issuance, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS, LIMIT_MAX_PIDS,
-    NOOP_FLEET, Namespaces, ORGANIZATION, PermitNetwork, PoisonReport, Presenting,
+    AUDIENCE, Admission, AttemptRecord, BoundTreeReport, BuildOutcome, Channel, ChannelEvent,
+    Control, Credentials, DiskNeighbourReport, E2eError, EventStream, FleetLayout, HOLD_CPU_COUNT,
+    Host, Identity, InputLinks, IsolationReport, Issuance, LARGE_FLEET, LIMIT_CPU_PERIOD_MICROS,
+    LIMIT_MAX_PIDS, NOOP_FLEET, Namespaces, ORGANIZATION, PermitNetwork, PoisonReport, Presenting,
     PressureObservation, Probe, ProbeReport, Reply, Result, Run, SMALL_FLEET, Sandbox, ScopeFacts,
     SessionCookie, Settings, Signalled, System, TokenSpec, Variant, VictimReport,
 };
@@ -109,7 +109,7 @@ const SIM_CWD_NAME: &str = "sim-work";
 const SIM_PARENT_NAME: &str = "tmp";
 const SIM_GRANDPARENT_NAME: &str = "root";
 const SIBLING: &str = "cas";
-/// The per-action `TMPDIR` directory `NativeLink` creates beside the working directory.
+/// The per-action `TMPDIR` directory the worker creates beside the working directory.
 const SIM_ACTION_TMP_NAME: &str = "tmp";
 /// The principal of the one session the identity simulation issues.
 const SIM_PRINCIPAL: &str = "local-workers:developer";
@@ -843,6 +843,17 @@ impl Simulation {
                 }
                 .to_string(),
             ),
+            Probe::BoundTreePoison => {
+                let protected = self.behaviour.integrity != Integrity::Poisoned;
+                Some(
+                    BoundTreeReport {
+                        chmod_erofs: protected,
+                        write_denied: protected,
+                        intact: protected,
+                    }
+                    .to_string(),
+                )
+            }
             _ => Some("ran=yes\n".to_owned()),
         }
     }

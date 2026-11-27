@@ -16,9 +16,9 @@ use gang_reconciler::{PassTime, SourceProfiles};
 use gang_spi::{
     AuthenticationPort, CacheStorePort, ClientCertificates, ControllerConnections, ControllerDrain,
     ControllerHostIdentity, ControllerHostPort, ControllerHostState, ControllerId, ControllerReady,
-    ControllerSpec, CredentialLifecyclePort, HostMilestone, Lease, Listening, ObservationSink,
-    Observations, PortError, ProvisionerPort, RevocationEpoch, SchedulerPort, SchedulerSnapshot,
-    Scheme, ServerEndpoints, StateRepositoryPort,
+    ControllerSpec, ControllerStores, CredentialLifecyclePort, HostMilestone, Lease, Listening,
+    ObservationSink, Observations, PortError, ProvisionerPort, RevocationEpoch, SchedulerPort,
+    SchedulerSnapshot, Scheme, ServerEndpoints, StateRepositoryPort,
 };
 use gang_state::CacheBaseline;
 use gang_tls::{Alpn, ClientAuth, RevocationSet};
@@ -137,6 +137,11 @@ type ControllerListening<D> = ControllerConnections<
     Gate<D, <D as Stack>::Clients>,
     Gate<D, <D as Stack>::Workers>,
     PublicService<D>,
+>;
+/// The controller's typed cache stores.
+type DeploymentStores<D> = ControllerStores<
+    <<D as Deployment>::Cache as CacheStorePort>::Content,
+    <<D as Deployment>::Cache as CacheStorePort>::Actions,
 >;
 
 /// Treat a sent or dropped stop signal alike.
@@ -959,6 +964,10 @@ async fn finish_host<D: Deployment>(
 async fn drive_original<D: Deployment>(
     context: &LeadContext<'_, D>,
     spec: &ControllerSpec<'_>,
+    stores: ControllerStores<
+        <D::Cache as CacheStorePort>::Content,
+        <D::Cache as CacheStorePort>::Actions,
+    >,
     (connections, mut ends, stop_sender): (
         ControllerListening<D>,
         ListenerEnds,
@@ -974,6 +983,7 @@ async fn drive_original<D: Deployment>(
     let mut controller = Box::pin(context.scheduler.run_controller(
         spec,
         connections,
+        stores,
         controller_ready,
     ));
     let mut outgoing = None;
@@ -1170,15 +1180,14 @@ impl<D: Deployment> Server<D> {
         );
     }
 
-    fn cache_stores(
-        &self,
-    ) -> Result<(gang_spi::RenderedStoreSpec, gang_spi::RenderedStoreSpec), ServerError> {
-        let content = self.cache.content_store().map_err(ServerError::Cache)?;
-        let action = self
-            .cache
-            .action_store(&self.actions.environment)
-            .map_err(ServerError::Cache)?;
-        Ok((content, action))
+    fn cache_stores(&self) -> Result<DeploymentStores<D>, ServerError> {
+        let content = Arc::new(self.cache.content_store().map_err(ServerError::Cache)?);
+        let actions = Arc::new(
+            self.cache
+                .action_store(&self.actions.environment)
+                .map_err(ServerError::Cache)?,
+        );
+        Ok(ControllerStores { content, actions })
     }
 
     /// Runs the server until `shutdown` completes or a component fails. On shutdown, each
@@ -1212,10 +1221,8 @@ impl<D: Deployment> Server<D> {
     ) -> Result<(), ServerError> {
         let core = &*self.core;
         self.warn_startup();
-        let (content_store, action_store) = self.cache_stores()?;
+        let stores = self.cache_stores()?;
         let spec = ControllerSpec {
-            content_store: &content_store,
-            action_store: &action_store,
             fleets: self.fleets.catalog(),
             max_workers: self.fleets.max_instances(),
             client_action_timeout: self.client_action_timeout.get(),
@@ -1292,6 +1299,7 @@ impl<D: Deployment> Server<D> {
         let result = drive_original(
             &context,
             &spec,
+            stores,
             (connections, ends, stop_sender),
             ready,
             shutdown,

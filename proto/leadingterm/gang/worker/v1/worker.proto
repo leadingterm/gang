@@ -1,0 +1,268 @@
+syntax = "proto3";
+
+package leadingterm.gang.worker.v1;
+
+import "build/bazel/remote/execution/v2/remote_execution.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "google/rpc/status.proto";
+
+// Internal controller-worker session protocol for Gang's native execution engine.
+service WorkerService {
+  // Opens one bidirectional session per worker generation.
+  // The first WorkerMessage sent by the worker must be `register`.
+  rpc Connect(stream WorkerMessage) returns (stream ControllerMessage);
+}
+
+// Frame sent from a worker to the controller on the session stream.
+message WorkerMessage {
+  // Payload variant for a worker-to-controller message.
+  oneof kind {
+    // Initial generation registration; must be the first frame on the stream.
+    Register register = 1;
+    // Accepts an assigned attempt before `ack_deadline`.
+    Accept accept = 2;
+    // Declines an assigned attempt without consuming a retry.
+    Decline decline = 3;
+    // Action processes have exited; releases CPU and memory before output upload.
+    Executed executed = 4;
+    // Outputs uploaded and ActionCache written; releases disk and publishes result.
+    Completed completed = 5;
+    // Periodic store telemetry and observed memory capacity fact.
+    KeepAlive keep_alive = 6;
+    // Worker stop was requested; controller must not send new assignments.
+    GoingAway going_away = 7;
+  }
+}
+
+// Registers a worker generation and its effective capacity and environment.
+message Register {
+  // Physical instance identifier hosting this worker process.
+  string instance = 1;
+  // Fleet name the worker belongs to.
+  string fleet = 2;
+  // Gang build version string used to match the controller's current build.
+  string gang_version = 3;
+  // Worker properties derived from `FleetProperties::worker_properties()`.
+  map<string, string> properties = 4;
+  // Registered ledger capacity (post-reserve memory, oversubscribed CPU, action disk).
+  Resources capacity = 5;
+  // Effective per-action resource ceilings enforced by this worker's fleet.
+  Resources ceilings = 6;
+  // Maximum concurrent attempts accepted by this worker; 0 means unlimited.
+  uint32 max_inflight = 7;
+  // Whether this worker exits after completing a single action.
+  bool single_use = 8;
+  // Operational action environment served by this worker.
+  ActionEnvironment environment = 9;
+}
+
+// Confirms that the worker has admitted an assigned attempt.
+message Accept {
+  // Identifier of the accepted attempt.
+  string attempt = 1;
+}
+
+// Rejects an assigned attempt so the scheduler can requeue it at its original sequence.
+message Decline {
+  // Identifier of the declined attempt.
+  string attempt = 1;
+  // Reason the worker could not admit the attempt.
+  DeclineReason reason = 2;
+  // Observed free bytes on the worker's work volume at the time of decline.
+  uint64 free_bytes = 3;
+}
+
+// Reports process exit and measured resource usage before output upload begins.
+message Executed {
+  // Identifier of the attempt whose processes have exited.
+  string attempt = 1;
+  // Measured CPU, memory, and disk usage for the attempt.
+  ResourceUsage usage = 2;
+  // Set when the attempt was terminated by a controller or worker-enforced kill.
+  optional Kill kill = 3;
+  // Execution status prior to output upload.
+  google.rpc.Status status = 4;
+  // Process exit code reported by the sandbox.
+  int32 exit_code = 5;
+  // Timestamp when action execution started.
+  google.protobuf.Timestamp started = 6;
+  // Timestamp when all action processes had exited.
+  google.protobuf.Timestamp finished = 7;
+}
+
+// Reports completion after outputs are uploaded and cacheable results are published.
+message Completed {
+  // Identifier of the completed attempt.
+  string attempt = 1;
+  // Terminal outcome of upload and publication.
+  oneof outcome {
+    // Full REAPI v2 ActionResult when execution and output upload succeeded.
+    build.bazel.remote.execution.v2.ActionResult result = 2;
+    // Non-OK status when upload failed or execution did not produce a result.
+    google.rpc.Status status = 3;
+  }
+}
+
+// Periodic worker liveness message carrying cache statistics and memory capacity.
+message KeepAlive {
+  // Cumulative fast/slow store counters and current cache occupancy.
+  CacheStats cache = 1;
+  // Authoritative post-reserve action memory capacity in bytes, when available.
+  optional uint64 memory_capacity = 2;
+}
+
+// Signals that the worker is shutting down and will decline any further assignments.
+message GoingAway {}
+
+// Frame sent from the controller to a worker on the session stream.
+message ControllerMessage {
+  // Payload variant for a controller-to-worker message.
+  oneof kind {
+    // Acknowledges registration with the minted worker ID and keepalive cadence.
+    Registered registered = 1;
+    // Assigns an action attempt to the worker.
+    Assign assign = 2;
+    // Requests immediate termination of an in-flight attempt.
+    Kill kill = 3;
+    // Updates controller-driven draining state for this worker.
+    SetDraining set_draining = 4;
+    // Ends this session after attempts finish so the worker redials the new leader.
+    Rehome rehome = 5;
+  }
+}
+
+// Acknowledges worker registration on the controller.
+message Registered {
+  // Controller-minted worker identifier starting with the instance identifier.
+  string worker_id = 1;
+  // Expected application keepalive interval for this session.
+  google.protobuf.Duration keepalive_interval = 2;
+}
+
+// Assigns an operation attempt to execute on the worker.
+message Assign {
+  // Fresh UUIDv4 identifier for this execution attempt.
+  string attempt = 1;
+  // REAPI operation name this attempt serves.
+  string operation = 2;
+  // Digest of the REAPI `Action` proto.
+  build.bazel.remote.execution.v2.Digest action_digest = 3;
+  // Serialized REAPI `Action`, inlined only when `action.len() + command.len() <= assign_inline_max`.
+  optional bytes action = 4;
+  // Serialized REAPI `Command`, omitted alongside `action` when larger so the worker fetches from CAS.
+  optional bytes command = 5;
+  // Authoritative admitted platform properties; replaces raw client properties.
+  map<string, string> platform = 6;
+  // Fitted resource reservation held for this attempt in the scheduler ledger.
+  Resources reservation = 7;
+  // Absolute deadline by which this attempt must finish.
+  google.protobuf.Timestamp attempt_deadline = 8;
+  // Effective execution timeout for the action command.
+  google.protobuf.Duration timeout = 9;
+  // Bazel target label from request metadata, when present.
+  string target = 10;
+  // Bazel action mnemonic from request metadata, when present.
+  string mnemonic = 11;
+  // Whether ActionCache lookup was skipped for this operation.
+  bool skip_cache_lookup = 12;
+  // Whether the worker must skip writing the ActionResult to the ActionCache.
+  bool do_not_cache = 13;
+  // Out-of-band cgroup v2 `cpu.weight` (1..=10000); never part of platform or environment.
+  uint32 cpu_weight = 14;
+}
+
+// Requests or reports termination of a running attempt.
+message Kill {
+  // Identifier of the attempt to kill or that was killed.
+  string attempt = 1;
+  // Classification of why the attempt was terminated.
+  KillReason reason = 2;
+}
+
+// Instructs the worker whether the controller has placed it in draining mode.
+message SetDraining {
+  // True when draining (no new assignments expected); false to resume normal acceptance.
+  bool draining = 1;
+}
+
+// Instructs the worker on a draining old controller to finish active work and redial.
+message Rehome {}
+
+// Compute resource quantities for capacity, ceilings, and reservations.
+message Resources {
+  // CPU allocation or capacity in millicores.
+  uint64 cpu_millicores = 1;
+  // Memory allocation or capacity in bytes.
+  uint64 memory_bytes = 2;
+  // Action work-directory disk allocation or capacity in bytes.
+  uint64 disk_bytes = 3;
+}
+
+// Validated operational action environment identity served by a worker.
+message ActionEnvironment {
+  // Canonical identity: a 64-char lowercase hex rootfs digest or `host:<label>`.
+  string identity = 1;
+}
+
+// Measured resource consumption for an executed attempt.
+message ResourceUsage {
+  // Cumulative CPU time consumed by the attempt, when measured.
+  google.protobuf.Duration cpu_time = 1;
+  // Peak memory usage observed in the attempt's cgroup or process tree, in bytes.
+  optional uint64 peak_memory_bytes = 2;
+  // Peak action work-directory disk usage observed for the attempt, in bytes.
+  optional uint64 peak_disk_bytes = 3;
+  // Hierarchical kernel OOM kill count observed in the attempt's cgroup.
+  uint64 oom_kills = 4;
+  // Whether periodic resource sampling observed the running attempt.
+  bool sampled = 5;
+}
+
+// Measurements from one worker's local fast store and slow store.
+message CacheStats {
+  // Counted reads served from the local fast store.
+  uint64 local_read_requests = 1;
+  // Bytes transferred by reads from the local fast store.
+  uint64 local_read_bytes = 2;
+  // Counted reads served from the slow store.
+  uint64 slow_read_requests = 3;
+  // Bytes transferred by reads from the slow store.
+  uint64 slow_read_bytes = 4;
+  // Entries evicted from the fast store (excluding replacements).
+  uint64 evictions = 5;
+  // Bytes evicted from the fast store (excluding replacements).
+  uint64 evicted_bytes = 6;
+  // Current occupancy of the fast store in bytes.
+  uint64 size_bytes = 7;
+  // Configured fast store eviction budget in bytes.
+  uint64 budget_bytes = 8;
+}
+
+// Reasons a worker declines an `Assign` offer.
+enum DeclineReason {
+  // Default zero value; invalid on the wire.
+  DECLINE_REASON_UNSPECIFIED = 0;
+  // Insufficient unreserved free disk space on the worker volume.
+  DECLINE_REASON_DISK_SHORTAGE = 1;
+  // Worker is draining or stopping and no longer admits new attempts.
+  DECLINE_REASON_DRAINING = 2;
+}
+
+// Classifications for controller-initiated or worker-enforced attempt termination.
+enum KillReason {
+  // Default zero value; invalid on the wire.
+  KILL_REASON_UNSPECIFIED = 0;
+  // Client cancelled, lost all watchers past `client_action_timeout`, or worker stopped.
+  KILL_REASON_CANCELLED = 1;
+  // Controller-enforced attempt deadline elapsed.
+  KILL_REASON_DEADLINE_EXCEEDED = 2;
+  // Action execution timeout elapsed.
+  KILL_REASON_TIMEOUT = 3;
+  // Memory limit, cgroup OOM kill, or worker memory pressure monitor killed the attempt.
+  KILL_REASON_MEMORY = 4;
+  // Worker disk pressure monitor killed the attempt (eligible for disk escalation retry).
+  KILL_REASON_DISK_PRESSURE = 5;
+  // Action exceeded its soft disk ceiling (terminal failure without requeueing).
+  KILL_REASON_DISK_LIMIT = 6;
+}

@@ -90,6 +90,7 @@ mod tests {
             &ActionLimits {
                 cpu_count: None,
                 memory: None,
+                cpu_weight: None,
             },
         )
         .await;

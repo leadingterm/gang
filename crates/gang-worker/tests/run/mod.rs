@@ -123,11 +123,12 @@ async fn wrong_image_is_rejected_before_enrollment_and_registration() {
         settings,
         harness.build_limits(),
         |_, _| {
-            Ok(
-                "2222222222222222222222222222222222222222222222222222222222222222"
+            Ok(gang_worker::SandboxInfo {
+                environment: "2222222222222222222222222222222222222222222222222222222222222222"
                     .parse()
                     .expect("valid E2 identity"),
-            )
+                binds_read_only: false,
+            })
         },
         future::pending(),
     )
@@ -176,10 +177,13 @@ async fn selected_root_is_pinned_before_identity_and_serialization() {
             assert_eq!(root.as_path(), expected);
             fs::remove_file(&link).expect("remove link");
             symlink(&second, &link).expect("switch image link");
-            Ok(fs::read_to_string(root.join("identity"))
-                .expect("pinned identity")
-                .parse()
-                .expect("valid identity"))
+            Ok(gang_worker::SandboxInfo {
+                environment: fs::read_to_string(root.join("identity"))
+                    .expect("pinned identity")
+                    .parse()
+                    .expect("valid identity"),
+                binds_read_only: false,
+            })
         },
         future::pending(),
     )
@@ -1720,6 +1724,33 @@ async fn a_restart_with_a_filled_fast_cas_keeps_the_cold_start_budget() {
 
     // The cold-start budget: 50 percent of the 10 GiB scratch volume.
     assert_eq!(only_spec(&harness).fast_cas_budget.get(), 5 * GIB);
+}
+
+#[tokio::test]
+async fn trees_directory_requires_read_only_binds_and_input_trees_bind() {
+    for (binds_read_only, input_trees, expect_trees) in [
+        (true, gang_config::InputTrees::Bind, true),
+        (false, gang_config::InputTrees::Bind, false),
+        (true, gang_config::InputTrees::Link, false),
+    ] {
+        let harness = Harness::new(Isa::X86_64, WorkerLifetime::LongLived);
+        harness.scheduler.set_behaviour(Behaviour::Finish);
+        let mut settings = harness.settings();
+        settings.execution.input_trees = input_trees;
+        gang_worker::run(
+            harness.parts(false),
+            settings,
+            harness.build_limits(),
+            harness.build_sandbox_with(binds_read_only),
+            future::pending(),
+        )
+        .await
+        .expect("worker finishes");
+        let spec = only_spec(&harness);
+        let layout = Layout::new(&harness.volume);
+        let expected = expect_trees.then(|| layout.trees_directory());
+        assert_eq!(spec.trees_directory, expected);
+    }
 }
 
 #[tokio::test]

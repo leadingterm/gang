@@ -16,8 +16,9 @@ use std::path::{Path, PathBuf};
 use gang_noop::{Noop, NoopConfig};
 use gang_spi::{
     ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, NetworkAccess,
-    Plugin, PluginContext, PortError,
+    PortError,
 };
+use gang_spi::{Plugin, PluginContext};
 use gang_testkit::ChildTest;
 use gang_types::AbsolutePathBuf;
 
@@ -110,6 +111,8 @@ fn host() -> Result<(), Box<dyn Error>> {
     let environment = action_environment("echo", Some(ready.as_path()));
     let working_directory = std::env::current_dir()?;
     let spec = ActionExecutionSpec {
+        read_only_trees: &[],
+        ephemeral_dirs: &[],
         command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
         launcher: &[],
         environment: &environment,
@@ -151,7 +154,8 @@ fn advertises_host_identity_and_rejects_rootfs_identity() -> Result<(), Box<dyn 
             config_path: Path::new("sandbox.toml"),
         },
     );
-    assert!(matches!(result, Err(PortError::Config(_))));
+    let error = result.expect_err("a rootfs identity is rejected");
+    assert!(matches!(&error, PortError::Config(_)));
     Ok(())
 }
 
@@ -191,6 +195,8 @@ async fn spec_run(
     working_directory: &Path,
 ) -> Result<ActionExecutionOutcome, Box<dyn Error>> {
     let spec = ActionExecutionSpec {
+        read_only_trees: &[],
+        ephemeral_dirs: &[],
         command: ActionCommand::from_argv(argv).ok_or("empty argv")?,
         launcher: &[],
         environment,
@@ -368,6 +374,8 @@ async fn dropping_the_running_action_kills_it() -> Result<(), Box<dyn Error>> {
     let argv = action_argv()?;
     let environment = action_environment("block", Some(ready.as_path()));
     let spec = ActionExecutionSpec {
+        read_only_trees: &[],
+        ephemeral_dirs: &[],
         command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
         launcher: &[],
         environment: &environment,
@@ -391,7 +399,7 @@ async fn dropping_the_running_action_kills_it() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// `NativeLink` stops an action by signalling the process group of the `gang exec` process that
+/// The worker stops an action by signalling the process group of the `gang exec` process that
 /// hosts it, and on macOS it only ever sends SIGKILL to that group. The action must therefore
 /// not outlive its host's process group.
 #[tokio::test]

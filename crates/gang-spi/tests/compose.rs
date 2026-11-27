@@ -13,22 +13,23 @@ use gang_clock::Timestamp;
 use gang_config::{ConfigError, GangConfig, SandboxSelection};
 use gang_spi::{
     ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionLimits,
-    ActionLimitsPort, ActionMemoryPool, ActionScope, ActionUsage, Admitted, ApiRequestBody,
-    ApiResponseBody, ApiService, Authenticated, AuthenticationPort, BuildError, CacheStorePort,
-    CertificateSignerPort, ControllerConnections, ControllerEndpoints, ControllerReady,
-    ControllerSpec, ExpiringRecordPort, FleetInstance, FleetSupply, GateDecision, Listening,
-    LoginPort, LoginRequest, LoginSupport, NetworkAccess, NodeLifecyclePort, Peer, Plugin,
-    PluginContext, PortError, PreemptionNotice, ProofVerifierPort, ProvisionerPort, RecordId,
-    RecordKey, RecordKind, RecordVersion, Rejection, RenderedStoreSpec, RequestGate, RequestScope,
-    SchedulerPort, SchedulerSnapshot, Scheme, ScratchVolumePort, SignatureAlgorithm,
-    StateRepositoryPort, StoreAccess, Subject, WorkerSpec, WorkerTls, WorkloadCredentialPort,
+    ActionLimitsPort, ActionMemoryPool, ActionScope, ActionStore, ActionUsage, Admitted,
+    ApiRequestBody, ApiResponseBody, ApiService, Authenticated, AuthenticationPort, BlobStream,
+    BuildError, ByteRange, CacheStorePort, CertificateSignerPort, ContentStore,
+    ControllerConnections, ControllerEndpoints, ControllerReady, ControllerSpec, ControllerStores,
+    ExpiringRecordPort, FleetInstance, FleetSupply, GateDecision, Listening, LoginPort,
+    LoginRequest, LoginSupport, NetworkAccess, NodeLifecyclePort, Peer, Plugin, PluginContext,
+    PortError, PreemptionNotice, ProofVerifierPort, ProvisionerPort, RecordId, RecordKey,
+    RecordKind, RecordVersion, Rejection, RequestGate, RequestScope, SchedulerPort,
+    SchedulerSnapshot, Scheme, ScratchVolumePort, SignatureAlgorithm, StateRepositoryPort,
+    StoreAccess, StoreKind, Subject, WorkerSpec, WorkerStores, WorkerTls, WorkloadCredentialPort,
     full_body,
 };
 use gang_testkit::must_ready as ready;
 use gang_types::{
-    AuthenticationSettings, Bytes, CertSerial, Fleet, FleetActionPolicy, FleetCatalog, FleetName,
-    FleetProperties, Identity, InstanceId, InstanceLifecycle, Isa, NetworkRequest, NonZeroBytes,
-    Principal, Proof, ProviderName, RefreshToken, Resources, Url, WorkerLifetime,
+    AuthenticationSettings, Bytes, CertSerial, Digest, Fleet, FleetActionPolicy, FleetCatalog,
+    FleetName, FleetProperties, Identity, InstanceId, InstanceLifecycle, Isa, NetworkRequest,
+    NonZeroBytes, Principal, Proof, ProviderName, RefreshToken, Resources, Url, WorkerLifetime,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -258,6 +259,8 @@ fn execute(sandbox: &Sandbox) -> Result<ActionExecutionOutcome, Box<dyn Error>> 
         environment: &[],
         action_directory: Path::new("/work"),
         working_directory: Path::new("/work"),
+        read_only_trees: &[],
+        ephemeral_dirs: &[],
         network: NetworkAccess::Offline,
         memory_cgroup: None,
     };
@@ -446,20 +449,86 @@ fn selecting_the_other_provisioner_plugin_dispatches_to_it() -> Result<(), Box<d
 }
 
 #[test]
-fn cache_port_reaches_the_selected_plugin() -> Result<(), Box<dyn Error>> {
-    let config = parse(CONFIG)?;
-    let cache = Cache::build(config.cache, &context())?;
+fn cache_port_reaches_the_selected_plugin_and_delegates_stores() -> Result<(), Box<dyn Error>> {
+    let disk_config = parse(CONFIG)?;
+    let disk_cache = Cache::build(disk_config.cache, &context())?;
+    assert!(matches!(disk_cache, Cache::Disk(_)));
+    assert_eq!(disk_cache.worker_access(), StoreAccess::ViaController);
 
-    assert!(matches!(cache, Cache::Disk(_)));
+    let cloud_text = CONFIG.replace("[cache.disk]\nnumber = 10", "[cache.cloud]\nnumber = 20");
+    let cloud_config = parse(&cloud_text)?;
+    let cloud_cache = Cache::build(cloud_config.cache, &context())?;
+    assert!(matches!(cloud_cache, Cache::Cloud(_)));
+    assert_eq!(cloud_cache.worker_access(), StoreAccess::Direct);
+
+    let disk_content: CacheContent = disk_cache.content_store()?;
+    let cloud_content: CacheContent = cloud_cache.content_store()?;
+    assert!(matches!(&disk_content, CacheContent::Disk(store) if store.number() == 10));
+    assert!(matches!(&cloud_content, CacheContent::Cloud(store) if store.number() == 20));
     assert_eq!(
-        cache.content_store()?,
-        RenderedStoreSpec(serde_json::json!({ "content": 10 }))
+        disk_content.usage().map(|u| (u.store, u.used)),
+        Some((StoreKind::Content, 10))
     );
     assert_eq!(
-        cache.action_store(&gang_types::EnvironmentName::default())?,
-        RenderedStoreSpec(serde_json::json!({ "action": 10 }))
+        cloud_content.usage().map(|u| (u.store, u.used)),
+        Some((StoreKind::Content, 20))
     );
-    assert_eq!(cache.worker_access(), StoreAccess::ViaController);
+
+    let disk_payload = bytes::Bytes::from_static(b"disk-blob");
+    let disk_digest = Digest::from_bytes(&disk_payload);
+    let cloud_payload = bytes::Bytes::from_static(b"cloud-blob");
+    let cloud_digest = Digest::from_bytes(&cloud_payload);
+
+    ready(disk_content.write(disk_digest, BlobStream::from_bytes(disk_payload.clone())))?;
+    ready(cloud_content.write(cloud_digest, BlobStream::from_bytes(cloud_payload.clone())))?;
+
+    let mut missing = Vec::new();
+    ready(disk_content.find_missing(&[disk_digest, cloud_digest], &mut missing))?;
+    assert_eq!(missing, vec![cloud_digest]);
+    ready(cloud_content.find_missing(&[disk_digest, cloud_digest], &mut missing))?;
+    assert_eq!(missing, vec![disk_digest]);
+
+    let read_disk = ready(disk_content.read(disk_digest, ByteRange::FULL))?
+        .ok_or("disk store should hold disk_digest")?;
+    assert_eq!(ready(read_disk.collect())?, disk_payload);
+    assert!(ready(disk_content.read(cloud_digest, ByteRange::FULL))?.is_none());
+
+    let shared_cloud = Arc::new(cloud_content);
+    let read_cloud = ready(shared_cloud.read(cloud_digest, ByteRange::FULL))?
+        .ok_or("cloud store should hold cloud_digest")?;
+    assert_eq!(ready(read_cloud.collect())?, cloud_payload);
+
+    let env = gang_types::EnvironmentName::try_from("debian-13/2".to_owned())?;
+    let disk_actions: CacheActions = disk_cache.action_store(&env)?;
+    let cloud_actions: CacheActions = cloud_cache.action_store(&env)?;
+    assert!(
+        matches!(&disk_actions, CacheActions::Disk(store) if store.number() == 10 && store.environment() == "debian-13/2")
+    );
+    assert!(
+        matches!(&cloud_actions, CacheActions::Cloud(store) if store.number() == 20 && store.environment() == "debian-13/2")
+    );
+    assert_eq!(
+        disk_actions.usage().map(|u| (u.store, u.used)),
+        Some((StoreKind::Action, 10))
+    );
+    assert_eq!(
+        cloud_actions.usage().map(|u| (u.store, u.used)),
+        Some((StoreKind::Action, 20))
+    );
+
+    let action_a = Digest::from_bytes(b"action-disk");
+    let result_a = bytes::Bytes::from_static(b"result-disk");
+    let action_b = Digest::from_bytes(b"action-cloud");
+    let result_b = bytes::Bytes::from_static(b"result-cloud");
+
+    ready(disk_actions.put(action_a, result_a.clone()))?;
+    ready(cloud_actions.put(action_b, result_b.clone()))?;
+
+    assert_eq!(ready(disk_actions.get(action_a))?, Some(result_a));
+    assert_eq!(ready(disk_actions.get(action_b))?, None);
+    let shared_cloud_actions = Arc::new(cloud_actions);
+    assert_eq!(ready(shared_cloud_actions.get(action_b))?, Some(result_b));
+    assert_eq!(ready(shared_cloud_actions.get(action_a))?, None);
     Ok(())
 }
 
@@ -578,8 +647,12 @@ impl ApiService for TestApi {
 #[test]
 fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
     let scheduler = Stub::build(NumberConfig { number: 3 }, &context())?;
+    let cache = Cache::build(parse(CONFIG)?.cache, &context())?;
+    let controller_stores = ControllerStores {
+        content: Arc::new(cache.content_store()?),
+        actions: Arc::new(cache.action_store(&gang_types::EnvironmentName::default())?),
+    };
 
-    let stores = RenderedStoreSpec(serde_json::Value::Null);
     let name = FleetName::try_new("workers")?;
     let properties = FleetProperties::new(
         &name,
@@ -606,8 +679,6 @@ fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
         clock: Arc::new(gang_clock::TestClock::new(
             gang_clock::Timestamp::UNIX_EPOCH,
         )),
-        content_store: &stores,
-        action_store: &stores,
         fleets: &catalog,
         max_workers: 8,
         client_action_timeout: Duration::from_mins(1),
@@ -627,7 +698,7 @@ fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
         api: TestApi,
     };
     let (ready_signal, mut readiness) = ControllerReady::channel();
-    ready(scheduler.run_controller(&controller, connections, ready_signal))?;
+    ready(scheduler.run_controller(&controller, connections, controller_stores, ready_signal))?;
     assert!(
         readiness.try_recv().is_ok(),
         "the scheduler passes the readiness signal to its plugin"
@@ -643,12 +714,16 @@ fn scheduler_runs_controller_and_worker() -> Result<(), Box<dyn Error>> {
         work_directory: PathBuf::from("/work"),
         fast_cas_directory: PathBuf::from("/work/cas"),
         fast_cas_budget: Bytes::new(1024),
-        content_store: stores.clone(),
-        action_store: stores.clone(),
-        store_access: StoreAccess::ViaController,
+        trees_directory: None,
         entrypoint: PathBuf::from("/usr/bin/gang"),
     };
-    ready(scheduler.run_worker(&worker_spec, WorkerTls::Plain, std::future::ready(())))?;
+    let worker_stores = WorkerStores::<CacheContent, CacheActions>::ViaController;
+    ready(scheduler.run_worker(
+        &worker_spec,
+        worker_stores,
+        WorkerTls::Plain,
+        std::future::ready(()),
+    ))?;
     Ok(())
 }
 
@@ -757,6 +832,8 @@ fn sandbox_builds_the_selected_plugin_and_dispatches_by_variant() -> Result<(), 
     assert!(matches!(boxed, Sandbox::Boxed(_)));
     assert_eq!(direct.environment().as_str(), "host:direct");
     assert_eq!(boxed.environment().as_str(), "host:test");
+    assert!(!direct.binds_read_only());
+    assert!(boxed.binds_read_only());
     assert_eq!(execute(&direct)?, ActionExecutionOutcome::Exited(5));
     assert_eq!(execute(&boxed)?, ActionExecutionOutcome::Exited(6));
     Ok(())
@@ -810,6 +887,7 @@ fn limits_port_reaches_the_selected_plugin() -> Result<(), Box<dyn Error>> {
     let requested = ActionLimits {
         cpu_count: NonZeroU32::new(2),
         memory: Some(NonZeroBytes::kib(1)),
+        cpu_weight: None,
     };
     let scope = ready(limits.enter(&requested))?;
     let expected = [OsString::from("fake-join"), OsString::from("8")];

@@ -216,6 +216,7 @@ mod tests {
         ActionLimits {
             cpu_count: NonZeroU32::new(cpus),
             memory: NonZeroBytes::new(Bytes::new(memory)),
+            cpu_weight: None,
         }
     }
 

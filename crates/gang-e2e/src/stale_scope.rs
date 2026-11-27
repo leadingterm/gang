@@ -64,8 +64,8 @@ struct Stray {
     scope: PathBuf,
 }
 
-/// Runs under the noop sandbox with per-action cgroups and `NativeLink`'s memory enforcement off. It first runs the
-/// out-of-memory checks, then verifies guard reaping, the next action's sweep, and that a dead
+/// Runs under the noop sandbox with per-action cgroups and the worker's memory enforcement off.
+/// It first runs the out-of-memory checks, then verifies guard reaping, the next action's sweep, and that a dead
 /// worker's stale scope and stray are gone before its replacement serves, whichever component
 /// removes them.
 ///
@@ -190,7 +190,7 @@ fn stale_construction<S: System, E: Execution>(
         return Ok(checks);
     }
 
-    // While the worker lives, its embedded NativeLink signals every process group the action held
+    // While the worker lives, it signals every process group the action held
     // once `gang exec` is gone, so the stray may already be dead. With the guard gone, the
     // scope must still exist until a sweep removes it.
     if !exec.cgroup_exists(&stray.scope)? {
@@ -251,7 +251,7 @@ fn replaced_worker<S: System, E: Execution>(
             StrayObservation::Started(stray) => stray,
             observation => return Ok((observation, Vec::new())),
         };
-        // Freeze the worker's subtree first: its NativeLink cannot signal the stray, and the frozen
+        // Freeze the worker's subtree first: the worker cannot signal the stray, and the frozen
         // worker keeps its instance lock, so Local Mode cannot retire its cgroup while the stray's
         // survival is observed. The worker is killed only after that observation.
         let mut unmet = Vec::new();

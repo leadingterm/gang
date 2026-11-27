@@ -11,7 +11,7 @@ use gang_config::{
     AuthenticationConfig, DashboardConfig, GangConfig, IdentityConfig, PluginSet, ServerConfig,
     Transport,
 };
-use gang_nativelink::{NativeLink, NativeLinkConfig};
+use gang_engine::{Engine, EngineConfig};
 use gang_server::{
     DeviceSettings, HandshakeSettings, Listeners, LoginSettings, Parts, Provider, Providers,
     PublicEndpoint, RequestLimits, Server, ServerSettings, TlsSettings, TransportSettings,
@@ -58,7 +58,7 @@ impl gang_server::Deployment for GangDeployment {
     type Plugins = Plugins;
     type Provisioner = Arc<Provisioner>;
     type Cache = Cache;
-    type Scheduler = NativeLink;
+    type Scheduler = Engine;
     type Listener = TcpListener;
 }
 
@@ -170,7 +170,7 @@ async fn serve_prepared(
     let fleet = Arc::new(Provisioner::build(provisioner, &context)?);
     let cache = Cache::build(cache, &context)?;
     let signer = Signer::build(signer, &context)?;
-    let scheduler = NativeLink::try_new(NativeLinkConfig::for_controller(worker_endpoint, &server))
+    let scheduler = Engine::try_new(EngineConfig::for_controller(worker_endpoint, &server))
         .map_err(MainError::Scheduler)?;
     let repository = Database::build(database, &context)?;
     let (clients, workers) = build_authentication(authentication, &context)?;

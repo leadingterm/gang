@@ -17,7 +17,7 @@ const TLS_FAILURE_MARKERS: [&str; 7] = [
     "ssl exception",
 ];
 
-/// The exit status of an action killed by SIGKILL: 128 + 9, as `NativeLink` reports a signal.
+/// The exit status of an action killed by SIGKILL: 128 + 9, as the worker reports a signal.
 const SIGKILL_EXIT_STATUS: i32 = 137;
 
 /// The processes a build ran, by the runner that ran them, as Bazel's summary line counts them.

@@ -8,27 +8,28 @@ use std::path::PathBuf;
 
 use gang_clock::{Tick, Timestamp};
 use gang_spi::{
-    Acquisition, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionsView,
-    ApiService, ApplyRecords, Authenticated, AuthenticationHost, AuthenticationPort,
-    CacheStorePort, CandidateGeneration, CandidatePriority, Capabilities, CertStatus,
-    CertificateIssue, CertificateSignerPort, CertificateTarget, ClientCertificates,
-    ControllerConnections, ControllerDrain, ControllerEndpoints, ControllerHostIdentity,
-    ControllerHostPort, ControllerHostState, ControllerId, ControllerReady, ControllerSpec,
-    CredentialLifecyclePort, Evidence, ExpiringRecordPort, FleetInstance, FleetOptions,
-    FleetSupply, Held, HostMilestone, Insert, InstanceIdentity, IssuedCertRecord,
-    IssuedCertificate, IssuedToken, LeaderLeasePort, LearnedHistory, Lease, LeaseCandidate,
-    LeaseEpoch, ListingLimits, LoginChallenge, LoginClient, LoginGrant, LoginPort, LoginRequest,
-    LoginSupport, MeasuredUsage, MountedScratchVolume, NodeLifecyclePort, Plugin, PluginContext,
-    PortError, PreemptionNotice, PrincipalRecord, ProofVerifierPort, ProvisionerPort, QueuedDemand,
-    Record, RecordBatchSeq, RecordChange, RecordId, RecordKey, RecordKind, RecordVersion,
-    RecordedScalingEvent, Rejection, Remove, RenderedStoreSpec, Renewal, Replace, RequestGate,
-    RevocationEpoch, SandboxPrograms, SandboxedAction, ScalingAuditEvent, ScalingEventSeq,
-    SchedulerPort, SchedulerSnapshot, Scheme, ScratchVolumePort, SignatureAlgorithm,
-    StateRepositoryPort, StoreAccess, Subject, Takeover, TokenIssue, WorkerSpec, WorkerTls,
-    WorkloadCredentialPort, validate_record_changes,
+    Acquisition, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionStore,
+    ActionsView, ApiService, ApplyRecords, Authenticated, AuthenticationHost, AuthenticationPort,
+    BlobStream, ByteRange, CacheStorePort, CandidateGeneration, CandidatePriority, Capabilities,
+    CertStatus, CertificateIssue, CertificateSignerPort, CertificateTarget, ClientCertificates,
+    ContentStore, ControllerConnections, ControllerDrain, ControllerEndpoints,
+    ControllerHostIdentity, ControllerHostPort, ControllerHostState, ControllerId, ControllerReady,
+    ControllerSpec, ControllerStores, CredentialLifecyclePort, EngineStore, Evidence,
+    ExpiringRecordPort, FleetInstance, FleetOptions, FleetSupply, Held, HostMilestone, Insert,
+    InstanceIdentity, IssuedCertRecord, IssuedCertificate, IssuedToken, LeaderLeasePort,
+    LearnedHistory, Lease, LeaseCandidate, LeaseEpoch, ListingLimits, LoginChallenge, LoginClient,
+    LoginGrant, LoginPort, LoginRequest, LoginSupport, MeasuredUsage, MountedScratchVolume,
+    NodeLifecyclePort, Plugin, PluginContext, PortError, PreemptionNotice, PrincipalRecord,
+    ProofVerifierPort, ProvisionerPort, QueuedDemand, Record, RecordBatchSeq, RecordChange,
+    RecordId, RecordKey, RecordKind, RecordVersion, RecordedScalingEvent, Rejection, Remove,
+    Renewal, Replace, RequestGate, RevocationEpoch, SandboxPrograms, SandboxedAction,
+    ScalingAuditEvent, ScalingEventSeq, SchedulerPort, SchedulerSnapshot, Scheme,
+    ScratchVolumePort, SignatureAlgorithm, StateRepositoryPort, StoreAccess, StoreKind, Subject,
+    Takeover, TokenIssue, WorkerSpec, WorkerStores, WorkerTls, WorkloadCredentialPort,
+    validate_record_changes,
 };
 use gang_types::{
-    ActionResources, AuthenticationSettings, Bytes, CertSerial, Fleet, FleetName, FleetSet,
+    ActionResources, AuthenticationSettings, Bytes, CertSerial, Digest, Fleet, FleetName, FleetSet,
     Identity, InstanceId, InstanceLifecycle, Isa, LoginSession, Principal, Proof, ProviderName,
     RefreshToken, Url, WorkerLifetime,
 };
@@ -338,21 +339,156 @@ macro_rules! provisioner_plugin {
 provisioner_plugin!(Alpha, WorkerLifetime::LongLived, FakeFleetOptions);
 provisioner_plugin!(Beta, WorkerLifetime::SingleUse, OtherFleetOptions);
 
+/// In-memory [`ContentStore`] tagged with its cache plugin's `number`.
+#[derive(Debug)]
+pub struct StubContentStore {
+    number: u32,
+    blobs: Mutex<BTreeMap<Digest, bytes::Bytes>>,
+}
+
+impl StubContentStore {
+    /// Creates an empty tagged content store.
+    #[must_use]
+    pub fn new(number: u32) -> Self {
+        Self {
+            number,
+            blobs: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// The plugin number this store belongs to.
+    #[must_use]
+    pub const fn number(&self) -> u32 {
+        self.number
+    }
+}
+
+impl ContentStore for StubContentStore {
+    async fn find_missing(
+        &self,
+        digests: &[Digest],
+        missing: &mut Vec<Digest>,
+    ) -> Result<(), PortError> {
+        missing.clear();
+        let blobs = self.blobs.lock();
+        for &digest in digests {
+            if !digest.is_empty() && !blobs.contains_key(&digest) {
+                missing.push(digest);
+            }
+        }
+        Ok(())
+    }
+
+    async fn read(
+        &self,
+        digest: Digest,
+        _range: ByteRange,
+    ) -> Result<Option<BlobStream>, PortError> {
+        if digest.is_empty() {
+            return Ok(Some(BlobStream::empty()));
+        }
+        Ok(self
+            .blobs
+            .lock()
+            .get(&digest)
+            .cloned()
+            .map(BlobStream::from_bytes))
+    }
+
+    async fn write(&self, digest: Digest, body: BlobStream) -> Result<(), PortError> {
+        let bytes = body.collect().await?;
+        if Digest::from_bytes(&bytes) != digest {
+            return Err(PortError::refused(Rejection::DigestMismatch));
+        }
+        if !digest.is_empty() {
+            self.blobs.lock().insert(digest, bytes);
+        }
+        Ok(())
+    }
+
+    fn usage(&self) -> Option<EngineStore> {
+        Some(EngineStore {
+            store: StoreKind::Content,
+            used: u64::from(self.number),
+            budget: 1024,
+            evicted: 0,
+        })
+    }
+}
+
+/// In-memory [`ActionStore`] tagged with its cache plugin's `number` and environment.
+#[derive(Debug)]
+pub struct StubActionStore {
+    number: u32,
+    environment: String,
+    entries: Mutex<BTreeMap<Digest, bytes::Bytes>>,
+}
+
+impl StubActionStore {
+    /// Creates an empty tagged action store.
+    #[must_use]
+    pub fn new(number: u32, environment: &gang_types::EnvironmentName) -> Self {
+        Self {
+            number,
+            environment: environment.as_str().to_owned(),
+            entries: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// The plugin number this store belongs to.
+    #[must_use]
+    pub const fn number(&self) -> u32 {
+        self.number
+    }
+
+    /// The environment this action store was opened for.
+    #[must_use]
+    pub fn environment(&self) -> &str {
+        &self.environment
+    }
+}
+
+impl ActionStore for StubActionStore {
+    async fn get(&self, action: Digest) -> Result<Option<bytes::Bytes>, PortError> {
+        Ok(self.entries.lock().get(&action).cloned())
+    }
+
+    async fn put(&self, action: Digest, result: bytes::Bytes) -> Result<(), PortError> {
+        self.entries.lock().insert(action, result);
+        Ok(())
+    }
+
+    fn usage(&self) -> Option<EngineStore> {
+        Some(EngineStore {
+            store: StoreKind::Action,
+            used: u64::from(self.number),
+            budget: 2048,
+            evicted: 0,
+        })
+    }
+}
+
 macro_rules! cache_plugin {
-    ($plugin:ident) => {
+    ($plugin:ident, $access:expr) => {
         numbered_plugin!($plugin);
 
         impl CacheStorePort for $plugin {
-            fn content_store(&self) -> Result<RenderedStoreSpec, PortError> {
-                Ok(RenderedStoreSpec(serde_json::json!({ "content": self.number })))
+            type Content = StubContentStore;
+            type Actions = StubActionStore;
+
+            fn content_store(&self) -> Result<Self::Content, PortError> {
+                Ok(StubContentStore::new(self.number))
             }
 
-            fn action_store(&self, _environment: &gang_types::EnvironmentName) -> Result<RenderedStoreSpec, PortError> {
-                Ok(RenderedStoreSpec(serde_json::json!({ "action": self.number })))
+            fn action_store(
+                &self,
+                environment: &gang_types::EnvironmentName,
+            ) -> Result<Self::Actions, PortError> {
+                Ok(StubActionStore::new(self.number, environment))
             }
 
             fn worker_access(&self) -> StoreAccess {
-                StoreAccess::ViaController
+                $access
             }
 
             async fn measured_usage(&self) -> Result<Option<MeasuredUsage>, PortError> {
@@ -362,8 +498,8 @@ macro_rules! cache_plugin {
     };
 }
 
-cache_plugin!(CacheDisk);
-cache_plugin!(CacheCloud);
+cache_plugin!(CacheDisk, StoreAccess::ViaController);
+cache_plugin!(CacheCloud, StoreAccess::Direct);
 
 macro_rules! signer_plugin {
     ($plugin:ident) => {
@@ -467,7 +603,7 @@ impl SchedulerPort for Stub {
         into.source_rates.clear();
         into.source_rates_at = Tick::ORIGIN;
         into.cordons.clear();
-        into.fleet_memory.clear();
+        into.fleet_capacity.clear();
         let candidates = FleetSet::prefix(1).map_err(PortError::backend)?;
         into.queued.push(QueuedDemand {
             source: None,
@@ -514,10 +650,17 @@ impl SchedulerPort for Stub {
         self.endpoints.clone()
     }
 
-    async fn run_controller<P: RequestGate, W: RequestGate, A: ApiService>(
+    async fn run_controller<
+        C: ContentStore,
+        Ac: ActionStore,
+        P: RequestGate,
+        W: RequestGate,
+        A: ApiService,
+    >(
         &self,
         _spec: &ControllerSpec<'_>,
         _connections: ControllerConnections<P, W, A>,
+        _stores: ControllerStores<C, Ac>,
         ready: ControllerReady,
     ) -> Result<(), PortError> {
         ready.signal();
@@ -528,9 +671,10 @@ impl SchedulerPort for Stub {
         Err(PortError::unavailable("scheduler stub is not serving"))
     }
 
-    async fn run_worker(
+    async fn run_worker<C: ContentStore, Ac: ActionStore>(
         &self,
         _spec: &WorkerSpec,
+        _stores: WorkerStores<C, Ac>,
         _tls: WorkerTls<'_>,
         _stop: impl Future<Output = ()> + Send,
     ) -> Result<(), PortError> {
@@ -1124,10 +1268,14 @@ impl ExpiringRecordPort for Memory {
 }
 
 macro_rules! sandbox_port {
-    ($plugin:ident) => {
+    ($plugin:ident, $binds_ro:expr) => {
         impl ActionIsolationPort for $plugin {
             fn environment(&self) -> &gang_types::ActionEnvironment {
                 &self.environment
+            }
+
+            fn binds_read_only(&self) -> bool {
+                $binds_ro
             }
 
             async fn start(
@@ -1190,7 +1338,7 @@ impl Plugin for Direct {
     }
 }
 
-sandbox_port!(Direct);
+sandbox_port!(Direct, false);
 
 /// The `[sandbox.boxed]` section: the number its actions exit with, and the program that runs it.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1242,7 +1390,7 @@ impl Plugin for Boxed {
     }
 }
 
-sandbox_port!(Boxed);
+sandbox_port!(Boxed, true);
 
 numbered_plugin!(Token);
 

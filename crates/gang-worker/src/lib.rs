@@ -24,4 +24,4 @@ pub use deployment::{WorkerDeployment, WorkerParts, WorkerSettings};
 pub use errors::WorkerError;
 pub use layout::{IdentityFiles, Layout};
 pub use transport::{ServerCaError, ServerCaSource, Transport};
-pub use worker::run;
+pub use worker::{SandboxInfo, run};

@@ -464,7 +464,7 @@ struct Live {
 /// What the worker of the held probes can still do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerPhase {
-    /// It serves; its `NativeLink` signals the action's groups once `gang exec` is gone.
+    /// It serves; the worker signals the action's groups once `gang exec` is gone.
     Serving,
     /// Its subtree is frozen: it does nothing until it is thawed.
     Frozen,
@@ -1426,7 +1426,7 @@ impl Execution for ExecSim {
             } else if state.live.guard == GuardProcess::Gone
                 && state.worker_phase == WorkerPhase::Serving
             {
-                // A live, unfrozen worker's NativeLink signals the action's groups once
+                // A live, unfrozen worker signals the action's groups once
                 // `gang exec` is gone.
                 state.live.stray = false;
             }

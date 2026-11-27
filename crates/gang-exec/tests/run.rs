@@ -24,9 +24,8 @@ use gang_testkit::{
     CallLog, Opaque, RecordedScope, RecordingLimits, SandboxConfig, SandboxKey, ScriptedSandbox,
     TestLimits, TestPlugins,
 };
-use gang_types::{
-    Bytes, Capability, FleetActionPolicy, NonZeroBytes, NonZeroDuration, PublicEgressPolicy,
-};
+use gang_types::{Bytes, NonZeroBytes, NonZeroDuration};
+use gang_types::{Capability, CpuWeight, FleetActionPolicy, PublicEgressPolicy};
 use parking_lot::Mutex;
 use tempfile::TempDir;
 
@@ -85,6 +84,7 @@ fn sandbox_file(
         },
         execution: ExecutionConfig {
             input_links,
+            input_trees: gang_config::InputTrees::default(),
             egress: None,
         },
         actions: FleetActionPolicy::default(),
@@ -524,6 +524,7 @@ fn limits_section_builds_the_limits_plugin_and_enter_receives_the_requested_limi
     assert_eq!(
         calls.limits.entered(),
         [ActionLimits {
+            cpu_weight: None,
             cpu_count: NonZeroU32::new(2),
             memory: Some(NonZeroBytes::mib(1)),
         }]
@@ -786,9 +787,10 @@ impl ActionIsolationPort for MetadataCheckingSandbox {
                 "incorrect cgroup metadata",
             )));
         }
-        Ok(SandboxedAction::new(async {
-            Ok(ActionExecutionOutcome::Exited(0))
-        }))
+        Ok(
+            SandboxedAction::new(async { Ok(ActionExecutionOutcome::Exited(0)) })
+                .with_accounting_pid(Some(12345)),
+        )
     }
 }
 
@@ -833,6 +835,7 @@ fn publishes_scope_metadata_before_start_with_aliased_work_root() -> Result<(), 
     )?;
     assert_eq!(status, ExitCode::SUCCESS);
     assert_eq!(fs::read(&path)?, br#"{"peak_memory_kb":4}"#);
+    assert_eq!(fs::read(path.with_file_name("report.pid"))?, b"12345");
     Ok(())
 }
 
@@ -872,4 +875,432 @@ fn refuses_planted_report_symlink_under_aliased_root() -> Result<(), Box<dyn Err
     );
     assert!(!target.exists());
     Ok(())
+}
+
+struct MountSandbox {
+    inner: ScriptedSandbox,
+    source: PathBuf,
+    target: PathBuf,
+    scratch: PathBuf,
+}
+
+impl ActionIsolationPort for MountSandbox {
+    fn environment(&self) -> &gang_types::ActionEnvironment {
+        self.inner.environment()
+    }
+
+    async fn start(&self, spec: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
+        assert_eq!(spec.read_only_trees.len(), 1);
+        assert_eq!(spec.read_only_trees[0].source, self.source.as_path());
+        assert_eq!(spec.read_only_trees[0].target, self.target.as_path());
+        assert_eq!(spec.ephemeral_dirs, &[self.scratch.as_path()]);
+        self.inner.start(spec).await
+    }
+}
+
+#[test]
+fn protected_inputs_reach_the_sandbox_and_limits() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new(InputLinks::Keep)?;
+    fs::write(
+        fixture.entrypoint.with_file_name("sandbox.toml"),
+        sandbox_file(
+            &fixture.root,
+            "trusted",
+            InputLinks::Keep,
+            Some(TestLimits { max_pids: 1 }),
+        )?,
+    )?;
+    let root = fixture.root.canonicalize()?;
+    let action = root.join("a1");
+    let channel = root.join(".side_channels/a1");
+    fs::create_dir_all(&channel)?;
+    fs::create_dir_all(action.join("work/tmp"))?;
+    fs::write(channel.join("read_only_trees"), b"/cas/tree\0inputs\0")?;
+    fs::write(channel.join("ephemeral_dirs"), b"work/tmp\0")?;
+    fs::write(channel.join("cpu_weight"), b"1000\n")?;
+    let environment = [
+        (
+            SIDE_CHANNEL_FILE_ENV.into(),
+            channel.join("report").into_os_string(),
+        ),
+        (OsString::from("GANG_CPU_WEIGHT"), OsString::from("20")),
+    ];
+    let inner =
+        ScriptedSandbox::try_exiting(&CallLog::default(), ActionExecutionOutcome::Exited(0))?;
+    let limits = RecordingLimits::new(&CallLog::default());
+    let outcome = run_with::<TestPlugins, MountSandbox, RecordingLimits>(
+        &Invocation {
+            entrypoint: &fixture.entrypoint,
+            argv: &argv(),
+            environment: &environment,
+            working_directory: &fixture.working_directory,
+        },
+        |_, _, _| {
+            Ok(MountSandbox {
+                inner: inner.clone(),
+                source: PathBuf::from("/cas/tree"),
+                target: action.join("inputs"),
+                scratch: action.join("work/tmp"),
+            })
+        },
+        |_, _| Ok(limits.clone()),
+        || Ok(()),
+    )?;
+    assert_eq!(outcome, ExitCode::SUCCESS);
+    assert_eq!(inner.started().len(), 1);
+    assert_eq!(limits.entered().len(), 1);
+    assert_eq!(limits.entered()[0].cpu_weight, Some(CpuWeight::GATE));
+    Ok(())
+}
+
+#[test]
+fn ignores_cpu_weight_from_client_environment_without_side_channel() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new(InputLinks::Keep)?;
+    fs::write(
+        fixture.entrypoint.with_file_name("sandbox.toml"),
+        sandbox_file(
+            &fixture.root,
+            "trusted",
+            InputLinks::Keep,
+            Some(TestLimits { max_pids: 4 }),
+        )?,
+    )?;
+    let calls = Calls::default();
+    let started = Events::default();
+    let environment = [(OsString::from("GANG_CPU_WEIGHT"), OsString::from("1000"))];
+
+    let status = run_action_counting(
+        &argv(),
+        &fixture.entrypoint,
+        &fixture.working_directory,
+        &environment,
+        &started,
+        &calls,
+    )?;
+    assert_eq!(status, ExitCode::SUCCESS);
+    assert_eq!(
+        calls.limits.entered(),
+        [ActionLimits {
+            cpu_count: None,
+            memory: None,
+            cpu_weight: None,
+        }]
+    );
+    Ok(())
+}
+
+/// Real host-group-sharing sandbox matching `Noop` for verifying descendant cleanup on normal exit.
+struct HostGroupSandbox(gang_types::ActionEnvironment);
+
+impl ActionIsolationPort for HostGroupSandbox {
+    fn environment(&self) -> &gang_types::ActionEnvironment {
+        &self.0
+    }
+
+    async fn start(&self, spec: &ActionExecutionSpec<'_>) -> Result<SandboxedAction, PortError> {
+        let mut command = tokio::process::Command::new(spec.command.program());
+        command
+            .args(spec.command.args())
+            .current_dir(spec.working_directory)
+            .env_clear()
+            .envs(spec.environment.iter().map(|(k, v)| (k, v)))
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(PortError::backend)?;
+        let accounting_pid = child.id();
+        Ok(SandboxedAction::new(async move {
+            let status = child.wait().await.map_err(PortError::backend)?;
+            ActionExecutionOutcome::try_from(status)
+        })
+        .with_accounting_pid(accounting_pid))
+    }
+}
+
+const DESCENDANT_HOST: gang_testkit::ChildTest =
+    gang_testkit::ChildTest::new("descendant_cleanup_host");
+
+#[ignore = "child process helper of successful_noop_action_drains_surviving_descendant_with_closed_stdio"]
+#[test]
+fn descendant_cleanup_host() -> Result<(), Box<dyn Error>> {
+    let entrypoint =
+        PathBuf::from(std::env::var_os("TEST_ENTRYPOINT").ok_or("TEST_ENTRYPOINT is required")?);
+    let pid_file = PathBuf::from(
+        std::env::var_os("TEST_DESCENDANT_PID").ok_or("TEST_DESCENDANT_PID is required")?,
+    );
+    let script = format!(
+        "sleep 60 </dev/null >/dev/null 2>&1 & echo $! > '{}'; exit 0",
+        pid_file.display()
+    );
+    let argv = [
+        OsString::from("/bin/sh"),
+        OsString::from("-c"),
+        OsString::from(script),
+    ];
+    let code = gang_exec::run::<TestPlugins, HostGroupSandbox, RecordingLimits>(
+        &entrypoint,
+        &argv,
+        |_, _, _| {
+            Ok(HostGroupSandbox(
+                "host:test".parse().map_err(PortError::config)?,
+            ))
+        },
+        |_, _| Ok(RecordingLimits::new(&CallLog::default())),
+    )?;
+    assert_eq!(code, ExitCode::SUCCESS);
+    Ok(())
+}
+
+#[test]
+fn successful_noop_action_drains_surviving_descendant_with_closed_stdio()
+-> Result<(), Box<dyn Error>> {
+    use std::os::unix::process::CommandExt as _;
+
+    let fixture = Fixture::new(InputLinks::Keep)?;
+    let pid_file = fixture.working_directory.join("descendant.pid");
+    let status = DESCENDANT_HOST
+        .command()?
+        .current_dir(&fixture.working_directory)
+        .env("TEST_ENTRYPOINT", &fixture.entrypoint)
+        .env("TEST_DESCENDANT_PID", &pid_file)
+        .process_group(0)
+        .status()?;
+    assert!(status.success(), "host helper exited with {status}");
+
+    let raw_pid: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
+    let pid = rustix::process::Pid::from_raw(raw_pid).ok_or("invalid descendant pid")?;
+    let probe = rustix::process::test_kill_process(pid);
+    if probe.is_ok() {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        return Err(format!(
+            "surviving background descendant {raw_pid} outlived successful noop action"
+        )
+        .into());
+    }
+    assert_eq!(probe, Err(rustix::io::Errno::SRCH));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const SETSID_ACTION: gang_testkit::ChildTest = gang_testkit::ChildTest::new("setsid_action_helper");
+
+#[cfg(target_os = "linux")]
+#[ignore = "child helper for the session cleanup regression"]
+#[test]
+fn setsid_action_helper() -> Result<(), Box<dyn Error>> {
+    let path = PathBuf::from(std::env::var_os("TEST_DESCENDANT_PID").ok_or("missing pid file")?);
+    if std::env::var_os("TEST_SETSID_CHILD").is_some() {
+        rustix::process::setsid().expect("setsid must succeed");
+        let pid = rustix::process::getpid();
+        let sid = rustix::process::getsid(None)?;
+        assert_eq!(sid, pid);
+        let temporary = path.with_extension("tmp");
+        fs::write(
+            &temporary,
+            format!("{} {}", pid.as_raw_nonzero(), sid.as_raw_nonzero()),
+        )?;
+        fs::rename(temporary, path)?;
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Ok(());
+    }
+    let _child = SETSID_ACTION
+        .command()?
+        .env("TEST_SETSID_CHILD", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !path.exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err("setsid child did not become ready".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[ignore = "host helper for the session cleanup regression"]
+#[test]
+fn setsid_cleanup_host() -> Result<(), Box<dyn Error>> {
+    let entrypoint =
+        PathBuf::from(std::env::var_os("TEST_ENTRYPOINT").ok_or("missing entrypoint")?);
+    let mut argv = vec![std::env::current_exe()?.into_os_string()];
+    let action = if std::env::var_os("TEST_NESTED_SETSID").is_some() {
+        NESTED_ACTION
+    } else {
+        SETSID_ACTION
+    };
+    argv.extend(action.arguments().into_iter().map(OsString::from));
+    let code = gang_exec::run::<TestPlugins, HostGroupSandbox, RecordingLimits>(
+        &entrypoint,
+        &argv,
+        |_, _, _| {
+            Ok(HostGroupSandbox(
+                "host:test".parse().map_err(PortError::config)?,
+            ))
+        },
+        |_, _| Ok(RecordingLimits::new(&CallLog::default())),
+    )?;
+    assert_eq!(code, ExitCode::SUCCESS);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn successful_noop_action_drains_setsid_descendant_with_closed_stdio() -> Result<(), Box<dyn Error>>
+{
+    use std::os::unix::process::CommandExt as _;
+    let fixture = Fixture::new(InputLinks::Keep)?;
+    let path = fixture.working_directory.join("setsid.pid");
+    let host = gang_testkit::ChildTest::new("setsid_cleanup_host");
+    let status = host
+        .command()?
+        .current_dir(&fixture.working_directory)
+        .env("TEST_ENTRYPOINT", &fixture.entrypoint)
+        .env("TEST_DESCENDANT_PID", &path)
+        .process_group(0)
+        .status()?;
+    assert!(status.success(), "host helper exited with {status}");
+    let content = fs::read_to_string(path)?;
+    let mut parts = content.split_whitespace();
+    let pid: i32 = parts.next().ok_or("missing pid")?.parse()?;
+    let sid: i32 = parts.next().ok_or("missing sid")?.parse()?;
+    assert_eq!(sid, pid);
+    let pid = rustix::process::Pid::from_raw(pid).ok_or("invalid pid")?;
+    let result = rustix::process::test_kill_process(pid);
+    if result.is_ok() {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    }
+    assert_eq!(result, Err(rustix::io::Errno::SRCH));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const NESTED_ACTION: gang_testkit::ChildTest =
+    gang_testkit::ChildTest::new("nested_setsid_action_helper");
+
+#[cfg(target_os = "linux")]
+fn nested_action_command(role: &str) -> io::Result<std::process::Command> {
+    let mut command = NESTED_ACTION.command()?;
+    command
+        .env("TEST_NESTED_ROLE", role)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+#[ignore = "real nested process helper for the session cleanup regression"]
+#[test]
+fn nested_setsid_action_helper() -> Result<(), Box<dyn Error>> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let role = std::env::var("TEST_NESTED_ROLE").unwrap_or_else(|_| "action".into());
+    match role.as_str() {
+        "short" => return Ok(()),
+        "action" => {
+            let _parent = nested_action_command("parent")?.spawn()?;
+        }
+        "parent" => {
+            rustix::process::setsid()?;
+            assert!(nested_action_command("short")?.status()?.success());
+            let _grandchild = nested_action_command("grandchild")?.spawn()?;
+        }
+        "grandchild" => {
+            rustix::process::setsid()?;
+        }
+        _ => return Err("invalid nested action role".into()),
+    }
+    let socket = std::env::var_os("TEST_NESTED_SOCKET").ok_or("missing nested action socket")?;
+    let mut stream = UnixStream::connect(PathBuf::from(socket))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
+    writeln!(stream, "{role} {}", std::process::id())?;
+    if role == "action" {
+        stream.read_exact(&mut [0])?;
+    } else {
+        // The controller holds the socket until cleanup; EOF also releases helpers on failure.
+        let _ = stream.read(&mut [0])?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn successful_noop_action_drains_nested_setsid_descendants_with_reaping_parent()
+-> Result<(), Box<dyn Error>> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let fixture = Fixture::new(InputLinks::Keep)?;
+    let socket = fixture.base.join("nested.sock");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let listener = tokio::net::UnixListener::bind(&socket)?;
+            let host = gang_testkit::ChildTest::new("setsid_cleanup_host");
+            let mut command = tokio::process::Command::from(host.command()?);
+            command
+                .current_dir(&fixture.working_directory)
+                .env("TEST_ENTRYPOINT", &fixture.entrypoint)
+                .env("TEST_NESTED_SETSID", "1")
+                .env("TEST_NESTED_SOCKET", &socket);
+            let run = async {
+                gang_os::run_bounded(&mut command, None, NonZeroBytes::kib(64))
+                    .await
+                    .map_err(Box::<dyn Error>::from)
+            };
+            let ready = async {
+                let mut descendants = Vec::new();
+                let mut held = Vec::new();
+                let mut release = None;
+                for _ in 0..3 {
+                    let (stream, _) = listener.accept().await?;
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await?;
+                    let (role, raw) = line.trim().split_once(' ').ok_or("invalid readiness")?;
+                    let pid = rustix::process::Pid::from_raw(raw.parse()?).ok_or("invalid pid")?;
+                    if role == "action" {
+                        release = Some(reader.into_inner());
+                    } else {
+                        assert_eq!(
+                            rustix::process::getsid(Some(pid))?,
+                            pid,
+                            "{role} did not escape"
+                        );
+                        descendants.push(pid);
+                        held.push(reader.into_inner());
+                    }
+                }
+                assert_eq!(
+                    descendants.len(),
+                    2,
+                    "both escaped generations must become ready"
+                );
+                release
+                    .ok_or("missing action readiness")?
+                    .write_all(&[1])
+                    .await?;
+                Ok::<_, Box<dyn Error>>((descendants, held))
+            };
+            let (output, (descendants, _held)) = tokio::try_join!(run, ready)?;
+            assert!(
+                output.status.success(),
+                "nested cleanup host failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for pid in descendants {
+                assert_eq!(
+                    rustix::process::test_kill_process(pid),
+                    Err(rustix::io::Errno::SRCH),
+                    "escaped descendant {pid:?} survived successful action"
+                );
+            }
+            Ok::<(), Box<dyn Error>>(())
+        })
+        .await?
+    })
 }

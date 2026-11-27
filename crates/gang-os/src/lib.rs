@@ -16,6 +16,7 @@
 //! ```
 
 pub mod cgroup;
+mod descendants;
 mod errors;
 pub mod fs;
 mod lock;
@@ -23,6 +24,7 @@ mod process;
 mod signal;
 mod sys;
 
+pub use descendants::DescendantTracker;
 pub use errors::{PathIo, RunError, SpawnError};
 pub use lock::FileLock;
 pub use process::{

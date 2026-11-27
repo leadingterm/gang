@@ -1,6 +1,6 @@
 # ADR-54: Gang relays action termination without consuming the kill grace
 
-Status: Accepted. Complements ADR-17; abandoned limit-scope recovery remains in ADR-19.
+Status: Accepted; NativeLink termination-deadline ownership notes are superseded by [ADR-62](adr-62-native-execution-engine.md) (the native worker in `gang-engine` now owns the kill-grace deadline; `gang exec` signal relay and process-group rules remain unchanged). Complements ADR-17; abandoned limit-scope recovery remains in ADR-19.
 
 ## Context
 - NativeLink owns the termination deadline and can kill `gang exec` by PID after the grace period. Gang must let the action use that grace without leaving a sandbox or limit scope behind.

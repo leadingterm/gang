@@ -16,7 +16,7 @@ variable "cache_bucket_name" {
 variable "cache_expiration_days" {
   description = "Days after creation until every object in the cache bucket expires."
   type        = number
-  default     = 30
+  default     = 3
   nullable    = false
 
   validation {

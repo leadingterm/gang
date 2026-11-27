@@ -41,6 +41,7 @@ fn prepare_creates_the_directories() {
     assert!(side_channels.is_dir());
     assert_eq!(mode(&side_channels), DIRECTORY_MODE);
     assert!(layout.fast_cas_directory().is_dir());
+    assert_eq!(layout.trees_directory(), root.path().join("trees"));
     assert!(root.path().join("bin").is_dir());
     assert!(root.path().join("identity").is_dir());
     assert_eq!(mode(&root.path().join("identity")), DIRECTORY_MODE);
@@ -365,4 +366,18 @@ fn remove_credentials_of_a_missing_directory_is_ok() {
         .remove_credentials(&never_written)
         .expect("a missing generation is not an error");
     assert!(!directory.exists());
+}
+
+#[test]
+fn prepare_removes_stale_trees_directory() {
+    let root = tempfile::tempdir().expect("temporary directory can be created");
+    let executable = executable_in(root.path());
+    let layout = Layout::new(root.path());
+    let stale_tree = layout.trees_directory().join("deadbeef-4");
+    fs::create_dir_all(&stale_tree).expect("stale tree dir");
+    fs::write(stale_tree.join("blob"), b"stale").expect("stale file");
+    layout
+        .prepare(SANDBOX, &executable)
+        .expect("layout prepares");
+    assert!(!layout.trees_directory().exists());
 }

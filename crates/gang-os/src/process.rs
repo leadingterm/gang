@@ -161,7 +161,7 @@ pub fn parent_process_group() -> io::Result<i32> {
 
 /// Moves the calling process into its parent's process group.
 ///
-/// `gang exec` calls it once the action's first process exists: `NativeLink` signals the action's
+/// `gang exec` calls it once the action's first process exists: the worker signals the action's
 /// process groups but never the worker's own, so `gang exec` no longer receives the action's `SIGTERM`.
 ///
 /// # Errors
@@ -843,7 +843,10 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let dir = tempfile::tempdir()?;
+        // Unix socket paths are short; Bazel's test temporary directory may exceed SUN_LEN.
+        let dir = tempfile::Builder::new()
+            .prefix("gang-sock")
+            .tempdir_in("/tmp")?;
         let path = dir.path().join("retained-leader.sock");
         let listener = UnixListener::bind(&path)?;
         let result = runtime.block_on(async {
@@ -924,7 +927,10 @@ mod tests {
             .enable_all()
             .build()?;
         runtime.block_on(async {
-            let dir = tempfile::tempdir()?;
+            // Unix socket paths are short; Bazel's test temporary directory may exceed SUN_LEN.
+            let dir = tempfile::Builder::new()
+                .prefix("gang-sock")
+                .tempdir_in("/tmp")?;
             let path = dir.path().join("group.sock");
             let listener = UnixListener::bind(&path)?;
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();

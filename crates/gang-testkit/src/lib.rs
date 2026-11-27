@@ -73,6 +73,7 @@ pub mod schema_contract;
 mod signer;
 /// The contract suite that every `CertificateSignerPort` implementation must pass.
 pub mod signer_contract;
+mod stores;
 mod subscriber;
 mod test_result;
 mod tls_authority;
@@ -105,6 +106,10 @@ pub use scheduler::{
 };
 pub use signer::{
     AUTHORITY_SEED, FailingSigner, GarbageSigner, TestSigner, WrongKeySigner, signing_key,
+};
+pub use stores::{
+    MemoryActionStore, MemoryContentStore, action_store_contract, content_empty_digest,
+    content_store_contract, content_write_and_read_ranges, content_write_verification,
 };
 pub use subscriber::with_subscriber;
 pub use test_result::TestResult;

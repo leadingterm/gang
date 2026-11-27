@@ -1,0 +1,18 @@
+load("//bazel/rust:defs.bzl", "workspace_rust_binary")
+
+workspace_rust_binary(
+    name = "gang-protogen",
+    src = "src/main.rs",
+    data = [
+        "//crates/gang-reapi:workspace_sources",
+        "//proto/leadingterm/gang/worker/v1:protos",
+        "//third_party/remote-apis:protos",
+        "@rules_rust//tools/upstream_wrapper:rustfmt",
+    ],
+    env = {
+        "GANG_PROTOGEN_PROTO": "proto",
+        "GANG_PROTOGEN_REAPI_DIR": "crates/gang-reapi/src",
+        "GANG_PROTOGEN_REMOTE_APIS": "third_party/remote-apis",
+        "RUSTFMT": "$(rootpath @rules_rust//tools/upstream_wrapper:rustfmt)",
+    },
+)

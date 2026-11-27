@@ -27,8 +27,8 @@ use gang_types::{
     NonZeroBytes, PrivateKeyPem, Proof, WorkerLifetime,
 };
 use gang_worker::{
-    Credentials, EnrollError, Enroller, ServerCaError, ServerCaSource, Transport, WorkerDeployment,
-    WorkerParts, WorkerSettings,
+    Credentials, EnrollError, Enroller, SandboxInfo, ServerCaError, ServerCaSource, Transport,
+    WorkerDeployment, WorkerParts, WorkerSettings,
 };
 
 pub use gang_testkit::{Behaviour, FakeCache, FakeScheduler, RecordedSpec, RecordedTls};
@@ -551,10 +551,22 @@ impl Harness {
     /// Builds the test sandbox's declared local environment.
     pub fn build_sandbox(
         &self,
-    ) -> impl FnOnce(SandboxKey, &mut SandboxConfig) -> Result<ActionEnvironment, PortError> + use<>
-    {
+    ) -> impl FnOnce(SandboxKey, &mut SandboxConfig) -> Result<SandboxInfo, PortError> + use<> {
+        self.build_sandbox_with(false)
+    }
+
+    /// Builds the test sandbox's declared local environment with an explicit read-only bind flag.
+    pub fn build_sandbox_with(
+        &self,
+        binds_read_only: bool,
+    ) -> impl FnOnce(SandboxKey, &mut SandboxConfig) -> Result<SandboxInfo, PortError> + use<> {
         let environment = self.sandbox_environment.clone();
-        move |_, _| environment.map_err(PortError::config)
+        move |_, _| {
+            Ok(SandboxInfo {
+                environment: environment.map_err(PortError::config)?,
+                binds_read_only,
+            })
+        }
     }
 
     /// Advances the clock by `by`, then lets every tracked task run until it is idle.

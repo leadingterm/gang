@@ -1,6 +1,6 @@
 # ADR-02: NativeLink is embedded as a library and receives accepted connections
 
-Status: Accepted
+Status: Superseded by [ADR-62](adr-62-native-execution-engine.md) (the in-process worker, direct `SchedulerPort` calls, and accepted-connection controller model carry forward in `gang-engine`; embedded NativeLink and `gang-nativelink` have been removed).
 
 ## Context
 - NativeLink ships as a binary driven by a JSON5 file, with its own listeners, TLS from files and an admin HTTP API.

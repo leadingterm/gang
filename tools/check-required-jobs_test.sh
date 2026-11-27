@@ -35,7 +35,7 @@ reset_fixtures() {
 }
 
 expect success 'current workflow graph' "$guard" "$workflow" "$pr_workflow"
-critical=(nativelink-memory-tests nix-vm lint-checks linux-x86_64-shards linux-x86_64-bundle linux-arm64-bundle linux-arm64-checks cross-build e2e-gate-1-shards e2e-gate-2-shards e2e-v035-upgrade)
+critical=(nix-vm lint-checks linux-x86_64-shards linux-x86_64-bundle linux-arm64-bundle linux-arm64-checks cross-build e2e-gate-1-shards e2e-gate-2-shards e2e-v035-upgrade)
 for job in "${critical[@]}"; do
   reset_fixtures
   job="$job" yq -i 'del(.jobs.release-validation.needs[] | select(. == strenv(job)))' "$fixture"
@@ -120,9 +120,9 @@ for job in linux-arm64-checks e2e-gate-1-shards e2e-gate-2-shards e2e-v035-upgra
   job="$job" yq -i '.jobs[strenv(job)].needs = []' "$fixture"
   expect failure "$job requires its bundle" "$guard" "$fixture" "$pr_fixture"
 done
-for job in nativelink-memory-tests nix-vm cross-build linux-arm64-checks linux-x86_64-shards; do
+for job in nix-vm cross-build linux-arm64-checks linux-x86_64-shards; do
   reset_fixtures
-  job="$job" yq -i '(.jobs[strenv(job)].steps[] | select(.name == "Run NativeLink memory tests" or .name == "Run NixOS VM checks" or .name == "Cross-build gang" or .name == "Test") | .run) = "true"' "$fixture"
+  job="$job" yq -i '(.jobs[strenv(job)].steps[] | select(.name == "Run NixOS VM checks" or .name == "Cross-build gang" or .name == "Test") | .run) = "true"' "$fixture"
   expect failure "$job must run its actual validation" "$guard" "$fixture" "$pr_fixture"
 done
 for job in linux-x86_64-bundle linux-arm64-bundle; do
@@ -205,11 +205,11 @@ expect failure 'preflight cannot override permissions' "$guard" "$fixture" "$pr_
 
 # Execute the actual release result body for every failing or missing dependency.
 yq -o=json '.jobs.release-validation.steps[0].run' "$workflow" | jq -r . >"$scratch/release.sh"
-results=(success success success success success success success success success success success)
+results=(success success success success success success success success success success)
 expect success 'release gate accepts all success' env NEEDS_RESULTS="${results[*]}" bash --noprofile --norc -e -u -o pipefail "$scratch/release.sh"
-for ((i = 0; i < 11; i++)); do
+for ((i = 0; i < 10; i++)); do
   for value in failure cancelled skipped missing; do
-    results=(success success success success success success success success success success success)
+    results=(success success success success success success success success success success)
     if [[ $value == missing ]]; then unset 'results[i]'; else results[i]=$value; fi
     expect failure "release gate rejects $value at $i" env NEEDS_RESULTS="${results[*]}" bash --noprofile --norc -e -u -o pipefail "$scratch/release.sh"
   done

@@ -8,6 +8,7 @@ workspace_rust_library(
     },
     test_runtime_data = [":fake_launcher"],
     deps = [
+        "//crates/gang-cas:gang_cas",
         "//crates/gang-clock:gang_clock",
         "//crates/gang-os:gang_os",
         "//crates/gang-spi:gang_spi",

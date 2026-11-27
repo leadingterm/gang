@@ -48,7 +48,11 @@ impl ActionProperties {
 
         Ok(Self {
             network,
-            limits: ActionLimits { cpu_count, memory },
+            limits: ActionLimits {
+                cpu_count,
+                memory,
+                cpu_weight: None,
+            },
         })
     }
 }

@@ -62,6 +62,20 @@ run "cache_bucket_denies_non_tls_requests" {
   }
 }
 
+run "cache_objects_expire_after_three_days_by_default" {
+  command = plan
+
+  assert {
+    condition     = aws_s3_bucket_lifecycle_configuration.this.rule[0].expiration[0].days == 3
+    error_message = "Cache objects must expire after 3 days by default."
+  }
+
+  assert {
+    condition     = aws_s3_bucket_lifecycle_configuration.this.rule[0].abort_incomplete_multipart_upload[0].days_after_initiation == 1
+    error_message = "Incomplete multipart uploads must be aborted after one day."
+  }
+}
+
 run "cache_objects_expire_after_configured_days" {
   command = plan
 

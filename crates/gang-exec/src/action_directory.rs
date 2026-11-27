@@ -1,11 +1,11 @@
-//! The action directory: the directory under `NativeLink`'s work directory that holds one action.
+//! The action directory: the directory under the worker's work directory that holds one action.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use crate::errors::ExecError;
 
-/// The directory under `NativeLink`'s work directory that holds one action, and the working
+/// The directory under the worker's work directory that holds one action, and the working
 /// directory of its command inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionDirectory {
@@ -18,13 +18,13 @@ pub struct ActionDirectory {
 impl ActionDirectory {
     /// Resolves the action directory of an action whose command runs in `working_directory`.
     ///
-    /// `NativeLink` gives each action a directory directly under its work directory. The action's
+    /// The worker gives each action a directory directly under its work directory. The action's
     /// files live in `<root>/<id>/work/`, and its command runs in the working directory
     /// `<root>/<id>/work/<command working directory>`. Both paths are canonicalized first, so a
     /// symbolic link cannot move the working directory out of the work directory. The result is the
     /// canonical `<root>/<id>`. Both results are canonical, so a sandbox can bind `path` at its own
     /// path and still enter the working directory.
-    /// The reserved `.side_channels` directory cannot be an action directory.
+    /// The reserved `.side_channels` and `.graveyard` directories cannot be action directories.
     ///
     /// # Errors
     ///
@@ -42,7 +42,9 @@ impl ActionDirectory {
             .strip_prefix(&root)
             .ok()
             .and_then(|rest| match rest.components().next() {
-                Some(Component::Normal(id)) if id != ".side_channels" => Some(id),
+                Some(Component::Normal(id)) if id != ".side_channels" && id != ".graveyard" => {
+                    Some(id)
+                }
                 _ => None,
             });
         match id {

@@ -1065,7 +1065,11 @@ mod tests {
             .build()?;
         for code in [0, 17] {
             let root = tempfile::tempdir()?;
-            let path = root.path().join("control.sock");
+            // Unix socket paths are short; Bazel's test temporary directory may exceed SUN_LEN.
+            let sockets = tempfile::Builder::new()
+                .prefix("gang-sock")
+                .tempdir_in("/tmp")?;
+            let path = sockets.path().join("control.sock");
             let listener = runtime.block_on(async { tokio::net::UnixListener::bind(&path) })?;
             let log = root.path().join("log");
             let mut command = helper("host");
