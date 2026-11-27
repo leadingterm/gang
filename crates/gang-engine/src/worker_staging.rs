@@ -89,6 +89,8 @@ pub struct RemoteTreeSource {
     pub channel: Channel,
     /// REAPI `instance_name` sent on `GetTreeRequest`.
     pub instance_name: String,
+    /// Maximum encoded `gRPC` message size allowed on `GetTree` responses.
+    pub max_message_size: NonZeroBytes,
 }
 
 /// A read-only input subtree bound from [`TreeCache`] into an attempt's `work` directory.
@@ -897,7 +899,10 @@ async fn fetch_tree_via_grpc(
             reason: format!("root digest size {} overflows i64", root_digest.size()),
         })?,
     };
-    let mut client = ContentAddressableStorageClient::new(remote.channel.clone());
+    let max_size = remote.max_message_size.get().as_usize();
+    let mut client = ContentAddressableStorageClient::new(remote.channel.clone())
+        .max_decoding_message_size(max_size)
+        .max_encoding_message_size(max_size);
     let mut page_token = String::new();
 
     loop {
@@ -2645,6 +2650,100 @@ mod tests {
         assert!(matches!(err, StagingError::Cancelled));
         cancelled.cancel_and_join().await;
         assert!(!work_root.join(attempt_id2.as_str()).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_tree_via_grpc_honors_configured_max_message_size() -> TestResult {
+        use std::io;
+
+        use super::{RemoteTreeSource, fetch_tree_via_grpc};
+        use crate::reapi_cas::{CasConfig, CasService, InflightBlobBudget};
+        use futures::stream;
+        use tokio::net::TcpListener;
+        use tonic::transport::{Endpoint, Server};
+
+        let slow = Arc::new(MemoryContentStore::default());
+        let file_digest = slow.insert(Bytes::from_static(b"x"));
+        let file_proto = to_proto(&file_digest)?;
+
+        // Build a single Directory > 4 MiB (tonic's default decoding limit) so GetTree emits
+        // a > 4 MiB page when the controller is configured with max_message_size = 8 MiB.
+        let large_dir = reapi::Directory {
+            files: (0..45_000_usize)
+                .map(|i| reapi::FileNode {
+                    name: format!("entry_{i:05}_padding_for_large_get_tree_page.txt"),
+                    digest: Some(file_proto.clone()),
+                    is_executable: false,
+                    node_properties: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let encoded_len = large_dir.encoded_len();
+        assert!(
+            encoded_len > 4 * 1024 * 1024,
+            "encoded directory must exceed tonic's 4 MiB default ({encoded_len} bytes)"
+        );
+        let root_digest = store_proto(&slow, &large_dir);
+
+        let max_bytes = NonZeroBytes::mib(8);
+        let cas = CasService::new(
+            Arc::clone(&slow),
+            InflightBlobBudget::new(NonZeroBytes::mib(64)),
+            CasConfig {
+                max_batch_total_size_bytes: max_bytes,
+                ..CasConfig::default()
+            },
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let incoming = stream::unfold(listener, |listener| async move {
+            let (stream, _) = listener.accept().await.ok()?;
+            Some((Ok::<_, io::Error>(stream), listener))
+        });
+        let server = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(
+                    cas.into_server()
+                        .max_encoding_message_size(max_bytes.get().as_usize())
+                        .max_decoding_message_size(max_bytes.get().as_usize()),
+                )
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        let channel = Endpoint::from_shared(format!("http://{addr}"))?
+            .connect()
+            .await?;
+
+        // A 4 MiB client cap rejects the > 4 MiB page.
+        let small_source = RemoteTreeSource {
+            channel: channel.clone(),
+            instance_name: String::new(),
+            max_message_size: NonZeroBytes::mib(4),
+        };
+        let mut small_map = HashMap::new();
+        let small_cache = DirectoryCache::new(NonZeroBytes::mib(16));
+        let err = fetch_tree_via_grpc(&small_source, root_digest, &small_cache, &mut small_map)
+            .await
+            .expect_err("4 MiB client limit must reject > 4 MiB GetTree page");
+        assert!(matches!(err, StagingError::Store(_)));
+
+        // An 8 MiB client cap decodes the > 4 MiB page cleanly.
+        let large_source = RemoteTreeSource {
+            channel,
+            instance_name: String::new(),
+            max_message_size: max_bytes,
+        };
+        let mut large_map = HashMap::new();
+        let large_cache = DirectoryCache::new(NonZeroBytes::mib(16));
+        fetch_tree_via_grpc(&large_source, root_digest, &large_cache, &mut large_map).await?;
+        assert_eq!(large_map.len(), 1);
+        assert!(large_map.contains_key(&root_digest));
+        assert!(large_cache.get(&root_digest).is_some());
+
+        server.abort();
         Ok(())
     }
 }

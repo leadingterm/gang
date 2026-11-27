@@ -983,6 +983,7 @@ where
             .map(|channel| RemoteTreeSource {
                 channel,
                 instance_name: runtime.spec.instance_name.clone(),
+                max_message_size: runtime.spec.max_message_size,
             })
     } else {
         None

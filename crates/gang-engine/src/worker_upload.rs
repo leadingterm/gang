@@ -8,7 +8,7 @@
 //! store through [`Tiered`], and writes cacheable results to [`ActionStore`].
 
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read as _};
@@ -1144,7 +1144,101 @@ struct BuiltTree {
 struct BuiltNode {
     dir: reapi::Directory,
     digest: Digest,
-    descendants: Vec<(Digest, reapi::Directory, Bytes)>,
+    child_digests: Vec<Digest>,
+    descendants: Vec<(Digest, reapi::Directory, Bytes, Vec<Digest>)>,
+}
+
+struct TopoNode {
+    order: usize,
+    entry: Option<(reapi::Directory, Bytes)>,
+    edges: Vec<Digest>,
+}
+
+fn topological_order_tree(
+    root_digest: Digest,
+    root_children: Vec<Digest>,
+    descendants: Vec<(Digest, reapi::Directory, Bytes, Vec<Digest>)>,
+) -> (Vec<reapi::Directory>, Vec<(Digest, Bytes)>) {
+    let mut nodes: HashMap<Digest, TopoNode> = HashMap::new();
+    let mut root_edges = Vec::new();
+    let mut root_seen = HashSet::new();
+    for child in root_children {
+        if child != root_digest && root_seen.insert(child) {
+            root_edges.push(child);
+        }
+    }
+    nodes.insert(
+        root_digest,
+        TopoNode {
+            order: 0,
+            entry: None,
+            edges: root_edges,
+        },
+    );
+
+    let mut next_order = 1_usize;
+    for (digest, dir, bytes, child_digests) in descendants {
+        if nodes.contains_key(&digest) {
+            continue;
+        }
+        let mut unique_edges = Vec::new();
+        let mut seen_edges = HashSet::new();
+        for child in child_digests {
+            if child != digest && seen_edges.insert(child) {
+                unique_edges.push(child);
+            }
+        }
+        nodes.insert(
+            digest,
+            TopoNode {
+                order: next_order,
+                entry: Some((dir, bytes)),
+                edges: unique_edges,
+            },
+        );
+        next_order = next_order.saturating_add(1);
+    }
+
+    let mut in_degree: HashMap<Digest, usize> = nodes.keys().map(|&d| (d, 0)).collect();
+    for node in nodes.values() {
+        for child in &node.edges {
+            if let Some(deg) = in_degree.get_mut(child) {
+                *deg = deg.saturating_add(1);
+            }
+        }
+    }
+
+    let mut ready: BTreeSet<(usize, Digest)> = nodes
+        .iter()
+        .filter_map(|(&digest, node)| {
+            (in_degree.get(&digest).copied().unwrap_or(0) == 0).then_some((node.order, digest))
+        })
+        .collect();
+
+    let mut children = Vec::with_capacity(nodes.len().saturating_sub(1));
+    let mut encoded_children = Vec::with_capacity(nodes.len().saturating_sub(1));
+    while let Some((_, digest)) = ready.pop_first() {
+        let Some(node) = nodes.remove(&digest) else {
+            continue;
+        };
+        if let Some((dir, bytes)) = node.entry {
+            children.push(dir);
+            encoded_children.push((digest, bytes));
+        }
+        for child in node.edges {
+            let Some(deg) = in_degree.get_mut(&child) else {
+                continue;
+            };
+            *deg = deg.saturating_sub(1);
+            if *deg == 0
+                && let Some(child_node) = nodes.get(&child)
+            {
+                ready.insert((child_node.order, child));
+            }
+        }
+    }
+
+    (children, encoded_children)
 }
 
 fn build_reapi_tree(
@@ -1156,6 +1250,7 @@ fn build_reapi_tree(
         files: &[CollectedFile],
     ) -> Result<BuiltNode, UploadError> {
         let mut dir_nodes = Vec::with_capacity(node.subdirs.len());
+        let mut child_digests = Vec::with_capacity(node.subdirs.len());
         let mut descendants = Vec::new();
         for (name, child) in &node.subdirs {
             let built_child = build_node(child, files)?;
@@ -1164,7 +1259,13 @@ fn build_reapi_tree(
                 name: name.clone(),
                 digest: Some(to_proto(&built_child.digest)?),
             });
-            descendants.push((built_child.digest, built_child.dir, child_bytes));
+            child_digests.push(built_child.digest);
+            descendants.push((
+                built_child.digest,
+                built_child.dir,
+                child_bytes,
+                built_child.child_digests,
+            ));
             descendants.extend(built_child.descendants);
         }
 
@@ -1202,25 +1303,21 @@ fn build_reapi_tree(
         Ok(BuiltNode {
             dir,
             digest,
+            child_digests,
             descendants,
         })
     }
 
     let built_root = build_node(root, files)?;
     let root_bytes = Bytes::from(built_root.dir.encode_to_vec());
-
-    // Emit children in deterministic topological order (parents before children), deduplicated.
-    let mut seen = HashSet::new();
-    let mut children = Vec::new();
-    let mut encoded_dirs = vec![(built_root.digest, root_bytes)];
-    seen.insert(built_root.digest);
-
-    for (digest, dir, bytes) in built_root.descendants {
-        if seen.insert(digest) {
-            children.push(dir);
-            encoded_dirs.push((digest, bytes));
-        }
-    }
+    let (children, encoded_children) = topological_order_tree(
+        built_root.digest,
+        built_root.child_digests,
+        built_root.descendants,
+    );
+    let mut encoded_dirs = Vec::with_capacity(encoded_children.len().saturating_add(1));
+    encoded_dirs.push((built_root.digest, root_bytes));
+    encoded_dirs.extend(encoded_children);
 
     Ok(BuiltTree {
         tree: reapi::Tree {
@@ -2428,6 +2525,89 @@ mod tests {
             vec![payload_digest],
             "cancelled hash must never publish the blob"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn build_reapi_tree_topologically_sorts_shared_descendants() -> TestResult {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        use super::{CollectedDirNode, CollectedFile, build_reapi_tree};
+
+        // `a` and `b` have distinct files so their own digests differ, while both contain an
+        // identical empty subdirectory. Deduplicated topological order must emit both `a` and `b`
+        // before the shared empty subdirectory.
+        let file_a = CollectedFile {
+            abs_path: PathBuf::from("a/a.txt"),
+            executable: false,
+            size: 5,
+            dev: 1,
+            ino: 1,
+            digest: Digest::from_bytes(b"alpha"),
+        };
+        let file_b = CollectedFile {
+            abs_path: PathBuf::from("b/b.txt"),
+            executable: false,
+            size: 4,
+            dev: 1,
+            ino: 2,
+            digest: Digest::from_bytes(b"beta"),
+        };
+        let files = vec![file_a, file_b];
+
+        let mut dir_a = CollectedDirNode::new();
+        dir_a.files.push(("a.txt".to_owned(), 0));
+        dir_a
+            .subdirs
+            .insert("empty".to_owned(), CollectedDirNode::new());
+
+        let mut dir_b = CollectedDirNode::new();
+        dir_b.files.push(("b.txt".to_owned(), 1));
+        dir_b
+            .subdirs
+            .insert("empty".to_owned(), CollectedDirNode::new());
+
+        let mut root = CollectedDirNode::new();
+        root.subdirs.insert("a".to_owned(), dir_a);
+        root.subdirs.insert("b".to_owned(), dir_b);
+
+        let built = build_reapi_tree(&root, &files)?;
+        let empty_digest = Digest::from_bytes(&reapi::Directory::default().encode_to_vec());
+
+        // Build position map: root is index 0, children[i] is index i + 1.
+        let mut all_dirs = Vec::with_capacity(built.tree.children.len() + 1);
+        all_dirs.push(built.tree.root.as_ref().expect("tree root"));
+        all_dirs.extend(built.tree.children.iter());
+
+        let positions: HashMap<Digest, usize> = all_dirs
+            .iter()
+            .enumerate()
+            .map(|(idx, dir)| (Digest::from_bytes(&dir.encode_to_vec()), idx))
+            .collect();
+
+        assert_eq!(
+            positions.len(),
+            4,
+            "deduplicated tree must contain root, a, b, and one shared empty directory"
+        );
+        let empty_pos = *positions.get(&empty_digest).expect("shared empty dir");
+        assert_eq!(
+            empty_pos, 3,
+            "shared empty descendant must appear after both parent directories a and b"
+        );
+
+        for (parent_pos, dir) in all_dirs.iter().enumerate() {
+            for child in &dir.directories {
+                let child_digest =
+                    gang_reapi::from_proto(child.digest.as_ref().expect("child digest"))?;
+                let child_pos = *positions.get(&child_digest).expect("child in tree");
+                assert!(
+                    parent_pos < child_pos,
+                    "parent at {parent_pos} must precede child at {child_pos}"
+                );
+            }
+        }
         Ok(())
     }
 }
