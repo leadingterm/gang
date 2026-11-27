@@ -124,7 +124,7 @@ fn noop_namespaces_are_skipped() {
 fn bound_tree_read_only_verdicts_cover_bwrap_and_noop() {
     let protected = BoundTreeReport {
         chmod_erofs: true,
-        write_erofs: true,
+        write_denied: true,
         intact: true,
     };
     let passed = verdict::bound_tree_read_only(Sandbox::Bwrap, &protected);
@@ -138,17 +138,17 @@ fn bound_tree_read_only_verdicts_cover_bwrap_and_noop() {
     for bad in [
         BoundTreeReport {
             chmod_erofs: false,
-            write_erofs: true,
+            write_denied: true,
             intact: true,
         },
         BoundTreeReport {
             chmod_erofs: true,
-            write_erofs: false,
+            write_denied: false,
             intact: true,
         },
         BoundTreeReport {
             chmod_erofs: true,
-            write_erofs: true,
+            write_denied: true,
             intact: false,
         },
     ] {

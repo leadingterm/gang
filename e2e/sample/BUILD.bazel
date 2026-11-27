@@ -138,7 +138,7 @@ echo "poisoned=$poisoned"
 
 # Tries to chmod and write inside a read-only bound input subtree (`input_trees = "bind"`,
 # `tree_cache_min_files = 2`). Under bwrap both operations must fail with `EROFS`
-# ("Read-only file system") and leave the file intact.
+# for chmod; writes may also fail with EACCES because cached inodes are read-only.
 probe(
     name = "bound_tree_poison",
     srcs = [
@@ -155,14 +155,14 @@ else
 fi
 write_err=$( (echo POISONED >> bound_tree/a.txt) 2>&1 )
 write_status=$?
-if [ "$write_status" -ne 0 ] && printf '%s' "$write_err" | grep -qi 'read-only file system'; then
-  write_erofs=yes
+if [ "$write_status" -ne 0 ] && printf '%s' "$write_err" | grep -Eqi 'read-only file system|permission denied'; then
+  write_denied=yes
 else
-  write_erofs=no
+  write_denied=no
 fi
 if grep -q POISONED bound_tree/a.txt; then intact=no; else intact=yes; fi
 echo "chmod_erofs=$chmod_erofs"
-echo "write_erofs=$write_erofs"
+echo "write_denied=$write_denied"
 echo "intact=$intact"
 """,
 )

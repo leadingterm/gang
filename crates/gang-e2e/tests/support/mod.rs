@@ -848,7 +848,7 @@ impl Simulation {
                 Some(
                     BoundTreeReport {
                         chmod_erofs: protected,
-                        write_erofs: protected,
+                        write_denied: protected,
                         intact: protected,
                     }
                     .to_string(),

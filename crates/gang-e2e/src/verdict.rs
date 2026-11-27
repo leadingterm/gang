@@ -298,7 +298,7 @@ pub fn poison_attempted(poison: &PoisonReport) -> Check {
     })
 }
 
-/// Whether a read-only bound input subtree rejected `chmod` and writes with `EROFS` and stayed
+/// Whether a read-only bound input subtree rejected `chmod` with `EROFS`, denied writes, and stayed
 /// intact under `bwrap`; skipped under the `noop` sandbox.
 pub fn bound_tree_read_only(sandbox: Sandbox, report: &BoundTreeReport) -> Check {
     const NAME: &str = names::integrity::BOUND_TREE_READ_ONLY;
@@ -309,11 +309,11 @@ pub fn bound_tree_read_only(sandbox: Sandbox, report: &BoundTreeReport) -> Check
         ),
         Sandbox::Bwrap => Check::expect(
             NAME,
-            report.chmod_erofs && report.write_erofs && report.intact,
+            report.chmod_erofs && report.write_denied && report.intact,
             || {
                 format!(
-                    "expected chmod_erofs=yes, write_erofs=yes, intact=yes; got chmod_erofs={}, write_erofs={}, intact={}",
-                    report.chmod_erofs, report.write_erofs, report.intact
+                    "expected chmod_erofs=yes, write_denied=yes, intact=yes; got chmod_erofs={}, write_denied={}, intact={}",
+                    report.chmod_erofs, report.write_denied, report.intact
                 )
             },
         ),

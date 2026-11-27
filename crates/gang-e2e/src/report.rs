@@ -279,8 +279,8 @@ impl fmt::Display for VictimReport {
 pub struct BoundTreeReport {
     /// Whether `chmod u+w` failed with `EROFS` ("Read-only file system").
     pub chmod_erofs: bool,
-    /// Whether opening the file for writing failed with `EROFS` ("Read-only file system").
-    pub write_erofs: bool,
+    /// Whether opening the file for writing failed with `EROFS` or `EACCES`.
+    pub write_denied: bool,
     /// Whether the file content remained unchanged.
     pub intact: bool,
 }
@@ -292,12 +292,12 @@ impl TryFrom<&ProbeReport> for BoundTreeReport {
     ///
     /// # Errors
     ///
-    /// [`E2eError::Parse`] when any of `chmod_erofs`, `write_erofs`, or `intact` is missing or
+    /// [`E2eError::Parse`] when any of `chmod_erofs`, `write_denied`, or `intact` is missing or
     /// neither `yes` nor `no`.
     fn try_from(report: &ProbeReport) -> Result<Self> {
         Ok(Self {
             chmod_erofs: report.choice("chmod_erofs", [("yes", true), ("no", false)])?,
-            write_erofs: report.choice("write_erofs", [("yes", true), ("no", false)])?,
+            write_denied: report.choice("write_denied", [("yes", true), ("no", false)])?,
             intact: report.choice("intact", [("yes", true), ("no", false)])?,
         })
     }
@@ -312,8 +312,8 @@ impl fmt::Display for BoundTreeReport {
         )?;
         writeln!(
             f,
-            "write_erofs={}",
-            if self.write_erofs { "yes" } else { "no" }
+            "write_denied={}",
+            if self.write_denied { "yes" } else { "no" }
         )?;
         writeln!(f, "intact={}", if self.intact { "yes" } else { "no" })
     }

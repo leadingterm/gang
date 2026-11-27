@@ -249,23 +249,23 @@ fn the_victim_report_names_the_missing_key() {
 
 #[test]
 fn the_bound_tree_report_round_trips_and_validates_keys() -> gang_e2e::Result<()> {
-    let text = "chmod_erofs=yes\nwrite_erofs=yes\nintact=yes\n";
+    let text = "chmod_erofs=yes\nwrite_denied=yes\nintact=yes\n";
     let report = BoundTreeReport::try_from(&parsed(text)?).expect("valid bound-tree report");
     assert_eq!(
         report,
         BoundTreeReport {
             chmod_erofs: true,
-            write_erofs: true,
+            write_denied: true,
             intact: true,
         }
     );
     assert_eq!(report.to_string(), text);
 
     let missing = BoundTreeReport::try_from(&parsed("chmod_erofs=yes\nintact=yes\n")?)
-        .expect_err("write_erofs is missing");
+        .expect_err("write_denied is missing");
     assert_eq!(
         parse_error_detail(&missing).as_deref(),
-        Some("missing key `write_erofs`")
+        Some("missing key `write_denied`")
     );
     Ok(())
 }
