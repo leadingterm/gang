@@ -90,6 +90,9 @@ pub enum ExecError {
     /// The executor could not leave the action's process group after starting it.
     #[error("cannot leave the action's process group")]
     LeaveActionGroup(#[source] io::Error),
+    /// The action's remaining processes could not be terminated and drained.
+    #[error("cannot clean up action process group")]
+    CleanupActionGroup(#[source] io::Error),
     /// The scope guardian could not be started.
     #[error("cannot start the scope guardian")]
     Guard(#[source] io::Error),
@@ -153,8 +156,25 @@ pub enum SideChannelError {
         /// Target path relative to the action directory.
         target: PathBuf,
     },
-    /// Walking a read-only tree target inside the action directory failed.
-    #[error("cannot traverse read-only input tree target {}", target.display())]
+    /// The scratch path list is not NUL-terminated.
+    #[error("malformed side-channel ephemeral_dirs")]
+    MalformedEphemeralDirs,
+    /// The scratch path list exceeds the per-action limit.
+    #[error("too many ephemeral directories ({count}); at most {max} are allowed")]
+    TooManyEphemeralDirs {
+        /// Number of requested scratch paths.
+        count: usize,
+        /// Maximum permitted count.
+        max: usize,
+    },
+    /// A scratch path is empty or is not a safe relative path inside the action.
+    #[error("invalid ephemeral directory {}", path.display())]
+    InvalidEphemeralDir {
+        /// Rejected relative scratch path.
+        path: PathBuf,
+    },
+    /// Walking a side-channel target inside the action directory failed.
+    #[error("cannot traverse action directory target {}", target.display())]
     TraverseTarget {
         /// Target path relative to the action directory.
         target: PathBuf,

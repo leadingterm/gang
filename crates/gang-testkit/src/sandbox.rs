@@ -27,6 +27,8 @@ pub struct StartedAction {
     pub working_directory: PathBuf,
     /// Read-only input trees passed to the sandbox as `(source, target)` pairs.
     pub read_only_trees: Vec<(PathBuf, PathBuf)>,
+    /// Action-local ephemeral scratch directories passed to the sandbox.
+    pub ephemeral_dirs: Vec<PathBuf>,
     /// The trusted egress policy and controller endpoints, or none for offline actions.
     pub network: Option<(gang_types::PublicEgressPolicy, Box<[gang_types::Url]>)>,
     /// The command prefix the action was started through: empty when it started without a limits scope.
@@ -129,6 +131,11 @@ impl ActionIsolationPort for ScriptedSandbox {
                 .iter()
                 .map(|tree| (tree.source.to_path_buf(), tree.target.to_path_buf()))
                 .collect(),
+            ephemeral_dirs: spec
+                .ephemeral_dirs
+                .iter()
+                .map(|path| path.to_path_buf())
+                .collect(),
             network: match spec.network {
                 NetworkAccess::Offline => None,
                 NetworkAccess::PublicEgress {
@@ -189,6 +196,7 @@ mod tests {
             action_directory: Path::new("/work"),
             working_directory: Path::new("/work"),
             read_only_trees: &[],
+            ephemeral_dirs: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
             launcher: &[],
@@ -264,6 +272,7 @@ mod tests {
             action_directory: Path::new("/work"),
             working_directory: Path::new("/work"),
             read_only_trees: &[],
+            ephemeral_dirs: &[],
             network: NetworkAccess::PublicEgress {
                 policy: &policy,
                 controller_endpoints: &endpoints,
@@ -291,6 +300,7 @@ mod tests {
                 action_directory: PathBuf::from("/work"),
                 working_directory: PathBuf::from("/work"),
                 read_only_trees: Vec::new(),
+                ephemeral_dirs: vec![],
                 network: None,
                 launcher: Vec::new(),
             }]

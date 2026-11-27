@@ -15,6 +15,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::hash::BuildHasher;
 use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
@@ -28,7 +29,8 @@ use gang_os::fs::{PRIVATE_FILE, ensure_private_dir, remove_dir_optional};
 use gang_reapi::google::rpc as rpc_proto;
 use gang_reapi::leadingterm::gang::worker::v1 as proto;
 use gang_spi::{CPU_COUNT_ENV, MAX_RO_BINDS, MEMORY_KB_ENV, NETWORK_ENV, SIDE_CHANNEL_FILE_ENV};
-use gang_types::{AttemptId, CpuWeight, NonZeroDuration, property};
+use gang_types::NonZeroDuration;
+use gang_types::{AttemptId, CpuWeight, property};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt as _};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
@@ -251,14 +253,14 @@ impl SideChannelDir {
             cleaned: false,
         };
         if let Some(weight) = inputs.cpu_weight {
-            private.write_ephemeral(
+            private.write_atomic(
                 CPU_WEIGHT_FILE,
                 weight.get().to_string().as_bytes(),
                 PRIVATE_FILE,
             )?;
         }
         if let Some(bytes) = encoded_trees {
-            private.write_ephemeral(READ_ONLY_TREES_FILE, &bytes, PRIVATE_FILE)?;
+            private.write_atomic(READ_ONLY_TREES_FILE, &bytes, PRIVATE_FILE)?;
         }
         Ok(guard)
     }
@@ -299,7 +301,7 @@ impl SideChannelDir {
         };
         let mut bytes = Vec::new();
         if let Err(error) =
-            io::Read::take(file, MAX_REPORT_BYTES.saturating_add(1)).read_to_end(&mut bytes)
+            Read::take(file, MAX_REPORT_BYTES.saturating_add(1)).read_to_end(&mut bytes)
         {
             tracing::warn!(path = %path.display(), %error, "cannot read side-channel report");
             return None;
@@ -579,6 +581,8 @@ pub struct RunSpec {
     pub working_directory: PathBuf,
     /// Client `Command.environment_variables`.
     pub environment: Vec<(OsString, OsString)>,
+    /// All declared output paths relative to the working directory.
+    pub output_paths: Vec<PathBuf>,
     /// Authoritative admitted platform properties from `Assign.platform`.
     pub platform: HashMap<String, String>,
     /// Worker-provided side-channel inputs (`cpu_weight` and `read_only_trees`).
@@ -616,6 +620,14 @@ pub async fn run_attempt<K: Clock>(
 ) -> Result<RunOutcome, RunnerError> {
     let dirs = prepare_attempt_dirs(&spec.work_directory, &spec.attempt, &spec.working_directory)?;
     let side_channel = SideChannelDir::create(&dirs.work_root, &spec.attempt, &spec.side_channel)?;
+    publish_ephemeral_dir(
+        &dirs.attempt_dir,
+        &spec.working_directory,
+        &spec.environment,
+        &spec.output_paths,
+        &spec.side_channel.read_only_trees,
+        side_channel.dir(),
+    );
     let env = build_action_environment(
         &dirs.working_dir,
         &dirs.tmp_dir,
@@ -653,6 +665,9 @@ pub async fn run_attempt<K: Clock>(
         source,
     })?;
     let group = ProcessGroup::of(&child);
+    if let (Some(registry), Some(pid)) = (sampler, child.id()) {
+        registry.set_pgid(&spec.attempt, pid);
+    }
     let stdout_task = child.stdout.take().map(|pipe| {
         PipeTask(tokio::spawn(drain_bounded(
             pipe,
@@ -756,6 +771,126 @@ fn collect_final_usage(
     (usage, kill_reason)
 }
 
+#[allow(deprecated)]
+pub(crate) fn declared_output_paths(
+    command: &gang_reapi::build::bazel::remote::execution::v2::Command,
+) -> Vec<PathBuf> {
+    command
+        .output_paths
+        .iter()
+        .chain(&command.output_files)
+        .chain(&command.output_directories)
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn publish_ephemeral_dir(
+    action: &Path,
+    cwd: &Path,
+    environment: &[(OsString, OsString)],
+    outputs: &[PathBuf],
+    binds: &[ReadOnlyBind],
+    channel: &Path,
+) {
+    let Some((_, value)) = environment
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "TEST_TMPDIR")
+    else {
+        return;
+    };
+    let scratch = Path::new(value);
+    if scratch.as_os_str().is_empty()
+        || scratch.as_os_str().as_bytes().contains(&0)
+        || scratch
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return;
+    }
+    let mut target = PathBuf::from("work");
+    for component in cwd.components().chain(scratch.components()) {
+        if let Component::Normal(part) = component {
+            if part == SIDE_CHANNELS_DIR || part == ".graveyard" {
+                return;
+            }
+            target.push(part);
+        }
+    }
+    let mut base = PathBuf::from("work");
+    for component in cwd.components() {
+        if let Component::Normal(part) = component {
+            base.push(part);
+        }
+    }
+    if target == base || target.as_os_str().as_bytes().len() >= 64 * 1024 {
+        return;
+    }
+    for output in outputs {
+        if output
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+        {
+            return;
+        }
+        let mut path = base.clone();
+        for part in output.components() {
+            if let Component::Normal(part) = part {
+                path.push(part);
+            }
+        }
+        if path.starts_with(&target) || target.starts_with(&path) {
+            return;
+        }
+    }
+    if binds
+        .iter()
+        .any(|bind| bind.target.starts_with(&target) || target.starts_with(&bind.target))
+    {
+        return;
+    }
+    let Ok(directory) = open_scratch_directory(action, &target) else {
+        return;
+    };
+    let Ok(entries) = rustix::fs::Dir::read_from(&directory) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { return };
+        if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
+            return;
+        }
+    }
+    let Ok(private) = ensure_private_dir(channel) else {
+        return;
+    };
+    let mut bytes = target.as_os_str().as_bytes().to_vec();
+    bytes.push(0);
+    let _ = private.write_atomic("ephemeral_dirs", &bytes, PRIVATE_FILE);
+}
+
+fn open_scratch_directory(action: &Path, target: &Path) -> io::Result<OwnedFd> {
+    let flags = rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC;
+    let mut directory = rustix::fs::open(action, flags, rustix::fs::Mode::empty())?;
+    for component in target.components() {
+        let Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid scratch directory",
+            ));
+        };
+        match rustix::fs::mkdirat(&directory, name, gang_os::fs::PRIVATE_DIR) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(error.into()),
+        }
+        directory = rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty())?;
+    }
+    Ok(directory)
+}
+
 /// Canonicalized directories for one staged attempt (`<work>/<attempt>/{tmp,work/<cwd>}`).
 struct AttemptDirs {
     work_root: PathBuf,
@@ -852,6 +987,9 @@ async fn supervise_child<K: Clock>(
                 entrypoint: spec.entrypoint.clone(),
                 source,
             })?;
+            if let Some(cgroup) = side_channel.read_cgroup_path() {
+                let _ = try_cgroup_kill(&cgroup);
+            }
             return Ok((status, kill_waiter.reason()));
         }
         reason = kill_waiter.wait() => reason,
@@ -985,7 +1123,7 @@ async fn drain_bounded<R: AsyncRead + Unpin>(
             .map_err(|source| {
                 gang_os::PathIo::new("create action output spool", &path, source.into())
             })?;
-            let mut file = tokio::fs::File::from_std(std::fs::File::from(fd));
+            let mut file = tokio::fs::File::from_std(fs::File::from(fd));
             file.write_all(&bytes)
                 .await
                 .map_err(gang_os::PathIo::at("write action output spool", &path))?;
@@ -1210,13 +1348,17 @@ mod tests {
     use std::time::Duration;
 
     use gang_clock::{Clock, SystemClock, TestClock};
-    use gang_config::{DiskEnforcement, DiskTuning, MemoryEnforcement, MemoryTuning};
+    use gang_config::DiskEnforcement;
+    use gang_config::DiskTuning;
+    use gang_config::MemoryEnforcement;
+    use gang_config::MemoryTuning;
     use gang_reapi::leadingterm::gang::worker::v1::KillReason;
     use gang_spi::{
         CPU_COUNT_ENV, MAX_RO_BINDS, MEMORY_KB_ENV, NETWORK_ENV, SIDE_CHANNEL_FILE_ENV,
     };
     use gang_testkit::ChildTest;
-    use gang_types::{AttemptId, CpuWeight, NonZeroBytes, NonZeroDuration, Percent, property};
+    use gang_types::{AttemptId, CpuWeight, property};
+    use gang_types::{NonZeroBytes, NonZeroDuration, Percent};
     use parking_lot::Mutex;
 
     use super::*;
@@ -1232,6 +1374,41 @@ mod tests {
         ChildTest::new("worker_runner::tests::grandchild_sleeper");
     const REPORT_WRITER_CHILD: ChildTest =
         ChildTest::new("worker_runner::tests::report_writer_child");
+    const SCRATCH_READER_CHILD: ChildTest =
+        ChildTest::new("worker_runner::tests::scratch_reader_child");
+
+    #[ignore = "child test helper reading staged scratch input"]
+    #[test]
+    fn scratch_reader_child() -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = PathBuf::from(std::env::var_os("TEST_TMPDIR").ok_or("missing TEST_TMPDIR")?);
+        assert_eq!(fs::read(scratch.join("seed"))?, b"seeded input");
+        let report =
+            PathBuf::from(std::env::var_os(SIDE_CHANNEL_FILE_ENV).ok_or("missing report")?);
+        assert!(!report.with_file_name("ephemeral_dirs").exists());
+        SCRATCH_READER_CHILD.complete();
+        Ok(())
+    }
+
+    #[test]
+    fn staged_scratch_input_survives_action_execution() -> Result<(), Box<dyn std::error::Error>> {
+        run_gated(async {
+            let work = tempfile::tempdir()?;
+            let root = work.path().canonicalize()?;
+            fs::create_dir_all(root.join("seeded/work/scratch"))?;
+            fs::write(root.join("seeded/work/scratch/seed"), b"seeded input")?;
+            let mut spec = child_spec(&root, "seeded", SCRATCH_READER_CHILD)?;
+            spec.environment
+                .push(("TEST_TMPDIR".into(), "scratch".into()));
+            let (trigger, waiter) = kill_channel();
+            let outcome = run_attempt(&spec, &SystemClock::new(), None, waiter, trigger).await?;
+            assert_eq!(outcome.exit_code, 0);
+            let CapturedOutput::Bytes(stdout) = outcome.stdout else {
+                return Err("expected captured output".into());
+            };
+            assert!(SCRATCH_READER_CHILD.completed_in(&String::from_utf8(stdout)?));
+            Ok(())
+        })
+    }
 
     fn child_spec(
         work_dir: &Path,
@@ -1248,6 +1425,7 @@ mod tests {
             working_directory: PathBuf::new(),
             environment: Vec::new(),
             platform: HashMap::new(),
+            output_paths: Vec::new(),
             side_channel: SideChannelInputs::default(),
             reserved_memory_bytes: 0,
             reserved_disk_bytes: 0,
@@ -1374,7 +1552,7 @@ mod tests {
 
     fn run_gated<F, T>(future: F) -> Result<T, Box<dyn std::error::Error>>
     where
-        F: std::future::Future<Output = Result<T, Box<dyn std::error::Error>>>,
+        F: Future<Output = Result<T, Box<dyn std::error::Error>>>,
     {
         let _spawn = gang_testkit::fork_gate::spawner();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1436,7 +1614,17 @@ mod tests {
         else {
             return false;
         };
-        rustix::process::test_kill_process(raw).is_ok()
+        if rustix::process::test_kill_process(raw).is_err() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat"))
+            && let Some((_, rest)) = stat.rsplit_once(')')
+            && matches!(rest.trim_start().as_bytes().first(), Some(b'Z' | b'X'))
+        {
+            return false;
+        }
+        true
     }
 
     async fn wait_for_pids(pid_file: &Path) -> Result<(u32, u32), Box<dyn std::error::Error>> {
@@ -1452,6 +1640,124 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         Err("timed out waiting for child pid file".into())
+    }
+
+    #[test]
+    fn ephemeral_scratch_rejects_overlaps_and_unsafe_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let action = root.path().join("action");
+        let channel = root.path().join("channel");
+        fs::create_dir_all(action.join("work"))?;
+        fs::create_dir(&channel)?;
+        fs::create_dir_all(action.join("work/seeded"))?;
+        fs::write(action.join("work/seeded/seed"), b"input")?;
+        publish_ephemeral_dir(
+            &action,
+            Path::new(""),
+            &[("TEST_TMPDIR".into(), "seeded".into())],
+            &[],
+            &[],
+            &channel,
+        );
+        assert!(!channel.join("ephemeral_dirs").exists());
+        for (cwd, tmp, expected) in [
+            ("", "tmp/a", "work/tmp/a\0"),
+            ("sub", "tmp/a", "work/sub/tmp/a\0"),
+        ] {
+            publish_ephemeral_dir(
+                &action,
+                Path::new(cwd),
+                &[("TEST_TMPDIR".into(), tmp.into())],
+                &[],
+                &[],
+                &channel,
+            );
+            assert_eq!(
+                fs::read(channel.join("ephemeral_dirs"))?,
+                expected.as_bytes()
+            );
+            fs::remove_file(channel.join("ephemeral_dirs"))?;
+        }
+        for value in ["/absolute", "../escape", ".", "link/nested"] {
+            if value.starts_with("link") {
+                std::os::unix::fs::symlink(root.path(), action.join("work/link"))?;
+            }
+            publish_ephemeral_dir(
+                &action,
+                Path::new(""),
+                &[("TEST_TMPDIR".into(), value.into())],
+                &[],
+                &[],
+                &channel,
+            );
+            assert!(!channel.join("ephemeral_dirs").exists(), "accepted {value}");
+        }
+        for output in ["tmp", "tmp/a", "tmp/a/out"] {
+            publish_ephemeral_dir(
+                &action,
+                Path::new(""),
+                &[("TEST_TMPDIR".into(), "tmp/a".into())],
+                &[output.into()],
+                &[],
+                &channel,
+            );
+            assert!(
+                !channel.join("ephemeral_dirs").exists(),
+                "accepted output {output}"
+            );
+        }
+        let bind = ReadOnlyBind {
+            source: root.path().into(),
+            target: "work/tmp".into(),
+        };
+        publish_ephemeral_dir(
+            &action,
+            Path::new(""),
+            &[("TEST_TMPDIR".into(), "tmp/a".into())],
+            &[],
+            &[bind],
+            &channel,
+        );
+        assert!(!channel.join("ephemeral_dirs").exists());
+        Ok(())
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn every_declared_output_field_blocks_ephemeral_scratch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use gang_reapi::build::bazel::remote::execution::v2::Command as ReapiCommand;
+        let root = tempfile::tempdir()?;
+        let action = root.path().join("action");
+        let channel = root.path().join("channel");
+        fs::create_dir_all(action.join("work"))?;
+        fs::create_dir(&channel)?;
+        for command in [
+            ReapiCommand {
+                output_paths: vec!["tmp/out".into()],
+                ..Default::default()
+            },
+            ReapiCommand {
+                output_files: vec!["tmp/out".into()],
+                ..Default::default()
+            },
+            ReapiCommand {
+                output_directories: vec!["tmp/out".into()],
+                ..Default::default()
+            },
+        ] {
+            publish_ephemeral_dir(
+                &action,
+                Path::new(""),
+                &[("TEST_TMPDIR".into(), "tmp".into())],
+                &declared_output_paths(&command),
+                &[],
+                &channel,
+            );
+            assert!(!channel.join("ephemeral_dirs").exists());
+        }
+        Ok(())
     }
 
     #[test]

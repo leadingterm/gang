@@ -14,10 +14,13 @@
 //!   It reports no pid.
 //! - `report <payload>`: writes the payload to the info fd and stays alive with the fd open.
 //! - `mask <path>`: writes its blocked-signal mask and its and its parent's process groups.
+//! - `exec-session <program> [args...]`: starts a new-session leader (`setsid`) with `--chdir`
+//!   and `--setenv`, reports the leader's pid on `--info-fd`, `exec`s `<program> [args...]`, and
+//!   exits with its status.
 //!
-//! The leader and the action are this binary re-executed with a leading `leader` or `action`
-//! argument. The leader ignores `SIGTERM` as the sandbox's PID-namespace init does. The action
-//! records `ready` and then `terminated` in `<path>` around its `SIGTERM` and exits.
+//! The leader and the action are this binary re-executed with a leading `leader`, `exec-leader`,
+//! or `action` argument. The leader ignores `SIGTERM` as the sandbox's PID-namespace init does.
+//! The action records `ready` and then `terminated` in `<path>` around its `SIGTERM` and exits.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -29,6 +32,10 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 
 /// The first argument that makes this binary the sandbox's leader.
 const LEADER: &str = "leader";
+/// The first argument that makes this binary a `setsid` command-running sandbox leader.
+const EXEC_LEADER: &str = "exec-leader";
+/// The first argument that clears the signal mask and `exec`s the action inside `exec-leader`.
+const EXEC_ACTION: &str = "exec-action";
 /// The first argument that makes this binary the action.
 const ACTION: &str = "action";
 
@@ -70,12 +77,22 @@ fn write_line(record: &mut File, line: &str) {
     writeln!(record, "{line}").unwrap_or_else(|error| fail(format!("writing {line}: {error}")));
 }
 
-/// Splits bubblewrap's argv at `--`, returning the `--info-fd` descriptor and the action argv.
-fn split_arguments(argv: &[OsString]) -> (i32, &[OsString]) {
+/// Parsed bubblewrap arguments preceding `--` plus the action argv after `--`.
+struct BwrapInvocation<'a> {
+    info_fd: i32,
+    chdir: Option<&'a OsStr>,
+    env: Vec<(&'a OsStr, &'a OsStr)>,
+    action: &'a [OsString],
+}
+
+/// Splits bubblewrap's argv at `--`, returning the parsed flags and the action argv.
+fn split_arguments(argv: &[OsString]) -> BwrapInvocation<'_> {
     let mut uid = false;
     let mut gid = false;
     let mut unshare_user = false;
     let mut info_fd = None;
+    let mut chdir = None;
+    let mut env = Vec::new();
     let mut arguments = argv.iter();
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
@@ -83,6 +100,21 @@ fn split_arguments(argv: &[OsString]) -> (i32, &[OsString]) {
             Some("--uid") => uid = arguments.next().is_some_and(|value| value == "1000"),
             Some("--gid") => gid = arguments.next().is_some_and(|value| value == "1000"),
             Some("--ro-bind-data") => fail("unexpected per-action identity data"),
+            Some("--chdir") => {
+                let value = arguments
+                    .next()
+                    .unwrap_or_else(|| fail("--chdir needs a directory"));
+                chdir = Some(value.as_os_str());
+            }
+            Some("--setenv") => {
+                let name = arguments
+                    .next()
+                    .unwrap_or_else(|| fail("--setenv needs a name"));
+                let value = arguments
+                    .next()
+                    .unwrap_or_else(|| fail("--setenv needs a value"));
+                env.push((name.as_os_str(), value.as_os_str()));
+            }
             Some("--info-fd") => {
                 let value = arguments
                     .next()
@@ -96,7 +128,12 @@ fn split_arguments(argv: &[OsString]) -> (i32, &[OsString]) {
                     fail("missing sandbox user mapping");
                 }
                 let info_fd = info_fd.unwrap_or_else(|| fail("--info-fd is missing before --"));
-                return (info_fd, arguments.as_slice());
+                return BwrapInvocation {
+                    info_fd,
+                    chdir,
+                    env,
+                    action: arguments.as_slice(),
+                };
             }
             _ => {}
         }
@@ -139,8 +176,10 @@ fn sigterm() -> Signal {
 
 /// Runs as bubblewrap, where `argv` is everything after the program name.
 fn bwrap(argv: &[OsString]) -> ! {
-    let (info_fd, action) = split_arguments(argv);
-    let action = action
+    let invocation = split_arguments(argv);
+    let info_fd = invocation.info_fd;
+    let action = invocation
+        .action
         .strip_prefix(&[OsString::from("/gang-reset"), OsString::from("--")])
         .unwrap_or_else(|| fail("missing offline reset trampoline separator"));
     let (mode, operands) = split_mode(action);
@@ -217,6 +256,9 @@ fn bwrap(argv: &[OsString]) -> ! {
         }
         "sandbox" => supervise(info_fd, "action", path_operand(operands)),
         "starting" => supervise(info_fd, "idle", path_operand(operands)),
+        "exec-session" => {
+            supervise_exec_session(info_fd, invocation.chdir, &invocation.env, operands)
+        }
         "environment" => {
             let path = path_operand(operands);
             let mut record = File::create(path).unwrap_or_else(|error| {
@@ -310,11 +352,79 @@ fn action(arguments: &[OsString]) -> ! {
     std::process::exit(0)
 }
 
+/// Starts a new-session leader running `operands`, reports its pid on `info_fd`, and exits with
+/// its status.
+fn supervise_exec_session(
+    info_fd: i32,
+    chdir: Option<&OsStr>,
+    env: &[(&OsStr, &OsStr)],
+    operands: &[OsString],
+) -> ! {
+    if operands.is_empty() {
+        fail("exec-session needs a program");
+    }
+    let executable =
+        std::env::current_exe().unwrap_or_else(|error| fail(format!("finding self: {error}")));
+    let mut command = Command::new(executable);
+    command.arg(EXEC_LEADER).args(operands).env_clear();
+    for &(name, value) in env {
+        command.env(name, value);
+    }
+    if let Some(dir) = chdir {
+        command.current_dir(dir);
+    }
+    let mut leader = command
+        .spawn()
+        .unwrap_or_else(|error| fail(format!("starting exec-leader: {error}")));
+    report(info_fd, leader.id());
+    let status = leader
+        .wait()
+        .unwrap_or_else(|error| fail(format!("waiting for exec-leader: {error}")));
+    std::process::exit(exit_code(status))
+}
+
+/// Starts a new session (`setsid`), keeps termination signals blocked like bubblewrap's init,
+/// spawns [`EXEC_ACTION`] as its child so `/proc/<pid>/task/<pid>/children` is populated, and
+/// exits with the child's status.
+fn exec_leader(arguments: &[OsString]) -> ! {
+    if arguments.is_empty() {
+        fail("exec-leader needs a program");
+    }
+    rustix::process::setsid().unwrap_or_else(|error| fail(format!("creating session: {error}")));
+    let pid = rustix::process::getpid();
+    if rustix::process::getsid(None) != Ok(pid) {
+        fail("exec-leader did not become session leader");
+    }
+    let executable =
+        std::env::current_exe().unwrap_or_else(|error| fail(format!("finding self: {error}")));
+    let mut child = Command::new(executable)
+        .arg(EXEC_ACTION)
+        .args(arguments)
+        .spawn()
+        .unwrap_or_else(|error| fail(format!("starting exec-action: {error}")));
+    let status = child
+        .wait()
+        .unwrap_or_else(|error| fail(format!("waiting for exec-action: {error}")));
+    std::process::exit(exit_code(status))
+}
+
+/// Resets the signal mask like `/gang-reset` and `exec`s the action command.
+fn exec_action(arguments: &[OsString]) -> ! {
+    let Some((program, args)) = arguments.split_first() else {
+        fail("exec-action needs a program")
+    };
+    gang_os::clear_mask().unwrap_or_else(|error| fail(format!("resetting mask: {error}")));
+    let error = Command::new(program).args(args).exec();
+    fail(format!("execing {}: {error}", program.to_string_lossy()))
+}
+
 /// Dispatches on the leader and action markers; anything else is bubblewrap's argv.
 fn main() {
     let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
     match argv.split_first() {
         Some((first, rest)) if first.to_str() == Some(LEADER) => leader(rest),
+        Some((first, rest)) if first.to_str() == Some(EXEC_LEADER) => exec_leader(rest),
+        Some((first, rest)) if first.to_str() == Some(EXEC_ACTION) => exec_action(rest),
         Some((first, rest)) if first.to_str() == Some(ACTION) => action(rest),
         _ => bwrap(&argv),
     }

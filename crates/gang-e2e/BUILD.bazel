@@ -98,11 +98,15 @@ workspace_rust_library(
         allow_empty = True,
     ) + ["//:e2e/sample/BUILD.bazel"],
     test_env = {
+        "FAKE_BWRAP": "$(rootpath //crates/gang-bwrap:fake_bwrap)",
+        "GANG_E2E_GANG": "$(rootpath //crates/gang-main:gang)",
         "GANG_E2E_BASE_CONFIG": "$(rootpath //configs:gang.local.toml)",
         "GANG_E2E_TEST_BASH": "$(rootpath :test_bash)",
         "GANG_TEST_POSTGRES": "$(rootpath //crates/gang-testkit:postgresql_archive)",
     },
     test_runtime_data = [
+        "//crates/gang-bwrap:fake_bwrap",
+        "//crates/gang-main:gang",
         ":test_bash",
         "//configs:gang.local.toml",
         "//crates/gang-testkit:postgresql_archive",

@@ -16,8 +16,9 @@ use std::path::{Path, PathBuf};
 use gang_noop::{Noop, NoopConfig};
 use gang_spi::{
     ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, NetworkAccess,
-    Plugin, PluginContext, PortError,
+    PortError,
 };
+use gang_spi::{Plugin, PluginContext};
 use gang_testkit::ChildTest;
 use gang_types::AbsolutePathBuf;
 
@@ -110,12 +111,13 @@ fn host() -> Result<(), Box<dyn Error>> {
     let environment = action_environment("echo", Some(ready.as_path()));
     let working_directory = std::env::current_dir()?;
     let spec = ActionExecutionSpec {
+        read_only_trees: &[],
+        ephemeral_dirs: &[],
         command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
         launcher: &[],
         environment: &environment,
         action_directory: &working_directory,
         working_directory: &working_directory,
-        read_only_trees: &[],
         network: NetworkAccess::Offline,
         memory_cgroup: None,
     };
@@ -142,7 +144,6 @@ fn noop() -> Result<Noop, PortError> {
 fn advertises_host_identity_and_rejects_rootfs_identity() -> Result<(), Box<dyn Error>> {
     let sandbox = noop()?;
     assert_eq!(sandbox.environment().as_str(), "host:test");
-    assert!(!sandbox.binds_read_only());
     let config = NoopConfig {
         environment: "a".repeat(64).parse()?,
         scratch_dir: None,
@@ -153,7 +154,8 @@ fn advertises_host_identity_and_rejects_rootfs_identity() -> Result<(), Box<dyn 
             config_path: Path::new("sandbox.toml"),
         },
     );
-    assert!(matches!(result, Err(PortError::Config(_))));
+    let error = result.expect_err("a rootfs identity is rejected");
+    assert!(matches!(&error, PortError::Config(_)));
     Ok(())
 }
 
@@ -193,12 +195,13 @@ async fn spec_run(
     working_directory: &Path,
 ) -> Result<ActionExecutionOutcome, Box<dyn Error>> {
     let spec = ActionExecutionSpec {
+        read_only_trees: &[],
+        ephemeral_dirs: &[],
         command: ActionCommand::from_argv(argv).ok_or("empty argv")?,
         launcher: &[],
         environment,
         action_directory: working_directory,
         working_directory,
-        read_only_trees: &[],
         network: NetworkAccess::Offline,
         memory_cgroup: None,
     };
@@ -371,12 +374,13 @@ async fn dropping_the_running_action_kills_it() -> Result<(), Box<dyn Error>> {
     let argv = action_argv()?;
     let environment = action_environment("block", Some(ready.as_path()));
     let spec = ActionExecutionSpec {
+        read_only_trees: &[],
+        ephemeral_dirs: &[],
         command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
         launcher: &[],
         environment: &environment,
         action_directory: dir.path(),
         working_directory: dir.path(),
-        read_only_trees: &[],
         network: NetworkAccess::Offline,
         memory_cgroup: None,
     };

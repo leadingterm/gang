@@ -52,6 +52,7 @@ impl FleetProperties {
     const FLEET_POSITION: usize = 0;
     const SANDBOX_POSITION: usize = 2;
     const ENVIRONMENT_POSITION: usize = 3;
+    const CPU_POSITION: usize = 4;
     const MEMORY_POSITION: usize = 6;
     const FIXED_ENTRY_COUNT: usize = 8;
 
@@ -150,6 +151,39 @@ impl FleetProperties {
     /// Replaces the launch identity with the actual local sandbox identity.
     pub fn set_action_environment(&mut self, environment: &ActionEnvironment) {
         self.entries[Self::ENVIRONMENT_POSITION].value = environment.to_string();
+    }
+
+    /// Replaces estimated pools with actual worker capacity, preserving configured action ceilings.
+    pub fn set_capacity(&mut self, actual: Resources) {
+        let effective = self.actions.resources.effective(actual);
+        for (offset, key, capacity, limit) in [
+            (
+                0,
+                property::CPU_COUNT,
+                u64::from(actual.vcpus),
+                u64::from(effective.vcpus),
+            ),
+            (
+                1,
+                property::CPU_MILLICORES,
+                u64::from(actual.vcpus) * property::MILLICORES_PER_CORE,
+                u64::from(effective.vcpus) * property::MILLICORES_PER_CORE,
+            ),
+            (
+                2,
+                property::MEMORY_KB,
+                actual.memory.get() / 1024,
+                effective.memory.get() / 1024,
+            ),
+            (
+                3,
+                property::DISK_KB,
+                actual.disk.get() / 1024,
+                effective.disk.get() / 1024,
+            ),
+        ] {
+            self.entries[Self::CPU_POSITION + offset] = minimum(key, capacity, limit);
+        }
     }
 
     /// Replaces the estimated memory with actual worker capacity, preserving the action ceiling.
@@ -457,6 +491,48 @@ mod tests {
         fleet.set_memory_capacity(NonZeroBytes::gib(8));
         assert_eq!(fleet.capacity(property::MEMORY_KB), Some(8 * 1024 * 1024));
         assert_eq!(fleet.limit(property::MEMORY_KB), Some(8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn actual_capacity_preserves_independent_action_ceilings() {
+        let mut fleet = gang_x86();
+        fleet.actions.resources.cpu_count = std::num::NonZeroU32::new(4);
+        fleet.actions.resources.memory = Some(NonZeroBytes::gib(4));
+        fleet.actions.resources.disk = Some(NonZeroBytes::gib(6));
+        let mut actual = Resources {
+            vcpus: 20,
+            memory: Bytes::gib(12),
+            disk: Bytes::gib(120),
+        };
+        fleet.set_capacity(actual);
+        for (key, capacity, limit) in [
+            (property::CPU_COUNT, 20, 4),
+            (property::CPU_MILLICORES, 20_000, 4_000),
+            (property::MEMORY_KB, 12 * 1024 * 1024, 4 * 1024 * 1024),
+            (property::DISK_KB, 120 * 1024 * 1024, 6 * 1024 * 1024),
+        ] {
+            assert_eq!(fleet.capacity(key), Some(capacity));
+            assert_eq!(fleet.limit(key), Some(limit));
+            assert_eq!(fleet.get(key), Some(capacity.to_string().as_str()));
+        }
+        assert_eq!(fleet.options().collect::<Vec<_>>(), [("capacity", "spot")]);
+        let catalog = FleetCatalog::try_new(vec![fleet.clone()]).unwrap();
+        assert!(catalog.admit([(property::MEMORY_KB, "4194304")]).is_ok());
+        assert!(catalog.admit([(property::MEMORY_KB, "4194305")]).is_err());
+
+        actual.vcpus = 2;
+        actual.memory = Bytes::gib(2);
+        actual.disk = Bytes::gib(3);
+        fleet.set_capacity(actual);
+        assert_eq!(fleet.limit(property::CPU_COUNT), Some(2));
+        assert_eq!(fleet.limit(property::MEMORY_KB), Some(2 * 1024 * 1024));
+        assert_eq!(fleet.limit(property::DISK_KB), Some(3 * 1024 * 1024));
+
+        fleet.actions.resources = crate::ResourceCeilings::default();
+        fleet.set_capacity(actual);
+        assert_eq!(fleet.limit(property::CPU_COUNT), Some(2));
+        assert_eq!(fleet.limit(property::MEMORY_KB), Some(2 * 1024 * 1024));
+        assert_eq!(fleet.limit(property::DISK_KB), Some(3 * 1024 * 1024));
     }
 
     #[test]

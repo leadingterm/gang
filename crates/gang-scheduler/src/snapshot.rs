@@ -46,7 +46,7 @@ pub fn fill_snapshot(
     into.source_rates_at = now.tick;
     rates.snapshot_into(&mut into.source_rates);
     cordons.snapshot_into(&mut into.cordons);
-    capacity.fleet_memory(&mut into.fleet_memory);
+    capacity.fleet_capacity(&mut into.fleet_capacity);
 
     into.workers.clear();
     for (_, worker) in workers.workers_sorted() {
@@ -374,7 +374,7 @@ mod tests {
         assert_eq!(snap.source_rates.len(), 1);
         assert_eq!(snap.cordons.len(), 1);
         assert_eq!(snap.cordons[0].instance.as_ref(), &inst_z);
-        assert_eq!(snap.fleet_memory[0].capacity.get(), Bytes::gib(30));
+        assert_eq!(snap.fleet_capacity[0].capacity.memory, Bytes::gib(30));
         assert_eq!(snap.workers.len(), 2);
         assert!(snap.workers[0].id < snap.workers[1].id);
         assert_eq!(snap.workers[0].running_actions, 1);

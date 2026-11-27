@@ -6,7 +6,7 @@
 //!
 //! If a leader future in [`SingleFlight::run`] is dropped before completion, its drop guard
 //! clears the entry and notifies waiting followers so one promotes cleanly and re-drives the work
-//! without deadlock. [`SingleFlight::run_detached`] spawns the work on Tokio so cancelling a
+//! without deadlock. [`SingleFlight::run_detached`] spawns the work on `Tokio` so cancelling a
 //! single caller does not abort other followers.
 
 use std::collections::HashMap;
@@ -15,8 +15,9 @@ use std::future::Future;
 use std::hash::{BuildHasher as _, Hash, RandomState};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Notify, watch};
 
 const DEFAULT_SHARDS: usize = 64;
 
@@ -41,10 +42,63 @@ impl<T> Flight<T> {
 type ShardMap<K, T> = HashMap<K, Arc<Flight<T>>>;
 type Shard<K, T> = Mutex<ShardMap<K, T>>;
 
+#[derive(Debug, Default)]
+struct DetachedTasks {
+    active: AtomicUsize,
+    drained: Notify,
+}
+
+/// Cache-owned cancellation shared by every detached flight.
+#[derive(Debug, Clone, Default)]
+pub struct FlightCancel(Arc<FlightShutdown>);
+
+#[derive(Debug, Default)]
+struct FlightShutdown {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl FlightCancel {
+    /// Returns whether cache shutdown has been signalled.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Waits for cache shutdown, including cancellation before this future was polled.
+    pub async fn cancelled(&self) {
+        let notified = self.0.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_cancelled() {
+            notified.await;
+        }
+    }
+}
+
+struct DetachedGuard(Arc<DetachedTasks>);
+
+impl DetachedGuard {
+    fn new(tasks: &Arc<DetachedTasks>) -> Self {
+        tasks.active.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(tasks))
+    }
+}
+
+impl Drop for DetachedGuard {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.drained.notify_waiters();
+        }
+    }
+}
+
 /// Deduplicates concurrent asynchronous operations keyed by `K`.
 pub struct SingleFlight<K, T> {
     shards: Vec<Arc<Shard<K, T>>>,
     hash_builder: RandomState,
+    detached: Arc<DetachedTasks>,
+    cancel: FlightCancel,
 }
 
 impl<K, T> fmt::Debug for SingleFlight<K, T> {
@@ -89,6 +143,8 @@ where
         Self {
             shards: buckets,
             hash_builder: RandomState::new(),
+            detached: Arc::new(DetachedTasks::default()),
+            cancel: FlightCancel::default(),
         }
     }
 
@@ -128,10 +184,20 @@ where
     ///
     /// Because the first caller spawns the work onto Tokio, dropping a caller's future does not
     /// abort the in-flight work for other waiting followers. If the spawned task itself is
-    /// aborted or panics, waiting followers promote cleanly and re-drive.
+    /// aborted or panics, waiting followers promote cleanly and re-drive. [`Self::drain`] waits
+    /// for the spawned work even after all callers have been cancelled.
     pub async fn run_detached<F, Fut>(&self, key: K, work: F) -> T
     where
         F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        self.run_detached_cancellable(key, move |_| work()).await
+    }
+
+    /// Runs coalesced work with a cache shutdown token; cancelling a caller leaves it running.
+    pub async fn run_detached_cancellable<F, Fut>(&self, key: K, work: F) -> T
+    where
+        F: FnOnce(FlightCancel) -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
     {
         let shard = self.shard_for(&key);
@@ -141,8 +207,12 @@ where
                 Role::Leader(flight) => {
                     let shard_clone = Arc::clone(shard);
                     let key_clone = key.clone();
-                    let fut = work();
-                    let handle = tokio::spawn(drive_leader(shard_clone, key_clone, flight, fut));
+                    let fut = work(self.cancel.clone());
+                    let detached = DetachedGuard::new(&self.detached);
+                    let handle = tokio::spawn(async move {
+                        let _detached = detached;
+                        drive_leader(shard_clone, key_clone, flight, fut).await
+                    });
                     return match handle.await {
                         Ok(value) => value,
                         Err(err) if err.is_panic() => {
@@ -160,6 +230,33 @@ where
                     }
                 }
             }
+        }
+    }
+
+    /// Signals cache shutdown without cancelling individual callers' shared flights.
+    pub fn cancel(&self) {
+        self.cancel.0.cancelled.store(true, Ordering::Release);
+        self.cancel.0.notify.notify_waiters();
+    }
+
+    /// Cancels cache-owned work and waits for every detached flight to finish.
+    pub async fn shutdown(&self) {
+        self.cancel();
+        self.drain().await;
+    }
+
+    /// Waits for all detached work to finish, including work whose callers were cancelled.
+    ///
+    /// Stop admitting callers before draining; this does not prevent new flights from starting.
+    pub async fn drain(&self) {
+        loop {
+            let notified = self.detached.drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.detached.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -294,6 +391,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -303,50 +401,30 @@ mod tests {
 
     #[tokio::test]
     async fn coalesces_concurrent_callers_for_same_key() {
-        let flight = Arc::new(SingleFlight::<&'static str, Result<usize, String>>::new());
-        let calls = Arc::new(AtomicUsize::new(0));
-        let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-
-        let leader = {
-            let flight = Arc::clone(&flight);
-            let calls = Arc::clone(&calls);
-            let entered = Arc::clone(&entered);
-            let release = Arc::clone(&release);
-            tokio::spawn(async move {
-                flight
-                    .run("blob-a", || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        entered.notify_one();
-                        release.notified().await;
-                        Ok(42)
-                    })
-                    .await
-            })
-        };
-
-        entered.notified().await;
+        let flight = SingleFlight::new();
+        let calls = AtomicUsize::new(0);
+        let release = Notify::new();
+        let mut leader = Box::pin(flight.run("blob-a", || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            release.notified().await;
+            Ok::<_, &'static str>(42)
+        }));
+        assert!(futures::poll!(leader.as_mut()).is_pending());
 
         let mut followers = Vec::new();
         for _ in 0..8 {
-            let flight = Arc::clone(&flight);
-            let calls = Arc::clone(&calls);
-            followers.push(tokio::spawn(async move {
-                flight
-                    .run("blob-a", || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        Ok(99)
-                    })
-                    .await
+            let mut follower = Box::pin(flight.run("blob-a", || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(99)
             }));
+            assert!(futures::poll!(follower.as_mut()).is_pending());
+            followers.push(follower);
         }
 
-        tokio::task::yield_now().await;
-        release.notify_waiters();
-
-        assert_eq!(leader.await.expect("leader join"), Ok(42));
+        release.notify_one();
+        assert_eq!(leader.await, Ok(42));
         for follower in followers {
-            assert_eq!(follower.await.expect("follower join"), Ok(42));
+            assert_eq!(follower.await, Ok(42));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(flight.in_flight_count().await, 0);
@@ -354,158 +432,167 @@ mod tests {
 
     #[tokio::test]
     async fn leader_cancellation_promotes_waiting_follower_without_deadlock() {
-        let flight = Arc::new(SingleFlight::<&'static str, Result<usize, String>>::new());
-        let leader_started = Arc::new(Notify::new());
-        let follower_entered = Arc::new(Notify::new());
-        let follower_release = Arc::new(Notify::new());
-        let follower_calls = Arc::new(AtomicUsize::new(0));
+        let flight = SingleFlight::new();
+        let release = Notify::new();
+        let calls = AtomicUsize::new(0);
 
         let mut leader = Box::pin(flight.run("key", || {
-            let leader_started = Arc::clone(&leader_started);
-            async move {
-                leader_started.notify_one();
-                std::future::pending::<Result<usize, String>>().await
-            }
+            std::future::pending::<Result<usize, &'static str>>()
         }));
+        assert!(futures::poll!(leader.as_mut()).is_pending());
 
-        // Poll leader once so it enters pending() and registers the in-flight slot.
-        let noop_waker = std::task::Waker::noop();
-        let mut noop_cx = std::task::Context::from_waker(noop_waker);
-        assert!(leader.as_mut().poll(&mut noop_cx).is_pending());
+        let mut followers = Vec::new();
+        for _ in 0..2 {
+            let mut follower = Box::pin(flight.run("key", || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                Ok(77)
+            }));
+            assert!(futures::poll!(follower.as_mut()).is_pending());
+            followers.push(follower);
+        }
 
-        let follower1 = tokio::spawn({
-            let flight = Arc::clone(&flight);
-            let follower_calls = Arc::clone(&follower_calls);
-            let follower_entered = Arc::clone(&follower_entered);
-            let follower_release = Arc::clone(&follower_release);
-            async move {
-                flight
-                    .run("key", || async move {
-                        follower_calls.fetch_add(1, Ordering::SeqCst);
-                        follower_entered.notify_one();
-                        follower_release.notified().await;
-                        Ok(77)
-                    })
-                    .await
-            }
-        });
-        let follower2 = tokio::spawn({
-            let flight = Arc::clone(&flight);
-            let follower_calls = Arc::clone(&follower_calls);
-            let follower_entered = Arc::clone(&follower_entered);
-            let follower_release = Arc::clone(&follower_release);
-            async move {
-                flight
-                    .run("key", || async move {
-                        follower_calls.fetch_add(1, Ordering::SeqCst);
-                        follower_entered.notify_one();
-                        follower_release.notified().await;
-                        Ok(77)
-                    })
-                    .await
-            }
-        });
-
-        // Let both spawned followers register on the leader's watch channel.
-        tokio::task::yield_now().await;
-
-        // Cancel the leader future; one follower must promote and the other must follow it.
         drop(leader);
+        for follower in &mut followers {
+            assert!(futures::poll!(follower.as_mut()).is_pending());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.notify_one();
 
-        tokio::time::timeout(Duration::from_secs(2), follower_entered.notified())
-            .await
-            .expect("promoted follower must start work without deadlock");
-        tokio::task::yield_now().await;
-        follower_release.notify_waiters();
-
-        let (res1, res2) = tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::join!(follower1, follower2)
-        })
-        .await
-        .expect("followers must complete after leader drop");
-
-        assert_eq!(res1.expect("follower1 join"), Ok(77));
-        assert_eq!(res2.expect("follower2 join"), Ok(77));
-        assert_eq!(follower_calls.load(Ordering::SeqCst), 1);
+        for follower in followers {
+            assert_eq!(follower.await, Ok(77));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(flight.in_flight_count().await, 0);
     }
 
     #[tokio::test]
     async fn errors_propagate_to_current_waiters_without_poisoning_future_attempts() {
-        let flight = Arc::new(SingleFlight::<&'static str, Result<usize, &'static str>>::new());
-        let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
+        let flight = SingleFlight::new();
+        let release = Notify::new();
+        let mut leader = Box::pin(flight.run("key", || async {
+            release.notified().await;
+            Err::<usize, _>("transient failure")
+        }));
+        assert!(futures::poll!(leader.as_mut()).is_pending());
 
-        let t1 = {
-            let flight = Arc::clone(&flight);
-            let entered = Arc::clone(&entered);
-            let release = Arc::clone(&release);
-            tokio::spawn(async move {
-                flight
-                    .run("k", || async move {
-                        entered.notify_one();
-                        release.notified().await;
-                        Err("transient failure")
-                    })
-                    .await
-            })
-        };
+        let mut follower = Box::pin(flight.run("key", || async { Ok(123) }));
+        assert!(futures::poll!(follower.as_mut()).is_pending());
+        release.notify_one();
 
-        entered.notified().await;
-        let t2 = {
-            let flight = Arc::clone(&flight);
-            tokio::spawn(async move { flight.run("k", || async { Ok(123) }).await })
-        };
-
-        tokio::task::yield_now().await;
-        release.notify_waiters();
-
-        assert_eq!(t1.await.expect("t1 join"), Err("transient failure"));
-        assert_eq!(t2.await.expect("t2 join"), Err("transient failure"));
-
-        // A subsequent attempt after the error must not be poisoned.
-        let t3 = flight.run("k", || async { Ok(456) }).await;
-        assert_eq!(t3, Ok(456));
+        assert_eq!(leader.await, Err("transient failure"));
+        assert_eq!(follower.await, Err("transient failure"));
+        assert_eq!(flight.run("key", || async { Ok(456) }).await, Ok(456));
         assert_eq!(flight.in_flight_count().await, 0);
     }
 
     #[tokio::test]
     async fn detached_leader_survives_caller_cancellation() {
-        let flight = Arc::new(SingleFlight::<&'static str, usize>::new());
+        tokio::time::timeout(Duration::from_secs(5), detached_cancellation_drains())
+            .await
+            .expect("detached flight did not drain");
+    }
+
+    async fn detached_cancellation_drains() {
+        let flight = SingleFlight::new();
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
 
-        let leader = tokio::spawn({
-            let flight = Arc::clone(&flight);
+        let mut leader = Box::pin(flight.run_detached("detached", {
             let started = Arc::clone(&started);
             let release = Arc::clone(&release);
-            async move {
-                flight
-                    .run_detached("detached", move || async move {
-                        started.notify_one();
-                        release.notified().await;
-                        999
-                    })
-                    .await
+            move || async move {
+                started.notify_one();
+                release.notified().await;
+                999
             }
-        });
-
+        }));
+        assert!(futures::poll!(leader.as_mut()).is_pending());
+        let mut drain = Box::pin(flight.drain());
+        assert!(futures::poll!(drain.as_mut()).is_pending());
         started.notified().await;
 
-        let follower = tokio::spawn({
-            let flight = Arc::clone(&flight);
-            async move { flight.run_detached("detached", || async { 111 }).await }
-        });
-        tokio::task::yield_now().await;
+        let mut follower = Box::pin(flight.run_detached("detached", || async { 111 }));
+        assert!(futures::poll!(follower.as_mut()).is_pending());
+        drop(leader);
+        assert!(futures::poll!(drain.as_mut()).is_pending());
 
-        // Abort the leader's awaiting task; the detached work continues for the follower.
-        leader.abort();
-        let _ = leader.await;
-
-        release.notify_waiters();
-        assert_eq!(follower.await.expect("follower join"), 999);
+        release.notify_one();
+        assert_eq!(follower.await, 999);
+        drain.await;
         assert_eq!(flight.in_flight_count().await, 0);
     }
 
-    use std::sync::Arc;
+    #[tokio::test]
+    async fn shutdown_releases_all_cancellable_detached_flights() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let flight = SingleFlight::new();
+            let started = Arc::new(Notify::new());
+            let mut caller = Box::pin(flight.run_detached_cancellable("cancel", {
+                let started = Arc::clone(&started);
+                move |cancel| async move {
+                    started.notify_one();
+                    tokio::join!(cancel.cancelled(), cancel.cancelled());
+                    cancel.is_cancelled()
+                }
+            }));
+            assert!(futures::poll!(caller.as_mut()).is_pending());
+            started.notified().await;
+            drop(caller);
+            flight.shutdown().await;
+            assert_eq!(flight.in_flight_count().await, 0);
+            assert!(
+                flight
+                    .run_detached_cancellable("after", |cancel| async move {
+                        cancel.cancelled().await;
+                        cancel.is_cancelled()
+                    })
+                    .await
+            );
+            flight.shutdown().await;
+        })
+        .await
+        .expect("cache shutdown lost cancellation or completion notification");
+    }
+
+    #[tokio::test]
+    async fn drain_returns_immediately_when_idle() {
+        let flight = SingleFlight::<&str, usize>::new();
+        let mut drain = Box::pin(flight.drain());
+        assert!(futures::poll!(drain.as_mut()).is_ready());
+    }
+
+    #[tokio::test]
+    async fn panicking_detached_task_releases_all_drainers() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let flight = SingleFlight::<&str, usize>::new();
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let mut caller = Box::pin(flight.run_detached("panic", {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                move || async move {
+                    started.notify_one();
+                    release.notified().await;
+                    panic!("detached flight panic");
+                }
+            }));
+            assert!(futures::poll!(caller.as_mut()).is_pending());
+            started.notified().await;
+            drop(caller);
+
+            let mut first = Box::pin(flight.drain());
+            let mut second = Box::pin(flight.drain());
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            release.notify_one();
+            first.await;
+            second.await;
+            assert_eq!(flight.in_flight_count().await, 0);
+            assert_eq!(flight.run_detached("panic", || async { 123 }).await, 123);
+            flight.drain().await;
+        })
+        .await
+        .expect("panicking detached flight did not drain");
+    }
 }

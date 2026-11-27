@@ -603,7 +603,7 @@ impl SchedulerPort for Stub {
         into.source_rates.clear();
         into.source_rates_at = Tick::ORIGIN;
         into.cordons.clear();
-        into.fleet_memory.clear();
+        into.fleet_capacity.clear();
         let candidates = FleetSet::prefix(1).map_err(PortError::backend)?;
         into.queued.push(QueuedDemand {
             source: None,

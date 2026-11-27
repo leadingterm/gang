@@ -11,13 +11,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream::{self, BoxStream};
-use gang_spi::{BlobStream, ByteRange, ContentStore, EngineStore, PortError, Rejection};
+use gang_spi::EngineStore;
+use gang_spi::{BlobStream, ByteRange, ContentStore, PortError, Rejection};
 use gang_types::Digest;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 
-use crate::disk::{DiskCas, WriteOutcome};
-use crate::flight::SingleFlight;
+use crate::disk::{BlockingScope, DiskCas, WriteOutcome};
+use crate::flight::{FlightCancel, SingleFlight};
 use crate::layout::blob_path;
 use crate::lru::{BlobMode, CacheKey};
 use crate::pins::CasPin;
@@ -115,6 +116,7 @@ struct TieredInner<F, S> {
     fast: F,
     slow: S,
     flight: SingleFlight<CacheKey, Result<FlightOutcome, SharedPortError>>,
+    scope: BlockingScope,
 }
 
 impl<F, S> Tiered<F, S> {
@@ -126,6 +128,7 @@ impl<F, S> Tiered<F, S> {
                 fast,
                 slow,
                 flight: SingleFlight::new(),
+                scope: BlockingScope::new(),
             }),
         }
     }
@@ -140,6 +143,28 @@ impl<F, S> Tiered<F, S> {
     #[must_use]
     pub fn slow(&self) -> &S {
         &self.inner.slow
+    }
+
+    /// Signals cache-owned network and filesystem cancellation without stopping the shared store.
+    pub fn cancel_inflight(&self) {
+        self.inner.flight.cancel();
+        self.inner.scope.cancel();
+    }
+
+    /// Cancels detached fetches and joins every filesystem task before returning.
+    ///
+    /// Callers must stop submitting fetches before shutdown.
+    pub async fn shutdown_inflight(&self) {
+        self.cancel_inflight();
+        self.inner.flight.drain().await;
+        self.inner.scope.cancel_and_join().await;
+    }
+
+    /// Waits for detached blob fetches without shutting down the shared slow store.
+    ///
+    /// Stop admitting fetches before draining; new fetches may otherwise start afterwards.
+    pub async fn drain_inflight(&self) {
+        self.inner.flight.drain().await;
     }
 }
 
@@ -184,10 +209,6 @@ where
         if let Some(pin) = disk.pin_attempt(digest, executable) {
             disk.stats().record_local_read(digest.size());
             return Ok(FetchOutcome::Cached(pin));
-        }
-
-        if let Some(outcome) = try_promote_opposite_mode(disk, digest, executable).await? {
-            return Ok(outcome);
         }
 
         if !disk.can_admit(digest.size()) {
@@ -257,7 +278,7 @@ where
         digest: Digest,
         dest: &Path,
         executable: bool,
-        scope: &crate::BlockingScope,
+        scope: &BlockingScope,
     ) -> Result<bool, PortError> {
         if scope.is_cancelled() {
             return Err(PortError::unavailable("direct fetch cancelled"));
@@ -275,7 +296,14 @@ where
             return Ok(true);
         }
 
-        let Some(stream) = self.inner.slow.read(digest, ByteRange::FULL).await? else {
+        let stream = tokio::select! {
+            biased;
+            () = scope.cancelled() => {
+                return Err(PortError::unavailable("direct fetch cancelled"));
+            }
+            result = self.inner.slow.read(digest, ByteRange::FULL) => result?,
+        };
+        let Some(stream) = stream else {
             return Ok(false);
         };
         disk.write_verified_direct_scoped(digest, stream, dest, executable, scope)
@@ -295,9 +323,9 @@ where
         let result = self
             .inner
             .flight
-            .run_detached(key, move || async move {
+            .run_detached_cancellable(key, move |cancel| async move {
                 leader_flag.store(true, Ordering::Release);
-                fetch_into_disk(&inner, key.digest, executable)
+                fetch_into_disk(&inner, key.digest, executable, &cancel)
                     .await
                     .map_err(SharedPortError::new)
             })
@@ -308,41 +336,19 @@ where
     }
 }
 
-async fn try_promote_opposite_mode(
-    disk: &DiskCas,
-    digest: Digest,
-    executable: bool,
-) -> Result<Option<FetchOutcome>, PortError> {
-    let Some(_other_pin) = disk.pin_attempt(digest, !executable) else {
-        return Ok(None);
-    };
-    if !disk.can_admit(digest.size()) {
-        return Ok(Some(FetchOutcome::Bypassed));
-    }
-    let Some(stream) = disk.read(digest, ByteRange::FULL).await? else {
-        return Ok(None);
-    };
-    match disk.write_with_mode(digest, stream, executable).await? {
-        WriteOutcome::Cached => {
-            if let Some(pin) = disk.pin_attempt(digest, executable) {
-                Ok(Some(FetchOutcome::Cached(pin)))
-            } else {
-                Ok(None)
-            }
-        }
-        WriteOutcome::Bypassed => Ok(Some(FetchOutcome::Bypassed)),
-    }
-}
-
 async fn fetch_into_disk<F, S>(
     inner: &TieredInner<F, S>,
     digest: Digest,
     executable: bool,
+    cancel: &FlightCancel,
 ) -> Result<FlightOutcome, PortError>
 where
     F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
     S: ContentStore,
 {
+    if cancel.is_cancelled() {
+        return Err(PortError::unavailable("cache fetch cancelled"));
+    }
     let disk = inner.fast.borrow();
     if disk.pin_attempt(digest, executable).is_some() {
         return Ok(FlightOutcome::CachedFromFast);
@@ -352,19 +358,33 @@ where
         if !disk.can_admit(digest.size()) {
             return Ok(FlightOutcome::Bypassed);
         }
-        if let Some(stream) = disk.read(digest, ByteRange::FULL).await? {
-            return match disk.write_with_mode(digest, stream, executable).await? {
+        if let Some(stream) = read_cached_range_without_stats(disk, digest, ByteRange::FULL).await?
+        {
+            return match disk
+                .write_with_mode_scoped(digest, stream, executable, &inner.scope)
+                .await?
+            {
                 WriteOutcome::Cached => Ok(FlightOutcome::CachedFromFast),
                 WriteOutcome::Bypassed => Ok(FlightOutcome::Bypassed),
             };
         }
     }
 
-    let Some(stream) = inner.slow.read(digest, ByteRange::FULL).await? else {
+    let stream = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return Err(PortError::unavailable("cache fetch cancelled"));
+        }
+        result = inner.slow.read(digest, ByteRange::FULL) => result?,
+    };
+    let Some(stream) = stream else {
         return Ok(FlightOutcome::Missing);
     };
 
-    match disk.write_with_mode(digest, stream, executable).await? {
+    match disk
+        .write_with_mode_scoped(digest, stream, executable, &inner.scope)
+        .await?
+    {
         WriteOutcome::Cached => {
             disk.stats().record_slow_read(digest.size());
             Ok(FlightOutcome::CachedFromSlow)
@@ -498,6 +518,7 @@ where
     }
 
     async fn shutdown(&self) {
+        self.shutdown_inflight().await;
         self.inner.slow.shutdown().await;
     }
 }
@@ -690,12 +711,14 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
-    use gang_spi::{BlobStream, ByteRange, ContentStore, EngineStore, PortError, Rejection};
+    use futures::{StreamExt as _, stream};
+    use gang_spi::EngineStore;
+    use gang_spi::{BlobStream, ByteRange, ContentStore, PortError, Rejection};
     use gang_testkit::{TestResult, content_store_contract};
     use gang_types::Digest;
     use parking_lot::Mutex;
@@ -704,29 +727,25 @@ mod tests {
     use super::{FetchOutcome, Tiered};
     use crate::disk::DiskCas;
 
-    static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
-
     struct TempDir {
-        path: PathBuf,
+        directory: tempfile::TempDir,
     }
 
     impl TempDir {
         fn new() -> Result<Self, std::io::Error> {
-            let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("gang-cas-tiered-test-{}-{seq}", std::process::id()));
-            fs::create_dir_all(&path)?;
-            Ok(Self { path })
+            Ok(Self {
+                directory: tempfile::tempdir()?,
+            })
         }
 
         fn path(&self) -> &Path {
-            &self.path
+            self.directory.path()
         }
     }
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
+            let _ = gang_os::fs::remove_dir_optional(self.path());
         }
     }
 
@@ -736,7 +755,9 @@ mod tests {
         read_calls: AtomicUsize,
         write_calls: AtomicUsize,
         find_missing_calls: AtomicUsize,
+        shutdown_calls: AtomicUsize,
         gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+        stalled_stream: Mutex<Option<Arc<Notify>>>,
     }
 
     impl MockSlowStore {
@@ -812,6 +833,19 @@ mod tests {
                 None => available,
             };
             let end = start.saturating_add(usize::try_from(len).unwrap_or(data.len()));
+            let stalled = self.stalled_stream.lock().clone();
+            if let Some(stalled) = stalled {
+                let first = data.slice(start..start.saturating_add(1).min(end));
+                let chunks =
+                    stream::once(std::future::ready(Ok(first))).chain(stream::poll_fn(move |_| {
+                        stalled.notify_one();
+                        std::task::Poll::Pending
+                    }));
+                return Ok(Some(BlobStream {
+                    size: len,
+                    chunks: Box::pin(chunks),
+                }));
+            }
             Ok(Some(BlobStream::from_bytes(data.slice(start..end))))
         }
 
@@ -834,6 +868,111 @@ mod tests {
         fn usage(&self) -> Option<EngineStore> {
             None
         }
+
+        async fn shutdown(&self) {
+            self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_cancelled_fetch_before_stopping_slow_store() -> TestResult {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let dir = TempDir::new()?;
+            let fast = DiskCas::open(dir.path(), 1024).await?;
+            let slow = Arc::new(MockSlowStore::default());
+            let payload = b"fetch must finish before shutdown";
+            let digest = slow.insert(payload);
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            slow.set_read_gate(Arc::clone(&entered), Arc::clone(&release));
+            let tiered = Tiered::new(fast.clone(), Arc::clone(&slow));
+
+            let mut fetch = Box::pin(tiered.fetch_to_local(digest, false));
+            assert!(futures::poll!(fetch.as_mut()).is_pending());
+            entered.notified().await;
+            drop(fetch);
+
+            let mut shutdown = Box::pin(tiered.shutdown());
+            assert!(futures::poll!(shutdown.as_mut()).is_pending());
+            assert_eq!(slow.shutdown_calls.load(Ordering::SeqCst), 0);
+            shutdown.await;
+
+            assert_eq!(slow.shutdown_calls.load(Ordering::SeqCst), 1);
+            assert!(fast.read(digest, ByteRange::FULL).await?.is_none());
+            Ok(())
+        })
+        .await?
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_never_ending_stream_and_joins_held_writer() -> TestResult {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let dir = TempDir::new()?;
+            let fast = DiskCas::open(dir.path(), 1024).await?;
+            let slow = Arc::new(MockSlowStore::default());
+            let digest = slow.insert(b"unfinished-stream");
+            let stalled = Arc::new(Notify::new());
+            *slow.stalled_stream.lock() = Some(Arc::clone(&stalled));
+            let writing = Arc::new(Notify::new());
+            let (release, gate) = tokio::sync::oneshot::channel();
+            fast.gate_next_write(Arc::clone(&writing), gate);
+            let tiered = Tiered::new(fast.clone(), Arc::clone(&slow));
+
+            let mut fetch = Box::pin(tiered.fetch_to_local(digest, false));
+            assert!(futures::poll!(fetch.as_mut()).is_pending());
+            writing.notified().await;
+            stalled.notified().await;
+            drop(fetch);
+
+            let mut shutdown = Box::pin(tiered.shutdown_inflight());
+            let pending = futures::poll!(shutdown.as_mut()).is_pending();
+            // Always release the blocking pool before any assertion can unwind the runtime.
+            let released = release.send(());
+            assert!(
+                pending,
+                "shutdown released ownership while the disk writer was held"
+            );
+            released.map_err(|()| "writer gate closed")?;
+            shutdown.await;
+
+            assert!(fast.pin_attempt(digest, false).is_none());
+            assert!(fast.read(digest, ByteRange::FULL).await?.is_none());
+            assert_eq!(
+                fs::read_dir(fast.root().join(crate::TMP_DIR_NAME))?.count(),
+                0
+            );
+            assert_eq!(slow.read_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(slow.shutdown_calls.load(Ordering::SeqCst), 0);
+            Ok(())
+        })
+        .await?
+    }
+
+    #[tokio::test]
+    async fn cancelled_fetch_keeps_coalescing_until_cache_shutdown() -> TestResult {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let dir = TempDir::new()?;
+            let fast = DiskCas::open(dir.path(), 1024).await?;
+            let slow = Arc::new(MockSlowStore::default());
+            let digest = slow.insert(b"shared-fetch");
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            slow.set_read_gate(Arc::clone(&entered), Arc::clone(&release));
+            let tiered = Tiered::new(fast.clone(), Arc::clone(&slow));
+            let mut leader = Box::pin(tiered.fetch_to_local(digest, false));
+            assert!(futures::poll!(leader.as_mut()).is_pending());
+            entered.notified().await;
+            let mut follower = Box::pin(tiered.fetch_to_local(digest, false));
+            assert!(futures::poll!(follower.as_mut()).is_pending());
+            drop(leader);
+            release.notify_one();
+            assert!(matches!(follower.await?, FetchOutcome::Cached(_)));
+            assert_eq!(slow.read_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fast.worker_cache_stats().slow_read_requests, 1);
+            tiered.shutdown_inflight().await;
+            Ok(())
+        })
+        .await?
     }
 
     #[tokio::test]
@@ -953,26 +1092,25 @@ mod tests {
 
         let tiered = Tiered::new(fast.clone(), Arc::clone(&slow));
 
-        let t0 = tokio::spawn({
-            let tiered = tiered.clone();
-            async move { tiered.fetch_to_local(digest, false).await }
-        });
-        entered.notified().await;
+        let mut leader = Box::pin(tiered.fetch_to_local(digest, false));
+        tokio::select! {
+            biased;
+            () = entered.notified() => {}
+            result = &mut leader => panic!("slow read must be gated, got {result:?}"),
+        }
 
         let mut followers = Vec::new();
         for _ in 0..4 {
-            let tiered = tiered.clone();
-            followers.push(tokio::spawn(async move {
-                tiered.fetch_to_local(digest, false).await
-            }));
+            let mut follower = Box::pin(tiered.fetch_to_local(digest, false));
+            assert!(futures::poll!(follower.as_mut()).is_pending());
+            followers.push(follower);
         }
-        tokio::task::yield_now().await;
         slow.clear_read_gate();
         release.notify_waiters();
 
-        assert!(matches!(t0.await??, FetchOutcome::Cached(_)));
-        for handle in followers {
-            assert!(matches!(handle.await??, FetchOutcome::Cached(_)));
+        assert!(matches!(leader.await?, FetchOutcome::Cached(_)));
+        for follower in followers {
+            assert!(matches!(follower.await?, FetchOutcome::Cached(_)));
         }
 
         assert_eq!(slow.read_calls.load(Ordering::SeqCst), 1);

@@ -260,6 +260,7 @@ fn execute(sandbox: &Sandbox) -> Result<ActionExecutionOutcome, Box<dyn Error>> 
         action_directory: Path::new("/work"),
         working_directory: Path::new("/work"),
         read_only_trees: &[],
+        ephemeral_dirs: &[],
         network: NetworkAccess::Offline,
         memory_cgroup: None,
     };

@@ -33,7 +33,7 @@ use gang_scheduler::{
 };
 use gang_spi::{
     ActionsView, ControllerDrain, Executed as ObservedExecuted, ExecutionTimes,
-    FleetMemoryCapacity, LearnedHistory, ListingLimits, Observation, ObservationSink, Origin,
+    FleetResourceCapacity, LearnedHistory, ListingLimits, Observation, ObservationSink, Origin,
     Phase, SchedulerSnapshot,
 };
 use gang_types::{
@@ -434,15 +434,15 @@ pub enum ControlMsg {
         /// Reply channel reporting success or [`SketchError`].
         reply: oneshot::Sender<Result<(), SketchError>>,
     },
-    /// Replace peer-local memory capacity observations.
-    SetPeerMemory {
+    /// Replace peer-local physical capacity observations.
+    SetPeerCapacity {
         /// Peer observations by fleet index.
-        observations: Vec<FleetMemoryCapacity>,
+        observations: Vec<FleetResourceCapacity>,
         /// Reply channel reporting whether effective capacity changed or [`CapacityError`].
         reply: oneshot::Sender<Result<bool, CapacityError>>,
     },
-    /// Recompute local observed fleet memory capacities from connected workers.
-    RefreshLocalMemory {
+    /// Recompute local observed fleet physical capacities from connected workers.
+    RefreshLocalCapacity {
         /// Reply channel reporting whether effective capacity changed.
         reply: oneshot::Sender<bool>,
     },
@@ -871,15 +871,15 @@ impl<C: Clock> ControllerActor<C> {
                 let res = self.scheduler.restore_learned_history(wall, &records);
                 let _ = reply.send(res);
             }
-            ControlMsg::SetPeerMemory {
+            ControlMsg::SetPeerCapacity {
                 observations,
                 reply,
             } => {
-                let res = self.scheduler.set_peer_memory_observations(observations);
+                let res = self.scheduler.set_peer_capacity_observations(observations);
                 let _ = reply.send(res);
             }
-            ControlMsg::RefreshLocalMemory { reply } => {
-                let changed = self.scheduler.refresh_local_memory_observations();
+            ControlMsg::RefreshLocalCapacity { reply } => {
+                let changed = self.scheduler.refresh_local_capacity_observations();
                 let _ = reply.send(changed);
             }
             ControlMsg::Shutdown { reply } => {

@@ -7,7 +7,8 @@ use gang_spi::ActionExecutionSpec;
 
 /// Builds the command for `spec` with its complete environment, working directory, and a
 /// `TMPDIR` pointing at `temporary_directory`.
-/// The action directory is not used: without isolation every path is already visible.
+/// The action directory and mount requests are unused: host paths are already visible,
+/// and this sandbox does not mount read-only trees or ephemeral directories.
 ///
 /// The command is `spec.launcher` followed by `spec.command`. With a launcher (limits), the launcher
 /// starts the action inside its limits scope. The command stays in the process group of its
@@ -50,12 +51,13 @@ mod tests {
             OsString::from("/scope"),
         ];
         let spec = ActionExecutionSpec {
+            read_only_trees: &[],
+            ephemeral_dirs: &[],
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &launcher,
             environment: &[],
             action_directory: Path::new("/work"),
             working_directory: Path::new("/work"),
-            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };

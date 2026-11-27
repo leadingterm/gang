@@ -92,6 +92,12 @@ const GROUP_LEAVE_ENV: &str = "GANG_TEST_GROUP_LEAVE";
 /// The address for the default-memory-floor helper to report its reservation.
 #[cfg(target_os = "linux")]
 const MEMORY_ENV: &str = "GANG_TEST_MEMORY";
+/// Child helper for the production-path Bubblewrap new-session memory enforcement regression.
+#[cfg(target_os = "linux")]
+const BWRAP_MEMORY_HELPER: ChildTest = ChildTest::new("bwrap_memory_helper");
+/// TCP listener address used by the Bubblewrap memory helper.
+#[cfg(target_os = "linux")]
+const BWRAP_MEMORY_ENV: &str = "GANG_TEST_BWRAP_MEMORY";
 /// Makes the memory output contain a symlink whose target cannot be encoded in REAPI.
 #[cfg(target_os = "linux")]
 const MEMORY_INVALID_OUTPUT_ENV: &str = "GANG_TEST_MEMORY_INVALID_OUTPUT";
@@ -3730,6 +3736,326 @@ async fn learned_history_flushes_after_controller_drain_and_exit() -> TestResult
         let mut records = Vec::new();
         plugin.learned_history(now, &mut records).await?;
         assert!(!records.is_empty(), "post-drain learned_history() empty");
+        Ok::<(), Box<dyn Error>>(())
+    })
+    .await?
+}
+
+/// Child helper for [`bwrap_new_session_memory_is_enforced_via_report_pid_without_cgroups`].
+#[cfg(target_os = "linux")]
+#[ignore = "child process helper of the embedded bwrap memory enforcement test"]
+#[test]
+fn bwrap_memory_helper() -> TestResult {
+    use std::io::Write as _;
+
+    let Some(address) = std::env::var_os(BWRAP_MEMORY_ENV) else {
+        return Ok(());
+    };
+    let pid = rustix::process::getpid();
+    let parent = rustix::process::getppid().ok_or("missing parent pid")?;
+    let session = rustix::process::getsid(None)?;
+    assert_eq!(
+        session, parent,
+        "bwrap action must run inside bwrap's new session"
+    );
+    assert_eq!(
+        rustix::process::getpgrp(),
+        session,
+        "bwrap action must share bwrap's session process group"
+    );
+    let reservation = std::env::var("GANG_MEMORY_KB")?;
+    let mut stream = std::net::TcpStream::connect(address.to_string_lossy().as_ref())?;
+    writeln!(
+        stream,
+        "{reservation} {} {}",
+        pid.as_raw_nonzero(),
+        session.as_raw_nonzero()
+    )?;
+    stream.flush()?;
+    let mut memory = vec![0x3C_u8; 96 * 1024 * 1024];
+    for page in memory.chunks_mut(4096) {
+        page[0] = 0x5A;
+    }
+    std::hint::black_box(&memory);
+    std::io::copy(&mut stream, &mut std::io::sink())?;
+    std::hint::black_box(&memory);
+    let input = std::fs::read(INPUT_NAME)?;
+    std::fs::write(OUTPUT_NAME, input)?;
+    Ok(())
+}
+
+/// Prepares pinned `gang-exec` + `sandbox.toml` (`selected = "bwrap"`, no `[limits]`) and rootfs.
+#[cfg(target_os = "linux")]
+fn prepare_bwrap_memory_fixture(
+    scratch: &Path,
+) -> Result<(WorkerPaths, PathBuf, String, FleetProperties), Box<dyn Error>> {
+    let runfiles = std::env::current_dir()?;
+    let gang_bin = runfiles.join(std::env::var_os("GANG_E2E_GANG").ok_or("missing GANG_E2E_GANG")?);
+    let fake_bwrap = runfiles.join(std::env::var_os("FAKE_BWRAP").ok_or("missing FAKE_BWRAP")?);
+    assert!(
+        gang_bin.is_file(),
+        "missing pinned gang binary at {}",
+        gang_bin.display()
+    );
+    assert!(
+        fake_bwrap.is_file(),
+        "missing pinned fake_bwrap binary at {}",
+        fake_bwrap.display()
+    );
+
+    let mut paths = WorkerPaths::new(scratch, "worker");
+    paths.prepare()?;
+    paths.work = std::fs::canonicalize(&paths.work)?;
+
+    let rootfs = scratch.join("rootfs");
+    std::fs::create_dir_all(rootfs.join("root"))?;
+    let rootfs_id = "a".repeat(64);
+    std::fs::write(rootfs.join("identity"), format!("{rootfs_id}\n"))?;
+    let rootfs = std::fs::canonicalize(&rootfs)?;
+
+    let bin_dir = scratch.join("bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    let entrypoint = bin_dir.join("gang-exec");
+    std::os::unix::fs::symlink(&gang_bin, &entrypoint)?;
+
+    let mut bwrap_table = toml::Table::new();
+    bwrap_table.insert(
+        "root".to_owned(),
+        toml::Value::String(rootfs.to_string_lossy().into_owned()),
+    );
+    bwrap_table.insert(
+        "program".to_owned(),
+        toml::Value::String(fake_bwrap.to_string_lossy().into_owned()),
+    );
+    let mut sandbox_table = toml::Table::new();
+    sandbox_table.insert("bwrap".to_owned(), toml::Value::Table(bwrap_table));
+    let mut doc = toml::Table::new();
+    doc.insert(
+        "work_directory".to_owned(),
+        toml::Value::String(paths.work.to_string_lossy().into_owned()),
+    );
+    doc.insert(
+        "selected".to_owned(),
+        toml::Value::String("bwrap".to_owned()),
+    );
+    doc.insert("sandbox".to_owned(), toml::Value::Table(sandbox_table));
+    let sandbox_toml = toml::to_string(&doc)?;
+    let _validated: gang_config::SandboxFile<gang_main::plugins::Plugins> = sandbox_toml.parse()?;
+    std::fs::write(
+        gang_config::SandboxFile::<gang_main::plugins::Plugins>::beside(&entrypoint),
+        sandbox_toml,
+    )?;
+
+    let fleet = FleetProperties::new(
+        &FleetName::try_new(DEFAULT_FLEET)?,
+        Isa::X86_64,
+        &SANDBOX,
+        &rootfs_id.parse()?,
+        Resources {
+            vcpus: WORKER_VCPUS,
+            memory: Bytes::new(WORKER_MEMORY),
+            disk: Bytes::new(FLEET_DISK),
+        },
+        &gang_types::FleetActionPolicy::default(),
+        [],
+    );
+    Ok((paths, entrypoint, rootfs_id, fleet))
+}
+
+/// Builds a REAPI action invoking `bwrap_memory_helper` via `fake_bwrap`'s `exec-session` mode.
+#[cfg(target_os = "linux")]
+fn build_bwrap_memory_action(rootfs_id: &str, address: &str) -> Result<TestAction, Box<dyn Error>> {
+    let input = HELLO.to_vec();
+    let input_digest = digest_of(&input)?;
+    let root = Directory {
+        files: vec![FileNode {
+            name: INPUT_NAME.into(),
+            digest: Some(input_digest.clone()),
+            is_executable: false,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let root_bytes = root.encode_to_vec();
+    let root_digest = digest_of(&root_bytes)?;
+    let platform = Platform {
+        properties: vec![
+            platform::Property {
+                name: "ISA".into(),
+                value: "x86-64".into(),
+            },
+            platform::Property {
+                name: "memory_kb".into(),
+                value: "65536".into(),
+            },
+            platform::Property {
+                name: gang_types::property::ACTION_ENVIRONMENT.into(),
+                value: rootfs_id.to_owned(),
+            },
+        ],
+    };
+    let mut arguments = vec![
+        "exec-session".to_owned(),
+        std::env::current_exe()?.to_string_lossy().into_owned(),
+    ];
+    arguments.extend(
+        BWRAP_MEMORY_HELPER
+            .arguments()
+            .into_iter()
+            .map(String::from),
+    );
+    #[allow(deprecated)]
+    let command = Command {
+        arguments,
+        environment_variables: vec![command::EnvironmentVariable {
+            name: BWRAP_MEMORY_ENV.into(),
+            value: address.to_owned(),
+        }],
+        output_files: vec![OUTPUT_NAME.into()],
+        platform: Some(platform.clone()),
+        ..Default::default()
+    };
+    let command_bytes = command.encode_to_vec();
+    let command_digest = digest_of(&command_bytes)?;
+    let action = Action {
+        command_digest: Some(command_digest.clone()),
+        input_root_digest: Some(root_digest.clone()),
+        platform: Some(platform),
+        ..Default::default()
+    };
+    let action_bytes = action.encode_to_vec();
+    let action_digest = digest_of(&action_bytes)?;
+    Ok(TestAction {
+        digest: action_digest.clone(),
+        blobs: vec![
+            (input_digest, input),
+            (root_digest, root_bytes),
+            (command_digest, command_bytes),
+            (action_digest, action_bytes),
+        ],
+    })
+}
+
+/// Reads `<reservation> <pid> <session>` from one helper connection while ensuring `execution` has
+/// not already completed.
+#[cfg(target_os = "linux")]
+async fn accept_bwrap_attempt<F>(
+    listener: &TcpListener,
+    execution: &mut std::pin::Pin<&mut F>,
+    stage: &str,
+) -> Result<(BufReader<TcpStream>, String, u32, u32), Box<dyn Error>>
+where
+    F: Future<Output = Result<ExecuteResponse, Box<dyn Error>>>,
+{
+    let (stream, _) = tokio::select! {
+        accepted = listener.accept() => accepted?,
+        response = execution.as_mut() => {
+            let response = response?;
+            return Err(format!("bwrap action completed before {stage} connected: {response:?}").into());
+        }
+    };
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    tokio::select! {
+        read = reader.read_line(&mut line) => { read?; }
+        response = execution.as_mut() => {
+            let response = response?;
+            return Err(format!("bwrap action completed before {stage} reported pid: {response:?}").into());
+        }
+    }
+    let mut parts = line.split_whitespace();
+    let reservation = parts.next().ok_or("missing reservation")?.to_owned();
+    let pid: u32 = parts.next().ok_or("missing pid")?.parse()?;
+    let session: u32 = parts.next().ok_or("missing session")?.parse()?;
+    Ok((reader, reservation, pid, session))
+}
+
+/// Production-path Bubblewrap regression without cgroups: real `gang-exec` + `Bwrap` (`--new-session`,
+/// `--info-fd`) publishes `report.pid`, `WorkerSampler` measures `/proc/<pid>/smaps_rollup` PSS
+/// across the new session boundary, enforces soft memory limits, and retries at the escalated tier.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bwrap_new_session_memory_is_enforced_via_report_pid_without_cgroups() -> TestResult {
+    tokio::time::timeout(Duration::from_mins(1), async {
+        let scratch = tempfile::tempdir()?;
+        let (paths, entrypoint, rootfs_id, fleet) = prepare_bwrap_memory_fixture(scratch.path())?;
+        let mut harness = Harness::start_configured(
+            vec![fleet.clone()],
+            TestGate::allow(),
+            Vec::new(),
+            gang_config::ActionsConfig {
+                memory: gang_config::MemoryTuning {
+                    enforcement: gang_config::MemoryEnforcement::Soft,
+                    sample_interval: NonZeroDuration::from_millis(50),
+                    soft_samples: NonZeroU32::MIN,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            gang_config::WorkerConfig::default(),
+        )
+        .await?;
+        let (stop, receiver) = oneshot::channel();
+        let worker_task = spawn_worker(
+            Arc::clone(&harness.plugin),
+            Arc::clone(&harness.actions),
+            InstanceId::try_new(WORKER_INSTANCE)?,
+            paths,
+            entrypoint,
+            fleet,
+            receiver,
+        );
+        harness.workers.push(RunningWorker {
+            stop,
+            task: worker_task,
+        });
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?.to_string();
+        let action = build_bwrap_memory_action(&rootfs_id, &address)?;
+
+        let channel = public_channel(harness.public_port).await?;
+        upload_blobs(&channel, action.blobs).await?;
+        let execution = run_action(&channel, &action.digest);
+        tokio::pin!(execution);
+
+        let (mut first, first_res, first_pid, first_session) =
+            accept_bwrap_attempt(&listener, &mut execution, "attempt 1").await?;
+        assert_eq!(first_res, "65536");
+        assert_ne!(first_session, first_pid);
+        let mut byte = [0];
+        let closed = tokio::select! {
+            read = first.read(&mut byte) => read,
+            response = &mut execution => {
+                let response = response?;
+                return Err(format!("bwrap action completed before attempt 1 was killed: {response:?}").into());
+            }
+        };
+        match closed {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            result => {
+                return Err(format!(
+                    "attempt 1 helper did not terminate on memory kill: {result:?}"
+                )
+                .into());
+            }
+        }
+
+        let (second, second_res, second_pid, second_session) =
+            accept_bwrap_attempt(&listener, &mut execution, "escalated retry").await?;
+        assert_eq!(second_res, "131072");
+        assert_ne!(second_session, second_pid);
+        assert_ne!(second_session, first_session);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(second);
+
+        let response = execution.await?;
+        let result = response
+            .result
+            .ok_or("the response carries no action result")?;
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(output_digest(&result)?, Some(&digest_of(HELLO)?));
         Ok::<(), Box<dyn Error>>(())
     })
     .await?

@@ -4,15 +4,16 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
 use gang_spi::{
-    ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, NetworkAccess, Plugin,
-    PluginContext, PortError, SandboxedAction,
+    ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, NetworkAccess, PortError,
+    SandboxedAction,
 };
+use gang_spi::{Plugin, PluginContext};
 use gang_types::ActionEnvironment;
 use rustix::process::Pid;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
-use crate::command_line::validate_read_only_trees;
+use crate::command_line::{validate_ephemeral_dirs, validate_read_only_trees};
 use crate::errors::BwrapError;
 use crate::relay::Relay;
 use crate::{BwrapConfig, EgressPrograms};
@@ -46,7 +47,7 @@ pub(crate) struct StartedBwrap {
     pub child: tokio::process::Child,
     pub launcher: Option<Pid>,
     pub sandbox: Option<Pid>,
-    info: Option<std::io::PipeReader>,
+    info: Option<io::PipeReader>,
 }
 
 impl StartedBwrap {
@@ -196,7 +197,7 @@ impl Bwrap {
         spec: &ActionExecutionSpec<'_>,
         network: Option<BorrowedFd<'_>>,
     ) -> Result<StartedBwrap, BwrapError> {
-        let (reader, writer) = std::io::pipe().map_err(BwrapError::InfoPipe)?;
+        let (reader, writer) = io::pipe().map_err(BwrapError::InfoPipe)?;
         if let Some(resolver) = network {
             rustix::io::fcntl_setfd(resolver, rustix::io::FdFlags::empty())
                 .map_err(|errno| BwrapError::NetworkSetup(io::Error::from(errno)))?;
@@ -255,6 +256,7 @@ impl ActionIsolationPort for Bwrap {
             return Err(BwrapError::ActionDirectory(action.to_path_buf()).into());
         }
         validate_read_only_trees(spec)?;
+        validate_ephemeral_dirs(spec)?;
         let setup = async {
             let resolver: Option<std::fs::File> = match spec.network {
                 NetworkAccess::Offline => None,
@@ -316,14 +318,16 @@ impl ActionIsolationPort for Bwrap {
             let status = child.wait().await.map_err(BwrapError::Wait)?;
             ActionExecutionOutcome::try_from(status)
         };
+        let accounting_pid = sandbox.and_then(|pid| u32::try_from(pid.as_raw_nonzero().get()).ok());
         match (launcher, sandbox) {
             (Some(launcher), Some(sandbox)) => {
                 let relay = Relay::new(launcher, sandbox);
                 Ok(SandboxedAction::relayed(wait, move |termination| {
                     relay.relay(termination).map_err(PortError::from)
-                }))
+                })
+                .with_accounting_pid(accounting_pid))
             }
-            _ => Ok(SandboxedAction::new(wait)),
+            _ => Ok(SandboxedAction::new(wait).with_accounting_pid(accounting_pid)),
         }
     }
 }
@@ -371,7 +375,7 @@ fn pid(raw: u32) -> Option<Pid> {
 /// [`BwrapError::InfoPipe`] when the pipe cannot be registered for reading, [`BwrapError::Info`]
 /// when a read fails or the report names an invalid pid, and [`BwrapError::InfoFormat`] when the
 /// report is not the JSON object `bwrap` writes or ends before it is complete.
-async fn sandbox_pid(reader: std::io::PipeReader) -> Result<Option<Pid>, BwrapError> {
+async fn sandbox_pid(reader: io::PipeReader) -> Result<Option<Pid>, BwrapError> {
     let mut receiver = tokio::net::unix::pipe::Receiver::from_owned_fd(OwnedFd::from(reader))
         .map_err(BwrapError::InfoPipe)?
         .take(INFO_LIMIT);
@@ -417,11 +421,11 @@ pub(super) mod tests {
     use std::time::Duration;
 
     use gang_spi::{
-        ActionCommand, ActionExecutionSpec, ActionIsolationPort, NetworkAccess, Plugin,
-        PluginContext, PortError,
+        ActionCommand, ActionExecutionSpec, ActionIsolationPort, NetworkAccess, PortError,
     };
     #[cfg(target_os = "linux")]
     use gang_spi::{ActionExecutionOutcome, Termination};
+    use gang_spi::{Plugin, PluginContext};
     use gang_types::AbsolutePathBuf;
     #[cfg(target_os = "linux")]
     use rustix::process::Signal;
@@ -453,13 +457,6 @@ pub(super) mod tests {
             egress: None,
             program: PathBuf::from("/usr/bin/bwrap"),
         }
-    }
-
-    #[test]
-    fn binds_read_only_is_true() {
-        let directory = tempfile::tempdir().expect("fixture");
-        let sandbox = Bwrap::build(config(directory.path()), &context()).expect("build");
-        assert!(sandbox.binds_read_only());
     }
 
     #[test]
@@ -520,11 +517,12 @@ pub(super) mod tests {
             "/gang-reset",
         ] {
             let spec = ActionExecutionSpec {
+                read_only_trees: &[],
+                ephemeral_dirs: &[],
                 command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
                 environment: &[],
                 action_directory: Path::new(path),
                 working_directory: Path::new(path),
-                read_only_trees: &[],
                 network: NetworkAccess::Offline,
                 memory_cgroup: None,
                 launcher: &[],
@@ -532,11 +530,12 @@ pub(super) mod tests {
             assert!(sandbox.start(&spec).await.is_err(), "{path}");
         }
         let spec = ActionExecutionSpec {
+            read_only_trees: &[],
+            ephemeral_dirs: &[],
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             environment: &[],
             action_directory: Path::new("/tmp/action"),
             working_directory: Path::new("/tmp/action"),
-            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
             launcher: &[],
@@ -607,8 +606,9 @@ pub(super) mod tests {
                 ..config(directory.path())
             };
 
+            let error = Bwrap::build(config, &context()).expect_err("program must be rejected");
             assert!(
-                matches!(Bwrap::build(config, &context()), Err(PortError::Config(_))),
+                matches!(&error, PortError::Config(_)),
                 "program {program:?} must be rejected"
             );
         }
@@ -624,7 +624,13 @@ pub(super) mod tests {
             ..config(directory.path())
         };
         let error = Bwrap::build(config, &context()).expect_err("relative helper rejected");
-        assert!(error.to_string().contains("egress"), "{error}");
+        let chain = std::iter::successors(Some(&error as &dyn std::error::Error), |error| {
+            error.source()
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+        assert!(chain.contains("egress"), "{chain}");
     }
 
     #[cfg(target_os = "linux")]
@@ -667,11 +673,12 @@ pub(super) mod tests {
         let policy: gang_types::PublicEgressPolicy =
             toml::from_str("protected_networks = ['10.0.0.0/8']\ndns_servers = ['1.1.1.1']")?;
         let spec = ActionExecutionSpec {
+            read_only_trees: &[],
+            ephemeral_dirs: &[],
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
-            read_only_trees: &[],
             network: NetworkAccess::PublicEgress {
                 policy: &policy,
                 controller_endpoints: &[],
@@ -702,12 +709,13 @@ pub(super) mod tests {
         )?;
         let argv = [OsString::from("mask"), record.clone().into_os_string()];
         let spec = ActionExecutionSpec {
+            read_only_trees: &[],
+            ephemeral_dirs: &[],
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
-            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -753,12 +761,13 @@ pub(super) mod tests {
         )?;
         let argv = [OsString::from("exit"), OsString::from("3")];
         let spec = ActionExecutionSpec {
+            read_only_trees: &[],
+            ephemeral_dirs: &[],
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
-            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -783,12 +792,13 @@ pub(super) mod tests {
         )?;
         let argv = [OsString::from("exit"), OsString::from("0")];
         let spec = ActionExecutionSpec {
+            read_only_trees: &[],
+            ephemeral_dirs: &[],
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
-            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -819,12 +829,13 @@ pub(super) mod tests {
         )?;
         let argv = [OsString::from("report"), OsString::from(payload)];
         let spec = ActionExecutionSpec {
+            read_only_trees: &[],
+            ephemeral_dirs: &[],
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
-            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -866,12 +877,13 @@ pub(super) mod tests {
         )?;
         let argv = [OsString::from("/bin/true")];
         let spec = ActionExecutionSpec {
+            read_only_trees: &[],
+            ephemeral_dirs: &[],
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
-            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -900,12 +912,13 @@ pub(super) mod tests {
         )?;
         let argv = [OsString::from("hold"), fifo.clone().into_os_string()];
         let spec = ActionExecutionSpec {
+            read_only_trees: &[],
+            ephemeral_dirs: &[],
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
-            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -950,12 +963,13 @@ pub(super) mod tests {
         )?;
         let argv = [OsString::from("sandbox"), fifo.clone().into_os_string()];
         let spec = ActionExecutionSpec {
+            read_only_trees: &[],
+            ephemeral_dirs: &[],
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
-            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };
@@ -990,12 +1004,13 @@ pub(super) mod tests {
         )?;
         let argv = [OsString::from("starting"), fifo.clone().into_os_string()];
         let spec = ActionExecutionSpec {
+            read_only_trees: &[],
+            ephemeral_dirs: &[],
             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
             launcher: &[],
             environment: &[],
             action_directory: directory.path(),
             working_directory: directory.path(),
-            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
         };

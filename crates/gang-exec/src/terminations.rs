@@ -3,7 +3,7 @@
 //! The worker sends `SIGTERM` or `SIGINT` to the process group of `gang exec` when an action
 //! times out or is cancelled. These are real handlers, not `SIG_IGN`: the action's dispositions
 //! reset at exec, so the action starts with the default ones, while `gang exec` survives
-//! the worker's `SIGTERM` and lives through the kill grace, relaying each request to the action.
+//! The worker's `SIGTERM` and lives through the kill grace, relaying each request to the action.
 
 use std::io;
 use std::pin::Pin;
@@ -120,31 +120,36 @@ mod tests {
                     let argv = [OsString::from("cmd")];
                     let action = Action {
                         spec: ActionExecutionSpec {
+                            read_only_trees: &[],
+                            ephemeral_dirs: &[],
                             command: ActionCommand::from_argv(&argv).ok_or("empty argv")?,
                             environment: &[],
                             action_directory: directory.path(),
                             working_directory: directory.path(),
-                            read_only_trees: &[],
                             network: NetworkAccess::Offline,
                             memory_cgroup: None,
                             launcher: &[],
                         },
                         limits: ActionLimits {
+                            cpu_weight: None,
                             cpu_count: None,
                             memory: None,
-                            cpu_weight: None,
                         },
                     };
                     let mut terminations = listen()?;
                     signal_hook::low_level::raise(signal)?;
-                    let outcome = execute::<_, RecordingLimits>(
+                    let outcome = execute::<_, RecordingLimits, _, _, _, _>(
                         &sandbox,
                         with_limits.then_some(&limits),
                         InputLinks::Break,
                         &action,
                         &mut terminations,
-                        |_| {},
-                        || Ok(()),
+                        execute::ExecutionHooks {
+                            publish_cgroup: |_| {},
+                            publish_pid: |_| {},
+                            leave_action_group: || Ok(()),
+                            cleanup_action_group: || Ok(()),
+                        },
                     )
                     .await?;
                     assert_eq!(

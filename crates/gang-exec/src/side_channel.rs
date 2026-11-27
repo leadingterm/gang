@@ -7,9 +7,10 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-use gang_spi::{ActionUsage, MAX_RO_BINDS, SIDE_CHANNEL_FILE_ENV};
+use gang_spi::{ActionUsage, MAX_EPHEMERAL_DIRS, MAX_RO_BINDS, SIDE_CHANNEL_FILE_ENV};
 use gang_types::CpuWeight;
-use rustix::fs::{Mode, OFlags, open, openat};
+use rustix::fs;
+use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::errors::SideChannelError;
@@ -18,6 +19,10 @@ use crate::errors::SideChannelError;
 const CPU_WEIGHT_FILE: &str = "cpu_weight";
 /// File inside `.side_channels/<attempt_id>/` carrying NUL-terminated `(source, target)` pairs.
 const READ_ONLY_TREES_FILE: &str = "read_only_trees";
+/// File containing NUL-terminated scratch paths relative to the action directory.
+const EPHEMERAL_DIRS_FILE: &str = "ephemeral_dirs";
+/// Maximum bytes accepted from the bounded scratch path list.
+const MAX_EPHEMERAL_DIRS_BYTES: u64 = 64 * 1024;
 /// Maximum bytes accepted from `cpu_weight`.
 const MAX_CPU_WEIGHT_BYTES: u64 = 64;
 /// Maximum bytes accepted from `read_only_trees` (bounded for `MAX_RO_BINDS` paths).
@@ -37,12 +42,14 @@ pub(crate) struct ReadOnlyTreeOwned {
 pub(crate) struct SideChannelInputs {
     /// Read-only input trees to bind inside the action directory.
     pub read_only_trees: Vec<ReadOnlyTreeOwned>,
+    /// Scratch directories resolved inside the canonical action directory.
+    pub ephemeral_dirs: Vec<PathBuf>,
     /// Optional `cgroup` v2 `cpu.weight` for the action's scope.
     pub cpu_weight: Option<CpuWeight>,
 }
 
-/// Reads and validates optional worker inputs (`read_only_trees`, `cpu_weight`) from the
-/// worker-owned side-channel directory when `GANG_SIDE_CHANNEL_FILE` is configured.
+/// Reads optional worker inputs from the protected directory when `GANG_SIDE_CHANNEL_FILE`
+/// is configured. Read-only trees and scratch paths resolve inside the action directory.
 pub(crate) fn read_inputs(
     environment: &[(OsString, OsString)],
     action: &Path,
@@ -53,10 +60,53 @@ pub(crate) fn read_inputs(
     let dir = open_channel_dir(action, path).map_err(|_| SideChannelError::InvalidPath)?;
     let cpu_weight = read_cpu_weight(&dir)?;
     let read_only_trees = read_and_validate_trees(&dir, action)?;
+    let ephemeral_dirs = read_ephemeral_dirs(&dir, action)?;
     Ok(SideChannelInputs {
         read_only_trees,
+        ephemeral_dirs,
         cpu_weight,
     })
+}
+
+fn read_ephemeral_dirs(dir: &OwnedFd, action: &Path) -> Result<Vec<PathBuf>, SideChannelError> {
+    let Some(bytes) = read_optional_file(dir, EPHEMERAL_DIRS_FILE, MAX_EPHEMERAL_DIRS_BYTES)?
+    else {
+        return Ok(Vec::new());
+    };
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(trimmed) = bytes.strip_suffix(b"\0") else {
+        return Err(SideChannelError::MalformedEphemeralDirs);
+    };
+    let count = trimmed.split(|&byte| byte == 0).count();
+    if count > MAX_EPHEMERAL_DIRS {
+        return Err(SideChannelError::TooManyEphemeralDirs {
+            count,
+            max: MAX_EPHEMERAL_DIRS,
+        });
+    }
+    let action_fd = fs::open(
+        action,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| SideChannelError::TraverseTarget {
+        target: action.to_path_buf(),
+        source: source.into(),
+    })?;
+    let mut resolved = Vec::with_capacity(count);
+    for field in trimmed.split(|&byte| byte == 0) {
+        let target = Path::new(OsStr::from_bytes(field));
+        if !valid_relative_target(target) {
+            return Err(SideChannelError::InvalidEphemeralDir {
+                path: target.to_path_buf(),
+            });
+        }
+        walk_target_directory(&action_fd, target)?;
+        resolved.push(action.join(target));
+    }
+    Ok(resolved)
 }
 
 fn read_cpu_weight(dir: &OwnedFd) -> Result<Option<CpuWeight>, SideChannelError> {
@@ -93,7 +143,7 @@ fn read_and_validate_trees(
     if pairs.is_empty() {
         return Ok(Vec::new());
     }
-    let action_fd = open(
+    let action_fd = fs::open(
         action,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
@@ -141,13 +191,13 @@ fn walk_target_directory(action_fd: &OwnedFd, target: &Path) -> Result<(), SideC
     let mut current: Option<OwnedFd> = None;
     for component in target.components() {
         let Component::Normal(segment) = component else {
-            return Err(SideChannelError::InvalidReadOnlyTree {
-                host_path: PathBuf::new(),
+            return Err(SideChannelError::TraverseTarget {
                 target: target.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::InvalidInput, "invalid directory component"),
             });
         };
         let parent = current.as_ref().map_or(action_fd.as_fd(), AsFd::as_fd);
-        let next = openat(
+        let next = fs::openat(
             parent,
             segment,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -200,7 +250,7 @@ fn read_optional_file(
     name: &'static str,
     max_bytes: u64,
 ) -> Result<Option<Vec<u8>>, SideChannelError> {
-    let fd = match openat(
+    let fd = match fs::openat(
         dir,
         name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -232,11 +282,33 @@ fn read_optional_file(
     Ok(Some(bytes))
 }
 
+/// Publishes the trusted sandbox PID once startup completes.
+pub(crate) fn publish_pid(environment: &[(OsString, OsString)], action: &Path, pid: Option<u32>) {
+    let (Some(pid), Some(path)) = (pid, channel_path(environment)) else {
+        return;
+    };
+    let result = (|| -> io::Result<()> {
+        let dir = open_channel_dir(action, path)?;
+        let file = fs::openat(
+            &dir,
+            "report.pid.tmp",
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )?;
+        File::from(file).write_all(pid.to_string().as_bytes())?;
+        fs::renameat(&dir, "report.pid.tmp", &dir, "report.pid")?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        tracing::warn!(%error, "cannot write action accounting pid side channel");
+    }
+}
+
 /// Publishes the scope before the sandbox starts, when a side channel is available.
 pub(crate) fn publish_cgroup(
     environment: &[(OsString, OsString)],
     action: &Path,
-    cgroup: Option<std::path::PathBuf>,
+    cgroup: Option<PathBuf>,
 ) {
     let Some(cgroup) = cgroup else { return };
     let Some(path) = channel_path(environment) else {
@@ -311,7 +383,7 @@ fn open_channel_dir(action: &Path, path: &Path) -> io::Result<OwnedFd> {
     if std::fs::canonicalize(parent)? != expected {
         return Err(invalid());
     }
-    open(
+    fs::open(
         &expected,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
@@ -321,7 +393,7 @@ fn open_channel_dir(action: &Path, path: &Path) -> io::Result<OwnedFd> {
 
 fn write_file(action: &Path, path: &Path, name: &str, contents: &[u8]) -> io::Result<()> {
     let dir = open_channel_dir(action, path)?;
-    let file = openat(
+    let file = fs::openat(
         &dir,
         name,
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -643,6 +715,146 @@ mod tests {
             read_inputs(&env, &action),
             Err(SideChannelError::Read {
                 file: CPU_WEIGHT_FILE,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn absent_worker_inputs_default_to_empty() {
+        assert_eq!(
+            read_inputs(&[], Path::new("/action")).expect("no channel"),
+            SideChannelInputs::default()
+        );
+    }
+
+    fn scratch_channel() -> io::Result<(tempfile::TempDir, PathBuf, PathBuf)> {
+        let root = tempfile::tempdir()?;
+        let canonical = root.path().canonicalize()?;
+        let action = canonical.join("a17");
+        let channel = canonical.join(".side_channels/a17");
+        std::fs::create_dir_all(&channel)?;
+        std::fs::create_dir_all(action.join("work/tmp"))?;
+        Ok((root, action, channel))
+    }
+
+    #[test]
+    fn reads_ephemeral_dirs_up_to_the_limit() -> Result<(), Box<dyn std::error::Error>> {
+        let (_root, action, channel) = scratch_channel()?;
+        let env = [(
+            SIDE_CHANNEL_FILE_ENV.into(),
+            channel.join("report").into_os_string(),
+        )];
+        assert!(read_inputs(&env, &action)?.ephemeral_dirs.is_empty());
+        let file = channel.join(EPHEMERAL_DIRS_FILE);
+        std::fs::write(&file, b"work/tmp\0")?;
+        assert_eq!(
+            read_inputs(&env, &action)?.ephemeral_dirs,
+            [action.join("work/tmp")]
+        );
+        let mut encoded = Vec::new();
+        for index in 0..MAX_EPHEMERAL_DIRS {
+            let dir = format!("tmp-{index}");
+            std::fs::create_dir(action.join(&dir))?;
+            encoded.extend_from_slice(dir.as_bytes());
+            encoded.push(0);
+        }
+        std::fs::write(&file, &encoded)?;
+        assert_eq!(
+            read_inputs(&env, &action)?.ephemeral_dirs.len(),
+            MAX_EPHEMERAL_DIRS
+        );
+        encoded.extend_from_slice(b"extra\0");
+        std::fs::write(&file, &encoded)?;
+        assert!(matches!(
+            read_inputs(&env, &action),
+            Err(SideChannelError::TooManyEphemeralDirs { count, max })
+                if count == MAX_EPHEMERAL_DIRS + 1 && max == MAX_EPHEMERAL_DIRS
+        ));
+        std::fs::write(&file, b"")?;
+        assert!(read_inputs(&env, &action)?.ephemeral_dirs.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_malformed_or_escaping_scratch_paths() -> Result<(), Box<dyn std::error::Error>> {
+        let (_root, action, channel) = scratch_channel()?;
+        let env = [(
+            SIDE_CHANNEL_FILE_ENV.into(),
+            channel.join("report").into_os_string(),
+        )];
+        let file = channel.join(EPHEMERAL_DIRS_FILE);
+        for invalid in [
+            b"\0".as_slice(),
+            b"/absolute\0",
+            b"../escape\0",
+            b"work/../tmp\0",
+            b"./work/tmp\0",
+            b".side_channels/x\0",
+            b".graveyard/x\0",
+            b"work/tmp\0\0",
+        ] {
+            std::fs::write(&file, invalid)?;
+            assert!(
+                matches!(
+                    read_inputs(&env, &action),
+                    Err(SideChannelError::InvalidEphemeralDir { .. })
+                ),
+                "accepted {invalid:?}"
+            );
+        }
+        std::fs::write(&file, b"work/tmp")?;
+        assert!(matches!(
+            read_inputs(&env, &action),
+            Err(SideChannelError::MalformedEphemeralDirs)
+        ));
+        let oversized = vec![b'x'; usize::try_from(MAX_EPHEMERAL_DIRS_BYTES)? + 1];
+        std::fs::write(&file, oversized)?;
+        assert!(matches!(
+            read_inputs(&env, &action),
+            Err(SideChannelError::Read {
+                file: EPHEMERAL_DIRS_FILE,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn scratch_targets_must_be_existing_directories_without_symlinks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (root, action, channel) = scratch_channel()?;
+        let env = [(
+            SIDE_CHANNEL_FILE_ENV.into(),
+            channel.join("report").into_os_string(),
+        )];
+        let file = channel.join(EPHEMERAL_DIRS_FILE);
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(outside.join("nested"))?;
+        std::os::unix::fs::symlink(&outside, action.join("link"))?;
+        std::fs::write(action.join("regular"), b"not a directory")?;
+        for path in [
+            b"link\0".as_slice(),
+            b"link/nested\0",
+            b"regular\0",
+            b"missing\0",
+        ] {
+            std::fs::write(&file, path)?;
+            assert!(
+                matches!(
+                    read_inputs(&env, &action),
+                    Err(SideChannelError::TraverseTarget { .. })
+                ),
+                "accepted {path:?}"
+            );
+        }
+        std::fs::remove_file(&file)?;
+        std::os::unix::fs::symlink(action.join("work/tmp"), &file)?;
+        assert!(matches!(
+            read_inputs(&env, &action),
+            Err(SideChannelError::Read {
+                file: EPHEMERAL_DIRS_FILE,
                 ..
             })
         ));

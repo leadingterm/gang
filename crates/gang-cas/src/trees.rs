@@ -11,23 +11,25 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use gang_reapi::build::bazel::remote::execution::v2::Directory;
 use gang_reapi::from_proto;
 use gang_spi::{ByteRange, ContentStore, PortError, Rejection};
-use gang_types::{Digest, Percent};
+use gang_types::Digest;
+use gang_types::Percent;
 use parking_lot::Mutex;
 use rustix::fs::{
     AtFlags, CWD, Mode, OFlags, Timespec, Timestamps, fchmod, futimens, openat, utimensat,
 };
 
-use crate::disk::{DiskCas, WriteOutcome};
-use crate::flight::SingleFlight;
+use crate::disk::{BlockingScope, DiskCas, WriteOutcome};
+use crate::flight::{FlightCancel, SingleFlight};
 use crate::layout::{DETERMINISTIC_MTIME_SECS, TMP_DIR_NAME, blob_path, create_empty_file};
 use crate::lru::{BlobMode, CacheKey};
 use crate::pins::CasPin;
@@ -284,6 +286,7 @@ struct TreeCacheInner {
     config: TreeCacheConfig,
     state: Arc<Mutex<TreeIndex>>,
     flight: SingleFlight<Digest, Result<bool, SharedPortError>>,
+    scope: BlockingScope,
     evict_hook: Option<EvictHook>,
 }
 
@@ -352,6 +355,7 @@ impl TreeCache {
                 config,
                 state: Arc::new(Mutex::new(TreeIndex::default())),
                 flight: SingleFlight::new(),
+                scope: BlockingScope::new(),
                 evict_hook,
             }),
         })
@@ -379,6 +383,29 @@ impl TreeCache {
     #[must_use]
     pub fn cas(&self) -> &DiskCas {
         &self.inner.cas
+    }
+
+    /// Signals cancellation of cache-owned fetches and filesystem work.
+    pub fn cancel(&self) {
+        self.inner.flight.cancel();
+        self.inner.scope.cancel();
+    }
+
+    /// Cancels tree builds and joins filesystem work before eviction sinks may be drained.
+    ///
+    /// Callers must stop submitting materializations before shutdown.
+    pub async fn shutdown(&self) {
+        self.cancel();
+        self.inner.flight.drain().await;
+        self.inner.scope.cancel_and_join().await;
+    }
+
+    /// Waits for detached tree builds, including publication and eviction cleanup dispatch.
+    ///
+    /// Stop admitting materializations before draining. A custom eviction sink must then drain
+    /// its own cleanup queue.
+    pub async fn drain(&self) {
+        self.inner.flight.drain().await;
     }
 
     /// Returns the maximum distinct bytes allowed for `tree_pins` under [`DiskCas`].
@@ -458,7 +485,8 @@ impl TreeCache {
             return Ok(None);
         }
 
-        self.drive_materialization(root, plan).await
+        self.drive_materialization(root, plan, |_, _| async { Ok(Some(Vec::new())) })
+            .await
     }
 
     /// Like [`Self::get_or_materialize`], but fetches any file blobs missing from [`DiskCas`]
@@ -490,60 +518,54 @@ impl TreeCache {
             return Ok(None);
         }
 
-        // Hold temporary attempt pins while staging missing blobs so concurrent writes cannot
-        // evict early files before tree materialization pins them.
-        let mut staging_pins = Vec::new();
-        let mut seen_keys = HashSet::new();
-        for file in &plan.files {
-            if file.digest.is_empty() {
-                continue;
-            }
-            let key = CacheKey::new(file.digest, BlobMode::from_executable(file.executable));
-            if !seen_keys.insert(key) {
-                continue;
-            }
-            if let Some(pin) = self.inner.cas.pin_attempt(file.digest, file.executable) {
-                staging_pins.push(pin);
-                continue;
-            }
-            match tiered.fetch_to_local(file.digest, file.executable).await? {
-                FetchOutcome::Empty => {}
-                FetchOutcome::Cached(pin) => staging_pins.push(pin),
-                FetchOutcome::Bypassed => return Ok(None),
-                FetchOutcome::Missing => {
-                    return Err(PortError::backend(format!(
-                        "missing blob {} for tree {}",
-                        file.digest, root
-                    )));
-                }
-            }
-        }
-
-        let result = self.drive_materialization(root, plan).await;
-        drop(staging_pins);
-        result
+        let tiered = tiered.clone();
+        let cas = self.inner.cas.clone();
+        self.drive_materialization(root, plan, move |plan, cancel| {
+            let tiered = tiered.clone();
+            let cas = cas.clone();
+            async move { fetch_tree_files(root, &plan, &cas, &tiered, &cancel).await }
+        })
+        .await
     }
 
-    async fn drive_materialization(
+    async fn drive_materialization<P, Fut>(
         &self,
         root: Digest,
         plan: TreePlan,
-    ) -> Result<Option<TreeLease>, PortError> {
+        prepare: P,
+    ) -> Result<Option<TreeLease>, PortError>
+    where
+        P: Fn(Arc<TreePlan>, FlightCancel) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<Vec<CasPin>>, PortError>> + Send + 'static,
+    {
         let shared_plan = Arc::new(plan);
+        let prepare = Arc::new(prepare);
         loop {
             if let Some(lease) = self.acquire_existing_lease(root) {
                 return Ok(Some(lease));
             }
 
             let inner = Arc::clone(&self.inner);
-            let plan_clone = Arc::clone(&shared_plan);
+            let plan = Arc::clone(&shared_plan);
+            let prepare = Arc::clone(&prepare);
             let admitted = self
                 .inner
                 .flight
-                .run_detached(root, move || async move {
-                    materialize_tree(&inner, root, &plan_clone)
-                        .await
-                        .map_err(SharedPortError::new)
+                .run_detached_cancellable(root, move |cancel| async move {
+                    let result = async {
+                        if cancel.is_cancelled() {
+                            return Err(PortError::unavailable("tree build cancelled"));
+                        }
+                        let Some(staging_pins) = prepare(Arc::clone(&plan), cancel.clone()).await?
+                        else {
+                            return Ok(false);
+                        };
+                        let result = materialize_tree(&inner, root, &plan).await;
+                        drop(staging_pins);
+                        result
+                    }
+                    .await;
+                    result.map_err(SharedPortError::new)
                 })
                 .await
                 .map_err(SharedPortError::into_port_error)?;
@@ -572,6 +594,54 @@ impl TreeCache {
             total_bytes: entry.total_bytes,
         })
     }
+}
+
+async fn fetch_tree_files<F, S>(
+    root: Digest,
+    plan: &TreePlan,
+    cas: &DiskCas,
+    tiered: &Tiered<F, S>,
+    cancel: &FlightCancel,
+) -> Result<Option<Vec<CasPin>>, PortError>
+where
+    F: std::borrow::Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
+    S: ContentStore,
+{
+    // Keep earlier blobs resident until the materializer has acquired tree pins.
+    let mut pins = Vec::new();
+    let mut seen_keys = HashSet::new();
+    for file in &plan.files {
+        if file.digest.is_empty() {
+            continue;
+        }
+        let key = CacheKey::new(file.digest, BlobMode::from_executable(file.executable));
+        if !seen_keys.insert(key) {
+            continue;
+        }
+        if let Some(pin) = cas.pin_attempt(file.digest, file.executable) {
+            pins.push(pin);
+            continue;
+        }
+        let outcome = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Err(PortError::unavailable("tree fetch cancelled"));
+            }
+            result = tiered.fetch_to_local(file.digest, file.executable) => result?,
+        };
+        match outcome {
+            FetchOutcome::Empty => {}
+            FetchOutcome::Cached(pin) => pins.push(pin),
+            FetchOutcome::Bypassed => return Ok(None),
+            FetchOutcome::Missing => {
+                return Err(PortError::backend(format!(
+                    "missing blob {} for tree {}",
+                    file.digest, root
+                )));
+            }
+        }
+    }
+    Ok(Some(pins))
 }
 
 #[derive(Debug, Clone)]
@@ -605,7 +675,7 @@ struct Expansion {
 fn expansion_limit() -> PortError {
     PortError::rejected(
         Rejection::MalformedRequest,
-        "REAPI directory tree exceeds expanded node or path-byte limits",
+        io::Error::other("REAPI directory tree exceeds expanded node or path-byte limits"),
     )
 }
 
@@ -623,13 +693,13 @@ fn measure_expansion(
     if visiting.len() >= MAX_TREE_DEPTH || !visiting.insert(digest) {
         return Err(PortError::rejected(
             Rejection::MalformedRequest,
-            "REAPI directory tree is cyclic or exceeds maximum depth",
+            io::Error::other("REAPI directory tree is cyclic or exceeds maximum depth"),
         ));
     }
     let dir = directories.get(&digest).ok_or_else(|| {
         PortError::rejected(
             Rejection::MalformedRequest,
-            format!("missing Directory {digest}"),
+            io::Error::other(format!("missing Directory {digest}")),
         )
     })?;
     let mut expansion = Expansion {
@@ -655,7 +725,7 @@ fn measure_expansion(
         let proto = child.digest.as_ref().ok_or_else(|| {
             PortError::rejected(
                 Rejection::MalformedRequest,
-                format!("directory `{}` has no digest", child.name),
+                io::Error::other(format!("directory `{}` has no digest", child.name)),
             )
         })?;
         let child_digest = from_proto(proto)
@@ -688,7 +758,7 @@ fn measure_expansion(
     if expansion.depth > MAX_TREE_DEPTH {
         return Err(PortError::rejected(
             Rejection::MalformedRequest,
-            "REAPI directory tree exceeds maximum depth",
+            io::Error::other("REAPI directory tree exceeds maximum depth"),
         ));
     }
     visiting.remove(&digest);
@@ -713,7 +783,7 @@ fn build_tree_plan(
     let root_dir = directories.get(&root).ok_or_else(|| {
         PortError::rejected(
             Rejection::MalformedRequest,
-            format!("missing root Directory {root}"),
+            io::Error::other(format!("missing root Directory {root}")),
         )
     })?;
     visiting.insert(root);
@@ -724,19 +794,22 @@ fn build_tree_plan(
             if stack.len() >= MAX_TREE_DEPTH {
                 return Err(PortError::rejected(
                     Rejection::MalformedRequest,
-                    "REAPI directory tree exceeds maximum depth",
+                    io::Error::other("REAPI directory tree exceeds maximum depth"),
                 ));
             }
             if !visiting.insert(next_subdir.digest) {
                 return Err(PortError::rejected(
                     Rejection::MalformedRequest,
-                    format!("cycle detected at Directory {}", next_subdir.digest),
+                    io::Error::other(format!(
+                        "cycle detected at Directory {}",
+                        next_subdir.digest
+                    )),
                 ));
             }
             let dir_msg = directories.get(&next_subdir.digest).ok_or_else(|| {
                 PortError::rejected(
                     Rejection::MalformedRequest,
-                    format!("missing child Directory {}", next_subdir.digest),
+                    io::Error::other(format!("missing child Directory {}", next_subdir.digest)),
                 )
             })?;
             plan.dirs.push(next_subdir.rel_path.clone());
@@ -767,7 +840,7 @@ fn collect_directory_entries(frame: &WalkFrame<'_>, plan: &mut TreePlan) -> Resu
         if !seen_names.insert(dir_node.name.as_str()) {
             return Err(PortError::rejected(
                 Rejection::MalformedRequest,
-                format!("duplicate directory entry `{}`", dir_node.name),
+                io::Error::other(format!("duplicate directory entry `{}`", dir_node.name)),
             ));
         }
     }
@@ -777,13 +850,13 @@ fn collect_directory_entries(frame: &WalkFrame<'_>, plan: &mut TreePlan) -> Resu
         if !seen_names.insert(file_node.name.as_str()) {
             return Err(PortError::rejected(
                 Rejection::MalformedRequest,
-                format!("duplicate file entry `{}`", file_node.name),
+                io::Error::other(format!("duplicate file entry `{}`", file_node.name)),
             ));
         }
         let file_proto = file_node.digest.as_ref().ok_or_else(|| {
             PortError::rejected(
                 Rejection::MalformedRequest,
-                format!("file `{}` has no digest", file_node.name),
+                io::Error::other(format!("file `{}` has no digest", file_node.name)),
             )
         })?;
         let file_digest = from_proto(file_proto)
@@ -801,13 +874,13 @@ fn collect_directory_entries(frame: &WalkFrame<'_>, plan: &mut TreePlan) -> Resu
         if !seen_names.insert(sym_node.name.as_str()) {
             return Err(PortError::rejected(
                 Rejection::MalformedRequest,
-                format!("duplicate symlink entry `{}`", sym_node.name),
+                io::Error::other(format!("duplicate symlink entry `{}`", sym_node.name)),
             ));
         }
         if sym_node.target.is_empty() || sym_node.target.contains('\0') {
             return Err(PortError::rejected(
                 Rejection::MalformedRequest,
-                format!("invalid symlink target for `{}`", sym_node.name),
+                io::Error::other(format!("invalid symlink target for `{}`", sym_node.name)),
             ));
         }
         plan.symlinks.push(PlannedSymlink {
@@ -838,7 +911,7 @@ impl<'a> WalkFrame<'a> {
             let child_proto = child.digest.as_ref().ok_or_else(|| {
                 PortError::rejected(
                     Rejection::MalformedRequest,
-                    format!("directory `{}` has no digest", child.name),
+                    io::Error::other(format!("directory `{}` has no digest", child.name)),
                 )
             })?;
             let child_digest = from_proto(child_proto)
@@ -861,7 +934,7 @@ fn validate_node_name(name: &str) -> Result<(), PortError> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(PortError::rejected(
             Rejection::MalformedRequest,
-            format!("invalid REAPI node name `{name}`"),
+            io::Error::other(format!("invalid REAPI node name `{name}`")),
         ));
     }
     Ok(())
@@ -870,7 +943,7 @@ fn validate_node_name(name: &str) -> Result<(), PortError> {
 async fn materialize_tree(
     inner: &TreeCacheInner,
     root: Digest,
-    plan: &TreePlan,
+    plan: &Arc<TreePlan>,
 ) -> Result<bool, PortError> {
     {
         let index = inner.state.lock();
@@ -882,6 +955,9 @@ async fn materialize_tree(
         }
     }
 
+    if inner.scope.is_cancelled() {
+        return Err(PortError::unavailable("tree build cancelled"));
+    }
     let max_tree_pinned = inner.config.max_tree_pinned_bytes(inner.cas.budget_bytes());
     let Some(pins) = acquire_tree_pins(inner, plan, max_tree_pinned).await? else {
         return Ok(false);
@@ -889,7 +965,7 @@ async fn materialize_tree(
 
     // Ensure max_trees room before building the directory on disk (and again before inserting).
     while needs_tree_slot(inner) {
-        if !evict_one_unleased(inner, false).await? {
+        if !evict_one_unleased(inner).await? {
             drop(pins);
             return Ok(false);
         }
@@ -898,21 +974,26 @@ async fn materialize_tree(
     let final_path = tree_dir_path(&inner.root, root);
     let root_dir = inner.root.clone();
     let cas = inner.cas.clone();
-    let plan_owned = plan.clone();
+    let plan_owned = Arc::clone(plan);
     let final_path_clone = final_path.clone();
 
-    tokio::task::spawn_blocking(move || {
-        build_and_publish_tree(&root_dir, &final_path_clone, &cas, &plan_owned)
-    })
-    .await
-    .map_err(PortError::backend)??;
+    inner
+        .scope
+        .run(move |cancelled| {
+            build_and_publish_tree(&root_dir, &final_path_clone, &cas, &plan_owned, cancelled)
+        })
+        .await
+        .map_err(PortError::backend)??;
 
     // Re-check `max_trees` right before registering under the index lock.
     while needs_tree_slot(inner) {
-        if !evict_one_unleased(inner, false).await? {
-            let _ =
-                tokio::task::spawn_blocking(move || gang_os::fs::remove_dir_optional(&final_path))
-                    .await;
+        if !evict_one_unleased(inner).await? {
+            inner
+                .scope
+                .run(move |_| gang_os::fs::remove_dir_optional(&final_path))
+                .await
+                .map_err(PortError::backend)?
+                .map_err(PortError::backend)?;
             drop(pins);
             return Ok(false);
         }
@@ -938,6 +1019,13 @@ async fn materialize_tree(
         },
     );
     Ok(true)
+}
+
+fn check_tree_cancellation(cancelled: &AtomicBool) -> Result<(), PortError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(PortError::unavailable("tree build cancelled"));
+    }
+    Ok(())
 }
 
 fn needs_tree_slot(inner: &TreeCacheInner) -> bool {
@@ -986,7 +1074,12 @@ async fn acquire_tree_pins(
                     if let Some(stream) = inner.cas.read(file.digest, ByteRange::FULL).await? {
                         match inner
                             .cas
-                            .write_with_mode(file.digest, stream, file.executable)
+                            .write_with_mode_scoped(
+                                file.digest,
+                                stream,
+                                file.executable,
+                                &inner.scope,
+                            )
                             .await?
                         {
                             WriteOutcome::Cached => continue,
@@ -1001,7 +1094,7 @@ async fn acquire_tree_pins(
             }
 
             // Cap reached: evict an unleased LRU tree and wait for its pins to release.
-            if !evict_one_unleased(inner, true).await? {
+            if !evict_one_unleased(inner).await? {
                 return Ok(None);
             }
         }
@@ -1010,30 +1103,29 @@ async fn acquire_tree_pins(
     Ok(Some(pins))
 }
 
-async fn evict_one_unleased(
-    inner: &TreeCacheInner,
-    await_pin_release: bool,
-) -> Result<bool, PortError> {
+async fn evict_one_unleased(inner: &TreeCacheInner) -> Result<bool, PortError> {
     let state = Arc::clone(&inner.state);
     let dest_parent = inner
         .graveyard
         .clone()
         .unwrap_or_else(|| inner.root.join(DOT_TMP_DIR_NAME));
-    let detached = tokio::task::spawn_blocking(move || {
-        let mut index = state.lock();
-        let Some(victim) = index.oldest_unleased_digest() else {
-            return Ok(None);
-        };
-        let Some(entry) = index.entries.get(&victim) else {
-            return Ok(None);
-        };
-        // Keep the entry locked until its canonical path is detached. A new publication/lease
-        // can then use that key while cleanup owns only this unique graveyard path.
-        let path = move_to_graveyard(&entry.path, &dest_parent)?;
-        Ok::<_, PortError>(index.entries.remove(&victim).map(|entry| (entry, path)))
-    })
-    .await
-    .map_err(PortError::backend)??;
+    let detached = inner
+        .scope
+        .run(move |_| {
+            let mut index = state.lock();
+            let Some(victim) = index.oldest_unleased_digest() else {
+                return Ok(None);
+            };
+            let Some(entry) = index.entries.get(&victim) else {
+                return Ok(None);
+            };
+            // Keep the entry locked until its canonical path is detached. A new publication/lease
+            // can then use that key while cleanup owns only this unique graveyard path.
+            let path = move_to_graveyard(&entry.path, &dest_parent)?;
+            Ok::<_, PortError>(index.entries.remove(&victim).map(|entry| (entry, path)))
+        })
+        .await
+        .map_err(PortError::backend)??;
     let Some((entry, graveyard_path)) = detached else {
         return Ok(false);
     };
@@ -1046,19 +1138,20 @@ async fn evict_one_unleased(
     };
 
     if let Some(hook) = &inner.evict_hook {
-        hook(evicted);
+        let hook = Arc::clone(hook);
+        inner
+            .scope
+            .run(move |_| hook(evicted))
+            .await
+            .map_err(PortError::backend)?;
         return Ok(true);
     }
 
-    if await_pin_release {
-        tokio::task::spawn_blocking(move || evicted.unlink_and_release())
-            .await
-            .map_err(PortError::backend)??;
-    } else {
-        tokio::task::spawn_blocking(move || {
-            let _ = evicted.unlink_and_release();
-        });
-    }
+    inner
+        .scope
+        .run(move |_| evicted.unlink_and_release())
+        .await
+        .map_err(PortError::backend)??;
 
     Ok(true)
 }
@@ -1068,7 +1161,9 @@ fn build_and_publish_tree(
     final_path: &Path,
     cas: &DiskCas,
     plan: &TreePlan,
+    cancelled: &AtomicBool,
 ) -> Result<(), PortError> {
+    check_tree_cancellation(cancelled)?;
     let tmp_root = trees_root.join(DOT_TMP_DIR_NAME);
     fs::create_dir_all(&tmp_root).map_err(PortError::backend)?;
     let tmp_dir = tmp_root.join(unique_uuid_v4());
@@ -1079,10 +1174,12 @@ fn build_and_publish_tree(
     };
 
     for rel_dir in &plan.dirs {
+        check_tree_cancellation(cancelled)?;
         fs::create_dir_all(tmp_dir.join(rel_dir)).map_err(PortError::backend)?;
     }
 
     for file in &plan.files {
+        check_tree_cancellation(cancelled)?;
         let dest = tmp_dir.join(&file.rel_path);
         let mode = BlobMode::from_executable(file.executable);
         if file.digest.is_empty() {
@@ -1106,6 +1203,7 @@ fn build_and_publish_tree(
 
     let times = deterministic_timestamps();
     for sym in &plan.symlinks {
+        check_tree_cancellation(cancelled)?;
         let dest = tmp_dir.join(&sym.rel_path);
         symlink(&sym.target, &dest).map_err(PortError::backend)?;
         if let Err(errno) = utimensat(CWD, &dest, &times, AtFlags::SYMLINK_NOFOLLOW)
@@ -1125,6 +1223,7 @@ fn build_and_publish_tree(
         normalize_dir(&tmp_dir.join(rel_dir), &times).map_err(PortError::backend)?;
     }
 
+    check_tree_cancellation(cancelled)?;
     match fs::rename(&tmp_dir, final_path) {
         Ok(()) => {
             guard.persist();
@@ -1316,9 +1415,8 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use bytes::Bytes;
     use gang_reapi::build::bazel::remote::execution::v2::{
@@ -1327,7 +1425,8 @@ mod tests {
     use gang_reapi::to_proto;
     use gang_spi::BlobStream;
     use gang_testkit::TestResult;
-    use gang_types::{Digest, Percent};
+    use gang_types::Digest;
+    use gang_types::Percent;
     use parking_lot::Mutex;
     use prost::Message as _;
 
@@ -1335,8 +1434,6 @@ mod tests {
     use crate::disk::DiskCas;
     use crate::layout::{DETERMINISTIC_MTIME_SECS, blob_path};
     use crate::lru::{BlobMode, CacheKey};
-
-    static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
 
     fn diamond_directories(levels: usize, name_len: usize) -> (Digest, HashMap<Digest, Directory>) {
         let leaf = Directory::default();
@@ -1406,27 +1503,24 @@ mod tests {
     }
 
     struct TempDir {
-        path: PathBuf,
+        directory: tempfile::TempDir,
     }
 
     impl TempDir {
         fn new() -> Result<Self, std::io::Error> {
-            let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("gang-cas-trees-test-{}-{seq}", std::process::id()));
-            fs::create_dir_all(&path)?;
-            Ok(Self { path })
+            Ok(Self {
+                directory: tempfile::tempdir()?,
+            })
         }
 
         fn path(&self) -> &Path {
-            &self.path
+            self.directory.path()
         }
     }
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            // Ensure read-only `0555` test trees are removed cleanly on drop.
-            let _ = gang_os::fs::remove_dir_optional(&self.path);
+            let _ = gang_os::fs::remove_dir_optional(self.path());
         }
     }
 
@@ -1546,7 +1640,14 @@ mod tests {
             total_bytes: 0,
         };
         assert!(
-            super::build_and_publish_tree(&trees, &destination, &cas, &plan).is_err(),
+            super::build_and_publish_tree(
+                &trees,
+                &destination,
+                &cas,
+                &plan,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .is_err(),
             "an unexpected rename failure must not acknowledge publication"
         );
         assert_eq!(fs::read(destination)?, b"not a directory");
@@ -1578,7 +1679,7 @@ mod tests {
                 .ok_or("tree")?,
         );
         fs::write(&graveyard, b"obstructed tombstone parent")?;
-        assert!(super::evict_one_unleased(&cache.inner, true).await.is_err());
+        assert!(super::evict_one_unleased(&cache.inner).await.is_err());
         let lease = cache
             .get_or_materialize(root, &directories)
             .await?

@@ -5,10 +5,18 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use gang_spi::WorkerCacheStats;
-use gang_types::{
-    ActionEnvironment, ActionResources, AttemptId, AttemptIdError, Bytes, FleetCatalog,
-    FleetCountError, FleetName, InstanceId, MAX_FLEETS, NameError, WorkerId,
-};
+use gang_types::ActionEnvironment;
+use gang_types::ActionResources;
+use gang_types::AttemptId;
+use gang_types::AttemptIdError;
+use gang_types::Bytes;
+use gang_types::FleetCatalog;
+use gang_types::FleetCountError;
+use gang_types::FleetName;
+use gang_types::InstanceId;
+use gang_types::MAX_FLEETS;
+use gang_types::NameError;
+use gang_types::WorkerId;
 use thiserror::Error;
 
 use crate::ledger::{LedgerError, WorkerLedger};
@@ -293,8 +301,12 @@ pub struct InstanceState {
     pub draining: bool,
     /// Persistent cordon state (e.g. stale-build replacement) for this physical instance.
     pub cordoned: bool,
+    /// Latest authoritative ledger CPU capacity fact (in millicores) reported by this instance.
+    pub cpu_capacity_millicores: Option<u64>,
     /// Latest authoritative physical/post-reserve memory capacity fact reported by this instance.
     pub memory_capacity: Option<Bytes>,
+    /// Latest authoritative physical action disk capacity fact reported by this instance.
+    pub disk_capacity: Option<Bytes>,
     capacity_fact_seq: u64,
     next_generation_seq: u64,
 }
@@ -305,7 +317,9 @@ impl Default for InstanceState {
             generations: Vec::new(),
             draining: false,
             cordoned: false,
+            cpu_capacity_millicores: None,
             memory_capacity: None,
+            disk_capacity: None,
             capacity_fact_seq: 0,
             next_generation_seq: 1,
         }
@@ -441,7 +455,9 @@ impl WorkerRegistry {
         let instance_entry = self.instances.entry(instance_key).or_default();
         let instance_generation_seq = instance_entry.next_generation_seq;
         instance_entry.next_generation_seq = instance_entry.next_generation_seq.saturating_add(1);
+        instance_entry.cpu_capacity_millicores = Some(registration.capacity.cpu_millicores);
         instance_entry.memory_capacity = Some(registration.capacity.memory);
+        instance_entry.disk_capacity = Some(registration.capacity.disk);
         instance_entry.capacity_fact_seq = instance_generation_seq;
 
         let mut drain = DrainSources::default();
@@ -760,7 +776,10 @@ mod tests {
     use std::time::Duration;
 
     use gang_clock::{Tick, Timestamp};
-    use gang_types::{FleetActionPolicy, FleetProperties, Isa, Resources};
+    use gang_types::FleetActionPolicy;
+    use gang_types::FleetProperties;
+    use gang_types::Isa;
+    use gang_types::Resources;
 
     use super::*;
 

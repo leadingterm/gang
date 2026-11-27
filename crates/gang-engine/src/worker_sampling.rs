@@ -6,6 +6,8 @@
 //! drives [`MemoryPressureMonitor`], [`DiskPressureMonitor`], [`SoftCeilingMonitor`],
 //! [`QuiescenceGate`], and [`pick_pressure_victim`] to terminate victims cleanly.
 
+#[cfg(any(target_os = "linux", test))]
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::future::Future;
 use std::os::unix::ffi::OsStrExt;
@@ -16,13 +18,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use gang_clock::{Clock, Tick};
-use gang_config::{DiskEnforcement, DiskTuning, MemoryEnforcement, MemoryTuning};
+use gang_config::DiskEnforcement;
+use gang_config::DiskTuning;
+use gang_config::MemoryEnforcement;
+use gang_config::MemoryTuning;
 use gang_reapi::leadingterm::gang::worker::v1 as proto;
-use gang_scheduler::{
-    DiskPressureMonitor, DiskSample, MemoryPressureMonitor, PressureCandidate, QuiescenceGate,
-    SoftCeilingMonitor, SoftVerdict, parse_cgroup_limit, parse_psi_total_us, pick_pressure_victim,
-    pool_available_bytes, reclaimable_bytes, soft_ceiling,
-};
+use gang_scheduler::DiskPressureMonitor;
+use gang_scheduler::DiskSample;
+use gang_scheduler::MemoryPressureMonitor;
+use gang_scheduler::PressureCandidate;
+use gang_scheduler::QuiescenceGate;
+use gang_scheduler::SoftCeilingMonitor;
+use gang_scheduler::SoftVerdict;
+use gang_scheduler::parse_cgroup_limit;
+use gang_scheduler::parse_psi_total_us;
+use gang_scheduler::pick_pressure_victim;
+use gang_scheduler::pool_available_bytes;
+use gang_scheduler::reclaimable_bytes;
+use gang_scheduler::soft_ceiling;
 use gang_types::AttemptId;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -300,6 +313,16 @@ pub trait SampleProbe: Send + Sync {
     /// Measures allocated bytes currently held in `<work>/<attempt_id>`.
     fn read_attempt_disk(&self, attempt_dir: &Path) -> Option<u64>;
 
+    /// Reads resident memory bytes across the attempt's process group when no `cgroup` is reported.
+    fn read_attempt_process_group_memory(&self, _pgid: u32) -> Option<u64> {
+        None
+    }
+
+    /// Measures an action tree rooted at the trusted sandbox PID, when available.
+    fn read_attempt_tree_memory(&self, wrapper: u32, _sandbox: Option<u32>) -> Option<u64> {
+        self.read_attempt_process_group_memory(wrapper)
+    }
+
     /// Reads worker-wide memory `PSI` and pool availability from the action memory pool `cgroup`.
     fn read_memory_pool(&self, pool_cgroup: &Path) -> MemoryPoolSample;
 
@@ -341,6 +364,14 @@ impl SampleProbe for SystemProbe {
         gang_os::fs::usage(attempt_dir)
             .ok()
             .map(gang_types::Bytes::get)
+    }
+
+    fn read_attempt_process_group_memory(&self, pgid: u32) -> Option<u64> {
+        read_process_tree_bytes(pgid, None)
+    }
+
+    fn read_attempt_tree_memory(&self, wrapper: u32, sandbox: Option<u32>) -> Option<u64> {
+        read_process_tree_bytes(wrapper, sandbox)
     }
 
     fn read_memory_pool(&self, pool_cgroup: &Path) -> MemoryPoolSample {
@@ -440,6 +471,107 @@ pub fn read_cgroup_sample(cgroup: &Path) -> AttemptCgroupSample {
     }
 }
 
+/// Parses the parent, group and session IDs from a Linux process stat line.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_stat(stat: &str) -> Option<(u32, u32, u32)> {
+    let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
+    fields.next()?;
+    Some((
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+    ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_memory_kib(text: &str, field: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let rest = line.strip_prefix(field)?;
+        let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        Some(kib.saturating_mul(1024))
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn collect_process_tree_pids(
+    processes: impl IntoIterator<Item = (u32, u32, u32, u32)>,
+    root: u32,
+    include_session: bool,
+) -> HashSet<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut selected = HashSet::new();
+    for (pid, parent, group, session) in processes {
+        children.entry(parent).or_default().push(pid);
+        if pid == root || group == root || (include_session && session == root) {
+            selected.insert(pid);
+        }
+    }
+    let mut queue: VecDeque<u32> = selected.iter().copied().collect();
+    while let Some(pid) = queue.pop_front() {
+        if let Some(descendants) = children.get(&pid) {
+            for child in descendants {
+                if selected.insert(*child) {
+                    queue.push_back(*child);
+                }
+            }
+        }
+    }
+    selected
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_tree_bytes(wrapper: u32, sandbox: Option<u32>) -> Option<u64> {
+    read_process_tree_pss_from(Path::new("/proc"), wrapper, sandbox)
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_tree_pss_from(proc_root: &Path, wrapper: u32, sandbox: Option<u32>) -> Option<u64> {
+    let mut processes = Vec::new();
+    for entry in std::fs::read_dir(proc_root).ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((parent, group, session)) = parse_proc_stat(&stat) else {
+            continue;
+        };
+        processes.push((pid, parent, group, session));
+    }
+    let mut selected = collect_process_tree_pids(
+        processes.iter().copied(),
+        sandbox.unwrap_or(wrapper),
+        sandbox.is_some(),
+    );
+    if selected.is_empty() && sandbox.is_some() {
+        selected = collect_process_tree_pids(processes, wrapper, false);
+    }
+    let mut total = 0_u64;
+    let mut matched = false;
+    for pid in selected {
+        let path = proc_root.join(pid.to_string()).join("smaps_rollup");
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        let bytes = parse_memory_kib(&text, "Pss:")?;
+        total = total.saturating_add(bytes);
+        matched = true;
+    }
+    matched.then_some(total)
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn read_process_tree_bytes(_wrapper: u32, _sandbox: Option<u32>) -> Option<u64> {
+    None
+}
+
 /// Reads worker-wide action memory pool `PSI` and available bytes from `pool_cgroup`.
 #[must_use]
 pub fn read_memory_pool_sample(pool_cgroup: &Path) -> MemoryPoolSample {
@@ -511,6 +643,8 @@ struct TrackedAttempt {
     attempt_dir: PathBuf,
     side_channel_dir: PathBuf,
     cgroup: Option<PathBuf>,
+    pgid: Option<u32>,
+    accounting_pid: Option<u32>,
     reserved_memory_bytes: u64,
     reserved_disk_bytes: u64,
     last_memory_bytes: u64,
@@ -587,6 +721,8 @@ impl SamplingRegistry {
             attempt_dir: registration.attempt_dir,
             side_channel_dir: registration.side_channel_dir,
             cgroup: None,
+            pgid: None,
+            accounting_pid: None,
             reserved_memory_bytes: registration.reserved_memory_bytes,
             reserved_disk_bytes: registration.reserved_disk_bytes,
             last_memory_bytes: 0,
@@ -601,6 +737,19 @@ impl SamplingRegistry {
         TrackedAttemptGuard {
             registry: self.clone(),
             attempt: Some(attempt),
+        }
+    }
+
+    /// Records the process group ID for `attempt` so soft memory sampling can fall back to
+    /// process-group RSS when no `cgroup` is attached.
+    pub fn set_pgid(&self, attempt: &AttemptId, pgid: u32) {
+        let mut state = self.state.lock();
+        if let Some(entry) = state
+            .attempts
+            .iter_mut()
+            .find(|entry| &entry.attempt == attempt)
+        {
+            entry.pgid = Some(pgid);
         }
     }
 
@@ -705,6 +854,8 @@ struct SampleTarget {
     attempt_dir: PathBuf,
     side_channel_dir: PathBuf,
     cgroup: Option<PathBuf>,
+    pgid: Option<u32>,
+    accounting_pid: Option<u32>,
 }
 
 /// Periodic worker resource sampler and pressure-kill driver (`§5.8`, `§6.4`).
@@ -771,12 +922,44 @@ impl<P: SampleProbe> WorkerSampler<P> {
                 self.probe
                     .read_attempt_cgroup_path(&target.side_channel_dir)
             });
-            let Some(cgroup) = cgroup else {
-                continue;
-            };
-            let sample = self.probe.read_attempt_cgroup(&cgroup);
-            if let Some(victim) = self.apply_memory_sample(&target.attempt, cgroup, sample) {
-                killed.push(victim);
+            if let Some(cgroup) = cgroup {
+                let sample = self.probe.read_attempt_cgroup(&cgroup);
+                if let Some(victim) =
+                    self.apply_memory_sample(&target.attempt, Some(cgroup), sample)
+                {
+                    killed.push(victim);
+                }
+            } else if let Some(pgid) = target.pgid {
+                let accounting_pid = target.accounting_pid.or_else(|| {
+                    let bytes =
+                        gang_os::fs::read_optional(&target.side_channel_dir.join("report.pid"))
+                            .ok()??;
+                    std::str::from_utf8(&bytes)
+                        .ok()?
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|pid| *pid > 0)
+                });
+                if let Some(pid) = accounting_pid {
+                    let mut state = self.registry.state.lock();
+                    if let Some(entry) = state
+                        .attempts
+                        .iter_mut()
+                        .find(|entry| entry.attempt == target.attempt)
+                    {
+                        entry.accounting_pid = Some(pid);
+                    }
+                }
+                let Some(bytes) = self.probe.read_attempt_tree_memory(pgid, accounting_pid) else {
+                    continue;
+                };
+                let sample = AttemptCgroupSample {
+                    current_memory_bytes: Some(bytes),
+                    ..AttemptCgroupSample::default()
+                };
+                if let Some(victim) = self.apply_memory_sample(&target.attempt, None, sample) {
+                    killed.push(victim);
+                }
             }
         }
         killed
@@ -904,6 +1087,8 @@ impl<P: SampleProbe> WorkerSampler<P> {
                 attempt_dir: entry.attempt_dir.clone(),
                 side_channel_dir: entry.side_channel_dir.clone(),
                 cgroup: entry.cgroup.clone(),
+                pgid: entry.pgid,
+                accounting_pid: entry.accounting_pid,
             })
             .collect()
     }
@@ -911,7 +1096,7 @@ impl<P: SampleProbe> WorkerSampler<P> {
     fn apply_memory_sample(
         &self,
         attempt: &AttemptId,
-        cgroup: PathBuf,
+        cgroup: Option<PathBuf>,
         sample: AttemptCgroupSample,
     ) -> Option<AttemptId> {
         let trigger = {
@@ -920,7 +1105,9 @@ impl<P: SampleProbe> WorkerSampler<P> {
                 .attempts
                 .iter_mut()
                 .find(|entry| &entry.attempt == attempt)?;
-            entry.cgroup = Some(cgroup);
+            if let Some(cgroup) = cgroup {
+                entry.cgroup = Some(cgroup);
+            }
             if !sample.observed() {
                 return None;
             }
@@ -1059,13 +1246,51 @@ mod tests {
     use std::time::Duration;
 
     use gang_clock::{TestClock, Tick};
-    use gang_config::{DiskEnforcement, DiskTuning, MemoryEnforcement, MemoryTuning};
+    use gang_config::DiskEnforcement;
+    use gang_config::DiskTuning;
+    use gang_config::MemoryEnforcement;
+    use gang_config::MemoryTuning;
     use gang_reapi::leadingterm::gang::worker::v1::KillReason;
     use gang_scheduler::DiskSample;
-    use gang_types::{AttemptId, HeadroomPercent, NonZeroBytes, NonZeroDuration, Percent};
+    use gang_types::{AttemptId, HeadroomPercent};
+    use gang_types::{NonZeroBytes, NonZeroDuration, Percent};
     use parking_lot::Mutex;
 
     use super::*;
+
+    #[test]
+    fn process_tree_includes_reparented_session_members_and_descendants() {
+        let processes = [
+            (10, 1, 10, 10),
+            (20, 10, 20, 20),
+            (21, 20, 21, 20),
+            (22, 1, 22, 20),
+            (23, 22, 23, 23),
+            (30, 1, 30, 30),
+        ];
+        assert_eq!(
+            collect_process_tree_pids(processes, 20, true),
+            [20, 21, 22, 23].into_iter().collect()
+        );
+        assert_eq!(
+            collect_process_tree_pids(processes, 10, false),
+            [10, 20, 21].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn parses_process_stat_and_proportional_memory() {
+        assert_eq!(
+            parse_proc_stat("123 (foo (bar)) S 42 123 123 0"),
+            Some((42, 123, 123))
+        );
+        assert_eq!(parse_proc_stat("123 (broken) S 42"), None);
+        assert_eq!(
+            parse_memory_kib("Rss: 30 kB\nPss: 17 kB\n", "Pss:"),
+            Some(17 * 1024)
+        );
+        assert_eq!(parse_memory_kib("Rss: 30 kB\n", "Pss:"), None);
+    }
 
     #[derive(Default)]
     struct FakeProbeState {
@@ -1333,6 +1558,33 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_pss_never_triggers_false_soft_memory_kill()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = base_config();
+        config.memory.enforcement = MemoryEnforcement::Soft;
+        config.memory.soft_samples = NonZeroU32::MIN;
+        config.memory_pool = None;
+        let sampler = WorkerSampler::new(config, FakeProbe::default());
+        let registry = sampler.registry();
+        let attempt = AttemptId::try_new("unavailable-pss")?;
+        let (tx, rx) = kill_channel();
+        let _guard = registry.register(AttemptRegistration {
+            attempt: attempt.clone(),
+            attempt_dir: PathBuf::from("/work/unavailable-pss"),
+            side_channel_dir: PathBuf::from("/work/.side_channels/unavailable-pss"),
+            reserved_memory_bytes: 1,
+            reserved_disk_bytes: 0,
+            kill: tx,
+        });
+        registry.set_pgid(&attempt, 42);
+        for _ in 0..3 {
+            assert!(sampler.sample_memory_attempts().is_empty());
+            assert_eq!(rx.reason(), None);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn soft_disk_ceiling_kills_with_disk_limit() -> Result<(), Box<dyn std::error::Error>> {
         let probe = FakeProbe::default();
         let mut config = base_config();
@@ -1481,6 +1733,240 @@ mod tests {
         assert_eq!(usage.peak_memory_bytes, Some(888));
         assert_eq!(usage.peak_disk_bytes, Some(333));
         assert_eq!(usage.cpu_time, Some(Duration::from_millis(12)));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_ready_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(content) = std::fs::read_to_string(path)
+                && !content.trim().is_empty()
+            {
+                return Ok(content);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("timed out waiting for {}", path.display()).into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_ready_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(tmp, path)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[ignore = "child helper for PSS and new-session memory accounting tests"]
+    #[test]
+    fn sampling_payload_helper() -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(mode) = std::env::var("GANG_SAMPLING_HELPER_MODE") else {
+            return Ok(());
+        };
+        let ready = PathBuf::from(
+            std::env::var_os("GANG_SAMPLING_READY").ok_or("missing GANG_SAMPLING_READY")?,
+        );
+        if mode == "new-session-wrapper" {
+            let mut child = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "worker_sampling::tests::sampling_payload_helper",
+                    "--nocapture",
+                ])
+                .env("GANG_SAMPLING_HELPER_MODE", "new-session-child")
+                .env("GANG_SAMPLING_READY", &ready)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            let status = child.wait()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        if mode == "new-session-child" {
+            rustix::process::setsid().expect("setsid must succeed");
+            let pid = rustix::process::getpid();
+            assert_eq!(rustix::process::getsid(None), Ok(pid));
+            let mut buf = vec![0x3C_u8; 20 * 1024 * 1024];
+            for chunk in buf.chunks_mut(4096) {
+                chunk[0] = 0x5A;
+            }
+            std::hint::black_box(&buf);
+            write_ready_atomic(
+                &ready,
+                &format!("{} {}\n", pid.as_raw_nonzero(), pid.as_raw_nonzero()),
+            )?;
+            std::thread::sleep(Duration::from_secs(30));
+            return Ok(());
+        }
+        if mode == "shared-parent" {
+            let child_ready = ready.with_extension("child");
+            let exe = std::env::current_exe()?;
+            let mut child = std::process::Command::new(exe)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "worker_sampling::tests::sampling_payload_helper",
+                    "--nocapture",
+                ])
+                .env("GANG_SAMPLING_HELPER_MODE", "shared-child")
+                .env("GANG_SAMPLING_READY", &child_ready)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            let child_pid = wait_for_ready_file(&child_ready)?;
+            write_ready_atomic(
+                &ready,
+                &format!("{} {}\n", std::process::id(), child_pid.trim()),
+            )?;
+            std::thread::sleep(Duration::from_secs(30));
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(());
+        }
+        if mode == "shared-child" {
+            write_ready_atomic(&ready, &format!("{}\n", std::process::id()))?;
+            std::thread::sleep(Duration::from_secs(30));
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_process_tree_bytes_uses_pss_without_double_counting_shared_pages()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::process::CommandExt as _;
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir()?;
+        let ready = dir.path().join("shared.ready");
+        let exe = std::env::current_exe()?;
+        let mut child = Command::new(exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "worker_sampling::tests::sampling_payload_helper",
+                "--nocapture",
+            ])
+            .env("GANG_SAMPLING_HELPER_MODE", "shared-parent")
+            .env("GANG_SAMPLING_READY", &ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?;
+
+        let content = wait_for_ready_file(&ready);
+        let sample = content.as_ref().ok().and_then(|text| {
+            let mut parts = text.split_whitespace();
+            let parent: u32 = parts.next()?.parse().ok()?;
+            let sub: u32 = parts.next()?.parse().ok()?;
+            let tree_bytes = read_process_tree_bytes(parent, Some(parent))?;
+            let rss = |pid: u32| {
+                std::fs::read_to_string(format!("/proc/{pid}/status"))
+                    .ok()
+                    .and_then(|s| parse_memory_kib(&s, "VmRSS:"))
+            };
+            let summed_rss = rss(parent)?.saturating_add(rss(sub)?);
+            let pss_readable = std::fs::read_to_string(format!("/proc/{parent}/smaps_rollup"))
+                .ok()
+                .and_then(|s| parse_memory_kib(&s, "Pss:"))
+                .is_some();
+            Some((tree_bytes, summed_rss, pss_readable))
+        });
+
+        let pgid = i32::try_from(child.id())?;
+        if let Some(pid) = rustix::process::Pid::from_raw(pgid) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+        let _ = child.wait();
+
+        let _ = content?;
+        let (tree_bytes, summed_rss, pss_readable) =
+            sample.ok_or("expected memory measurement for parent+child tree")?;
+        assert!(tree_bytes > 0);
+        if pss_readable {
+            assert!(
+                tree_bytes < summed_rss,
+                "PSS ({tree_bytes}) must stay strictly below summed VmRSS ({summed_rss}) for shared mappings"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_process_tree_bytes_measures_new_session_sandbox_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::process::CommandExt as _;
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir()?;
+        let ready = dir.path().join("session.ready");
+        let exe = std::env::current_exe()?;
+        let mut child = Command::new(exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "worker_sampling::tests::sampling_payload_helper",
+                "--nocapture",
+            ])
+            .env("GANG_SAMPLING_HELPER_MODE", "new-session-wrapper")
+            .env("GANG_SAMPLING_READY", &ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?;
+
+        let wrapper_pgid = child.id();
+        let ready_result = wait_for_ready_file(&ready);
+        let parsed = ready_result.as_ref().ok().and_then(|text| {
+            let mut parts = text.split_whitespace();
+            Some((
+                parts.next()?.parse::<u32>().ok()?,
+                parts.next()?.parse::<u32>().ok()?,
+            ))
+        });
+        let measured = parsed.and_then(|(pid, _)| read_process_tree_bytes(wrapper_pgid, Some(pid)));
+        if let Some((pid, _)) =
+            parsed.and_then(|(pid, sid)| i32::try_from(pid).ok().map(|pid| (pid, sid)))
+            && let Some(pid) = rustix::process::Pid::from_raw(pid)
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+        if parsed.is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        let _ = ready_result?;
+        let (sandbox_pid, sandbox_session) = parsed.ok_or("invalid sandbox pid and sid")?;
+        assert_eq!(sandbox_session, sandbox_pid);
+        assert_ne!(sandbox_session, wrapper_pgid);
+        let bytes = measured.ok_or("expected measurement for new-session sandbox payload")?;
+        assert!(
+            bytes >= 16 * 1024 * 1024,
+            "expected >= 16 MiB for new-session payload, got {bytes} bytes"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unavailable_pss_does_not_fall_back_to_rss() -> Result<(), Box<dyn std::error::Error>> {
+        let proc = tempfile::tempdir()?;
+        let process = proc.path().join("42");
+        std::fs::create_dir(&process)?;
+        std::fs::write(process.join("stat"), "42 (payload) S 1 42 42 0")?;
+        std::fs::write(process.join("status"), "VmRSS: 999999 kB\n")?;
+        std::fs::write(process.join("smaps_rollup"), "Rss: 999999 kB\n")?;
+        assert_eq!(read_process_tree_pss_from(proc.path(), 42, None), None);
         Ok(())
     }
 }

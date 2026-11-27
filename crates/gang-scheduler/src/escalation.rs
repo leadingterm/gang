@@ -464,9 +464,13 @@ mod tests {
         ])
         .expect("catalog");
         let mut cap = CapacityCatalog::new(cat, NonZeroU32::MIN);
-        cap.set_local_observations([gang_spi::FleetMemoryCapacity {
+        cap.set_local_observations([gang_spi::FleetResourceCapacity {
             fleet: 0,
-            capacity: NonZeroBytes::gib(60),
+            capacity: gang_types::Resources {
+                vcpus: 16,
+                memory: Bytes::gib(60),
+                disk: Bytes::gib(100),
+            },
         }])
         .expect("observed memory");
         let name = op_name();

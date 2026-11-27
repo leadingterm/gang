@@ -1,15 +1,19 @@
 //! Observed physical fleet capacity facts and effective per-action resource ceilings (`§5.3`).
 //!
 //! Configured fleet estimates in [`FleetCatalog`] are conservatively lowered by local connected
-//! worker memory reports and optional peer-local facts, never rising above the configured
+//! worker resource reports and optional peer-local facts, never rising above the configured
 //! estimate and keeping configured per-action ceilings independent.
 
 use std::num::NonZeroU32;
 
-use gang_spi::FleetMemoryCapacity;
-use gang_types::{
-    Bytes, FleetCatalog, FleetCountError, FleetProperties, MAX_FLEETS, NonZeroBytes, property,
-};
+use gang_spi::FleetResourceCapacity;
+use gang_types::Bytes;
+use gang_types::FleetCatalog;
+use gang_types::FleetCountError;
+use gang_types::FleetProperties;
+use gang_types::MAX_FLEETS;
+use gang_types::Resources;
+use gang_types::property;
 use thiserror::Error;
 
 use crate::workers::WorkerRegistry;
@@ -32,6 +36,12 @@ pub enum CapacityError {
         fleet: usize,
         /// Observed memory capacity in bytes.
         bytes: Bytes,
+    },
+    /// A capacity observation has no physical CPU or less than one KiB of disk.
+    #[error("invalid CPU or disk capacity for fleet {fleet}")]
+    InvalidResources {
+        /// Fleet index of the observation.
+        fleet: usize,
     },
     /// Rebuilding the derived [`FleetCatalog`] exceeded the maximum fleet count.
     #[error("too many fleets ({count}) for catalog")]
@@ -64,7 +74,7 @@ pub struct FleetCapacity {
     pub physical_memory_kb: u64,
     /// Effective per-action memory ceiling in `KiB`.
     pub memory_ceiling_kb: u64,
-    /// Configured physical action disk capacity per instance in `KiB`.
+    /// Observed physical action disk capacity per instance in `KiB`.
     pub physical_disk_kb: u64,
     /// Effective per-action disk ceiling in `KiB`.
     pub disk_ceiling_kb: u64,
@@ -85,16 +95,16 @@ impl FleetCapacity {
 }
 
 /// Maintains the current [`FleetCatalog`] derived from configured estimates and live observed
-/// physical memory capacity facts.
+/// physical resource capacity facts.
 #[derive(Debug, Clone)]
 pub struct CapacityCatalog {
     estimates: FleetCatalog,
     current: FleetCatalog,
     cpu_oversubscription: NonZeroU32,
-    estimate_memory_kb: Vec<u64>,
-    local_memory_kb: Vec<Option<u64>>,
-    peer_memory_kb: Vec<Option<u64>>,
-    effective_memory_kb: Vec<u64>,
+    estimates_by_fleet: Vec<Resources>,
+    local: Vec<Option<Resources>>,
+    peer: Vec<Option<Resources>>,
+    effective: Vec<Resources>,
     revision: u64,
 }
 
@@ -103,20 +113,17 @@ impl CapacityCatalog {
     #[must_use]
     pub fn new(estimates: FleetCatalog, cpu_oversubscription: NonZeroU32) -> Self {
         let count = estimates.len();
-        let estimate_memory_kb: Vec<u64> = estimates
-            .fleets()
-            .iter()
-            .map(|fleet| fleet.capacity(property::MEMORY_KB).unwrap_or(0))
-            .collect();
-        let effective_memory_kb = estimate_memory_kb.clone();
+        let estimates_by_fleet: Vec<Resources> =
+            estimates.fleets().iter().map(physical_resources).collect();
+        let effective = estimates_by_fleet.clone();
         Self {
             current: estimates.clone(),
             estimates,
             cpu_oversubscription,
-            estimate_memory_kb,
-            local_memory_kb: vec![None; count],
-            peer_memory_kb: vec![None; count],
-            effective_memory_kb,
+            estimates_by_fleet,
+            local: vec![None; count],
+            peer: vec![None; count],
+            effective,
             revision: 0,
         }
     }
@@ -178,123 +185,120 @@ impl CapacityCatalog {
         })
     }
 
-    /// Recomputes local observed memory capacities from the currently connected workers in
-    /// `workers`, returning `true` when [`Self::current`] changed.
+    /// Recomputes physical capacity from connected workers, returning whether the catalog changed.
     pub fn refresh_local(&mut self, workers: &WorkerRegistry) -> bool {
-        let mut observed = [None::<u64>; MAX_FLEETS];
+        let mut observed = [None::<Resources>; MAX_FLEETS];
+        let oversubscription = u64::from(self.cpu_oversubscription.get());
+        let millicores_per_physical_vcpu =
+            property::MILLICORES_PER_CORE.saturating_mul(oversubscription);
         for (_, worker) in workers.workers_sorted() {
             if worker.fleet >= self.estimates.len() {
                 continue;
             }
-            let bytes = workers
-                .instance_state(worker.fleet, &worker.instance)
+            let capacity = worker.ledger.capacity();
+            let instance_state = workers.instance_state(worker.fleet, &worker.instance);
+            let cpu_millicores = instance_state
+                .and_then(|state| state.cpu_capacity_millicores)
+                .unwrap_or(capacity.cpu_millicores);
+            let memory = instance_state
                 .and_then(|state| state.memory_capacity)
-                .unwrap_or_else(|| worker.ledger.capacity().memory);
-            let kib = bytes.get() / 1024;
-            if kib == 0 {
+                .unwrap_or(capacity.memory);
+            let disk = instance_state
+                .and_then(|state| state.disk_capacity)
+                .unwrap_or(capacity.disk);
+            let vcpus =
+                u32::try_from(cpu_millicores / millicores_per_physical_vcpu).unwrap_or(u32::MAX);
+            let actual = normalize(Resources {
+                vcpus,
+                memory,
+                disk,
+            });
+            if actual.vcpus == 0 || actual.memory.get() < 1024 || actual.disk.get() < 1024 {
                 continue;
             }
-            observed[worker.fleet] = Some(match observed[worker.fleet] {
-                Some(prev) => prev.min(kib),
-                None => kib,
-            });
+            let slot = &mut observed[worker.fleet];
+            *slot = Some(slot.map_or(actual, |previous| minimum(previous, actual)));
         }
-
-        let mut changed = false;
-        for (fleet, slot) in self.local_memory_kb.iter_mut().enumerate() {
-            let next = observed[fleet];
-            if *slot != next {
-                *slot = next;
-                changed = true;
-            }
-        }
-        if !changed {
+        if self.local.as_slice() == &observed[..self.local.len()] {
             return false;
         }
+        let count = self.local.len();
+        self.local.copy_from_slice(&observed[..count]);
         self.rebuild().unwrap_or(false)
     }
 
-    /// Replaces the local observed memory capacities from an explicit set of fleet observations,
-    /// combining multiple observations for the same fleet by minimum.
+    /// Replaces local physical observations, combining duplicate fleets by dimension minimum.
     ///
     /// # Errors
-    ///
-    /// Returns [`CapacityError`] if any observation names an unknown fleet or is smaller than
-    /// `1 KiB`.
+    /// Returns an error for an unknown fleet or an invalid resource capacity.
     pub fn set_local_observations(
         &mut self,
-        observations: impl IntoIterator<Item = FleetMemoryCapacity>,
+        observations: impl IntoIterator<Item = FleetResourceCapacity>,
     ) -> Result<bool, CapacityError> {
         let next = self.collect_observations(observations)?;
-        if self.local_memory_kb == next {
+        if self.local == next {
             return Ok(false);
         }
-        self.local_memory_kb = next;
+        self.local = next;
         self.rebuild()
     }
 
-    /// Replaces the peer-local observed memory capacities from peer beacons, combining multiple
-    /// observations for the same fleet by minimum.
+    /// Replaces peer physical observations, combining duplicate fleets by dimension minimum.
     ///
     /// # Errors
-    ///
-    /// Returns [`CapacityError`] if any observation names an unknown fleet or is smaller than
-    /// `1 KiB`.
+    /// Returns an error for an unknown fleet or an invalid resource capacity.
     pub fn set_peer_observations(
         &mut self,
-        observations: impl IntoIterator<Item = FleetMemoryCapacity>,
+        observations: impl IntoIterator<Item = FleetResourceCapacity>,
     ) -> Result<bool, CapacityError> {
         let next = self.collect_observations(observations)?;
-        if self.peer_memory_kb == next {
+        if self.peer == next {
             return Ok(false);
         }
-        self.peer_memory_kb = next;
+        self.peer = next;
         self.rebuild()
     }
 
-    /// Clears all peer-local memory observations, returning `true` if [`Self::current`] changed.
+    /// Clears peer observations, returning whether the effective catalog changed.
     pub fn clear_peer_observations(&mut self) -> bool {
-        if self.peer_memory_kb.iter().all(Option::is_none) {
+        if self.peer.iter().all(Option::is_none) {
             return false;
         }
-        self.peer_memory_kb.fill(None);
+        self.peer.fill(None);
         self.rebuild().unwrap_or(false)
     }
 
-    /// Populates `into` with local-only observed memory capacities (or the prelaunch estimate when
-    /// a fleet currently has no local observations), reusing `into`'s buffer.
-    pub fn local_fleet_memory(&self, into: &mut Vec<FleetMemoryCapacity>) {
+    /// Writes estimate-bounded local physical capacities, excluding peer observations.
+    pub fn local_fleet_capacity(&self, into: &mut Vec<FleetResourceCapacity>) {
         into.clear();
-        for (fleet, (&estimate_kb, &local_kb)) in self
-            .estimate_memory_kb
-            .iter()
-            .zip(&self.local_memory_kb)
-            .enumerate()
+        for (fleet, (&estimate, &local)) in
+            self.estimates_by_fleet.iter().zip(&self.local).enumerate()
         {
-            let kb = local_kb.map_or(estimate_kb, |obs| estimate_kb.min(obs));
-            if let Some(capacity) = NonZeroBytes::new(Bytes::kib(kb)) {
-                into.push(FleetMemoryCapacity { fleet, capacity });
-            }
+            into.push(FleetResourceCapacity {
+                fleet,
+                capacity: local.map_or(estimate, |actual| minimum(estimate, actual)),
+            });
         }
     }
 
-    /// Populates `into` with the current conservative usable memory per fleet (combining estimate,
-    /// local observations, and peer-local observations), reusing `into`'s buffer.
-    pub fn fleet_memory(&self, into: &mut Vec<FleetMemoryCapacity>) {
+    /// Writes estimate-bounded physical capacities including local and peer observations.
+    pub fn fleet_capacity(&self, into: &mut Vec<FleetResourceCapacity>) {
         into.clear();
-        for (fleet, &kb) in self.effective_memory_kb.iter().enumerate() {
-            if let Some(capacity) = NonZeroBytes::new(Bytes::kib(kb)) {
-                into.push(FleetMemoryCapacity { fleet, capacity });
-            }
-        }
+        into.extend(
+            self.effective
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(fleet, capacity)| FleetResourceCapacity { fleet, capacity }),
+        );
     }
 
     fn collect_observations(
         &self,
-        observations: impl IntoIterator<Item = FleetMemoryCapacity>,
-    ) -> Result<Vec<Option<u64>>, CapacityError> {
+        observations: impl IntoIterator<Item = FleetResourceCapacity>,
+    ) -> Result<Vec<Option<Resources>>, CapacityError> {
         let count = self.estimates.len();
-        let mut next = vec![None::<u64>; count];
+        let mut next = vec![None::<Resources>; count];
         for obs in observations {
             if obs.fleet >= count {
                 return Err(CapacityError::UnknownFleet {
@@ -302,51 +306,74 @@ impl CapacityCatalog {
                     count,
                 });
             }
-            let kib = obs.capacity.as_u64() / 1024;
-            if kib == 0 {
+            if obs.capacity.memory.get() < 1024 {
                 return Err(CapacityError::BelowOneKib {
                     fleet: obs.fleet,
-                    bytes: obs.capacity.get(),
+                    bytes: obs.capacity.memory,
                 });
             }
-            next[obs.fleet] = Some(match next[obs.fleet] {
-                Some(prev) => prev.min(kib),
-                None => kib,
-            });
+            if obs.capacity.vcpus == 0 || obs.capacity.disk.get() < 1024 {
+                return Err(CapacityError::InvalidResources { fleet: obs.fleet });
+            }
+            let actual = normalize(obs.capacity);
+            let slot = &mut next[obs.fleet];
+            *slot = Some(slot.map_or(actual, |previous| minimum(previous, actual)));
         }
         Ok(next)
     }
 
     fn rebuild(&mut self) -> Result<bool, CapacityError> {
-        let mut new_effective = Vec::with_capacity(self.estimates.len());
-        let mut changed = false;
-        for (fleet, &estimate_kb) in self.estimate_memory_kb.iter().enumerate() {
-            let mut kb = estimate_kb;
-            if let Some(local_kb) = self.local_memory_kb[fleet] {
-                kb = kb.min(local_kb);
-            }
-            if let Some(peer_kb) = self.peer_memory_kb[fleet] {
-                kb = kb.min(peer_kb);
-            }
-            if kb != self.effective_memory_kb[fleet] {
-                changed = true;
-            }
-            new_effective.push(kb);
+        let mut effective = Vec::with_capacity(self.estimates.len());
+        for (index, &estimate) in self.estimates_by_fleet.iter().enumerate() {
+            let local = self.local[index].map_or(estimate, |value| minimum(estimate, value));
+            effective.push(self.peer[index].map_or(local, |value| minimum(local, value)));
         }
-        if !changed {
+        if effective == self.effective {
             return Ok(false);
         }
-
-        let mut fleets: Vec<FleetProperties> = self.estimates.fleets().to_vec();
-        for (fleet, &kb) in fleets.iter_mut().zip(&new_effective) {
-            if let Some(bytes) = NonZeroBytes::new(Bytes::kib(kb)) {
-                fleet.set_memory_capacity(bytes);
-            }
+        let mut fleets = self.estimates.fleets().to_vec();
+        for (fleet, &capacity) in fleets.iter_mut().zip(&effective) {
+            fleet.set_capacity(capacity);
         }
         self.current = FleetCatalog::try_new(fleets)?;
-        self.effective_memory_kb = new_effective;
+        self.effective = effective;
         self.revision = self.revision.saturating_add(1);
         Ok(true)
+    }
+}
+
+fn physical_resources(fleet: &FleetProperties) -> Resources {
+    Resources {
+        vcpus: fleet
+            .capacity(property::CPU_COUNT)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0),
+        memory: Bytes::new(
+            fleet
+                .capacity(property::MEMORY_KB)
+                .unwrap_or(0)
+                .saturating_mul(1024),
+        ),
+        disk: Bytes::new(
+            fleet
+                .capacity(property::DISK_KB)
+                .unwrap_or(0)
+                .saturating_mul(1024),
+        ),
+    }
+}
+
+fn normalize(mut capacity: Resources) -> Resources {
+    capacity.memory = Bytes::new(capacity.memory.get() / 1024 * 1024);
+    capacity.disk = Bytes::new(capacity.disk.get() / 1024 * 1024);
+    capacity
+}
+
+fn minimum(left: Resources, right: Resources) -> Resources {
+    Resources {
+        vcpus: left.vcpus.min(right.vcpus),
+        memory: left.memory.min(right.memory),
+        disk: left.disk.min(right.disk),
     }
 }
 
@@ -357,7 +384,12 @@ mod tests {
     use std::time::Duration;
 
     use gang_clock::{Tick, Timestamp};
-    use gang_types::{ActionResources, FleetActionPolicy, FleetName, InstanceId, Isa, Resources};
+    use gang_types::ActionResources;
+    use gang_types::FleetActionPolicy;
+    use gang_types::FleetName;
+    use gang_types::InstanceId;
+    use gang_types::Isa;
+    use gang_types::NonZeroBytes;
 
     use super::*;
     use crate::operations::Now;
@@ -454,11 +486,15 @@ mod tests {
         // Policy ceiling remains 4 GiB independent of observed physical memory.
         assert_eq!(alpha.memory_ceiling_kb, 4 * 1024 * 1024);
 
-        // Peer lowers beta below its estimate; local_fleet_memory omits peer facts.
+        // Peer lowers beta below its estimate; local_fleet_capacity omits peer facts.
         assert!(
-            cap.set_peer_observations([FleetMemoryCapacity {
+            cap.set_peer_observations([FleetResourceCapacity {
                 fleet: 1,
-                capacity: NonZeroBytes::gib(24),
+                capacity: Resources {
+                    vcpus: 16,
+                    memory: Bytes::gib(24),
+                    disk: Bytes::gib(100)
+                },
             }])
             .expect("peer obs")
         );
@@ -467,8 +503,8 @@ mod tests {
             24 * 1024 * 1024
         );
         let mut local_only = Vec::new();
-        cap.local_fleet_memory(&mut local_only);
-        assert_eq!(local_only[1].capacity, NonZeroBytes::gib(32));
+        cap.local_fleet_capacity(&mut local_only);
+        assert_eq!(local_only[1].capacity.memory, Bytes::gib(32));
 
         // Disconnecting w1 restores alpha to its configured estimate.
         workers.disconnect(w1);
@@ -485,9 +521,13 @@ mod tests {
             32 * 1024 * 1024
         );
         assert!(
-            !cap.set_peer_observations([FleetMemoryCapacity {
+            !cap.set_peer_observations([FleetResourceCapacity {
                 fleet: 0,
-                capacity: NonZeroBytes::gib(128),
+                capacity: Resources {
+                    vcpus: 16,
+                    memory: Bytes::gib(128),
+                    disk: Bytes::gib(100)
+                },
             }])
             .expect("above estimate")
         );
@@ -501,18 +541,174 @@ mod tests {
     fn rejects_unknown_fleet_and_sub_kib_observations() {
         let mut cap = CapacityCatalog::new(two_fleets(), NonZeroU32::new(2).expect("nonzero"));
         assert!(matches!(
-            cap.set_local_observations([FleetMemoryCapacity {
+            cap.set_local_observations([FleetResourceCapacity {
                 fleet: 9,
-                capacity: NonZeroBytes::gib(1),
+                capacity: Resources {
+                    vcpus: 16,
+                    memory: Bytes::gib(1),
+                    disk: Bytes::gib(100)
+                },
             }]),
             Err(CapacityError::UnknownFleet { fleet: 9, count: 2 })
         ));
         assert!(matches!(
-            cap.set_peer_observations([FleetMemoryCapacity {
+            cap.set_peer_observations([FleetResourceCapacity {
                 fleet: 0,
-                capacity: NonZeroBytes::new(Bytes::new(512)).expect("nonzero"),
+                capacity: Resources {
+                    vcpus: 16,
+                    memory: Bytes::new(512),
+                    disk: Bytes::gib(100)
+                },
             }]),
             Err(CapacityError::BelowOneKib { fleet: 0, .. })
         ));
+    }
+    #[test]
+    fn all_dimensions_use_minimum_and_recover_after_peer_disconnect() {
+        let mut catalog = CapacityCatalog::new(two_fleets(), NonZeroU32::new(2).expect("nonzero"));
+        let entry = |vcpus, memory, disk| FleetResourceCapacity {
+            fleet: 0,
+            capacity: Resources {
+                vcpus,
+                memory: Bytes::gib(memory),
+                disk: Bytes::gib(disk),
+            },
+        };
+        assert!(
+            catalog
+                .set_local_observations([entry(12, 48, 80)])
+                .expect("local")
+        );
+        assert!(
+            catalog
+                .set_peer_observations([entry(8, 60, 50), entry(10, 40, 70)])
+                .expect("peer")
+        );
+        let mut observed = Vec::new();
+        catalog.fleet_capacity(&mut observed);
+        assert_eq!(
+            observed[0].capacity,
+            Resources {
+                vcpus: 8,
+                memory: Bytes::gib(40),
+                disk: Bytes::gib(50)
+            }
+        );
+        let current = catalog.fleet(0).expect("fleet");
+        assert_eq!(
+            (
+                current.physical_vcpus,
+                current.physical_memory_kb,
+                current.physical_disk_kb
+            ),
+            (8, 40 * 1024 * 1024, 50 * 1024 * 1024)
+        );
+        assert_eq!(current.memory_ceiling_kb, 4 * 1024 * 1024);
+        assert!(catalog.clear_peer_observations());
+        catalog.fleet_capacity(&mut observed);
+        assert_eq!(
+            observed[0].capacity,
+            Resources {
+                vcpus: 12,
+                memory: Bytes::gib(48),
+                disk: Bytes::gib(80)
+            }
+        );
+        assert!(catalog.set_local_observations([]).expect("clear local"));
+        catalog.fleet_capacity(&mut observed);
+        assert_eq!(
+            observed[0].capacity,
+            Resources {
+                vcpus: 16,
+                memory: Bytes::gib(63),
+                disk: Bytes::gib(100)
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_local_derives_cpu_and_disk_from_registered_capacity_and_preserves_generation_order()
+    {
+        let mut cap = CapacityCatalog::new(two_fleets(), NonZeroU32::new(2).expect("nonzero"));
+        let mut workers = WorkerRegistry::from_catalog(cap.estimates()).expect("workers");
+
+        // Generation 1 registers smaller CPU (16_000 / 2 = 8 vCPUs), memory (40 GiB), and disk (50 GiB).
+        let gen1 = workers
+            .register(
+                now(1),
+                "0.3.9",
+                false,
+                WorkerRegistration {
+                    instance: Arc::new(InstanceId::try_new("i-1").expect("instance")),
+                    fleet: FleetName::try_new("alpha").expect("fleet"),
+                    gang_version: "0.3.9".to_owned(),
+                    properties: BTreeMap::new(),
+                    capacity: ActionResources {
+                        cpu_millicores: 16_000,
+                        memory: Bytes::gib(40),
+                        disk: Bytes::gib(50),
+                    },
+                    ceilings: ActionResources {
+                        cpu_millicores: 8_000,
+                        memory: Bytes::gib(40),
+                        disk: Bytes::gib(50),
+                    },
+                    max_inflight: None,
+                    single_use: false,
+                    environment: None,
+                    uuid_bytes: [1; 16],
+                },
+            )
+            .expect("gen1");
+        assert!(cap.refresh_local(&workers));
+        let alpha = cap.fleet(0).expect("alpha");
+        assert_eq!(alpha.physical_vcpus, 8);
+        assert_eq!(alpha.physical_cpu_millicores, 8_000);
+        assert_eq!(alpha.ledger_cpu_millicores, 16_000);
+        assert_eq!(alpha.physical_memory_kb, 40 * 1024 * 1024);
+        assert_eq!(alpha.physical_disk_kb, 50 * 1024 * 1024);
+
+        // Overlapping newer generation 2 on the same instance supersedes gen 1's CPU, memory, and disk.
+        let gen2 = workers
+            .register(
+                now(2),
+                "0.3.9",
+                false,
+                WorkerRegistration {
+                    instance: Arc::new(InstanceId::try_new("i-1").expect("instance")),
+                    fleet: FleetName::try_new("alpha").expect("fleet"),
+                    gang_version: "0.3.9".to_owned(),
+                    properties: BTreeMap::new(),
+                    capacity: ActionResources {
+                        cpu_millicores: 24_000,
+                        memory: Bytes::gib(48),
+                        disk: Bytes::gib(80),
+                    },
+                    ceilings: ActionResources {
+                        cpu_millicores: 12_000,
+                        memory: Bytes::gib(48),
+                        disk: Bytes::gib(80),
+                    },
+                    max_inflight: None,
+                    single_use: false,
+                    environment: None,
+                    uuid_bytes: [2; 16],
+                },
+            )
+            .expect("gen2");
+        assert!(cap.refresh_local(&workers));
+        let alpha = cap.fleet(0).expect("alpha");
+        assert_eq!(alpha.physical_vcpus, 12);
+        assert_eq!(alpha.physical_memory_kb, 48 * 1024 * 1024);
+        assert_eq!(alpha.physical_disk_kb, 80 * 1024 * 1024);
+
+        // Disconnecting both generations restores configured estimates.
+        workers.disconnect(gen1);
+        workers.disconnect(gen2);
+        assert!(cap.refresh_local(&workers));
+        let alpha = cap.fleet(0).expect("alpha");
+        assert_eq!(alpha.physical_vcpus, 16);
+        assert_eq!(alpha.physical_memory_kb, 63 * 1024 * 1024);
+        assert_eq!(alpha.physical_disk_kb, 100 * 1024 * 1024);
     }
 }

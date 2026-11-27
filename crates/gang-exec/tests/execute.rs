@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
 use gang_config::InputLinks;
-use gang_exec::{Action, ExecError, ExecFailure, execute, exit_status};
+use gang_exec::{Action, ExecError, ExecFailure, ExecutionHooks, execute, exit_status};
 use gang_spi::{
     ActionCommand, ActionExecutionOutcome, ActionExecutionSpec, ActionIsolationPort, ActionLimits,
     ActionLimitsPort, ActionScope, NetworkAccess, PortError, SandboxedAction, Termination,
@@ -69,9 +69,9 @@ fn link_counts(directory: &Path) -> Vec<u64> {
 
 fn limits() -> ActionLimits {
     ActionLimits {
+        cpu_weight: None,
         cpu_count: NonZeroU32::new(2),
         memory: Some(NonZeroBytes::kib(1)),
-        cpu_weight: None,
     }
 }
 
@@ -82,11 +82,12 @@ fn action<'a>(
 ) -> Result<Action<'a>, Box<dyn Error>> {
     Ok(Action {
         spec: ActionExecutionSpec {
+            read_only_trees: &[],
+            ephemeral_dirs: &[],
             command: ActionCommand::from_argv(argv).ok_or("empty argv")?,
             environment: &[],
             action_directory,
             working_directory,
-            read_only_trees: &[],
             network: NetworkAccess::Offline,
             memory_cgroup: None,
             launcher: &[],
@@ -246,10 +247,17 @@ async fn enters_starts_waits_and_leaves_in_order() -> Result<(), Box<dyn Error>>
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
-        |_| {},
-        || {
-            log.record("leave_action_group");
-            Ok(())
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || {
+                log.record("leave_action_group");
+                Ok(())
+            },
+            cleanup_action_group: || {
+                log.record("cleanup_group");
+                Ok(())
+            },
         },
     )
     .await?;
@@ -263,6 +271,7 @@ async fn enters_starts_waits_and_leaves_in_order() -> Result<(), Box<dyn Error>>
             "sandbox.start",
             "leave_action_group",
             "sandbox.wait",
+            "cleanup_group",
             "limits.leave"
         ]
     );
@@ -277,16 +286,20 @@ async fn without_limits_neither_enters_nor_leaves() -> Result<(), Box<dyn Error>
     let directory = tempfile::tempdir()?;
     let action = action(&argv, directory.path(), directory.path())?;
 
-    let outcome = execute::<ScriptedSandbox, RecordingLimits>(
+    let outcome = execute::<ScriptedSandbox, RecordingLimits, _, _, _, _>(
         &sandbox,
         None,
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
-        |_| {},
-        || {
-            log.record("leave_action_group");
-            Ok(())
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || {
+                log.record("leave_action_group");
+                Ok(())
+            },
+            cleanup_action_group: || Ok(()),
         },
     )
     .await?;
@@ -321,10 +334,14 @@ async fn leave_action_group_failure_drops_action_and_leaves_scope() -> Result<()
                 InputLinks::Keep,
                 &action,
                 &mut no_terminations(),
-                |_| {},
-                || {
-                    log.record("leave_action_group");
-                    Err(std::io::Error::other("transition failed"))
+                ExecutionHooks {
+                    publish_cgroup: |_| {},
+                    publish_pid: |_| {},
+                    leave_action_group: || {
+                        log.record("leave_action_group");
+                        Err(io::Error::other("transition failed"))
+                    },
+                    cleanup_action_group: || Ok(()),
                 },
             )
             .await;
@@ -373,10 +390,14 @@ async fn pending_termination_prevents_start_with_and_without_limits() -> Result<
                 InputLinks::Keep,
                 &action,
                 &mut receiver,
-                |_| {},
-                || {
-                    log.record("leave_action_group");
-                    Ok(())
+                ExecutionHooks {
+                    publish_cgroup: |_| {},
+                    publish_pid: |_| {},
+                    leave_action_group: || {
+                        log.record("leave_action_group");
+                        Ok(())
+                    },
+                    cleanup_action_group: || Ok(()),
                 },
             )
             .await?;
@@ -421,10 +442,14 @@ async fn termination_during_startup_drops_start_and_leaves_scope() -> Result<(),
                 InputLinks::Keep,
                 &action,
                 &mut terminations,
-                |_| {},
-                || {
-                    log.record("leave_action_group");
-                    Ok(())
+                ExecutionHooks {
+                    publish_cgroup: |_| {},
+                    publish_pid: |_| {},
+                    leave_action_group: || {
+                        log.record("leave_action_group");
+                        Ok(())
+                    },
+                    cleanup_action_group: || Ok(()),
                 },
             ),
             async {
@@ -488,10 +513,14 @@ async fn signal_error_during_startup_drops_start_and_preserves_usage() -> Result
                 InputLinks::Keep,
                 &action,
                 &mut terminations,
-                |_| {},
-                || {
-                    log.record("leave_action_group");
-                    Ok(())
+                ExecutionHooks {
+                    publish_cgroup: |_| {},
+                    publish_pid: |_| {},
+                    leave_action_group: || {
+                        log.record("leave_action_group");
+                        Ok(())
+                    },
+                    cleanup_action_group: || Ok(()),
                 },
             ),
             async {
@@ -542,10 +571,14 @@ async fn signal_stream_error_prevents_start_and_leaves_scope() -> Result<(), Box
             InputLinks::Keep,
             &action,
             &mut terminations,
-            |_| {},
-            || {
-                log.record("leave_action_group");
-                Ok(())
+            ExecutionHooks {
+                publish_cgroup: |_| {},
+                publish_pid: |_| {},
+                leave_action_group: || {
+                    log.record("leave_action_group");
+                    Ok(())
+                },
+                cleanup_action_group: || Ok(()),
             },
         )
         .await;
@@ -585,10 +618,14 @@ async fn an_action_in_its_own_group_keeps_gang_exec_in_the_action_group()
             InputLinks::Keep,
             &action,
             &mut terminations,
-            |_| {},
-            || {
-                log.record("leave_action_group");
-                Ok(())
+            ExecutionHooks {
+                publish_cgroup: |_| {},
+                publish_pid: |_| {},
+                leave_action_group: || {
+                    log.record("leave_action_group");
+                    Ok(())
+                },
+                cleanup_action_group: || Ok(()),
             },
         )
         .await?;
@@ -619,8 +656,12 @@ async fn leaves_the_scope_when_the_sandbox_fails_to_start() -> Result<(), Box<dy
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
-        |_| {},
-        || Ok(()),
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || Ok(()),
+            cleanup_action_group: || Ok(()),
+        },
     )
     .await;
 
@@ -652,8 +693,12 @@ async fn a_failing_wait_while_limits_are_active_is_a_sandbox_error_and_the_scope
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
-        |_| {},
-        || Ok(()),
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || Ok(()),
+            cleanup_action_group: || Ok(()),
+        },
     )
     .await;
 
@@ -691,8 +736,12 @@ async fn leave_failure_after_success_is_a_limits_error() -> Result<(), Box<dyn E
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
-        |_| {},
-        || Ok(()),
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || Ok(()),
+            cleanup_action_group: || Ok(()),
+        },
     )
     .await;
 
@@ -730,8 +779,12 @@ async fn sandbox_error_wins_over_leave_error() -> Result<(), Box<dyn Error>> {
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
-        |_| {},
-        || Ok(()),
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || Ok(()),
+            cleanup_action_group: || Ok(()),
+        },
     )
     .await;
 
@@ -760,8 +813,12 @@ async fn enter_failure_never_starts_the_sandbox() -> Result<(), Box<dyn Error>> 
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
-        |_| {},
-        || Ok(()),
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || Ok(()),
+            cleanup_action_group: || Ok(()),
+        },
     )
     .await;
 
@@ -790,14 +847,18 @@ async fn break_leaves_one_link_per_file_before_the_sandbox_starts() -> Result<()
     std::fs::hard_link(&first, directory.path().join("second"))?;
     let action = action(&argv, directory.path(), directory.path())?;
 
-    let outcome = execute::<LinkCounting, RecordingLimits>(
+    let outcome = execute::<LinkCounting, RecordingLimits, _, _, _, _>(
         &sandbox,
         None,
         InputLinks::Break,
         &action,
         &mut no_terminations(),
-        |_| {},
-        || Ok(()),
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || Ok(()),
+            cleanup_action_group: || Ok(()),
+        },
     )
     .await?;
 
@@ -816,14 +877,18 @@ async fn breaks_links_under_the_action_directory_outside_the_working_directory()
     let (action_directory, working_directory) = linked_inputs(root.path())?;
     let action = action(&argv, &action_directory, &working_directory)?;
 
-    let outcome = execute::<ScriptedSandbox, RecordingLimits>(
+    let outcome = execute::<ScriptedSandbox, RecordingLimits, _, _, _, _>(
         &sandbox,
         None,
         InputLinks::Break,
         &action,
         &mut no_terminations(),
-        |_| {},
-        || Ok(()),
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || Ok(()),
+            cleanup_action_group: || Ok(()),
+        },
     )
     .await?;
 
@@ -848,14 +913,18 @@ async fn keep_leaves_hard_links_in_place() -> Result<(), Box<dyn Error>> {
     std::fs::hard_link(&first, working_directory.join("second"))?;
     let action = action(&argv, &action_directory, &working_directory)?;
 
-    let outcome = execute::<LinkCounting, RecordingLimits>(
+    let outcome = execute::<LinkCounting, RecordingLimits, _, _, _, _>(
         &sandbox,
         None,
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
-        |_| {},
-        || Ok(()),
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || Ok(()),
+            cleanup_action_group: || Ok(()),
+        },
     )
     .await?;
     assert_eq!(outcome.outcome, ActionExecutionOutcome::Exited(0));
@@ -875,14 +944,18 @@ async fn break_failure_never_starts_the_sandbox() -> Result<(), Box<dyn Error>> 
     let missing = directory.path().join("missing");
     let action = action(&argv, &missing, &missing)?;
 
-    let result = execute::<ScriptedSandbox, RecordingLimits>(
+    let result = execute::<ScriptedSandbox, RecordingLimits, _, _, _, _>(
         &sandbox,
         None,
         InputLinks::Break,
         &action,
         &mut no_terminations(),
-        |_| {},
-        || Ok(()),
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || Ok(()),
+            cleanup_action_group: || Ok(()),
+        },
     )
     .await;
 
@@ -913,14 +986,18 @@ async fn a_termination_while_waiting_is_relayed_and_the_action_outcome_is_report
     let directory = tempfile::tempdir()?;
     let action = action(&argv, directory.path(), directory.path())?;
 
-    let outcome = execute::<Relaying, RecordingLimits>(
+    let outcome = execute::<Relaying, RecordingLimits, _, _, _, _>(
         &sandbox,
         None,
         InputLinks::Keep,
         &action,
         &mut terminations,
-        |_| {},
-        || Ok(()),
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || Ok(()),
+            cleanup_action_group: || Ok(()),
+        },
     )
     .await?;
 
@@ -951,8 +1028,12 @@ async fn a_relayed_termination_still_leaves_the_limits_scope() -> Result<(), Box
         InputLinks::Keep,
         &action,
         &mut terminations,
-        |_| {},
-        || Ok(()),
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || Ok(()),
+            cleanup_action_group: || Ok(()),
+        },
     )
     .await?;
 
@@ -979,8 +1060,12 @@ async fn the_action_starts_through_the_scope_launcher() -> Result<(), Box<dyn Er
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
-        |_| {},
-        || Ok(()),
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || Ok(()),
+            cleanup_action_group: || Ok(()),
+        },
     )
     .await?;
     assert_eq!(outcome.outcome, ActionExecutionOutcome::Exited(0));
@@ -997,14 +1082,18 @@ async fn without_limits_the_action_starts_without_a_launcher() -> Result<(), Box
     let directory = tempfile::tempdir()?;
     let action = action(&argv, directory.path(), directory.path())?;
 
-    let outcome = execute::<ScriptedSandbox, RecordingLimits>(
+    let outcome = execute::<ScriptedSandbox, RecordingLimits, _, _, _, _>(
         &sandbox,
         None,
         InputLinks::Keep,
         &action,
         &mut no_terminations(),
-        |_| {},
-        || Ok(()),
+        ExecutionHooks {
+            publish_cgroup: |_| {},
+            publish_pid: |_| {},
+            leave_action_group: || Ok(()),
+            cleanup_action_group: || Ok(()),
+        },
     )
     .await?;
     assert_eq!(outcome.outcome, ActionExecutionOutcome::Exited(0));

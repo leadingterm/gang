@@ -11,7 +11,7 @@ use std::time::Duration;
 use gang_clock::{Tick, Timestamp};
 use gang_config::{ActionsConfig, ScalingConfig};
 use gang_spi::{
-    ActionsView, ControllerDrain, FleetMemoryCapacity, LearnedHistory, ListingLimits,
+    ActionsView, ControllerDrain, FleetResourceCapacity, LearnedHistory, ListingLimits,
     SchedulerSnapshot, WorkerCacheStats,
 };
 use gang_types::{
@@ -466,7 +466,7 @@ impl Scheduler {
             .cordons
             .on_worker_registered(worker_key, &mut self.workers);
         self.emit_draining_updates(&affected, out);
-        self.refresh_local_memory_observations();
+        self.refresh_local_capacity_observations();
         self.timers.arm(
             TimerSubject::Worker(worker_key),
             now.tick + self.policy.worker_timeout,
@@ -510,7 +510,7 @@ impl Scheduler {
                     .workers
                     .on_keepalive(worker, now, cache, memory_capacity);
                 if memory_capacity.is_some() {
-                    self.refresh_local_memory_observations();
+                    self.refresh_local_capacity_observations();
                 }
                 if cleared_hold == Some(true) {
                     self.dispatch_for_worker(worker, now, out);
@@ -535,7 +535,7 @@ impl Scheduler {
         if self.workers.disconnect(worker).is_none() {
             return;
         }
-        self.refresh_local_memory_observations();
+        self.refresh_local_capacity_observations();
         let loss = self.attempts.on_worker_lost(
             worker,
             self.policy.actions.max_worker_loss_retries,
@@ -577,7 +577,7 @@ impl Scheduler {
             });
         }
         if !effects.timed_out_workers.is_empty() {
-            self.refresh_local_memory_observations();
+            self.refresh_local_capacity_observations();
         }
         for worker in effects.timed_out_workers {
             out.push(Effect::CloseWorker { worker });
@@ -742,15 +742,15 @@ impl Scheduler {
         self.learned.restore(now, records)
     }
 
-    /// Replaces peer-local memory capacity observations, returning `true` if effective catalog
+    /// Replaces peer-local physical capacity observations, returning `true` if effective catalog
     /// capacity changed.
     ///
     /// # Errors
     ///
     /// Returns [`CapacityError`] if any observation names an unknown fleet or is below `1 KiB`.
-    pub fn set_peer_memory_observations(
+    pub fn set_peer_capacity_observations(
         &mut self,
-        observations: impl IntoIterator<Item = FleetMemoryCapacity>,
+        observations: impl IntoIterator<Item = FleetResourceCapacity>,
     ) -> Result<bool, CapacityError> {
         let changed = self.capacity.set_peer_observations(observations)?;
         if changed {
@@ -759,9 +759,9 @@ impl Scheduler {
         Ok(changed)
     }
 
-    /// Recomputes local observed fleet memory capacities from connected workers, returning `true`
+    /// Recomputes local observed fleet physical capacities from connected workers, returning `true`
     /// if effective catalog capacity changed.
-    pub fn refresh_local_memory_observations(&mut self) -> bool {
+    pub fn refresh_local_capacity_observations(&mut self) -> bool {
         let changed = self.capacity.refresh_local(&self.workers);
         if changed {
             self.sync_learned_memory_ceiling();
@@ -1510,9 +1510,13 @@ mod tests {
             if peer {
                 assert!(
                     sched
-                        .set_peer_memory_observations([FleetMemoryCapacity {
+                        .set_peer_capacity_observations([FleetResourceCapacity {
                             fleet: 0,
-                            capacity: NonZeroBytes::gib(4),
+                            capacity: gang_types::Resources {
+                                vcpus: 16,
+                                memory: Bytes::gib(4),
+                                disk: Bytes::gib(100)
+                            },
                         }])
                         .expect("peer capacity")
                 );
@@ -1749,7 +1753,9 @@ mod tests {
 
     fn assert_gate_precedes_retry(kill: Option<KillCause>) {
         let cat = FleetCatalog::try_new(vec![fleet_props("small", 16, None)]).expect("catalog");
-        let mut sched = make_scheduler(&cat, default_policy());
+        let mut policy = default_policy();
+        policy.actions.cpu_oversubscription = NonZeroU32::MIN;
+        let mut sched = make_scheduler(&cat, policy);
         let mut out = Effects::new();
         let mut reg = worker_reg("small", "i-priority", 1, 4_000, 16, 100);
         reg.ceilings.cpu_millicores = 4_000;
@@ -1830,6 +1836,7 @@ mod tests {
     fn blocked_fleet_prefix_does_not_starve_another_fleet() {
         let cat = two_fleet_catalog();
         let mut policy = default_policy();
+        policy.actions.cpu_oversubscription = NonZeroU32::MIN;
         policy.dispatch_scan_limit = 3;
         let blocked_count = policy.dispatch_scan_limit + 5;
         let mut sched = make_scheduler(&cat, policy);

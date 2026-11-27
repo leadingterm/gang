@@ -4,19 +4,20 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use gang_config::{PluginSet, SandboxFile};
 use gang_spi::{
     ActionCommand, ActionExecutionSpec, ActionIsolationPort, ActionLimitsPort, GUARD_LINK_NAME,
-    NetworkAccess, PluginContext, PortError, ReadOnlyTree, SIDE_CHANNEL_FILE_ENV,
+    NetworkAccess, ReadOnlyTree, SIDE_CHANNEL_FILE_ENV,
 };
+use gang_spi::{PluginContext, PortError};
 use gang_types::{Capability, NetworkRequest};
 
 use crate::action_directory::ActionDirectory;
 use crate::errors::ExecError;
-use crate::execute::{Action, execute, exit_status};
+use crate::execute::{Action, ExecutionHooks, execute, exit_status};
 use crate::properties::ActionProperties;
 use crate::side_channel;
 use crate::terminations;
@@ -70,6 +71,9 @@ where
         build_sandbox,
         build_limits,
         gang_os::join_parent_group,
+        |action_dir, guardian_pid| {
+            gang_os::DescendantTracker::start(action_dir, guardian_pid).map(Some)
+        },
         || {
             let group = gang_os::parent_process_group().map_err(ExecError::Guard)?;
             let executable = std::env::current_exe().map_err(ExecError::Guard)?;
@@ -85,7 +89,7 @@ where
                 .stderr(Stdio::null())
                 .process_group(group)
                 .spawn()
-                .map(drop)
+                .map(|child| Some(child.id()))
                 .map_err(ExecError::Guard)
         },
     )
@@ -131,8 +135,33 @@ where
         build_sandbox,
         build_limits,
         leave_action_group,
-        || Ok(()),
+        |_, _| Ok(None),
+        || Ok(None),
     )
+}
+
+fn resolve_network<'a>(
+    request: NetworkRequest,
+    grants: &std::collections::BTreeSet<Capability>,
+    egress: Option<&'a gang_types::PublicEgressPolicy>,
+    controller_endpoints: &'a [gang_types::Url],
+) -> Result<NetworkAccess<'a>, ExecError> {
+    match request {
+        NetworkRequest::NotRequested => Ok(NetworkAccess::Offline),
+        NetworkRequest::Requested => {
+            if !grants.contains(&Capability::Network) {
+                return Err(ExecError::NetworkNotGranted);
+            }
+            let policy = egress.ok_or(ExecError::NetworkPolicyMissing)?;
+            if controller_endpoints.is_empty() {
+                return Err(ExecError::NetworkEndpointsMissing);
+            }
+            Ok(NetworkAccess::PublicEgress {
+                policy,
+                controller_endpoints,
+            })
+        }
+    }
 }
 
 /// Runs an invocation, starting its guardian after the limits plugin is built when configured.
@@ -141,7 +170,8 @@ fn run_inner<P, S, L>(
     build_sandbox: impl FnOnce(P::SandboxKey, P::Sandbox, &PluginContext<'_>) -> Result<S, PortError>,
     build_limits: impl FnOnce(P::Limits, &PluginContext<'_>) -> Result<L, PortError>,
     leave_action_group: impl FnOnce() -> io::Result<()>,
-    start_guardian: impl FnOnce() -> Result<(), ExecError>,
+    start_tracker: impl FnOnce(&Path, Option<u32>) -> io::Result<Option<gang_os::DescendantTracker>>,
+    start_guardian: impl FnOnce() -> Result<Option<u32>, ExecError>,
 ) -> Result<ExitCode, ExecError>
 where
     P: PluginSet,
@@ -157,29 +187,17 @@ where
     let path = SandboxFile::<P>::beside(invocation.entrypoint);
     let file = read_sandbox_file::<P>(&path)?;
     let properties = ActionProperties::from_environment(invocation.environment)?;
-    let network = match properties.network {
-        NetworkRequest::NotRequested => NetworkAccess::Offline,
-        NetworkRequest::Requested => {
-            if !file.actions.grants.contains(&Capability::Network) {
-                return Err(ExecError::NetworkNotGranted);
-            }
-            let policy = file
-                .execution
-                .egress
-                .as_ref()
-                .ok_or(ExecError::NetworkPolicyMissing)?;
-            if file.controller_endpoints.is_empty() {
-                return Err(ExecError::NetworkEndpointsMissing);
-            }
-            NetworkAccess::PublicEgress {
-                policy,
-                controller_endpoints: &file.controller_endpoints,
-            }
-        }
-    };
+    let network = resolve_network(
+        properties.network,
+        &file.actions.grants,
+        file.execution.egress.as_ref(),
+        &file.controller_endpoints,
+    )?;
     let directory = ActionDirectory::try_new(&file.work_directory, invocation.working_directory)?;
     let side_channel_inputs = side_channel::read_inputs(invocation.environment, &directory.path)?;
-    let context = PluginContext { config_path: &path };
+    let context = PluginContext {
+        config_path: Path::new(&path),
+    };
 
     let sandbox =
         build_sandbox(file.selected, file.sandbox, &context).map_err(ExecError::Sandbox)?;
@@ -188,9 +206,9 @@ where
         .map(|config| build_limits(config, &context))
         .transpose()
         .map_err(ExecError::Limits)?;
-    if limits.is_some() {
-        start_guardian()?;
-    }
+    let guardian_pid = limits.is_some().then(start_guardian).transpose()?.flatten();
+    let mut tracker =
+        start_tracker(&directory.path, guardian_pid).map_err(ExecError::CleanupActionGroup)?;
 
     let environment: Vec<_> = invocation
         .environment
@@ -198,6 +216,7 @@ where
         .filter(|(name, _)| name != SIDE_CHANNEL_FILE_ENV)
         .cloned()
         .collect();
+
     let read_only_trees: Vec<ReadOnlyTree<'_>> = side_channel_inputs
         .read_only_trees
         .iter()
@@ -206,22 +225,49 @@ where
             target: &tree.target,
         })
         .collect();
+    let ephemeral_dirs: Vec<&Path> = side_channel_inputs
+        .ephemeral_dirs
+        .iter()
+        .map(PathBuf::as_path)
+        .collect();
     let mut action_limits = properties.limits;
     action_limits.cpu_weight = side_channel_inputs.cpu_weight;
 
     let action = Action {
         spec: ActionExecutionSpec {
             command,
+            read_only_trees: &read_only_trees,
+            ephemeral_dirs: &ephemeral_dirs,
             environment: &environment,
             action_directory: &directory.path,
             working_directory: &directory.working_directory,
-            read_only_trees: &read_only_trees,
             network,
             memory_cgroup: None,
             launcher: &[],
         },
         limits: action_limits,
     };
+    run_action(
+        &sandbox,
+        limits.as_ref(),
+        file.execution.input_links,
+        &action,
+        invocation.environment,
+        leave_action_group,
+        tracker.as_mut(),
+    )
+}
+
+fn run_action<S: ActionIsolationPort, L: ActionLimitsPort>(
+    sandbox: &S,
+    limits: Option<&L>,
+    input_links: gang_config::InputLinks,
+    action: &Action<'_>,
+    environment: &[(OsString, OsString)],
+    leave_action_group: impl FnOnce() -> io::Result<()>,
+    tracker: Option<&mut gang_os::DescendantTracker>,
+) -> Result<ExitCode, ExecError> {
+    let action_dir = action.spec.action_directory;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -229,13 +275,30 @@ where
     let execution = runtime.block_on(async {
         let mut terminations = terminations::listen().map_err(ExecError::Signals)?;
         execute(
-            &sandbox,
-            limits.as_ref(),
-            file.execution.input_links,
-            &action,
+            sandbox,
+            limits,
+            input_links,
+            action,
             &mut terminations,
-            |cgroup| side_channel::publish_cgroup(invocation.environment, &directory.path, cgroup),
-            leave_action_group,
+            ExecutionHooks {
+                publish_cgroup: |cgroup| {
+                    side_channel::publish_cgroup(environment, action_dir, cgroup);
+                },
+                publish_pid: |pid| {
+                    side_channel::publish_pid(environment, action_dir, pid);
+                },
+                leave_action_group,
+                cleanup_action_group: || {
+                    if let Some(tracker) = tracker {
+                        let raw = i32::try_from(std::process::id())
+                            .map_err(|_| io::Error::other("invalid action process group"))?;
+                        let group = rustix::process::Pid::from_raw(raw)
+                            .ok_or_else(|| io::Error::other("invalid action process group"))?;
+                        tracker.drain(group, std::time::Duration::from_secs(10))?;
+                    }
+                    Ok(())
+                },
+            },
         )
         .await
     });
@@ -243,11 +306,11 @@ where
     runtime.shutdown_background();
     match execution {
         Ok(execution) => {
-            side_channel::report(invocation.environment, &directory.path, execution.usage);
+            side_channel::report(environment, action_dir, execution.usage);
             Ok(ExitCode::from(exit_status(execution.outcome)))
         }
         Err(failure) => {
-            side_channel::report(invocation.environment, &directory.path, failure.usage);
+            side_channel::report(environment, action_dir, failure.usage);
             Err(failure.error)
         }
     }

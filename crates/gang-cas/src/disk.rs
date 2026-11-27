@@ -9,13 +9,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream::{self, BoxStream};
-use gang_spi::{
-    BlobStream, ByteRange, ContentStore, EngineStore, PortError, Rejection, StoreKind,
-    WorkerCacheStats,
-};
+use gang_spi::EngineStore;
+use gang_spi::StoreKind;
+use gang_spi::WorkerCacheStats;
+use gang_spi::{BlobStream, ByteRange, ContentStore, PortError, Rejection};
 use gang_types::Digest;
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::layout::{
@@ -32,14 +32,15 @@ const WRITE_CHANNEL_CAPACITY: usize = 8;
 
 static EVICT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-type BlockingTaskList = Vec<(u64, JoinHandle<()>)>;
+type BlockingTaskList = Vec<JoinHandle<()>>;
 
 /// Tracks `spawn_blocking` tasks owned by an attempt phase so cancellation signals them
 /// cooperatively and awaits every handle before retiring directories or acknowledging cleanup.
 #[derive(Debug, Default, Clone)]
 pub struct BlockingScope {
     cancelled: Arc<AtomicBool>,
-    next_id: Arc<AtomicU64>,
+    notify: Arc<Notify>,
+    join: Arc<tokio::sync::Mutex<()>>,
     tasks: Arc<Mutex<BlockingTaskList>>,
 }
 
@@ -53,6 +54,7 @@ impl BlockingScope {
     /// Signals cooperative cancellation to every blocking task in this scope.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
     }
 
     /// Returns whether cancellation has been signaled for this scope.
@@ -61,48 +63,38 @@ impl BlockingScope {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    /// Spawns `f` on Tokio's blocking pool, retaining its join handle in this scope until
-    /// [`Self::finish`] or [`Self::cancel_and_join`] consumes it.
-    pub(crate) fn spawn_tracked<F, T>(&self, f: F) -> (u64, oneshot::Receiver<T>)
+    /// Waits for cancellation without losing a signal concurrent with registration.
+    pub async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_cancelled() {
+            notified.await;
+        }
+    }
+
+    /// Spawns `f` on Tokio's blocking pool, retaining its handle through task completion.
+    fn spawn_tracked<F, T>(&self, f: F) -> oneshot::Receiver<T>
     where
         F: FnOnce(&AtomicBool) -> T + Send + 'static,
         T: Send + 'static,
     {
         let cancelled = Arc::clone(&self.cancelled);
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         let handle = tokio::task::spawn_blocking(move || {
             let value = f(&cancelled);
             let _ = tx.send(value);
         });
         let mut guard = self.tasks.lock();
-        guard.retain(|(_, task)| !task.is_finished());
-        guard.push((id, handle));
-        (id, rx)
+        guard.retain(|task| !task.is_finished());
+        guard.push(handle);
+        rx
     }
 
-    /// Awaits a previously spawned tracked task and removes its handle from the scope on completion.
-    pub(crate) async fn finish<T>(&self, id: u64, rx: oneshot::Receiver<T>) -> io::Result<T> {
-        if let Ok(value) = rx.await {
-            let mut guard = self.tasks.lock();
-            if let Some(pos) = guard.iter().position(|(entry_id, _)| *entry_id == id) {
-                guard.swap_remove(pos);
-            }
-            return Ok(value);
-        }
-        let handle = {
-            let mut guard = self.tasks.lock();
-            guard
-                .iter()
-                .position(|(entry_id, _)| *entry_id == id)
-                .map(|pos| guard.swap_remove(pos).1)
-        };
-        if let Some(handle) = handle {
-            handle.await.map_err(io::Error::other)?;
-        }
-        Err(io::Error::other(
-            "blocking task exited before sending result",
-        ))
+    /// Awaits the task's result, retaining its handle until it has fully exited.
+    async fn finish<T>(rx: oneshot::Receiver<T>) -> io::Result<T> {
+        rx.await
+            .map_err(|_| io::Error::other("blocking task exited before sending result"))
     }
 
     /// Runs `f` on Tokio's blocking pool, retaining its join handle even if this future is dropped
@@ -116,25 +108,36 @@ impl BlockingScope {
         F: FnOnce(&AtomicBool) -> T + Send + 'static,
         T: Send + 'static,
     {
-        let (id, rx) = self.spawn_tracked(f);
-        self.finish(id, rx).await
+        let rx = self.spawn_tracked(f);
+        Self::finish(rx).await
     }
 
     /// Signals cooperative cancellation and joins every blocking task spawned in this scope.
     pub async fn cancel_and_join(&self) {
+        use std::future::{Future as _, poll_fn};
+        use std::pin::Pin;
+        use std::task::Poll;
+
         self.cancel();
-        loop {
-            let handles: Vec<JoinHandle<()>> = {
-                let mut guard = self.tasks.lock();
-                if guard.is_empty() {
-                    break;
+        let _join = self.join.lock().await;
+        poll_fn(|cx| {
+            let mut tasks = self.tasks.lock();
+            let mut index = 0;
+            while index < tasks.len() {
+                if Pin::new(&mut tasks[index]).poll(cx).is_ready() {
+                    // Only remove a joined handle; dropping this drain future retains ownership.
+                    drop(tasks.swap_remove(index));
+                } else {
+                    index += 1;
                 }
-                guard.drain(..).map(|(_, handle)| handle).collect()
-            };
-            for handle in handles {
-                let _ = handle.await;
             }
-        }
+            if tasks.is_empty() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
     }
 }
 
@@ -155,6 +158,9 @@ enum WriteChunk {
     Commit,
 }
 
+#[cfg(test)]
+type WriteGate = (Arc<Notify>, Arc<Mutex<Option<oneshot::Receiver<()>>>>);
+
 /// Fast local `NVMe` content-addressed store backed by a 256-way sharded directory tree and a
 /// 16-way sharded O(1) LRU index.
 #[derive(Debug, Clone)]
@@ -168,6 +174,8 @@ struct DiskCasInner {
     budget_bytes: u64,
     lru: Arc<ShardedLru>,
     stats: CasStats,
+    #[cfg(test)]
+    write_gate: Mutex<Option<WriteGate>>,
 }
 
 impl DiskCas {
@@ -206,6 +214,8 @@ impl DiskCas {
                 budget_bytes,
                 lru,
                 stats,
+                #[cfg(test)]
+                write_gate: Mutex::new(None),
             }),
         };
 
@@ -321,11 +331,41 @@ impl DiskCas {
         body: BlobStream,
         executable: bool,
     ) -> Result<WriteOutcome, PortError> {
+        self.write_with_mode_inner(digest, body, executable, None)
+            .await
+    }
+
+    /// Writes a verified blob while retaining all filesystem tasks in `scope` through shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortError`] on cancellation, digest mismatch, filesystem, or stream failure.
+    pub async fn write_with_mode_scoped(
+        &self,
+        digest: Digest,
+        body: BlobStream,
+        executable: bool,
+        scope: &BlockingScope,
+    ) -> Result<WriteOutcome, PortError> {
+        self.write_with_mode_inner(digest, body, executable, Some(scope))
+            .await
+    }
+
+    async fn write_with_mode_inner(
+        &self,
+        digest: Digest,
+        body: BlobStream,
+        executable: bool,
+        scope: Option<&BlockingScope>,
+    ) -> Result<WriteOutcome, PortError> {
+        if scope.is_some_and(BlockingScope::is_cancelled) {
+            return Err(PortError::unavailable("cache write cancelled"));
+        }
         if body.size != digest.size() {
             return Err(PortError::refused(Rejection::DigestMismatch));
         }
         if digest.is_empty() {
-            verify_empty_stream(body).await?;
+            verify_empty_stream(body, scope).await?;
             return Ok(WriteOutcome::Cached);
         }
 
@@ -333,7 +373,7 @@ impl DiskCas {
         let key = CacheKey::new(digest, mode);
 
         if let Some(pin) = self.inner.lru.pin_resident(key) {
-            verify_stream_only(digest, body).await?;
+            verify_stream_only(digest, body, scope).await?;
             if !pin.touch() {
                 return Err(PortError::backend(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -344,40 +384,73 @@ impl DiskCas {
         }
 
         if !self.can_admit(digest.size()) {
-            verify_stream_only(digest, body).await?;
+            verify_stream_only(digest, body, scope).await?;
             return Ok(WriteOutcome::Bypassed);
         }
 
         let target_after_evict = self.inner.budget_bytes.saturating_sub(digest.size());
         if self.inner.lru.size_bytes() > target_after_evict {
-            self.evict_and_unlink_until(target_after_evict).await?;
+            self.evict_and_unlink_until_scoped(target_after_evict, scope)
+                .await?;
         }
         if self.inner.lru.size_bytes() > target_after_evict {
             // Concurrent pins grew while evicting; bypass rather than exceeding budget.
-            verify_stream_only(digest, body).await?;
+            verify_stream_only(digest, body, scope).await?;
             return Ok(WriteOutcome::Bypassed);
         }
 
         let writer = {
             let root = self.inner.root.clone();
-            tokio::task::spawn_blocking(move || VerifiedWriter::open_cas(&root, key))
-                .await
-                .map_err(PortError::backend)?
-                .map_err(PortError::backend)?
+            let open = move |cancelled: &AtomicBool| {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "cache write cancelled",
+                    ));
+                }
+                VerifiedWriter::open_cas(&root, key)
+            };
+            if let Some(scope) = scope {
+                scope
+                    .run(open)
+                    .await
+                    .map_err(PortError::backend)?
+                    .map_err(PortError::backend)?
+            } else {
+                tokio::task::spawn_blocking(move || open(&AtomicBool::new(false)))
+                    .await
+                    .map_err(PortError::backend)?
+                    .map_err(PortError::backend)?
+            }
         };
 
+        #[cfg(test)]
+        let on_write = self
+            .inner
+            .write_gate
+            .lock()
+            .take()
+            .map(|(entered, release)| {
+                Arc::new(move || {
+                    entered.notify_one();
+                    if let Some(release) = release.lock().take() {
+                        let _ = release.blocking_recv();
+                    }
+                }) as Arc<dyn Fn() + Send + Sync>
+            });
         stream_into_verified_writer(
             body,
             writer,
             Some((Arc::clone(&self.inner), key)),
-            None,
+            scope,
             #[cfg(test)]
-            None,
+            on_write,
         )
         .await?;
 
         if self.inner.lru.size_bytes() > self.inner.budget_bytes {
-            self.evict_and_unlink_until(self.inner.budget_bytes).await?;
+            self.evict_and_unlink_until_scoped(self.inner.budget_bytes, scope)
+                .await?;
         }
 
         Ok(WriteOutcome::Cached)
@@ -459,7 +532,7 @@ impl DiskCas {
         }
         let mode = BlobMode::from_executable(executable);
         if digest.is_empty() {
-            verify_empty_stream(body).await?;
+            verify_empty_stream(body, scope).await?;
             let dest_owned = dest.to_path_buf();
             let create = move |cancelled: &AtomicBool| -> io::Result<()> {
                 #[cfg(test)]
@@ -663,13 +736,31 @@ impl DiskCas {
     }
 
     async fn evict_and_unlink_until(&self, target_bytes: u64) -> Result<(), PortError> {
+        self.evict_and_unlink_until_scoped(target_bytes, None).await
+    }
+
+    async fn evict_and_unlink_until_scoped(
+        &self,
+        target_bytes: u64,
+        scope: Option<&BlockingScope>,
+    ) -> Result<(), PortError> {
         let cas = self.clone();
-        tokio::task::spawn_blocking(move || {
+        let evict = move |_: &AtomicBool| {
             let tombstones = cas.detach_evicted_until(target_bytes)?;
             unlink_tombstones(tombstones).map_err(PortError::backend)
-        })
-        .await
-        .map_err(PortError::backend)?
+        };
+        if let Some(scope) = scope {
+            scope.run(evict).await.map_err(PortError::backend)?
+        } else {
+            tokio::task::spawn_blocking(move || evict(&AtomicBool::new(false)))
+                .await
+                .map_err(PortError::backend)?
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_next_write(&self, entered: Arc<Notify>, release: oneshot::Receiver<()>) {
+        *self.inner.write_gate.lock() = Some((entered, Arc::new(Mutex::new(Some(release)))));
     }
 
     fn detach_evicted_until(&self, target_bytes: u64) -> Result<Vec<PathBuf>, PortError> {
@@ -830,7 +921,7 @@ impl ContentStore for DiskCas {
             WriteOutcome::Cached => Ok(()),
             WriteOutcome::Bypassed => Err(PortError::rejected(
                 Rejection::ResourceExhausted,
-                "content store capacity cannot admit the verified blob",
+                io::Error::other("content store capacity cannot admit the verified blob"),
             )),
         }
     }
@@ -851,8 +942,26 @@ fn unlink_tombstones(paths: Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
-async fn verify_empty_stream(mut body: BlobStream) -> Result<(), PortError> {
-    while let Some(chunk) = body.chunks.next().await {
+async fn next_chunk(
+    body: &mut BlobStream,
+    scope: Option<&BlockingScope>,
+) -> Result<Option<Result<Bytes, PortError>>, PortError> {
+    if let Some(scope) = scope {
+        tokio::select! {
+            biased;
+            () = scope.cancelled() => Err(PortError::unavailable("cache write cancelled")),
+            next = body.chunks.next() => Ok(next),
+        }
+    } else {
+        Ok(body.chunks.next().await)
+    }
+}
+
+async fn verify_empty_stream(
+    mut body: BlobStream,
+    scope: Option<&BlockingScope>,
+) -> Result<(), PortError> {
+    while let Some(chunk) = next_chunk(&mut body, scope).await? {
         let chunk = chunk?;
         if !chunk.is_empty() {
             return Err(PortError::refused(Rejection::DigestMismatch));
@@ -861,12 +970,16 @@ async fn verify_empty_stream(mut body: BlobStream) -> Result<(), PortError> {
     Ok(())
 }
 
-async fn verify_stream_only(digest: Digest, mut body: BlobStream) -> Result<(), PortError> {
+async fn verify_stream_only(
+    digest: Digest,
+    mut body: BlobStream,
+    scope: Option<&BlockingScope>,
+) -> Result<(), PortError> {
     use sha2::{Digest as _, Sha256};
 
     let mut hasher = Sha256::new();
     let mut seen = 0_u64;
-    while let Some(chunk) = body.chunks.next().await {
+    while let Some(chunk) = next_chunk(&mut body, scope).await? {
         let chunk = chunk?;
         let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
         seen = seen
@@ -888,19 +1001,16 @@ async fn verify_stream_only(digest: Digest, mut body: BlobStream) -> Result<(), 
 }
 
 enum WriterHandle {
-    Scoped(u64, oneshot::Receiver<Result<(), VerifiedWriteError>>),
+    Scoped(oneshot::Receiver<Result<(), VerifiedWriteError>>),
     Unscoped(JoinHandle<Result<(), VerifiedWriteError>>),
 }
 
 impl WriterHandle {
-    async fn join(self, scope: Option<&BlockingScope>) -> Result<(), PortError> {
+    async fn join(self) -> Result<(), PortError> {
         let result = match self {
-            Self::Scoped(id, rx) => {
-                let Some(scope) = scope else {
-                    return Err(PortError::backend("missing blocking scope"));
-                };
-                scope.finish(id, rx).await.map_err(PortError::backend)?
-            }
+            Self::Scoped(rx) => BlockingScope::finish(rx)
+                .await
+                .map_err(PortError::backend)?,
             Self::Unscoped(handle) => handle.await.map_err(PortError::backend)?,
         };
         match result {
@@ -913,100 +1023,131 @@ impl WriterHandle {
     }
 }
 
+fn write_chunks(
+    mut writer: VerifiedWriter,
+    mut rx: mpsc::Receiver<WriteChunk>,
+    publication: Option<(Arc<DiskCasInner>, CacheKey)>,
+    cancelled: &AtomicBool,
+    #[cfg(test)] mut on_write: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> Result<(), VerifiedWriteError> {
+    while let Some(msg) = rx.blocking_recv() {
+        #[cfg(test)]
+        if let Some(callback) = on_write.take() {
+            callback();
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return Err(VerifiedWriteError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "direct write cancelled",
+            )));
+        }
+        match msg {
+            WriteChunk::Data(bytes) => writer.write_chunk(&bytes)?,
+            WriteChunk::Commit => {
+                if let Some((inner, key)) = publication {
+                    let outcome = inner
+                        .lru
+                        .publish(key, key.digest.size(), || writer.commit())?;
+                    if let InsertOutcome::Inserted { size } = outcome {
+                        inner.stats.add_size_bytes(size);
+                    }
+                    return Ok(());
+                }
+                return writer.commit();
+            }
+        }
+    }
+    // Losing the sender before Commit drops the temporary file without publishing.
+    Ok(())
+}
+
 async fn stream_into_verified_writer(
     mut body: BlobStream,
-    mut writer: VerifiedWriter,
+    writer: VerifiedWriter,
     publication: Option<(Arc<DiskCasInner>, CacheKey)>,
     scope: Option<&BlockingScope>,
     #[cfg(test)] on_write: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<(), PortError> {
-    let (tx, mut rx) = mpsc::channel::<WriteChunk>(WRITE_CHANNEL_CAPACITY);
+    let (tx, rx) = mpsc::channel::<WriteChunk>(WRITE_CHANNEL_CAPACITY);
 
-    let run_writer = move |cancelled: &AtomicBool| -> Result<(), VerifiedWriteError> {
-        #[cfg(test)]
-        let mut hook = on_write;
-        while let Some(msg) = rx.blocking_recv() {
+    let run_writer = move |cancelled: &AtomicBool| {
+        write_chunks(
+            writer,
+            rx,
+            publication,
+            cancelled,
             #[cfg(test)]
-            if let Some(callback) = hook.take() {
-                callback();
-            }
-            if cancelled.load(Ordering::Acquire) {
-                return Err(VerifiedWriteError::Io(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "direct write cancelled",
-                )));
-            }
-            match msg {
-                WriteChunk::Data(bytes) => writer.write_chunk(&bytes)?,
-                WriteChunk::Commit => {
-                    if let Some((inner, key)) = publication {
-                        let outcome = inner
-                            .lru
-                            .publish(key, key.digest.size(), || writer.commit())?;
-                        if let InsertOutcome::Inserted { size } = outcome {
-                            inner.stats.add_size_bytes(size);
-                        }
-                        return Ok(());
-                    }
-                    return writer.commit();
-                }
-            }
-        }
-        // Sender dropped before Commit (stream error or caller cancellation): drop temp without publishing.
-        Ok(())
+            on_write,
+        )
     };
 
     let writer_handle = if let Some(scope) = scope {
-        let (id, rx) = scope.spawn_tracked(run_writer);
-        WriterHandle::Scoped(id, rx)
+        let rx = scope.spawn_tracked(run_writer);
+        WriterHandle::Scoped(rx)
     } else {
         WriterHandle::Unscoped(tokio::task::spawn_blocking(move || {
             run_writer(&AtomicBool::new(false))
         }))
     };
 
-    while let Some(chunk_res) = body.chunks.next().await {
-        if scope.is_some_and(BlockingScope::is_cancelled) {
-            drop(tx);
-            let _ = writer_handle.join(scope).await;
-            return Err(PortError::unavailable("direct write cancelled"));
-        }
-        let chunk = match chunk_res {
-            Ok(chunk) => chunk,
-            Err(error) => {
+    loop {
+        let next = next_chunk(&mut body, scope).await;
+        let chunk = match next {
+            Ok(Some(Ok(chunk))) => chunk,
+            Ok(None) => break,
+            Ok(Some(Err(error))) | Err(error) => {
+                drop(body);
                 drop(tx);
-                let _ = writer_handle.join(scope).await;
+                let _ = writer_handle.join().await;
                 return Err(error);
             }
         };
-        if !chunk.is_empty() && tx.send(WriteChunk::Data(chunk)).await.is_err() {
-            break;
+        if chunk.is_empty() {
+            continue;
+        }
+        let send_future = tx.send(WriteChunk::Data(chunk));
+        let sent = if let Some(scope) = scope {
+            tokio::select! {
+                biased;
+                () = scope.cancelled() => false,
+                result = send_future => result.is_ok(),
+            }
+        } else {
+            send_future.await.is_ok()
+        };
+        if !sent {
+            drop(body);
+            drop(tx);
+            writer_handle.join().await?;
+            return Err(PortError::unavailable("cache write cancelled"));
         }
     }
 
     if scope.is_some_and(BlockingScope::is_cancelled) {
+        drop(body);
         drop(tx);
-        let _ = writer_handle.join(scope).await;
-        return Err(PortError::unavailable("direct write cancelled"));
+        let _ = writer_handle.join().await;
+        return Err(PortError::unavailable("cache write cancelled"));
     }
 
     let _ = tx.send(WriteChunk::Commit).await;
     drop(tx);
 
-    writer_handle.join(scope).await
+    writer_handle.join().await
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use bytes::Bytes;
     use futures::{StreamExt as _, stream};
-    use gang_spi::{BlobStream, ByteRange, ContentStore, EngineStore, StoreKind};
+    use gang_spi::EngineStore;
+    use gang_spi::StoreKind;
+    use gang_spi::{BlobStream, ByteRange, ContentStore};
     use gang_testkit::{TestResult, content_store_contract};
     use gang_types::Digest;
 
@@ -1014,30 +1155,105 @@ mod tests {
     use crate::layout::{DETERMINISTIC_MTIME_SECS, blob_path};
     use crate::lru::{BlobMode, CacheKey};
 
-    static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
-
     struct TempDir {
-        path: PathBuf,
+        directory: tempfile::TempDir,
     }
 
     impl TempDir {
         fn new() -> Result<Self, std::io::Error> {
-            let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("gang-cas-disk-test-{}-{seq}", std::process::id()));
-            fs::create_dir_all(&path)?;
-            Ok(Self { path })
+            Ok(Self {
+                directory: tempfile::tempdir()?,
+            })
         }
 
         fn path(&self) -> &Path {
-            &self.path
+            self.directory.path()
         }
     }
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
+            let _ = gang_os::fs::remove_dir_optional(self.path());
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_verifiers_cancel_without_waiting_for_stream_eof() -> TestResult {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let dir = TempDir::new()?;
+            let cas = DiskCas::open(dir.path(), 4).await?;
+            let resident = Bytes::from_static(b"warm");
+            let resident_digest = Digest::from_bytes(&resident);
+            cas.write(resident_digest, BlobStream::from_bytes(resident.clone()))
+                .await?;
+            let bypassed = Digest::from_bytes(b"too large");
+            for digest in [Digest::EMPTY, resident_digest, bypassed] {
+                let scope = BlockingScope::new();
+                let body = BlobStream {
+                    size: digest.size(),
+                    chunks: Box::pin(stream::pending()),
+                };
+                let mut write = Box::pin(cas.write_with_mode_scoped(digest, body, false, &scope));
+                assert!(futures::poll!(write.as_mut()).is_pending());
+                scope.cancel();
+                assert!(matches!(
+                    write.await,
+                    Err(gang_spi::PortError::Unavailable(_))
+                ));
+                scope.cancel_and_join().await;
+            }
+            assert_eq!(
+                cas.read(resident_digest, ByteRange::FULL)
+                    .await?
+                    .ok_or("resident")?
+                    .collect()
+                    .await?,
+                resident
+            );
+            assert!(cas.read(bypassed, ByteRange::FULL).await?.is_none());
+            assert_eq!(
+                fs::read_dir(cas.root().join(crate::TMP_DIR_NAME))?.count(),
+                0
+            );
+            Ok(())
+        })
+        .await?
+    }
+
+    #[tokio::test]
+    async fn cancelled_drain_retains_unfinished_blocking_task() -> TestResult {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let scope = BlockingScope::new();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let latch = TestLatch::new();
+            let _guard = LatchGuard(Arc::clone(&latch));
+            let worker_latch = Arc::clone(&latch);
+            let worker_entered = Arc::clone(&entered);
+            let mut work = Box::pin(scope.run(move |_| {
+                worker_entered.notify_one();
+                worker_latch.wait();
+            }));
+            assert!(futures::poll!(work.as_mut()).is_pending());
+            entered.notified().await;
+            drop(work);
+            let mut first = Box::pin(scope.cancel_and_join());
+            let first_pending = futures::poll!(first.as_mut()).is_pending();
+            drop(first);
+            let mut second = Box::pin(scope.cancel_and_join());
+            let second_pending = futures::poll!(second.as_mut()).is_pending();
+            latch.release();
+            second.await;
+            assert!(
+                first_pending,
+                "first drain released an unfinished blocking task"
+            );
+            assert!(
+                second_pending,
+                "dropping a drain detached its unfinished blocking task"
+            );
+            Ok(())
+        })
+        .await?
     }
 
     #[tokio::test]

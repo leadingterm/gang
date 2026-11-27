@@ -989,9 +989,22 @@ mod harness {
             let pct = self.rng.range_u64(80, 100);
             let cap = NonZeroBytes::new(Bytes::kib((est_kb * pct) / 100)).expect("nonzero");
             self.scheduler
-                .set_peer_memory_observations([gang_spi::FleetMemoryCapacity {
+                .set_peer_capacity_observations([gang_spi::FleetResourceCapacity {
                     fleet,
-                    capacity: cap,
+                    capacity: gang_types::Resources {
+                        vcpus: u32::try_from(
+                            self.catalog.fleets()[fleet]
+                                .capacity(property::CPU_COUNT)
+                                .unwrap_or(1),
+                        )
+                        .expect("vcpus"),
+                        memory: cap.get(),
+                        disk: Bytes::kib(
+                            self.catalog.fleets()[fleet]
+                                .capacity(property::DISK_KB)
+                                .unwrap_or(1),
+                        ),
+                    },
                 }])
                 .expect("valid peer observation");
             self.check_invariants("peer_memory");

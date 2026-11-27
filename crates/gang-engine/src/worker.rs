@@ -20,18 +20,19 @@ use gang_cas::{
     TreeCacheConfig,
 };
 use gang_clock::{Clock, Timestamp};
-use gang_config::{ActionsConfig, WorkerConfig};
+use gang_config::ActionsConfig;
+use gang_config::WorkerConfig;
 use gang_reapi::from_proto;
 use gang_reapi::google::rpc as rpc_proto;
 use gang_reapi::leadingterm::gang::worker::v1 as proto;
+use gang_spi::EngineStore;
 use gang_spi::{
-    ActionMemoryPool, ActionStore, BlobStream, ByteRange, ContentStore, EngineStore, PortError,
-    PortFailure, WorkerStores,
+    ActionMemoryPool, ActionStore, BlobStream, ByteRange, ContentStore, PortError, WorkerStores,
 };
 use gang_types::{
-    AttemptId, CpuWeight, Digest, FleetProperties, InstanceId, NonZeroBytes, NonZeroDuration,
-    WorkerId, WorkerLifetime, property,
+    AttemptId, CpuWeight, Digest, FleetProperties, InstanceId, WorkerId, WorkerLifetime, property,
 };
+use gang_types::{NonZeroBytes, NonZeroDuration};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
@@ -40,7 +41,7 @@ use tonic::transport::Channel;
 use crate::worker_graveyard::{Graveyard, GraveyardError, sweep_work_root};
 use crate::worker_runner::{
     DEFAULT_MAX_OUTPUT_BYTES, ReadOnlyBind, RunOutcome, RunSpec, RunnerError, SideChannelInputs,
-    run_attempt, start_orphan_reaper,
+    declared_output_paths, run_attempt, start_orphan_reaper,
 };
 use crate::worker_sampling::{
     GraveyardPending, KillTrigger, KillWaiter, SamplingConfig, SamplingRegistry, SystemProbe,
@@ -98,7 +99,7 @@ pub struct WorkerRuntimeSpec {
 }
 
 /// Fatal errors returned by [`run_worker`].
-#[derive(Debug, thiserror::Error, PortFailure)]
+#[derive(Debug, thiserror::Error, gang_spi::PortFailure)]
 pub enum WorkerError {
     /// Worker specification or configuration was invalid.
     #[error("invalid worker configuration: {0}")]
@@ -110,6 +111,7 @@ pub enum WorkerError {
     Session(#[from] SessionError),
     /// Preparing, retiring into, or draining `.graveyard` or `<work>` failed.
     #[error(transparent)]
+    #[failure(backend)]
     Graveyard(#[from] GraveyardError),
     /// Opening or operating [`DiskCas`] or [`TreeCache`] failed.
     #[error("local cache failure: {0}")]
@@ -137,11 +139,9 @@ struct ControllerCas {
 
 impl ControllerCas {
     fn client(&self) -> Result<RemoteCas, PortError> {
-        let channel = self
-            .channel
-            .lock()
-            .clone()
-            .ok_or_else(|| PortError::unavailable("worker session is not connected"))?;
+        let channel = self.channel.lock().clone().ok_or_else(|| {
+            PortError::unavailable(std::io::Error::other("worker session is not connected"))
+        })?;
         Ok(RemoteCas::with_config(channel, self.config.clone()))
     }
 }
@@ -449,8 +449,25 @@ where
     )
     .await;
 
-    prepared.runtime.graveyard.drain().await;
+    drain_worker_caches(&prepared.runtime).await;
     result
+}
+
+async fn drain_worker_caches<C, A, K>(runtime: &WorkerRuntime<C, A, K>)
+where
+    C: ContentStore,
+{
+    // Signal both owners before joining: a tree build may be awaiting a detached CAS fetch.
+    if let Some(trees) = &runtime.tree_cache {
+        trees.cancel();
+    }
+    runtime.tiered.cancel_inflight();
+    if let Some(trees) = &runtime.tree_cache {
+        trees.shutdown().await;
+    }
+    // Direct stores are shared across certificate generations and remain owned by the caller.
+    runtime.tiered.shutdown_inflight().await;
+    runtime.graveyard.drain().await;
 }
 
 struct PreparedWorker<C, A, K> {
@@ -605,7 +622,7 @@ where
     let mut controller_draining = false;
     let mut single_use_claimed = false;
     let single_use = matches!(runtime.spec.lifetime, WorkerLifetime::SingleUse);
-    let mut fatal_session_error: Option<SessionError> = None;
+    let mut fatal_error: Option<WorkerError> = None;
     let mut session_finished = false;
 
     loop {
@@ -627,10 +644,10 @@ where
                 match joined {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
-                        fatal_session_error = Some(err);
+                        fatal_error = Some(WorkerError::Session(err));
                     }
                     Err(join_err) => {
-                        return Err(WorkerError::Config(format!(
+                        fatal_error = Some(WorkerError::Config(format!(
                             "worker session task failed: {join_err}"
                         )));
                     }
@@ -755,17 +772,23 @@ where
     drain_attempts(&mut attempt_tasks).await;
     if !session_finished {
         session_stop.notify_one();
-        if let Ok(Err(err)) = (&mut session_task.0).await
-            && fatal_session_error.is_none()
-        {
-            fatal_session_error = Some(err);
+        match (&mut session_task.0).await {
+            Ok(Err(err)) if fatal_error.is_none() => {
+                fatal_error = Some(WorkerError::Session(err));
+            }
+            Err(join_err) if fatal_error.is_none() => {
+                fatal_error = Some(WorkerError::Config(format!(
+                    "worker session task failed: {join_err}"
+                )));
+            }
+            _ => {}
         }
     }
     sampler_stop.notify_one();
     let _ = (&mut sampler_task.0).await;
 
-    if let Some(err) = fatal_session_error {
-        return Err(WorkerError::Session(err));
+    if let Some(err) = fatal_error {
+        return Err(err);
     }
     Ok(())
 }
@@ -853,7 +876,7 @@ async fn execute_assigned_attempt<C, A, K>(
     staged.release_for_upload();
     retire_guard.walk_bytes = run_outcome.usage.peak_disk_bytes.unwrap_or(0);
 
-    // Emit `WorkerMessage::Executed` immediately before upload (`§6.4`).
+    // Emit `ConnectRequest::Executed` immediately before upload (`§6.4`).
     let executed_proto = run_outcome.to_executed_proto(&attempt_id);
     if outbound.executed(executed_proto.clone()).await.is_err() {
         let _ = retire_guard.retire_now();
@@ -1150,12 +1173,8 @@ fn build_session_config(spec: &WorkerRuntimeSpec) -> SessionConfig {
     let ceiling_cpu = ceilings.cpu_count.map_or(cpu_physical, |count| {
         u64::from(count.get()).saturating_mul(property::MILLICORES_PER_CORE)
     });
-    let ceiling_mem = ceilings
-        .memory
-        .map_or(memory_bytes, gang_types::NonZeroBytes::as_u64);
-    let ceiling_disk = ceilings
-        .disk
-        .map_or(disk_bytes, gang_types::NonZeroBytes::as_u64);
+    let ceiling_mem = ceilings.memory.map_or(memory_bytes, NonZeroBytes::as_u64);
+    let ceiling_disk = ceilings.disk.map_or(disk_bytes, NonZeroBytes::as_u64);
 
     let properties: HashMap<String, String> = spec
         .properties
@@ -1237,6 +1256,7 @@ fn build_run_spec(
         work_directory: spec.work_directory.clone(),
         working_directory: PathBuf::from(&command.working_directory),
         environment,
+        output_paths: declared_output_paths(command),
         platform: assign.platform.clone(),
         side_channel: SideChannelInputs {
             cpu_weight,
@@ -1369,7 +1389,8 @@ mod tests {
     use bytes::Bytes;
     use futures::stream;
     use gang_clock::SystemClock;
-    use gang_config::{ActionsConfig, WorkerConfig};
+    use gang_config::ActionsConfig;
+    use gang_config::WorkerConfig;
     use gang_reapi::build::bazel::remote::execution::v2::action_cache_server::ActionCacheServer;
     use gang_reapi::build::bazel::remote::execution::v2::content_addressable_storage_server::ContentAddressableStorageServer;
     use gang_reapi::build::bazel::remote::execution::v2::{self as reapi};
@@ -1383,9 +1404,10 @@ mod tests {
     };
     use gang_reapi::to_proto;
     use gang_testkit::{ChildTest, MemoryActionStore, MemoryContentStore, TestResult};
+    use gang_types::Bytes as GangBytes;
     use gang_types::{
-        ActionEnvironment, Bytes as GangBytes, Digest, FleetActionPolicy, FleetName,
-        FleetProperties, InstanceId, Isa, Resources, WorkerLifetime,
+        ActionEnvironment, Digest, FleetActionPolicy, FleetName, FleetProperties, InstanceId, Isa,
+        Resources, WorkerLifetime,
     };
     use prost::Message as _;
     use tempfile::TempDir;
@@ -1837,7 +1859,7 @@ mod tests {
             Ok(())
         }
 
-        fn usage(&self) -> Option<gang_spi::EngineStore> {
+        fn usage(&self) -> Option<EngineStore> {
             None
         }
     }
@@ -1954,6 +1976,271 @@ mod tests {
         }
         prepared.runtime.graveyard.drain().await;
         Ok(())
+    }
+
+    async fn prepare_gated_tree_worker<C: ContentStore>(
+        spec: &WorkerRuntimeSpec,
+        stores: WorkerStores<C, MemoryActionStore>,
+        entered: Arc<Notify>,
+        release: oneshot::Receiver<()>,
+    ) -> TestResult<PreparedWorker<C, MemoryActionStore, SystemClock>> {
+        let mut prepared = prepare_worker_runtime(spec, stores, &SystemClock::new()).await?;
+        let runtime = Arc::get_mut(&mut prepared.runtime).ok_or("runtime already shared")?;
+        let config = *runtime.tree_cache.as_ref().ok_or("tree cache")?.config();
+        let graveyard = runtime.graveyard.clone();
+        let release = Mutex::new(Some(release));
+        runtime.tree_cache = Some(
+            TreeCache::open_with_evict_hook(
+                spec.trees_directory.as_ref().ok_or("trees directory")?,
+                Some(graveyard.dir().to_path_buf()),
+                runtime.tiered.disk().clone(),
+                config,
+                move |evicted| {
+                    let gate = release.lock().take();
+                    if let Some(gate) = gate {
+                        entered.notify_one();
+                        tokio::task::block_in_place(|| {
+                            let _ = gate.blocking_recv();
+                        });
+                    }
+                    graveyard.retire_evicted_tree(evicted);
+                },
+            )
+            .await?,
+        );
+        Ok(prepared)
+    }
+
+    fn single_file_directory(
+        name: &str,
+        digest: Digest,
+    ) -> TestResult<(Digest, HashMap<Digest, reapi::Directory>)> {
+        let directory = reapi::Directory {
+            files: vec![reapi::FileNode {
+                name: name.to_owned(),
+                digest: Some(to_proto(&digest)?),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let root = Digest::from_bytes(&directory.encode_to_vec());
+        Ok((root, HashMap::from([(root, directory)])))
+    }
+
+    #[derive(Debug)]
+    struct StalledContentStore {
+        contents: MemoryContentStore,
+        digest: Digest,
+        stalled: Arc<Notify>,
+    }
+
+    impl ContentStore for StalledContentStore {
+        async fn find_missing(
+            &self,
+            digests: &[Digest],
+            missing: &mut Vec<Digest>,
+        ) -> Result<(), PortError> {
+            self.contents.find_missing(digests, missing).await
+        }
+
+        async fn read(
+            &self,
+            digest: Digest,
+            range: ByteRange,
+        ) -> Result<Option<BlobStream>, PortError> {
+            use futures::StreamExt as _;
+
+            let Some(body) = self.contents.read(digest, range).await? else {
+                return Ok(None);
+            };
+            if digest != self.digest {
+                return Ok(Some(body));
+            }
+            let stalled = Arc::clone(&self.stalled);
+            let chunks = body.chunks.chain(stream::poll_fn(move |_| {
+                stalled.notify_one();
+                std::task::Poll::Pending
+            }));
+            Ok(Some(BlobStream {
+                size: body.size,
+                chunks: Box::pin(chunks),
+            }))
+        }
+
+        async fn write(&self, digest: Digest, body: BlobStream) -> Result<(), PortError> {
+            self.contents.write(digest, body).await
+        }
+
+        fn usage(&self) -> Option<EngineStore> {
+            None
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_shutdown_cancels_stalled_stream_and_joins_filesystem_work() -> TestResult {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let tmp = TempDir::new()?;
+            let mut spec = test_spec(&tmp.path().canonicalize()?, WorkerLifetime::LongLived, true)?;
+            spec.worker.tree_cache_min_files = NonZeroUsize::MIN;
+            spec.worker.tree_cache_max_trees = NonZeroUsize::MIN;
+            let payload = Bytes::from_static(b"never-finishing-worker-stream");
+            let digest = Digest::from_bytes(&payload);
+            let stalled = Arc::new(Notify::new());
+            let content = Arc::new(StalledContentStore {
+                contents: MemoryContentStore::new(),
+                digest,
+                stalled: Arc::clone(&stalled),
+            });
+            content
+                .write(digest, BlobStream::from_bytes(payload))
+                .await?;
+            let stores = WorkerStores::Direct {
+                content,
+                actions: Arc::new(MemoryActionStore::new()),
+            };
+            let entered = Arc::new(Notify::new());
+            let (release, gate) = oneshot::channel();
+            let prepared =
+                prepare_gated_tree_worker(&spec, stores, Arc::clone(&entered), gate).await?;
+            let disk = prepared.runtime.tiered.disk();
+            let resident = Bytes::from_static(b"resident-worker-tree");
+            let resident_digest = Digest::from_bytes(&resident);
+            disk.write(resident_digest, BlobStream::from_bytes(resident))
+                .await?;
+            let trees = prepared.runtime.tree_cache.as_ref().ok_or("tree cache")?;
+            let (old_root, old_dirs) = single_file_directory("old", resident_digest)?;
+            drop(
+                trees
+                    .get_or_materialize(old_root, &old_dirs)
+                    .await?
+                    .ok_or("old tree")?,
+            );
+
+            // Hold an eviction's tracked filesystem task before graveyard dispatch.
+            let (new_root, new_dirs) = single_file_directory("new", resident_digest)?;
+            let mut building = Box::pin(trees.get_or_materialize(new_root, &new_dirs));
+            assert!(futures::poll!(building.as_mut()).is_pending());
+            entered.notified().await;
+            drop(building);
+
+            // A second tree owns a CAS fetch whose stream never reaches EOF.
+            let (stalled_root, stalled_dirs) = single_file_directory("stalled", digest)?;
+            let mut staging = Box::pin(trees.get_or_materialize_from(
+                stalled_root,
+                &stalled_dirs,
+                &prepared.runtime.tiered,
+            ));
+            assert!(futures::poll!(staging.as_mut()).is_pending());
+            stalled.notified().await;
+            drop(staging);
+
+            let mut shutdown = Box::pin(drain_worker_caches(&prepared.runtime));
+            let pending = futures::poll!(shutdown.as_mut()).is_pending();
+            let released = release.send(());
+            assert!(
+                pending,
+                "worker released ownership of unfinished filesystem work"
+            );
+            released.map_err(|()| "eviction gate closed")?;
+            shutdown.await;
+
+            assert!(disk.read(digest, ByteRange::FULL).await?.is_none());
+            assert!(disk.pin_attempt(digest, false).is_none());
+            assert!(!trees.contains(stalled_root));
+            assert_eq!(
+                fs::read_dir(disk.root().join(gang_cas::TMP_DIR_NAME))?.count(),
+                0
+            );
+            assert_eq!(fs::read_dir(trees.root().join(".tmp"))?.count(), 0);
+            assert_eq!(prepared.runtime.graveyard.in_flight(), 0);
+            assert_eq!(prepared.runtime.graveyard.failures(), 0);
+            assert_eq!(fs::read_dir(prepared.runtime.graveyard.dir())?.count(), 0);
+            Ok(())
+        })
+        .await?
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renewal_waits_for_cancelled_tree_build_and_its_graveyard_work() -> TestResult {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let tmp = TempDir::new()?;
+            let mut spec = test_spec(&tmp.path().canonicalize()?, WorkerLifetime::LongLived, true)?;
+            spec.worker.tree_cache_min_files = NonZeroUsize::MIN;
+            spec.worker.tree_cache_max_trees = NonZeroUsize::MIN;
+            let stores = WorkerStores::Direct {
+                content: Arc::new(MemoryContentStore::new()),
+                actions: Arc::new(MemoryActionStore::new()),
+            };
+            let entered = Arc::new(Notify::new());
+            let (release_tx, release_rx) = oneshot::channel();
+            let prepared =
+                prepare_gated_tree_worker(&spec, stores.clone(), Arc::clone(&entered), release_rx)
+                    .await?;
+            let payload = Bytes::from_static(b"renewal-tree-payload");
+            let digest = Digest::from_bytes(&payload);
+            prepared
+                .runtime
+                .tiered
+                .disk()
+                .write(digest, BlobStream::from_bytes(payload.clone()))
+                .await?;
+            let trees = prepared.runtime.tree_cache.as_ref().ok_or("tree cache")?;
+            let (old_root, old_dirs) = single_file_directory("old", digest)?;
+            drop(
+                trees
+                    .get_or_materialize(old_root, &old_dirs)
+                    .await?
+                    .ok_or("old tree")?,
+            );
+            let (new_root, new_dirs) = single_file_directory("new", digest)?;
+            let mut staging = Box::pin(trees.get_or_materialize(new_root, &new_dirs));
+            assert!(futures::poll!(staging.as_mut()).is_pending());
+            entered.notified().await;
+            drop(staging);
+
+            // Eviction has detached the old tree, but its cleanup is not queued until release.
+            assert_eq!(prepared.runtime.graveyard.in_flight(), 0);
+            assert_eq!(fs::read_dir(prepared.runtime.graveyard.dir())?.count(), 1);
+            let mut shutdown = Box::pin(drain_worker_caches(&prepared.runtime));
+            assert!(
+                futures::poll!(shutdown.as_mut()).is_pending(),
+                "generation ended while its cancelled staging still owned a tree build"
+            );
+            release_tx.send(()).map_err(|()| "tree gate closed")?;
+            shutdown.await;
+            assert!(
+                !trees.contains(new_root),
+                "cancelled tree build published after shutdown"
+            );
+            assert_eq!(prepared.runtime.graveyard.failures(), 0);
+            assert_eq!(prepared.runtime.graveyard.in_flight(), 0);
+            assert_eq!(fs::read_dir(prepared.runtime.graveyard.dir())?.count(), 0);
+            drop(prepared);
+
+            let next = prepare_worker_runtime(&spec, stores, &SystemClock::new()).await?;
+            let reopened = next.runtime.tree_cache.as_ref().ok_or("new tree cache")?;
+            assert!(reopened.is_empty());
+            assert_eq!(fs::read_dir(next.runtime.graveyard.dir())?.count(), 0);
+            assert_eq!(next.runtime.graveyard.failures(), 0);
+            let blob = next
+                .runtime
+                .tiered
+                .read(digest, ByteRange::FULL)
+                .await?
+                .ok_or("reopened blob")?;
+            assert_eq!(blob.collect().await?, payload);
+            let tree = reopened
+                .get_or_materialize(new_root, &new_dirs)
+                .await?
+                .ok_or("reopened tree")?;
+            assert_eq!(fs::read(tree.path().join("new"))?, payload.as_ref());
+            drop(tree);
+            drain_worker_caches(&next.runtime).await;
+            drop(next);
+            gang_os::fs::remove_dir_optional(tmp.path())?;
+            Ok(())
+        })
+        .await?
     }
 
     #[test]
@@ -2442,7 +2729,7 @@ mod tests {
             let root = tmp.path().canonicalize()?;
             let mut spec = test_spec(&root, WorkerLifetime::LongLived, false)?;
             spec.actions = Arc::new(ActionsConfig {
-                kill_grace: gang_types::NonZeroDuration::from_millis(80),
+                kill_grace: NonZeroDuration::from_millis(80),
                 ..ActionsConfig::default()
             });
             let content = Arc::new(MemoryContentStore::new());

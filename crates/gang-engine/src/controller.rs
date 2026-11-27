@@ -15,8 +15,8 @@ use gang_scheduler::{
     WorkerRegistration,
 };
 use gang_spi::{
-    ActionsView, ControllerDrain, FleetMemoryCapacity, FleetSupply, LearnedHistory, ListingLimits,
-    PortError, SchedulerSnapshot,
+    ActionsView, ControllerDrain, FleetResourceCapacity, FleetSupply, LearnedHistory,
+    ListingLimits, PortError, SchedulerSnapshot,
 };
 use gang_types::{FleetName, InstanceId, NonZeroDuration, OperationName};
 use parking_lot::Mutex;
@@ -636,19 +636,19 @@ impl ControllerHandle {
         Ok(())
     }
 
-    /// Replaces peer-local memory capacity observations.
+    /// Replaces peer-local physical capacity observations.
     ///
     /// # Errors
     ///
     /// Returns [`PortError::Unavailable`] if the actor has stopped or enqueueing times out, or
     /// [`PortError::Backend`] if an observation is invalid.
-    pub async fn set_peer_memory_observations(
+    pub async fn set_peer_capacity_observations(
         &self,
-        observations: Vec<FleetMemoryCapacity>,
+        observations: Vec<FleetResourceCapacity>,
     ) -> Result<bool, PortError> {
         let permit = self.reserve_control().await?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        permit.send(ControlMsg::SetPeerMemory {
+        permit.send(ControlMsg::SetPeerCapacity {
             observations,
             reply: reply_tx,
         });
@@ -658,15 +658,15 @@ impl ControllerHandle {
             .map_err(PortError::backend)
     }
 
-    /// Recomputes local observed fleet memory capacities from connected workers.
+    /// Recomputes local observed fleet physical capacities from connected workers.
     ///
     /// # Errors
     ///
     /// Returns [`PortError::Unavailable`] if the actor has stopped or enqueueing times out.
-    pub async fn refresh_local_memory_observations(&self) -> Result<bool, PortError> {
+    pub async fn refresh_local_capacity_observations(&self) -> Result<bool, PortError> {
         let permit = self.reserve_control().await?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        permit.send(ControlMsg::RefreshLocalMemory { reply: reply_tx });
+        permit.send(ControlMsg::RefreshLocalCapacity { reply: reply_tx });
         reply_rx
             .await
             .map_err(|_| PortError::unavailable(ControllerClosed))
