@@ -10,6 +10,7 @@ mod controller;
 mod engine;
 mod gate;
 mod handoff;
+mod legacy_worker;
 mod observer;
 mod reapi_ac;
 mod reapi_bytestream;

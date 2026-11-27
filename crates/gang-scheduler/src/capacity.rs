@@ -192,7 +192,7 @@ impl CapacityCatalog {
         let millicores_per_physical_vcpu =
             property::MILLICORES_PER_CORE.saturating_mul(oversubscription);
         for (_, worker) in workers.workers_sorted() {
-            if worker.fleet >= self.estimates.len() {
+            if !worker.is_current_build() || worker.fleet >= self.estimates.len() {
                 continue;
             }
             let capacity = worker.ledger.capacity();
@@ -535,6 +535,47 @@ mod tests {
             cap.fleet(0).expect("alpha").physical_memory_kb,
             63 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn stale_generation_does_not_change_fleet_capacity() {
+        let mut cap = CapacityCatalog::new(two_fleets(), NonZeroU32::new(2).expect("nonzero"));
+        let mut workers = WorkerRegistry::from_catalog(cap.estimates()).expect("workers");
+        register_worker(&mut workers, "alpha", "i-1", 1, Bytes::gib(40));
+        assert!(cap.refresh_local(&workers));
+        let mut before = Vec::new();
+        cap.fleet_capacity(&mut before);
+        workers
+            .register(
+                now(2),
+                "0.3.9",
+                false,
+                WorkerRegistration {
+                    instance: Arc::new(InstanceId::try_new("i-1").expect("instance")),
+                    fleet: FleetName::try_new("alpha").expect("fleet"),
+                    gang_version: "legacy".to_owned(),
+                    properties: BTreeMap::new(),
+                    capacity: ActionResources {
+                        cpu_millicores: 2_000,
+                        memory: Bytes::mib(1),
+                        disk: Bytes::mib(1),
+                    },
+                    ceilings: ActionResources {
+                        cpu_millicores: 2_000,
+                        memory: Bytes::mib(1),
+                        disk: Bytes::mib(1),
+                    },
+                    max_inflight: None,
+                    single_use: false,
+                    environment: None,
+                    uuid_bytes: [2; 16],
+                },
+            )
+            .expect("stale registration");
+        cap.refresh_local(&workers);
+        let mut after = Vec::new();
+        cap.fleet_capacity(&mut after);
+        assert_eq!(before, after);
     }
 
     #[test]

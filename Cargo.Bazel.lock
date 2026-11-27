@@ -1,5 +1,5 @@
 {
-  "checksum": "76c2d7a74f972f2e30972e55eea3592fe9774585c5f60a6f1b1df6d17e9f96f6",
+  "checksum": "089bf6e40edd0ad2e933ef574b4012fcd99e7c6acc0cc57ffff3ff88159369f0",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -11265,6 +11265,10 @@
             {
               "id": "tonic 0.14.9",
               "target": "tonic"
+            },
+            {
+              "id": "tonic-prost 0.14.9",
+              "target": "tonic_prost"
             },
             {
               "id": "tower 0.5.3",

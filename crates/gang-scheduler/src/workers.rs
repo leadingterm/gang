@@ -455,10 +455,12 @@ impl WorkerRegistry {
         let instance_entry = self.instances.entry(instance_key).or_default();
         let instance_generation_seq = instance_entry.next_generation_seq;
         instance_entry.next_generation_seq = instance_entry.next_generation_seq.saturating_add(1);
-        instance_entry.cpu_capacity_millicores = Some(registration.capacity.cpu_millicores);
-        instance_entry.memory_capacity = Some(registration.capacity.memory);
-        instance_entry.disk_capacity = Some(registration.capacity.disk);
-        instance_entry.capacity_fact_seq = instance_generation_seq;
+        if registration.gang_version == expected_gang_version {
+            instance_entry.cpu_capacity_millicores = Some(registration.capacity.cpu_millicores);
+            instance_entry.memory_capacity = Some(registration.capacity.memory);
+            instance_entry.disk_capacity = Some(registration.capacity.disk);
+            instance_entry.capacity_fact_seq = instance_generation_seq;
+        }
 
         let mut drain = DrainSources::default();
         drain.set(DrainSources::INSTANCE, instance_entry.draining);
@@ -541,7 +543,7 @@ impl WorkerRegistry {
         cache: Option<WorkerCacheStats>,
         memory_capacity: Option<Bytes>,
     ) -> Option<bool> {
-        let (fleet, instance, gen_seq, had_hold) = {
+        let (fleet, instance, gen_seq, had_hold, current_build) = {
             let worker = self.get_mut(key)?;
             worker.last_seen = now;
             let had_hold = worker.has_disk_hold();
@@ -554,10 +556,11 @@ impl WorkerRegistry {
                 Arc::clone(&worker.instance),
                 worker.instance_generation_seq,
                 had_hold,
+                worker.is_current_build(),
             )
         };
 
-        if let Some(memory) = memory_capacity {
+        if let Some(memory) = memory_capacity.filter(|_| current_build) {
             let instance_key = (fleet, instance);
             let generations_to_update = if let Some(state) = self.instances.get_mut(&instance_key) {
                 if gen_seq >= state.capacity_fact_seq {

@@ -179,7 +179,7 @@ struct ExecutedMeta {
 
 /// Shared exact-once notifier ensuring [`ControllerHandle::worker_lost`] fires at most once across
 /// the inbound reader task and outbound stream teardown paths.
-struct WorkerLossGuard {
+pub(crate) struct WorkerLossGuard {
     controller: ControllerHandle,
     worker: WorkerKey,
     worker_id: WorkerId,
@@ -188,7 +188,7 @@ struct WorkerLossGuard {
 }
 
 impl WorkerLossGuard {
-    const fn new(
+    pub(crate) const fn new(
         controller: ControllerHandle,
         worker: WorkerKey,
         worker_id: WorkerId,
@@ -204,7 +204,7 @@ impl WorkerLossGuard {
     }
 
     /// Delivers [`ControllerHandle::worker_lost`] asynchronously if not already sent.
-    async fn notify_lost(&self) {
+    pub(crate) async fn notify_lost(&self) {
         if !self.lost_sent.swap(true, Ordering::AcqRel) {
             tracing::debug!(
                 worker_id = %self.worker_id,
@@ -218,7 +218,7 @@ impl WorkerLossGuard {
 
     /// Delivers [`ControllerHandle::worker_lost`] from a synchronous [`Drop`] path by spawning on
     /// the captured Tokio runtime handle if not already sent.
-    fn notify_lost_background(&self) {
+    pub(crate) fn notify_lost_background(&self) {
         if !self.lost_sent.swap(true, Ordering::AcqRel) {
             tracing::debug!(
                 worker_id = %self.worker_id,
@@ -237,9 +237,9 @@ impl WorkerLossGuard {
 
 /// RAII guard owned by the outbound gRPC response stream: aborts the inbound reader task and
 /// guarantees exact-once `worker_lost` delivery whenever the response stream finishes or drops.
-struct SessionDropGuard {
-    loss: Arc<WorkerLossGuard>,
-    inbound_task: JoinHandle<()>,
+pub(crate) struct SessionDropGuard {
+    pub(crate) loss: Arc<WorkerLossGuard>,
+    pub(crate) inbound_task: JoinHandle<()>,
 }
 
 impl Drop for SessionDropGuard {
@@ -251,8 +251,8 @@ impl Drop for SessionDropGuard {
 
 /// Fallback drop guard inside the inbound reader task so even external cancellation triggers
 /// exact-once `worker_lost`.
-struct InboundDropGuard {
-    loss: Arc<WorkerLossGuard>,
+pub(crate) struct InboundDropGuard {
+    pub(crate) loss: Arc<WorkerLossGuard>,
 }
 
 impl Drop for InboundDropGuard {
@@ -629,7 +629,7 @@ fn parse_resources(
     })
 }
 
-fn map_register_error(err: ControllerRegisterError) -> Status {
+pub(crate) fn map_register_error(err: ControllerRegisterError) -> Status {
     match err {
         ControllerRegisterError::Closed => Status::unavailable("controller is shutting down"),
         ControllerRegisterError::Register(RegisterError::HandingOff) => {

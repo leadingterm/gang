@@ -897,8 +897,15 @@ fn build_controller_routes<C: ContentStore, A: ActionStore, Api: ApiService>(
     .into_server()
     .max_decoding_message_size(limit)
     .max_encoding_message_size(limit);
+    let legacy_svc = crate::legacy_worker::LegacyWorkerService::new(
+        handle.clone(),
+        WorkerServiceConfig::from_worker_timeout(NonZeroDuration::from(config.worker_timeout)),
+        Arc::clone(&spec.clock),
+        limit,
+    );
     let worker_leader = Routes::from(Router::new())
         .add_service(worker_svc)
+        .add_service(legacy_svc)
         .into_axum_router();
 
     (
@@ -1934,6 +1941,29 @@ mod tests {
         Ok(())
     }
 
+    async fn assert_legacy_route(address: std::net::SocketAddr) -> TestResult {
+        let channel = Endpoint::from_shared(format!("http://{address}"))?
+            .connect()
+            .await?;
+        let mut legacy = tonic::client::Grpc::new(channel);
+        legacy.ready().await?;
+        let path = http::uri::PathAndQuery::from_static(
+            "/com.github.trace_machina.nativelink.remote_execution.WorkerApi/ConnectWorker",
+        );
+        let response: Result<tonic::Response<tonic::Streaming<()>>, _> = legacy
+            .streaming(
+                tonic::Request::new(futures::stream::empty::<()>()),
+                path,
+                tonic_prost::ProstCodec::default(),
+            )
+            .await;
+        assert_eq!(
+            response.expect_err("empty registration").code(),
+            tonic::Code::InvalidArgument
+        );
+        Ok(())
+    }
+
     #[test]
     fn full_controller_worker_reapi_roundtrip_and_post_drain_learned_history() -> TestResult {
         run_gated(async {
@@ -1995,6 +2025,7 @@ mod tests {
             });
 
             ready_rx.await?;
+            assert_legacy_route(worker_addr).await?;
             let byte_limit_during_serve = controller_engine.learned_history_byte_limit()?;
             assert_fallback_api(public_addr).await?;
 
