@@ -195,7 +195,7 @@ fn baseline(sandbox: Sandbox) -> Variant {
 }
 
 /// The variant the limits scenario runs under: the workers enforce cgroup limits and
-/// `NativeLink`'s soft memory enforcement is off, so only the kernel can end the memory hog. The
+/// the worker's soft memory enforcement is off, so only the kernel can end the memory hog. The
 /// suite runs it under the no-op sandbox, because the cgroup is what ends the orphan there; under
 /// bwrap the PID namespace teardown would kill the orphan anyway.
 fn limited() -> Variant {
@@ -970,7 +970,7 @@ fn disk_without_the_sampler_skips_the_kill_checks() -> gang_e2e::Result<()> {
 }
 
 /// The variant the memory scenario runs under: the workers enforce cgroup limits and
-/// `NativeLink`'s soft memory enforcement stays on.
+/// the worker's soft memory enforcement stays on.
 fn soft_limited() -> Variant {
     Variant {
         sandbox: Sandbox::Noop,

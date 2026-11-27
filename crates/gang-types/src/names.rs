@@ -157,7 +157,7 @@ define_name! {
 }
 
 define_name! {
-    /// Identifier of a `NativeLink` worker.
+    /// Identifier of a Gang worker.
     ///
     /// A worker id is the worker name followed by a UUID. Gang names every worker `{instance}-`
     /// plus a UUID, so [`WorkerId::instance`] recovers the [`InstanceId`] of the host that runs it.
@@ -279,7 +279,7 @@ impl Principal {
     pub const ANONYMOUS: Self = Self(Cow::Borrowed("anonymous"));
 }
 
-/// Separator between a worker name and the UUID that `NativeLink` appends to it.
+/// Separator between an instance ID and a worker UUID.
 const WORKER_NAME_SEPARATOR: char = '-';
 
 /// Length of a hyphenated UUID, such as `0194d5a2-7b3c-6f10-8a4e-1c2d3e4f5a6b`.
@@ -312,9 +312,9 @@ fn instance_of(worker: &str) -> Option<&str> {
 }
 
 impl InstanceId {
-    /// Returns the `NativeLink` worker `name` that Gang gives every worker on this instance.
+    /// Returns the worker ID prefix: this instance ID followed by a separator.
     ///
-    /// `NativeLink` appends a UUID to the name, so a worker id is this name followed by a UUID.
+    /// The scheduler and worker append a UUID to form a worker ID.
     #[must_use]
     pub fn worker_name(&self) -> String {
         format!("{self}{WORKER_NAME_SEPARATOR}")

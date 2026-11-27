@@ -166,7 +166,7 @@ async fn wait_relaying(
 
 /// Moves `gang exec` out of the action's process group when the action shares it, so the group
 /// kill at the end of the kill grace spares `gang exec`. An action in its own process group keeps
-/// `gang exec` in the original group, which `NativeLink` signals, so every termination reaches
+/// `gang exec` in the original group, which the worker signals, so every termination reaches
 /// `gang exec` and is relayed, including one that arrives before the sandbox has started the
 /// action.
 fn leave_if_shared(

@@ -1,6 +1,6 @@
 //! Bounded log2 resource histograms, per-key `LRU` families, and v3 snapshot codec.
 //!
-//! Ported as a pure, single-owner state machine from the `NativeLink` fork's `resource_sketch`.
+//! A pure, single-owner state machine for resource sampling.
 //! A sample counts for between half a window and a whole one (two half-window histograms per
 //! entry). Kill floors expire with the window. Command keys stay on probation until their second
 //! sighting or a kill.

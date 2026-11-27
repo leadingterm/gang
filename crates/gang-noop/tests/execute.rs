@@ -395,7 +395,7 @@ async fn dropping_the_running_action_kills_it() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// `NativeLink` stops an action by signalling the process group of the `gang exec` process that
+/// The worker stops an action by signalling the process group of the `gang exec` process that
 /// hosts it, and on macOS it only ever sends SIGKILL to that group. The action must therefore
 /// not outlive its host's process group.
 #[tokio::test]

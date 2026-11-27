@@ -42,7 +42,7 @@ pub trait ActionIsolationPort: Send + Sync {
 
 /// A termination request the process hosting an action received: `SIGTERM` or `SIGINT`.
 ///
-/// `NativeLink` sends one to the host's process group when an action times out or is cancelled,
+/// The worker sends one to the host's process group when an action times out or is cancelled,
 /// and kills the group once its kill grace has passed. The host stays alive for that grace and
 /// passes the request on with [`SandboxedAction::relay`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

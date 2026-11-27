@@ -1,5 +1,5 @@
 //! The soft memory scenario: an action that outgrows its memory reservation is killed by
-//! `NativeLink`'s sampler and requeued on a doubled reservation, on which it completes, and the
+//! the worker's sampler and requeued on a doubled reservation, on which it completes, and the
 //! worker keeps serving.
 
 use crate::check::Check;
@@ -17,7 +17,7 @@ use crate::verdict;
 /// next action must still succeed.
 ///
 /// The suite runs this under [`Sandbox::Noop`](crate::system::Sandbox::Noop) with the workers'
-/// cgroup limits and `NativeLink`'s soft memory enforcement on.
+/// cgroup limits and the worker's soft memory enforcement on.
 ///
 /// `stderr_tail_lines` is how many lines of the build's stderr the failed serving check quotes.
 ///

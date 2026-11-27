@@ -6,8 +6,8 @@
 //!   processes launched from the current executable, keeps their records and desired capacity
 //!   in a state directory, serves scratch volumes and workload credentials, and runs a mock
 //!   IMDS that workers query in place of a cloud metadata service.
-//! - [`FilesystemCache`] (`[cache.filesystem]`) is the `cache` domain: a `NativeLink` filesystem
-//!   store under one directory.
+//! - [`FilesystemCache`] (`[cache.filesystem]`) is the `cache` domain: a `DiskCas`-backed filesystem
+//!   cache under one directory.
 //! - [`FileSigner`] (`[signer.file]`) is the `signer` domain: a certificate authority key
 //!   kept in one PKCS#8 file.
 //!

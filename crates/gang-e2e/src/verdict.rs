@@ -56,14 +56,14 @@ pub fn namespaces(sandbox: Sandbox, host: &Host, isolated: &Namespaces) -> Vec<C
     }
 }
 
-/// The directory `NativeLink` creates in each action directory, beside the input root, for the
+/// The directory the worker creates in each action directory, beside the input root, for the
 /// action's `TMPDIR` (`set_tmpdir`, on by default).
 const ACTION_TMP_NAME: &str = "tmp";
 
 /// Whether the action's parent directories show no more than the sandbox allows.
 ///
 /// Under bwrap the action sees its whole action directory, so the parent lists exactly the working
-/// directory and `NativeLink`'s per-action `tmp`; the worker's CAS sits beside the action's
+/// directory and the worker's per-action `tmp`; the worker's CAS sits beside the action's
 /// grandparent directory, so the grandparent must list only the parent and the great-grandparent
 /// only the grandparent. The noop control must list all three levels, the great-grandparent holding
 /// a sibling of the grandparent, which proves the probe would see the CAS if it were there.

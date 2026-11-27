@@ -1,9 +1,9 @@
 //! The termination signals `gang exec` keeps for the whole run.
 //!
-//! `NativeLink` sends `SIGTERM` or `SIGINT` to the process group of `gang exec` when an action
+//! The worker sends `SIGTERM` or `SIGINT` to the process group of `gang exec` when an action
 //! times out or is cancelled. These are real handlers, not `SIG_IGN`: the action's dispositions
 //! reset at exec, so the action starts with the default ones, while `gang exec` survives
-//! `NativeLink`'s `SIGTERM` and lives through the kill grace, relaying each request to the action.
+//! the worker's `SIGTERM` and lives through the kill grace, relaying each request to the action.
 
 use std::io;
 use std::pin::Pin;

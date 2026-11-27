@@ -1,7 +1,6 @@
 //! Learned action duration averages with bounded `LRU` eviction and v1 JSON persistence.
 //!
-//! Ported from `crates/gang-nativelink/src/durations.rs` with zero `serde_json` dependency,
-//! producing byte-for-byte identical v1 records and keys.
+//! Produces v1 records and keys without a `serde_json` dependency.
 
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};

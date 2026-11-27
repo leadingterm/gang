@@ -198,7 +198,7 @@ pub(crate) fn action_key_prefix(config: &S3CacheConfig, environment: &Environmen
     }
 }
 
-/// Formats an object key under `prefix` using `NativeLink`'s `{hex}-{size}` digest layout.
+/// Formats an object key under `prefix` using the v0.3.9-compatible `{hex}-{size}` digest layout.
 #[must_use]
 pub(crate) fn object_key(prefix: &str, digest: Digest) -> String {
     format!("{prefix}{}-{}", digest.hex(), digest.size())

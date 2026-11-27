@@ -137,9 +137,9 @@ pub struct Variant {
     pub limits: ActionLimits,
     /// The `[[fleets]]` the deployment declares.
     pub fleets: FleetLayout,
-    /// Whether `NativeLink`'s soft memory enforcement runs beside the kernel limit.
+    /// Whether the worker's soft memory enforcement runs beside the kernel limit.
     pub soft_memory: SoftMemory,
-    /// Whether the disk scenario opts into `NativeLink`'s soft disk enforcement.
+    /// Whether the disk scenario opts into the worker's soft disk enforcement.
     pub soft_disk: bool,
     /// The identity family's knobs.
     pub identity: IdentityKnobs,

@@ -109,7 +109,7 @@ const SIM_CWD_NAME: &str = "sim-work";
 const SIM_PARENT_NAME: &str = "tmp";
 const SIM_GRANDPARENT_NAME: &str = "root";
 const SIBLING: &str = "cas";
-/// The per-action `TMPDIR` directory `NativeLink` creates beside the working directory.
+/// The per-action `TMPDIR` directory the worker creates beside the working directory.
 const SIM_ACTION_TMP_NAME: &str = "tmp";
 /// The principal of the one session the identity simulation issues.
 const SIM_PRINCIPAL: &str = "local-workers:developer";

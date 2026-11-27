@@ -1,7 +1,6 @@
 //! Bounded first-creator identity memo and event-time completion kernels.
 //!
-//! Ported from `crates/gang-nativelink/src/source_rates.rs` as a pure, single-owner state machine
-//! taking explicit `Tick`s. Scheduler-generated drops are deliberately not completions, and
+//! A pure, single-owner state machine taking explicit `Tick`s. Scheduler-generated drops are deliberately not completions, and
 //! evicting a source can lose unsampled events; both effects bias service estimates conservatively.
 
 use std::num::NonZeroUsize;

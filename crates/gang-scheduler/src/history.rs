@@ -16,8 +16,7 @@ use crate::sketch::{ResourceSketch, SAMPLER_GENERATION, SketchError, SketchKey, 
 const VERSION: u8 = 1;
 const HISTORY_KEY_DOMAIN: &[u8] = b"gang-learned-history-key-v1\0";
 
-// Hyper 1.12.0's HTTP/1 default read-buffer maximum bounds accepted request headers, matching
-// `crates/gang-nativelink/src/plugin.rs`.
+// Hyper 1.12.0's HTTP/1 default read-buffer maximum bounds accepted request headers.
 const MAX_REQUEST_HEADER_BYTES: usize = 8_192 + 4_096 * 100;
 const DURATION_JSON_OVERHEAD: usize = 1_024;
 

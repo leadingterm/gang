@@ -137,7 +137,7 @@ gang_types::string_enum! {
         Restart = "restart",
         /// Per-action cgroup limits apply, and are cleaned up once an action ends.
         Limits = "limits",
-        /// An action that outgrows its soft memory reservation is killed by `NativeLink` and
+        /// An action that outgrows its soft memory reservation is killed by the worker and
         /// requeued with a doubled reservation, on which it completes, and the worker keeps serving.
         Memory = "memory",
         /// An action that writes past its disk reservation is killed by its worker, and a
@@ -1338,7 +1338,7 @@ impl ExecutionScenario {
 
 /// The variant of an execution scenario, and whether it needs Linux (bwrap, cgroups or /proc).
 /// Every variant but the knob it tests is the baseline; the scenarios that observe action scopes
-/// add per-action cgroups, with `NativeLink`'s memory enforcement off where an out-of-memory kill
+/// add per-action cgroups, with the worker's memory enforcement off where an out-of-memory kill
 /// is checked.
 fn execution_variant(scenario: ExecutionScenario, baseline: &Variant) -> (Variant, bool) {
     let scoped = |sandbox: Sandbox, execution: ExecutionKnobs, soft_memory: SoftMemory| Variant {

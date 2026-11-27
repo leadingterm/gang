@@ -39,7 +39,7 @@ pub struct Invocation<'a> {
 /// Takes the entrypoint, the arguments, the environment and the working directory from the
 /// process, and runs them with [`run_with`].
 ///
-/// `NativeLink` signals action process groups and eventually kills `gang exec` itself by PID.
+/// The worker signals action process groups and eventually kills `gang exec` itself by PID.
 /// When limits are configured, a guardian in the worker's group reaps scopes after it exits; it
 /// starts with an empty environment and no standard streams, and waits for this process's exit
 /// as the kernel reports it.

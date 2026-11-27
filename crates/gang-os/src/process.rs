@@ -161,7 +161,7 @@ pub fn parent_process_group() -> io::Result<i32> {
 
 /// Moves the calling process into its parent's process group.
 ///
-/// `gang exec` calls it once the action's first process exists: `NativeLink` signals the action's
+/// `gang exec` calls it once the action's first process exists: the worker signals the action's
 /// process groups but never the worker's own, so `gang exec` no longer receives the action's `SIGTERM`.
 ///
 /// # Errors

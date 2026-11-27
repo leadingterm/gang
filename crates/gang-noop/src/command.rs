@@ -11,7 +11,7 @@ use gang_spi::ActionExecutionSpec;
 ///
 /// The command is `spec.launcher` followed by `spec.command`. With a launcher (limits), the launcher
 /// starts the action inside its limits scope. The command stays in the process group of its
-/// parent, whether or not there is a launcher. A signal sent to that group, as `NativeLink` does
+/// parent, whether or not there is a launcher. A signal sent to that group, as the worker does
 /// to the `gang exec` process that hosts the action, reaches every descendant of the action as
 /// well. `TMPDIR` is set after the given environment and therefore overrides any `TMPDIR` the
 /// action supplied, keeping its temporary files in the per-action directory.

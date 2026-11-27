@@ -8,9 +8,9 @@ use crate::ExecError;
 
 /// Waits for the watched `gang exec` to exit, then removes its abandoned action scopes.
 ///
-/// `NativeLink` v1.8.3's `nativelink-worker/src/running_actions_manager.rs` `hard_kill`
-/// SIGKILLs its direct child by PID after `kill_grace`, even if that child changed groups.
-/// The guardian lives in the worker's process group, which `NativeLink` never signals, and
+/// The `gang-engine` worker sends SIGTERM and, after `kill_grace`, attempts to kill the
+/// action scope or process group, with a direct child PID fallback if the child changed groups.
+/// The guardian lives in the worker's process group, which the worker does not signal, and
 /// installs no termination handlers so it dies when the worker's group is torn down.
 /// `exited` completes once the kernel has ended `creator` (`gang_os::ParentExit`), never
 /// earlier, so every scope `creator` left behind is recognised as abandoned. Only scopes

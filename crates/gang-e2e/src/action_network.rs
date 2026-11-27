@@ -72,7 +72,7 @@ mod linux {
         )?;
         let group = gang_os::ProcessGroup::of(&child).ok_or("action has no process group")?;
         signal(&listener).await?;
-        // Signal NativeLink's original gang-exec group, not the payload's guest group.
+        // Signal the worker's original `gang exec` group, not the payload's guest group.
         group.terminate()?;
         let status = tokio::time::timeout(Duration::from_secs(30), child.wait()).await??;
         group.disarm();
