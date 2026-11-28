@@ -613,6 +613,17 @@ mod tests {
             sample_seq: 1,
             observed_assign_seq: seq,
         });
+        // Only the 2 unreserved physical cores remain; reclamation cannot invade guaranteed capacity.
+        assert_eq!(entry.effective_cpu_free(false), 2_000);
+        entry.accept_load(crate::workers::WorkerLoadSnapshot {
+            observed_cpu_millicores: 8_000,
+            non_guaranteed_observed_cpu_millicores: 8_000,
+            cpu_psi_percent: 0,
+            cpu_saturated: false,
+            reclaimable_cpu_millicores: 5_600,
+            sample_seq: 2,
+            observed_assign_seq: seq,
+        });
         assert_eq!(entry.effective_cpu_free(false), 0);
         entry.accept_load(crate::workers::WorkerLoadSnapshot {
             observed_cpu_millicores: 8_000,
@@ -620,10 +631,33 @@ mod tests {
             cpu_psi_percent: 0,
             cpu_saturated: false,
             reclaimable_cpu_millicores: 5_600,
-            sample_seq: 2,
+            sample_seq: 3,
             observed_assign_seq: seq,
         });
         assert_eq!(entry.effective_cpu_free(false), 5_600);
+    }
+
+    #[test]
+    fn idle_worker_preserves_full_physical_cpu_after_load_sample() {
+        let cat = two_fleet_catalog();
+        let mut workers = WorkerRegistry::from_catalog(&cat).expect("registry");
+        let worker = register_worker(&mut workers, "preferred", "worker", 1, 8_000, 32);
+        let entry = workers.get_mut(worker).expect("worker");
+        entry.accept_load(crate::workers::WorkerLoadSnapshot {
+            observed_cpu_millicores: 200,
+            non_guaranteed_observed_cpu_millicores: 0,
+            cpu_psi_percent: 0,
+            cpu_saturated: false,
+            reclaimable_cpu_millicores: 6_600,
+            sample_seq: 1,
+            observed_assign_seq: 0,
+        });
+        assert_eq!(entry.effective_cpu_free(false), 8_000);
+        let mut ops = Operations::new();
+        let mut queue = OperationQueue::new(cat.len()).expect("queue");
+        let big = admit_op(&mut ops, &mut queue, "operations/big", &[0], 100, 8_000, 1);
+        let placed = place_operation(big, &mut ops, &mut queue, &mut workers);
+        assert!(placed.is_some());
     }
 
     #[test]

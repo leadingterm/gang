@@ -313,23 +313,25 @@ impl Worker {
     pub fn effective_cpu_free(&self, guaranteed: bool) -> u64 {
         let physical = self.ledger.capacity().cpu_millicores;
         let physical_free = self.ledger.free().cpu_millicores;
-        if guaranteed {
+        if guaranteed || self.inflight_attempts == 0 {
             return physical_free;
         }
         let headroom = u64::try_from(
             u128::from(physical) * u128::from(self.cpu_tuning.headroom_percent) / 100,
         )
         .unwrap_or(u64::MAX);
-        let protected_free = self.live_load.map_or(physical_free, |load| {
-            let used = load
-                .observed_cpu_millicores
+        let used = self.live_load.map_or(0, |load| {
+            load.observed_cpu_millicores
                 .max(
                     self.guaranteed_cpu_millicores
                         .saturating_add(load.non_guaranteed_observed_cpu_millicores),
                 )
-                .saturating_add(self.dispatched_since_load_cpu);
-            physical.saturating_sub(headroom).saturating_sub(used)
+                .saturating_add(self.dispatched_since_load_cpu)
         });
+        let base_free = self.live_load.map_or(physical_free, |_| {
+            physical_free.min(physical.saturating_sub(used))
+        });
+        let protected_free = physical.saturating_sub(headroom).saturating_sub(used);
         let reclaimed = self
             .live_load
             .filter(|load| !load.cpu_saturated && !self.cpu_pressure_hold)
@@ -340,9 +342,8 @@ impl Worker {
             });
         let ceiling =
             physical.saturating_mul(u64::from(self.cpu_tuning.max_reclaimed_cpu_ratio.get()));
-        physical_free
+        base_free
             .max(reclaimed)
-            .min(protected_free)
             .min(ceiling.saturating_sub(self.ledger.reserved().cpu_millicores))
     }
 
