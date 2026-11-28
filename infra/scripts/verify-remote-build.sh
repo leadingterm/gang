@@ -18,6 +18,22 @@ if [[ ! $run_id =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$run_id"
+attempts=${REMOTE_BUILD_APPEAR_ATTEMPTS:-15}
+delay=${REMOTE_BUILD_APPEAR_DELAY:-2}
+if [[ ! $attempts =~ ^[1-9][0-9]*$ ]]; then
+  echo '::error::invalid remote build appearance attempt count' >&2
+  exit 1
+fi
+for ((attempt = 1; attempt <= attempts; attempt++)); do
+  if gh run view "$run_id" --repo "$GITHUB_REPOSITORY" --json databaseId >/dev/null 2>&1; then
+    break
+  fi
+  if ((attempt == attempts)); then
+    echo "::error::remote build did not appear: $url" >&2
+    exit 1
+  fi
+  sleep "$delay"
+done
 if ! gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status; then
   echo "::error::remote build failed: $url" >&2
   exit 1

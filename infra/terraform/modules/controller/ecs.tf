@@ -400,13 +400,13 @@ resource "aws_ecs_task_definition" "controller" {
     operating_system_family = "LINUX"
   }
   container_definitions = jsonencode([{
-    name        = "controller"
-    image       = "${aws_ecr_repository.controller[0].repository_url}@${var.controller_image_digest}"
-    essential   = true
-    cpu         = 512
-    memory      = 1536
-    stopTimeout = var.stop_timeout_seconds
-    dnsServers  = ["127.0.0.1"]
+    name      = "controller"
+    image     = "${aws_ecr_repository.controller[0].repository_url}@${var.controller_image_digest}"
+    essential = true
+    cpu       = 512
+    memory    = 1536
+    # EC2 uses ECS_CONTAINER_STOP_TIMEOUT, which supports drain budgets above 120 seconds.
+    dnsServers = ["127.0.0.1"]
     portMappings = [for port in distinct(concat([8080], [for group in values(var.target_groups) : group.port])) : {
       containerPort = port
       hostPort      = port
@@ -419,7 +419,7 @@ resource "aws_ecs_task_definition" "controller" {
       { name = "GANG_SECRET_FILES", value = join("\n", [for i, file in sort(keys(var.secret_parameters)) : "${i}=${file}"]) },
     ]
     secrets = concat(
-      [{ name = "GANG_CONFIG", valueFrom = "arn:${data.aws_partition.this.partition}:ssm:${data.aws_region.this.region}:${data.aws_caller_identity.this.account_id}:parameter${var.config_parameter_reference}" }],
+      [{ name = "GANG_CONFIG", valueFrom = "arn:${data.aws_partition.this.partition}:ssm:${data.aws_region.this.region}:${data.aws_caller_identity.this.account_id}:parameter${split(":", var.config_parameter_reference)[0]}" }],
       [for i, file in sort(keys(var.secret_parameters)) : { name = "GANG_SECRET_${i}", valueFrom = "arn:${data.aws_partition.this.partition}:ssm:${data.aws_region.this.region}:${data.aws_caller_identity.this.account_id}:parameter${var.secret_parameters[file]}" }]
     )
     logConfiguration = {
