@@ -1373,6 +1373,50 @@ impl System for Stack<'_> {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl Stack<'_> {
+    fn wait_for_stable_working_set(
+        &self,
+        victim: &Path,
+        neighbour: &Path,
+        hold_timeout: Duration,
+    ) -> Result<u64> {
+        let deadline = std::time::Instant::now() + hold_timeout;
+        let sample_interval = self
+            .pressure_sample_interval
+            .ok_or_else(|| E2eError::system("pressure scenario has no resource sample interval"))?;
+        let mut held_since = None;
+        let mut stable_peak = None;
+        while std::time::Instant::now() < deadline {
+            let held = self.pressure_number(&victim.join("memory.current"))?
+                >= self.settings.pressure_victim_minimum.as_u64()
+                && self.pressure_number(&neighbour.join("memory.current"))?
+                    >= self.settings.pressure_neighbour_minimum.as_u64();
+            if held {
+                let working_set = pressure_working_set(victim)
+                    .ok_or_else(|| E2eError::system("victim working set unavailable"))?;
+                let start = held_since.get_or_insert_with(std::time::Instant::now);
+                stable_peak =
+                    Some(stable_peak.map_or(working_set, |old: u64| old.min(working_set)));
+                if start.elapsed() >= sample_interval.saturating_mul(2) {
+                    break;
+                }
+            } else {
+                held_since = None;
+                stable_peak = None;
+            }
+            std::thread::sleep(self.settings.pressure_observe_interval);
+        }
+        stable_peak
+            .filter(|_| {
+                held_since.is_some_and(|start| start.elapsed() >= sample_interval.saturating_mul(2))
+            })
+            .ok_or_else(|| {
+                E2eError::system("pressure probes did not reach stable held allocations")
+            })
+    }
+}
+
 impl Limits for Stack<'_> {
     fn await_hold(&self) -> Result<crate::Signalled> {
         self.signal.wait(self.settings.hold_timeout)
@@ -1495,39 +1539,7 @@ impl Limits for Stack<'_> {
             .ok_or_else(|| E2eError::system("pressure scenario has no resource policy"))?
             .saturating_mul(3);
         let hold_timeout = self.settings.hold_timeout.max(settle);
-        let deadline = Instant::now() + hold_timeout;
-        let sample_interval = self
-            .pressure_sample_interval
-            .ok_or_else(|| E2eError::system("pressure scenario has no resource sample interval"))?;
-        let mut held_since = None;
-        let mut stable_peak = None;
-        while Instant::now() < deadline {
-            let held = self.pressure_number(&victim.join("memory.current"))?
-                >= self.settings.pressure_victim_minimum.as_u64()
-                && self.pressure_number(&neighbour.join("memory.current"))?
-                    >= self.settings.pressure_neighbour_minimum.as_u64();
-            if held {
-                let working_set = pressure_working_set(&victim)
-                    .ok_or_else(|| E2eError::system("victim working set unavailable"))?;
-                let start = held_since.get_or_insert_with(Instant::now);
-                stable_peak =
-                    Some(stable_peak.map_or(working_set, |old: u64| old.min(working_set)));
-                if start.elapsed() >= sample_interval.saturating_mul(2) {
-                    break;
-                }
-            } else {
-                held_since = None;
-                stable_peak = None;
-            }
-            std::thread::sleep(self.settings.pressure_observe_interval);
-        }
-        let peak = stable_peak
-            .filter(|_| {
-                held_since.is_some_and(|start| start.elapsed() >= sample_interval.saturating_mul(2))
-            })
-            .ok_or_else(|| {
-                E2eError::system("pressure probes did not reach stable held allocations")
-            })?;
+        let peak = self.wait_for_stable_working_set(&victim, &neighbour, hold_timeout)?;
         let high = pool.join("memory.high");
         let original = read_trimmed(&high)?;
         let victim_current = self.pressure_number(&victim.join("memory.current"))?;
