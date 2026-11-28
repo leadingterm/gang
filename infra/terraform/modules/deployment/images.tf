@@ -1,6 +1,7 @@
 locals {
   # Ownership: The module's version is its repository's [workspace.package] version; git sources fetch the whole repository.
-  version = regex("(?ms)^\\[workspace\\.package\\]$.*?^version = \"([^\"]+)\"$", file("${path.module}/../../../../Cargo.toml"))[0]
+  version               = regex("(?ms)^\\[workspace\\.package\\]$.*?^version = \"([^\"]+)\"$", file("${path.module}/../../../../Cargo.toml"))[0]
+  effective_release_tag = var.release_tag != null ? var.release_tag : "v${local.version}"
   # Correctness: Map each fleet ISA to Gang's image architecture.
   isa_architectures       = { "x86-64" = "x86_64", aarch64 = "aarch64" }
   controller_architecture = contains(data.aws_ec2_instance_type.controller.supported_architectures, "arm64") ? "aarch64" : "x86_64"
@@ -30,10 +31,10 @@ data "aws_ec2_instance_type" "controller" {
   instance_type = var.controller_instance_type
 }
 
-# Correctness: The SHA-256 of each image comes from the release of this module's version, the file its attestation covers.
+# Correctness: The SHA-256 of each image comes from the release of the selected release.
 data "http" "sha256sums" {
   count = length(local.release_architectures) > 0 ? 1 : 0
-  url   = "https://github.com/${var.release_repository}/releases/download/v${local.version}/SHA256SUMS"
+  url   = "https://github.com/${var.release_repository}/releases/download/${local.effective_release_tag}/SHA256SUMS"
 
   lifecycle {
     postcondition {

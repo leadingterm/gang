@@ -20,6 +20,7 @@
 #         remote_build_workflow: remote-build.yml
 #       permissions:
 #         contents: read
+#         attestations: read
 #         id-token: write
 #         pull-requests: write
 #         actions: write
@@ -72,6 +73,10 @@ on:
         description: "SHA-256 of the release asset gang-<arch>-unknown-linux-musl for the runner's architecture, from the release's SHA256SUMS."
         required: true
         type: string
+      release_tag:
+        description: "Release tag for the binary and controller image; empty uses the workflow tag."
+        type: string
+        default: ''
       apply_environment:
         description: "GitHub environment of the apply job; empty runs without an environment."
         type: string
@@ -152,6 +157,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     permissions:
       contents: read
+      attestations: read
       id-token: write
       pull-requests: write
     steps:
@@ -174,6 +180,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GANG_REPOSITORY: ${{ job.workflow_repository }}
           GANG_WORKFLOW_REF: ${{ job.workflow_ref }}
+          GANG_RELEASE_TAG: ${{ inputs.release_tag }}
         run: .gang/infra/scripts/install-gang.sh
       - name: Assume plan role
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
@@ -206,6 +213,7 @@ jobs:
     environment: ${{ inputs.apply_environment }}
     permissions: &apply_permissions
       contents: read
+      attestations: read
       id-token: write
       actions: write
       pull-requests: read
@@ -233,6 +241,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GANG_REPOSITORY: ${{ job.workflow_repository }}
           GANG_WORKFLOW_REF: ${{ job.workflow_ref }}
+          GANG_RELEASE_TAG: ${{ inputs.release_tag }}
         run: .gang/infra/scripts/install-gang.sh
       - name: Resolve reviewed plan
         id: resolve
@@ -258,6 +267,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GANG_REPOSITORY: ${{ job.workflow_repository }}
           GANG_WORKFLOW_REF: ${{ job.workflow_ref }}
+          GANG_RELEASE_TAG: ${{ inputs.release_tag }}
         run: .gang/infra/scripts/publish-controller-image.sh
       - name: Apply reviewed plan
         env:

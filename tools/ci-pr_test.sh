@@ -38,7 +38,7 @@ SH
 chmod +x "$scratch/repo/tools/lint.sh" "$scratch/bazel"
 export LOG="$scratch/log" BAZEL="$scratch/bazel" TMPDIR="$scratch/tmp"
 script="$scratch/repo/tools/ci-pr.sh"
-export MANIFEST='{"lint":["//crate:crate_clippy_test","//crate:crate_rustfmt_test"],"unit":["//crate:crate_unit_test"]}'
+export MANIFEST='{"lint":["//crate:crate_clippy_test","//crate:crate_rustfmt_test"],"unit":["//crate:crate_unit_test"],"build_binary":true}'
 "$script" base head
 cat > "$scratch/expected" <<'EOF'
 lint --portable
@@ -52,12 +52,11 @@ bazel test
 EOF
 cmp "$scratch/expected" "$LOG"
 : > "$LOG"
-export MANIFEST='{"lint":["//:root_clippy_test"],"unit":[]}'
+export MANIFEST='{"lint":["//:root_clippy_test"],"unit":[],"build_binary":false}'
 "$script" base head
 cat > "$scratch/expected" <<'EOF'
 lint --portable
 selector base head
-bazel build
 bazel test
 //:root_clippy_test
 EOF
@@ -73,15 +72,17 @@ while IFS= read -r manifest; do
   cmp "$scratch/expected" "$LOG"
 done <<'EOF'
 {}
-{"lint":[],"unit":[]}
+{"lint":[],"unit":[],"build_binary":false}
 {"lint":["//pkg:ok"],"unit":[],"extra":[]}
-{"lint":["//pkg:ok"],"lint":["//pkg:ok"],"unit":[]}
-{"lint":["//pkg:ok"],"unit":["//pkg:bad\n//:injected"]}
-{"lint":["//pkg:../bad"],"unit":[]}
-{"lint":[1],"unit":[]}
+{"lint":["//pkg:ok"],"lint":["//pkg:ok"],"unit":[],"build_binary":false}
+{"lint":["//pkg:ok"],"unit":["//pkg:bad\n//:injected"],"build_binary":true}
+{"lint":["//pkg:../bad"],"unit":[],"build_binary":false}
+{"lint":[1],"unit":[],"build_binary":false}
+{"lint":["//pkg:ok"],"unit":[],"build_binary":"false"}
+{"lint":["//pkg:ok"],"unit":["//pkg:ok_unit_test"],"build_binary":false}
 not json
 EOF
-export MANIFEST='{"lint":["//:root_clippy_test"],"unit":[]}'
+export MANIFEST='{"lint":["//:root_clippy_test"],"unit":[],"build_binary":true}'
 for failure in FAIL_LINT FAIL_SELECTOR FAIL_BAZEL; do
   : > "$LOG"
   if env "$failure=1" "$script" base head; then

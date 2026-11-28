@@ -43,7 +43,10 @@ class SelectorTest(unittest.TestCase):
         self.git("init", "-q")
         self.git("config", "user.email", "fixture@example.com")
         self.git("config", "user.name", "Fixture")
-        self.put("BUILD.bazel", "")
+        self.put("BUILD.bazel", 'filegroup(name = "gang", srcs = ["//shared:lib", "gang-only.txt"])\n')
+        self.put("gang-only.txt", "binary input\n")
+        self.put("infra/BUILD.bazel", 'exports_files(["settings.tf"])\n')
+        self.put("infra/settings.tf", "infra\n")
         self.put(".bazelversion", (SELECTOR.parent.parent / ".bazelversion").read_text(encoding="utf-8"))
         self.put(".bazelrc", "common --incompatible_autoload_externally=\n")
         self.put("MODULE.bazel", 'module(name = "fixture")\n')
@@ -148,12 +151,14 @@ fixture_test(name = "other_clippy_test")
     def assert_all_units(self, manifest):
         self.assert_lint(manifest)
         self.assertEqual(manifest["unit"], ["//app:app_unit_test", "//app:manual_unit_test", "//other:other_unit_test"])
+        self.assertTrue(manifest["build_binary"])
 
     def test_shared_source_reaches_downstream_units_and_visible_manual_child(self):
         self.put("shared/src/lib.rs", "changed\n")
         manifest = self.manifest()
         self.assert_lint(manifest)
         self.assertEqual(manifest["unit"], ["//app:app_unit_test", "//app:manual_unit_test"])
+        self.assertTrue(manifest["build_binary"])
 
     def test_nearest_package_source_excludes_unrelated_units(self):
         self.put("other/data.rs", "changed\n")
@@ -181,6 +186,19 @@ fixture_test(name = "other_clippy_test")
         manifest = self.manifest()
         self.assert_lint(manifest)
         self.assertEqual(manifest["unit"], [])
+        self.assertFalse(manifest["build_binary"])
+
+    def test_binary_only_source_still_builds_binary(self):
+        self.put("gang-only.txt", "changed\n")
+        manifest = self.manifest()
+        self.assertEqual(manifest["unit"], [])
+        self.assertTrue(manifest["build_binary"])
+
+    def test_unrelated_infra_does_not_build_binary(self):
+        self.put("infra/settings.tf", "changed\n")
+        manifest = self.manifest()
+        self.assertEqual(manifest["unit"], [])
+        self.assertFalse(manifest["build_binary"])
 
     def test_deleted_source_selects_all_units(self):
         (self.root / "shared/src/lib.rs").unlink()
