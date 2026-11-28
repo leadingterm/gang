@@ -1375,8 +1375,9 @@ fn ecs_access(
     let selector = selectors
         .next()
         .ok_or("missing ECS configuration selector")?;
+    let name = active.split_once(':').map_or(active, |(name, _)| name);
     if selectors.next().is_some()
-        || string(selector, "valueFrom")? != format!("{arn_prefix}:parameter{active}")
+        || string(selector, "valueFrom")? != format!("{arn_prefix}:parameter{name}")
     {
         return Err("ECS configuration selector does not use active generation".into());
     }
@@ -1669,15 +1670,14 @@ fn ecs_controller(
         .strip_suffix('s')
         .ok_or("invalid ECS host stop budget")?
         .parse()?;
-    let stop_timeout_seconds = number(&container, "stopTimeout")?;
-    if stop_timeout_seconds == 0 || host_timeout_seconds != stop_timeout_seconds {
-        return Err("ECS task and host stop budgets are invalid or differ".into());
+    if container.get("stopTimeout").is_some() || host_timeout_seconds == 0 {
+        return Err("ECS task and host stop budgets are invalid".into());
     }
     if config
         .get("server")
         .and_then(|server| server.get("stop_timeout"))
         .and_then(toml::Value::as_str)
-        != Some(format!("{stop_timeout_seconds}s").as_str())
+        != Some(format!("{host_timeout_seconds}s").as_str())
     {
         return Err("ECS host stop budget differs from controller shutdown timeout".into());
     }
@@ -1690,7 +1690,7 @@ fn ecs_controller(
         deregistration_delay_seconds,
         mode: Some("ecs"),
         image: Some(image.into()),
-        stop_timeout_seconds: Some(stop_timeout_seconds),
+        stop_timeout_seconds: Some(host_timeout_seconds),
         network_mode: Some(network.into()),
         circuit_breaker_enable: Some(true),
         circuit_breaker_rollback: Some(true),
@@ -2260,7 +2260,6 @@ mod tests {
                 "deployment_circuit_breaker":[{"enable":true,"rollback":true}]}}));
         entries.push(json!({"address":"module.controller.aws_ecs_task_definition.controller[0]","type":"aws_ecs_task_definition",
             "values":{"network_mode":"host","container_definitions":json!([{"name":"controller",
-                "stopTimeout":2460,
                 "image":format!("000000000000.dkr.ecr.eu-north-1.amazonaws.com/gang-controller@sha256:{}", "a".repeat(64))}]).to_string()}}));
         entries.push(json!({"address":"module.controller.aws_launch_template.capacity[0]","type":"aws_launch_template",
             "values":{"user_data":base64::engine::general_purpose::STANDARD.encode("ECS_CONTAINER_STOP_TIMEOUT=2460s")}}));
@@ -2277,7 +2276,7 @@ mod tests {
             entries
                 .retain(|r| r["address"] != "module.controller.aws_launch_template.controller[0]");
             let container = json!([{"name":"controller", "secrets":[{"name":"GANG_CONFIG",
-                "valueFrom":format!("arn:aws:ssm:eu-north-1:000000000000:parameter{active}")}]}]);
+                "valueFrom":format!("arn:aws:ssm:eu-north-1:000000000000:parameter{}", active.split_once(':').expect("version").0)}]}]);
             entries.push(json!({"address":"module.controller.aws_ecs_task_definition.controller[0]","type":"aws_ecs_task_definition",
                 "values":{"execution_role_arn":"execution-arn","container_definitions":container.to_string()}}));
             entries.push(json!({"address":"module.controller.aws_iam_role.execution[0]","type":"aws_iam_role",
@@ -2514,8 +2513,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_invalid_or_mismatched_task_stop_timeout() {
-        for value in [Value::Null, json!(0), json!(2459), json!("2460")] {
+    fn rejects_versioned_ecs_selector() {
+        let mut events = ecs_events();
+        let state = event_payload(&mut events, "promote", "test_state");
+        let task = state["values"]["root_module"]["resources"]
+            .as_array_mut()
+            .expect("resources")
+            .iter_mut()
+            .find(|r| r["address"] == "module.controller.aws_ecs_task_definition.controller[0]")
+            .expect("task");
+        let mut containers: Value = serde_json::from_str(
+            task["values"]["container_definitions"]
+                .as_str()
+                .expect("definitions"),
+        )
+        .expect("container JSON");
+        let selector = containers[0]["secrets"][0]["valueFrom"]
+            .as_str()
+            .expect("selector");
+        containers[0]["secrets"][0]["valueFrom"] = json!(format!("{selector}:1"));
+        task["values"]["container_definitions"] = json!(containers.to_string());
+        assert!(extract(&encode_events(&events), "local".into()).is_err());
+    }
+
+    #[test]
+    fn rejects_any_task_stop_timeout() {
+        for value in [
+            Value::Null,
+            json!(0),
+            json!(120),
+            json!(2460),
+            json!("2460"),
+        ] {
             let mut events = ecs_events();
             let plan = event_payload(&mut events, "upgrade", "test_plan");
             let task = resources(plan)

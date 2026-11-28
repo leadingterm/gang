@@ -9,7 +9,7 @@ yq -er '.jobs.apply.steps[] | select(.name == "Verify a real remote build") | .r
   "$script_dir/../.github/workflows/deploy.yml" >"$scratch/step.sh"
 export GITHUB_REPOSITORY=example-org/example GITHUB_REF_NAME=main
 export GITHUB_SHA=0123456789012345678901234567890123456789 GITHUB_RUN_ID=42 GITHUB_RUN_ATTEMPT=2
-export GH_TOKEN=fixture REMOTE_BUILD_WORKFLOW=remote-build.yml CALLS="$scratch/calls"
+export GH_TOKEN=fixture REMOTE_BUILD_WORKFLOW=remote-build.yml REMOTE_BUILD_APPEAR_ATTEMPTS=3 REMOTE_BUILD_APPEAR_DELAY=2 CALLS="$scratch/calls"
 gh() {
   local sha
   case "$1 $2" in
@@ -28,7 +28,14 @@ gh() {
       [[ $SCENARIO != watch_failure ]]
       ;;
     'run view')
-      [[ $# == 7 && $3 == 123 && $4 == --repo && $5 == "$GITHUB_REPOSITORY" && $6 == --json && $7 == headSha,event,status,conclusion ]] || return 1
+      [[ $# == 7 && $3 == 123 && $4 == --repo && $5 == "$GITHUB_REPOSITORY" && $6 == --json ]] || return 1
+      if [[ $7 == databaseId ]]; then
+        echo appear >>"$CALLS"
+        [[ $SCENARIO != never_appears ]] || return 1
+        if [[ $SCENARIO == transient && $(grep -c ^appear "$CALLS") -lt 3 ]]; then return 1; fi
+        return 0
+      fi
+      [[ $7 == headSha,event,status,conclusion ]] || return 1
       echo view >>"$CALLS"
       if [[ $SCENARIO == wrong_sha ]]; then sha=wrong; else sha=$GITHUB_SHA; fi
       printf '{"headSha":"%s","event":"workflow_dispatch","status":"completed","conclusion":"success"}\n' "$sha"
@@ -36,24 +43,27 @@ gh() {
     *) return 1 ;;
   esac
 }
-export -f gh
-for SCENARIO in success dispatch_failure watch_failure wrong_sha missing_id invalid_filename; do
+sleep() { [[ $# == 1 && $1 == 2 ]] && echo sleep >>"$CALLS"; }
+export -f gh sleep
+for SCENARIO in success transient never_appears dispatch_failure watch_failure wrong_sha missing_id invalid_filename; do
   export SCENARIO
   if [[ $SCENARIO == invalid_filename ]]; then REMOTE_BUILD_WORKFLOW='../bad.yml'; else REMOTE_BUILD_WORKFLOW=remote-build.yml; fi
   : >"$CALLS"
   if (cd "$scratch" && bash "$scratch/step.sh") >"$scratch/output" 2>&1; then
-    [[ $SCENARIO == success ]]
+    [[ $SCENARIO == success || $SCENARIO == transient ]]
   else
-    [[ $SCENARIO != success ]]
+    [[ $SCENARIO != success && $SCENARIO != transient ]]
   fi
   case "$SCENARIO" in
-    success) expected=$'dispatch\nwatch\nview' ;;
+    success) expected=$'dispatch\nappear\nwatch\nview' ;;
+    transient) expected=$'dispatch\nappear\nsleep\nappear\nsleep\nappear\nwatch\nview' ;;
+    never_appears) expected=$'dispatch\nappear\nsleep\nappear\nsleep\nappear'; grep -Fq '::error::remote build did not appear:' "$scratch/output" ;;
     dispatch_failure) expected=dispatch; grep -Fq '::error::cannot dispatch remote build:' "$scratch/output" ;;
-    watch_failure) expected=$'dispatch\nwatch'; grep -Fq "::error::remote build failed: https://github.com/$GITHUB_REPOSITORY/actions/runs/123" "$scratch/output" ;;
-    wrong_sha) expected=$'dispatch\nwatch\nview'; grep -Fq '::error::remote build does not match deployed commit or did not succeed:' "$scratch/output" ;;
+    watch_failure) expected=$'dispatch\nappear\nwatch'; grep -Fq "::error::remote build failed: https://github.com/$GITHUB_REPOSITORY/actions/runs/123" "$scratch/output" ;;
+    wrong_sha) expected=$'dispatch\nappear\nwatch\nview'; grep -Fq '::error::remote build does not match deployed commit or did not succeed:' "$scratch/output" ;;
     missing_id) expected=dispatch; grep -Fq '::error::cannot dispatch remote build:' "$scratch/output" ;;
     invalid_filename) expected=; grep -Fq '::error::invalid remote-build workflow filename' "$scratch/output" ;;
   esac
   [[ $(<"$CALLS") == "$expected" ]]
 done
-printf '6 cases, 0 failures\n'
+printf '8 cases, 0 failures\n'
