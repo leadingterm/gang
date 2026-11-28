@@ -170,9 +170,19 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
+        with:
+          cache-job: linux-arm64
+          restore-only: 'true'
       - name: Cross-build gang
         timeout-minutes: 45
         run: bazel build --build_event_json_file="$RUNNER_TEMP/bazel-cross.bep.json" --profile="$RUNNER_TEMP/bazel-cross.profile.gz" --platforms=@zig_sdk//libc_aware/platform:linux_amd64_musl //:gang
+      - name: Export the Bazel working set
+        if: always() && job.status == 'success'
+        uses: ./.github/actions/save-bazel-cache
+        with:
+          mode: export
+          shard: arm64-cross
+          prune: 'true'
 
   macos:
     # RunsOn does not support macOS; public queue CI runs this advisory job.
@@ -219,6 +229,9 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
+        with:
+          cache-job: linux-arm64
+          restore-only: 'true'
       - name: Check remote action shell environment
         run: tools/check-action-shell.sh
       - name: Build gang and e2e harness
@@ -247,6 +260,13 @@ jobs:
           name: e2e-harness-aarch64
           path: ${{ runner.temp }}/e2e
           if-no-files-found: error
+      - name: Export the Bazel working set
+        if: always() && job.status == 'success'
+        uses: ./.github/actions/save-bazel-cache
+        with:
+          mode: export
+          shard: arm64-bundle
+          prune: 'true'
 
   linux-arm64-checks:
     needs: [linux-arm64-bundle]
@@ -260,6 +280,9 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: ./.github/actions/setup-bazel
+        with:
+          cache-job: linux-arm64
+          restore-only: 'true'
       - name: Check BUILD files are in sync
         run: bazel run //:gazelle.check
       # Native ELF, shell/signal and PostgreSQL boundaries complement the full x86 suite (docs/SPECIFICATION.md §7).
@@ -274,6 +297,13 @@ jobs:
           //crates/gang-postgres:gang_postgres_integration_tests_tests/contract_test
           //crates/gang-postgres:gang_postgres_integration_tests_tests/plugin_test
           //crates/gang-testkit:gang_testkit_integration_tests_tests/postgres_test
+      - name: Export the Bazel working set
+        if: always() && job.status == 'success'
+        uses: ./.github/actions/save-bazel-cache
+        with:
+          mode: export
+          shard: arm64-checks
+          prune: 'true'
 
   e2e-gate-1-shards:
     needs: [linux-x86_64-bundle]

@@ -64,11 +64,11 @@ runs:
         build --repo_env=HERMETIC_CC_TOOLCHAIN_CACHE_PREFIX=$zig_cache
         build --sandbox_writable_path=$zig_cache
         EOF
-    # Only the canonical Linux x86 cache uses shared storage; other jobs keep local caches.
+    # Only canonical Linux architecture caches use shared storage; other jobs keep local caches.
     # On PRs, layer the PR working set over the default-branch baseline.
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       id: base
-      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && github.event_name == 'pull_request'
+      if: runner.os == 'Linux' && ((runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64') || (runner.arch == 'ARM64' && env.BAZEL_CACHE_JOB == 'linux-arm64')) && github.event_name == 'pull_request'
       with:
         path: |
           ${{ env.BAZEL_DISK_CACHE }}
@@ -78,7 +78,7 @@ runs:
           ${{ steps.name.outputs.default-inputs }}
           ${{ steps.name.outputs.default }}
     - name: Record trusted Bazel baseline
-      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && github.event_name == 'pull_request'
+      if: runner.os == 'Linux' && ((runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64') || (runner.arch == 'ARM64' && env.BAZEL_CACHE_JOB == 'linux-arm64')) && github.event_name == 'pull_request'
       shell: bash
       run: |
         manifest="$RUNNER_TEMP/bazel-base-manifest"
@@ -86,7 +86,7 @@ runs:
         echo "BAZEL_BASE_MANIFEST=$manifest" >> "$GITHUB_ENV"
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       id: pr
-      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && github.event_name == 'pull_request'
+      if: runner.os == 'Linux' && ((runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64') || (runner.arch == 'ARM64' && env.BAZEL_CACHE_JOB == 'linux-arm64')) && github.event_name == 'pull_request'
       env:
         TAR_OPTIONS: --skip-old-files
       with:
@@ -99,7 +99,7 @@ runs:
           ${{ steps.name.outputs.pr }}
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       id: restore
-      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && github.event_name != 'pull_request'
+      if: runner.os == 'Linux' && ((runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64') || (runner.arch == 'ARM64' && env.BAZEL_CACHE_JOB == 'linux-arm64')) && github.event_name != 'pull_request'
       with:
         path: |
           ${{ env.BAZEL_DISK_CACHE }}
@@ -109,7 +109,7 @@ runs:
           ${{ steps.name.outputs.default-inputs }}
           ${{ steps.name.outputs.default }}
     - name: Record restored Bazel cache
-      if: runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64'
+      if: runner.os == 'Linux' && ((runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64') || (runner.arch == 'ARM64' && env.BAZEL_CACHE_JOB == 'linux-arm64'))
       shell: bash
       env:
         BASE_PRESENT: ${{ steps.base.outputs.cache-matched-key != '' }}
@@ -122,7 +122,7 @@ runs:
     - name: Mark the start of the build
       shell: bash
       env:
-        SAVE: ${{ runner.os == 'Linux' && runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64' && steps.restore.outputs.cache-hit != 'true' && steps.pr.outputs.cache-hit != 'true' && inputs.restore-only != 'true' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))) }}
+        SAVE: ${{ runner.os == 'Linux' && ((runner.arch == 'X64' && env.BAZEL_CACHE_JOB == 'linux-x86_64') || (runner.arch == 'ARM64' && env.BAZEL_CACHE_JOB == 'linux-arm64')) && steps.restore.outputs.cache-hit != 'true' && steps.pr.outputs.cache-hit != 'true' && inputs.restore-only != 'true' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))) }}
         CURRENT_CACHE_HIT: ${{ steps.restore.outputs.cache-hit == 'true' || steps.pr.outputs.cache-hit == 'true' }}
         RESTORED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
         BASE_KEY: ${{ steps.base.outputs.cache-matched-key }}

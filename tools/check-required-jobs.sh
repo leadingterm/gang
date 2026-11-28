@@ -81,6 +81,9 @@ jq -en --slurpfile ci "$scratch/ci.json" --slurpfile pr "$scratch/pr.json" '
   | require([.steps[]? | select((.uses // "") | startswith("actions/checkout@")) | select(.with."fetch-depth" == 0)] | length == 1; "portable lint requires full checkout history")
   | require([.steps[]? | select(.run == "tools/lint.sh --portable")] | length == 1; "portable lint must run")
   | require([.steps[]? | select(.uses == "./.github/actions/save-bazel-cache") | select(.with.mode == "export" and .with.shard == "x86-lint")] | length == 1; "lint must export its working set")
+  | reduce [{id:"linux-arm64-bundle", shard:"arm64-bundle"}, {id:"linux-arm64-checks", shard:"arm64-checks"}, {id:"cross-build", shard:"arm64-cross"}][] as $arm (.;
+      $jobs[$arm.id] | require([.steps[]? | select(.uses == "./.github/actions/setup-bazel" and .with."cache-job" == "linux-arm64" and .with."restore-only" == "true")] | length == 1; "ARM jobs must restore the shared ARM cache")
+      | require([.steps[]? | select(.uses == "./.github/actions/save-bazel-cache" and .with.mode == "export" and .with.shard == $arm.shard and .with.prune == "true")] | length == 1; "ARM jobs must export their working set"))
   | reduce ["linux-x86_64-bundle", "linux-arm64-bundle"][] as $id (.;
       $jobs[$id] | (if $id == "linux-x86_64-bundle" then "x86_64" else "aarch64" end) as $arch
       | require([.steps[]? | select(.run? | strings | contains("bazel build") and contains("//:gang") and contains("//crates/gang-e2e:bundle"))] | length == 1; "bundle must build gang and harness")

@@ -126,6 +126,15 @@ expect failure 'nix-vm requires the ARM bundle, not the x86 bundle' "$guard" "$f
 reset_fixtures
 yq -i '.jobs.nix-vm.needs += ["linux-x86_64-bundle"]' "$fixture"
 expect failure 'nix-vm cannot add another dependency' "$guard" "$fixture" "$pr_fixture"
+for job in linux-arm64-bundle linux-arm64-checks cross-build; do
+  reset_fixtures
+  job="$job" yq -i 'del(.jobs[strenv(job)].steps[] | select(.uses == "./.github/actions/save-bazel-cache"))' "$fixture"
+  expect failure "$job exports ARM working set" "$guard" "$fixture" "$pr_fixture"
+  reset_fixtures
+  job="$job" yq -i '(.jobs[strenv(job)].steps[] | select(.uses == "./.github/actions/setup-bazel") | .with."cache-job") = "linux-x86_64"' "$fixture"
+  expect failure "$job restores ARM cache" "$guard" "$fixture" "$pr_fixture"
+done
+
 for job in nix-vm cross-build linux-arm64-checks linux-x86_64-shards; do
   reset_fixtures
   job="$job" yq -i '(.jobs[strenv(job)].steps[] | select(.name == "Run NixOS VM checks" or .name == "Cross-build gang" or .name == "Test") | .run) = "true"' "$fixture"

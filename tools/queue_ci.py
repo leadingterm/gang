@@ -13,14 +13,18 @@ SHA = re.compile(r"[0-9a-f]{40}\Z")
 CHECKS = frozenset(("release-validation", "lint", "cross", "linux-x86_64", "linux-arm64", "e2e-gate-1", "e2e-gate-2"))
 LINUX = ("gang-x86_64-unknown-linux-musl", "gang-aarch64-unknown-linux-musl")
 DARWIN = "gang-aarch64-apple-darwin"
-WORKING = tuple(f"bazel-working-set-x86-{n}" for n in (1, 2, 3, 4, "lint"))
+X86_WORKING = tuple(f"bazel-working-set-x86-{n}" for n in (1, 2, 3, 4, "lint"))
+
+ARM_WORKING = tuple(f"bazel-working-set-arm64-{name}" for name in ("bundle", "checks", "cross"))
+WORKING = X86_WORKING + ARM_WORKING
 
 
 @dataclass(frozen=True)
 class QueueRun:
     run_id: int
     tree_sha: str
-    working_set_artifact_ids: tuple[int, ...]
+    x86_working_set_artifact_ids: tuple[int, ...]
+    arm_working_set_artifact_ids: tuple[int, ...]
 
 
 def mapping(value: object) -> dict:
@@ -123,7 +127,8 @@ def select_queue_run(api: GitHubApi, sha: str, require_working_sets: bool = Fals
             ids.extend(found[DARWIN])
         if len(ids) != len(set(ids)):
             continue
-        return QueueRun(run_id, tree, tuple(found[name][0] for name in WORKING) if require_working_sets else ())
+        return QueueRun(run_id, tree, tuple(found[name][0] for name in X86_WORKING) if require_working_sets else (),
+                        tuple(found[name][0] for name in ARM_WORKING) if require_working_sets else ())
     raise ValueError("no qualified merge-queue CI run for commit")
 
 
@@ -137,7 +142,8 @@ def main(argv: list[str] | None = None, api: GitHubApi | None = None) -> int:
         result = select_queue_run(api if api is not None else GitHubApi.from_env(), args.sha, args.require_working_sets)
         with Path(args.github_output).open("a", encoding="utf-8") as output:
             output.write(f"run-id={result.run_id}\ntree-sha={result.tree_sha}\n")
-            output.write("working-set-artifact-ids=" + ",".join(map(str, result.working_set_artifact_ids)) + "\n")
+            output.write("x86-working-set-artifact-ids=" + ",".join(map(str, result.x86_working_set_artifact_ids)) + "\n")
+            output.write("arm-working-set-artifact-ids=" + ",".join(map(str, result.arm_working_set_artifact_ids)) + "\n")
     except (GitHubApiError, ValueError, OSError) as error:
         print(f"queue CI selection failed: {error}", file=sys.stderr)
         return 1
