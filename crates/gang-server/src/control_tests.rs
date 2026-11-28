@@ -440,7 +440,6 @@ async fn mid_pass_lapse_forgets_unapplied_termination() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -567,7 +566,6 @@ async fn lapsed_leader_does_not_record_worker_registration() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -610,7 +608,6 @@ async fn lapsed_leader_converges_no_fleet() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -655,7 +652,6 @@ async fn a_lease_lapsing_during_converge_skips_the_pass_as_lapsed() -> TestResul
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -697,7 +693,6 @@ async fn a_converge_failure_while_the_lease_holds_skips_as_provisioner_unavailab
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -729,7 +724,6 @@ async fn leader_converges_every_fleet_before_reading_it() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -780,7 +774,6 @@ async fn a_supplied_exit_is_recorded_as_an_exited_early_event() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -835,7 +828,6 @@ async fn exit_survives_failed_audit() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -859,7 +851,6 @@ async fn exit_survives_failed_audit() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -930,7 +921,6 @@ async fn exit_survives_leadership_lapse() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -958,7 +948,6 @@ async fn exit_survives_leadership_lapse() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1013,7 +1002,6 @@ async fn exit_survives_failed_acknowledgement() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1048,7 +1036,6 @@ async fn exit_survives_failed_acknowledgement() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1082,7 +1069,6 @@ async fn launch_failures_are_recorded_once_per_reason_until_request_is_met() -> 
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1178,7 +1164,6 @@ async fn failed_unneeded_request_is_withdrawn_and_audited() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1219,7 +1204,6 @@ async fn an_abandoned_request_is_withdrawn_and_audited_once() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1288,7 +1272,6 @@ async fn terminations_and_withdrawal_in_one_pass_never_raise_desired() -> TestRe
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1333,7 +1316,6 @@ async fn queued_action_scales_out_from_an_empty_fleet() -> Result<(), PortError>
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1382,7 +1364,6 @@ async fn failed_capacity_request_records_no_audit_event() -> Result<(), PortErro
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1420,7 +1401,6 @@ async fn failed_snapshot_skips_the_pass_without_touching_the_fleet() -> Result<(
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1457,7 +1437,6 @@ async fn held_scheduler_acquisition_skips_and_next_pass_retries() -> TestResult 
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1518,7 +1497,6 @@ async fn failed_supply_skips_the_pass_without_applying_steps() -> Result<(), Por
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1556,7 +1534,6 @@ async fn failed_supply_defers_worker_registration_until_a_completed_pass() -> Te
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1617,7 +1594,6 @@ async fn unconfigured_fleet_worker_joins_and_leaves_without_audit_events() -> Te
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1668,7 +1644,6 @@ async fn drain_of_a_worker_that_left_is_neither_applied_nor_audited() -> TestRes
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1734,7 +1709,6 @@ async fn replacement_cordon_forwards_destroy_mode_for_current_worker() -> TestRe
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1800,7 +1774,6 @@ async fn idle_worker_is_drained_then_terminated_once_empty() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1904,7 +1877,6 @@ async fn a_draining_worker_with_new_demand_is_resumed() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -1969,7 +1941,6 @@ async fn an_idle_worker_is_drained() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -2045,7 +2016,6 @@ async fn early_exit_clears_only_the_matching_fleet_termination() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -2127,7 +2097,6 @@ async fn early_exit_clears_a_failed_termination_without_a_termination_audit() ->
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -2215,7 +2184,6 @@ async fn failed_termination_of_live_worker_is_cancelled_when_demand_returns() ->
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -2329,7 +2297,6 @@ async fn committed_termination_is_retried_after_supply_disappears_or_terminates(
             ),
             Arc::new(gang_config::ScalingConfig::default()),
             source_profiles(),
-            gang_types::nonzero_u32(2),
             &crate::control::ControlPorts {
                 provisioner: &fleet,
                 scheduler: &scheduler,
@@ -2431,7 +2398,6 @@ async fn failed_terminate_is_planned_again_on_the_next_pass() {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -2500,7 +2466,6 @@ async fn audit_failure_still_counts_the_step_as_applied() -> Result<(), PortErro
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -2524,14 +2489,9 @@ async fn audit_failure_still_counts_the_step_as_applied() -> Result<(), PortErro
 
 #[tokio::test]
 async fn overflow_resource_demand_is_independent_of_execution_duration() -> TestResult {
-    // Four vCPUs of reservations fill the first worker without oversubscription.
-    // Doubling its CPU capacity keeps the queued reservation on that worker instead.
-    for (seconds, queued_duration, factor, applied) in [
-        (2, None, 1, 1),
-        (60, Some(Duration::from_mins(2)), 1, 1),
-        (2, None, 2, 0),
-        (60, Some(Duration::from_mins(2)), 2, 0),
-    ] {
+    // Four vCPUs of reservations fill the first worker.
+    for (seconds, queued_duration, applied) in [(2, None, 1), (60, Some(Duration::from_mins(2)), 1)]
+    {
         let clock = clock_at(1_000_000);
         let fleet = FakeProvisioner::default();
         let scheduler = FakeScheduler::new().expect("the scheduler fake builds");
@@ -2574,7 +2534,6 @@ async fn overflow_resource_demand_is_independent_of_execution_duration() -> Test
             settings,
             Arc::new(gang_config::ScalingConfig::default()),
             source_profiles(),
-            gang_types::nonzero_u32(factor),
             &crate::control::ControlPorts {
                 provisioner: &fleet,
                 scheduler: &scheduler,
@@ -2618,7 +2577,6 @@ async fn each_fleet_supply_is_refreshed_in_declaration_order() {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -2696,7 +2654,6 @@ async fn registrations_follow_snapshot_worker_id_order() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -2765,7 +2722,6 @@ async fn vanished_worker_is_recorded_as_deregistered_from_the_fleet_it_was_in() 
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -2845,7 +2801,6 @@ async fn unchanged_worker_set_records_nothing_on_the_next_pass() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -2907,7 +2862,6 @@ async fn failed_worker_event_recording_is_not_published() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3034,7 +2988,6 @@ async fn completed_pass_publishes_an_ok_pass_with_the_fleet_rows() -> Result<(),
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3086,7 +3039,6 @@ async fn failed_partial_supply_is_skipped_and_recovery_uses_fresh_supply() -> Te
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3167,7 +3119,6 @@ async fn observation_and_mutation_diagnostics_clear_on_recovery() -> TestResult 
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3255,7 +3206,6 @@ async fn skipped_pass_publishes_its_reason_with_no_good_pass_before() -> Result<
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3307,7 +3257,6 @@ async fn skipped_pass_reports_the_last_good_pass_and_keeps_the_rows() -> Result<
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3363,7 +3312,6 @@ async fn worker_joins_recorded_in_a_pass_are_in_that_pass_state() -> TestResult 
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3426,7 +3374,6 @@ async fn healthy_observation_is_published_before_the_first_pass() -> TestResult 
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3503,7 +3450,6 @@ async fn configuration_failure_retries_then_starts_observer_before_control() -> 
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3561,7 +3507,6 @@ async fn later_fatal_supply_error_takes_precedence_over_history_warning() -> Tes
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3621,7 +3566,6 @@ async fn post_supply_leadership_lapse_does_not_publish_observation_warning() -> 
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3668,7 +3612,6 @@ async fn post_supply_scheduler_unavailable_does_not_publish_observation_warning(
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3730,7 +3673,6 @@ async fn observation_retains_last_good_supply_when_worker_disconnects() -> TestR
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3824,7 +3766,6 @@ async fn slow_pass_does_not_publish_a_known_zero_before_the_first_observation() 
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3911,7 +3852,6 @@ async fn observation_recovers_after_scheduler_reads_time_out() -> TestResult {
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -3998,7 +3938,6 @@ async fn run_passes_at_once_then_once_per_poll_interval() -> Result<(), PortErro
         ),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -4149,7 +4088,6 @@ async fn assert_launch_warning_survives_observations(replacement: bool) -> TestR
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -4276,7 +4214,6 @@ async fn infrastructure_delivery_retries_and_replays_without_audit_duplicates() 
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -4329,7 +4266,6 @@ async fn infrastructure_delivery_retries_and_replays_without_audit_duplicates() 
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -4370,7 +4306,6 @@ async fn capacity_status_preserves_launch_audit_through_redelivery_and_expiry() 
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -4485,7 +4420,6 @@ async fn ordinary_provider_launch_does_not_suppress_worker_registration() -> Tes
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,
@@ -4539,7 +4473,6 @@ async fn failed_status_reload_clears_expired_risk_without_stopping_reconciliatio
         crate::control::ControlSettings::new(POLL_INTERVAL, &dashboard),
         Arc::new(gang_config::ScalingConfig::default()),
         source_profiles(),
-        gang_types::nonzero_u32(2),
         &crate::control::ControlPorts {
             provisioner: &fleet,
             scheduler: &scheduler,

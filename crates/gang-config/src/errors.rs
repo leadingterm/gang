@@ -11,6 +11,10 @@ use gang_types::{FleetName, Isa, MAX_FLEETS, ProviderName, RoleName, Url};
 /// helps is [`gang_types::Fix::fix`].
 #[derive(Debug, thiserror::Error, gang_types::Fix)]
 pub enum ConfigError {
+    /// CPU reclamation watermarks are inconsistent.
+    #[error("invalid actions.cpu watermarks: {0}")]
+    #[fix("adjust the CPU headroom and saturation watermarks")]
+    InvalidCpuWatermarks(&'static str),
     /// The `gang.toml` text is not valid TOML or does not match the configuration schema;
     /// unknown backends and unknown fields are reported here with the accepted keys.
     #[error("invalid gang.toml")]

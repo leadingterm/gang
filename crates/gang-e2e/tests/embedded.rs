@@ -3309,6 +3309,8 @@ async fn observe_worker_keepalives(server: &WorkerServer, worker: &mut HeldWorke
             worker_wire::KeepAlive {
                 cache: None,
                 memory_capacity,
+                load: None,
+                inflight: Vec::new(),
             },
         ))?;
         loop {
@@ -3433,10 +3435,7 @@ async fn higher_priority_actions_dispatch_first_through_engine() -> TestResult {
             vec![single_slot.clone()],
             TestGate::allow(),
             Vec::new(),
-            gang_config::ActionsConfig {
-                cpu_oversubscription: NonZeroU32::MIN,
-                ..Default::default()
-            },
+            gang_config::ActionsConfig::default(),
             gang_config::WorkerConfig::default(),
         )
         .await?;

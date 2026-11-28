@@ -589,6 +589,8 @@ pub struct RunSpec {
     pub side_channel: SideChannelInputs,
     /// Reserved memory in bytes for soft-ceiling and pressure-victim ranking.
     pub reserved_memory_bytes: u64,
+    /// Reserved CPU in millicores used as the initial live reporting threshold.
+    pub reserved_cpu_millicores: u64,
     /// Reserved disk in bytes for soft-ceiling and pressure-victim ranking.
     pub reserved_disk_bytes: u64,
     /// Action execution timeout starting when the process spawns.
@@ -642,6 +644,7 @@ pub async fn run_attempt<K: Clock>(
             attempt_dir: dirs.attempt_dir.clone(),
             side_channel_dir: side_channel.dir().to_path_buf(),
             reserved_memory_bytes: spec.reserved_memory_bytes,
+            reserved_cpu_millicores: spec.reserved_cpu_millicores,
             reserved_disk_bytes: spec.reserved_disk_bytes,
             kill: kill_trigger.clone(),
         })
@@ -743,8 +746,12 @@ fn collect_final_usage(
     if let Some(sample) = final_cgroup_sample
         && sample.observed()
     {
-        if let Some(current) = sample.current_memory_bytes {
-            usage.record_memory(current);
+        if let Some(current) = sample
+            .working_set_memory_bytes
+            .or(sample.current_memory_bytes)
+            .filter(|value| *value > 0)
+        {
+            usage.record_working_set(current);
         }
         if let Some(peak) = sample.peak_memory_bytes {
             usage.record_memory(peak);
@@ -1428,6 +1435,7 @@ mod tests {
             output_paths: Vec::new(),
             side_channel: SideChannelInputs::default(),
             reserved_memory_bytes: 0,
+            reserved_cpu_millicores: 0,
             reserved_disk_bytes: 0,
             timeout: Some(Duration::from_secs(15)),
             attempt_deadline: None,
@@ -1575,6 +1583,7 @@ mod tests {
         fn read_attempt_cgroup(&self, _cgroup: &Path) -> AttemptCgroupSample {
             AttemptCgroupSample {
                 current_memory_bytes: Some(256 * 1024 * 1024),
+                working_set_memory_bytes: None,
                 peak_memory_bytes: Some(300 * 1024 * 1024),
                 cpu_time: Some(Duration::from_millis(45)),
                 oom_kills: 0,
@@ -2077,6 +2086,8 @@ mod tests {
                 }),
             });
             let config = SamplingConfig {
+                cpu: gang_config::CpuTuning::default(),
+                physical_cpu_millicores: 4_000,
                 memory: MemoryTuning {
                     enforcement: MemoryEnforcement::Pressure,
                     reserve: NonZeroBytes::mib(100),
@@ -2137,7 +2148,7 @@ mod tests {
             let outcome = handle.await??;
             assert_eq!(outcome.kill, Some(KillReason::Memory));
             assert!(outcome.usage.sampled);
-            assert_eq!(outcome.usage.peak_memory_bytes, Some(300 * 1024 * 1024));
+            assert_eq!(outcome.usage.peak_memory_bytes, Some(256 * 1024 * 1024));
             assert_eq!(outcome.usage.cpu_time, Some(Duration::from_millis(45)));
             assert!(registry.is_quiescence_settled());
 

@@ -647,7 +647,6 @@ async fn lead_work<D: Deployment>(
         context.control_settings,
         Arc::clone(context.scaling),
         profiles.clone(),
-        context.actions.cpu_oversubscription,
         &crate::control::ControlPorts {
             provisioner: context.provisioner,
             scheduler: context.scheduler,
@@ -2009,7 +2008,6 @@ mod tests {
             policies,
             std::sync::Arc::clone(&settings.scaling),
             profiles.clone(),
-            settings.actions.cpu_oversubscription,
         );
         let mut fleets: Vec<_> = policies.iter().cloned().map(FleetPass::new).collect();
         let mut queued = crate::test_support::queued_demand(gang_types::FleetSet::prefix(1)?);

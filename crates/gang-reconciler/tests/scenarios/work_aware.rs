@@ -854,7 +854,6 @@ fn oversubscribed_serving_fleet_scales_to_live_max_regardless_of_payback() -> Te
         (1000, 12_000, 12_000),
     ] {
         let mut w = Workload::new(10, 15, payback)?;
-        w.h.set_cpu_oversubscription(NonZeroU32::new(2).ok_or("nonzero factor")?);
         for index in 0..6 {
             let name = format!("local-{index}");
             w.serve(X86, &name)?;
@@ -875,14 +874,13 @@ fn oversubscribed_serving_fleet_scales_to_live_max_regardless_of_payback() -> Te
 }
 
 #[test]
-fn cpu_oversubscription_survives_reconciler_restart() -> TestResult {
+fn physical_cpu_demand_survives_reconciler_restart() -> TestResult {
     let mut w = Workload::new(10, 15, 50)?;
-    w.h.set_cpu_oversubscription(NonZeroU32::new(2).ok_or("nonzero factor")?);
     w.queue(None, X86, 20, None)?;
     w.pass();
-    assert_eq!(w.h.outlook(X86)?.needed, 1);
+    assert_eq!(w.h.outlook(X86)?.needed, 2);
     w.h.restart();
     w.pass();
-    assert_eq!(w.h.outlook(X86)?.needed, 1);
+    assert_eq!(w.h.outlook(X86)?.needed, 2);
     Ok(())
 }

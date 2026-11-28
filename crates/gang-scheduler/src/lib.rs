@@ -38,9 +38,9 @@ pub use admission::{
 };
 pub use attempts::{
     AcceptOutcome, AckTimeoutOutcome, Attempt, AttemptDeadlineOutcome, AttemptKey, AttemptPhase,
-    AttemptUsage, Attempts, CancelOutcome, CompletedOutcome, CompletedReport, CompletionStatus,
-    DeclineOutcome, DeclineReason, ExecutedOutcome, ExecutedReport, KillDirective, KillReason,
-    PublishEvent, TerminalFailure, WorkerLossOutcome,
+    AttemptUsage, AttemptUsageUpdate, Attempts, CancelOutcome, CompletedOutcome, CompletedReport,
+    CompletionStatus, DeclineOutcome, DeclineReason, ExecutedOutcome, ExecutedReport,
+    KillDirective, KillReason, PublishEvent, TerminalFailure, WorkerLossOutcome,
 };
 pub use capacity::{CapacityCatalog, CapacityError, FleetCapacity};
 pub use cordons::{Census, CordonError, CordonRegistry};
@@ -94,5 +94,5 @@ pub use snapshot::{fill_snapshot, project_snapshot};
 pub use timers::{DueTimer, TimerEffects, TimerKind, TimerQueue, TimerSubject, on_timer};
 pub use workers::{
     DrainSources, InstanceState, RegistrationError, Worker, WorkerIdError, WorkerKey,
-    WorkerRegistration, WorkerRegistry, mint_random_worker_id, mint_worker_id,
+    WorkerLoadSnapshot, WorkerRegistration, WorkerRegistry, mint_random_worker_id, mint_worker_id,
 };

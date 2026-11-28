@@ -1,6 +1,5 @@
 //! Fleet-independent reservations and per-instance resource projections.
 
-use std::num::NonZeroU32;
 use std::ops::{Add, AddAssign};
 use std::time::Duration;
 
@@ -121,14 +120,9 @@ impl ResourceVector {
         }
     }
 
-    pub fn normalized(
-        self,
-        policy: &FleetPolicy,
-        cpu_oversubscription: NonZeroU32,
-    ) -> CapacityVector {
-        let cpu_capacity = u64::from(policy.vcpus_per_instance.get())
-            .saturating_mul(MILLICORES_PER_CORE)
-            .saturating_mul(u64::from(cpu_oversubscription.get()));
+    pub fn normalized(self, policy: &FleetPolicy) -> CapacityVector {
+        let cpu_capacity =
+            u64::from(policy.vcpus_per_instance.get()).saturating_mul(MILLICORES_PER_CORE);
         CapacityVector {
             cpu: self.cpu_millicores / u64_to_f64(cpu_capacity),
             memory: self.memory / u64_to_f64(policy.memory_per_instance.get().get()),
@@ -252,15 +246,9 @@ mod tests {
             memory: u64_to_f64(policy.memory_per_instance.get().get()),
             ..ResourceVector::default()
         };
+        exact((cpu + memory).normalized(&policy).max_component(), 1.0);
         exact(
-            (cpu + memory)
-                .normalized(&policy, NonZeroU32::MIN)
-                .max_component(),
-            1.0,
-        );
-        exact(
-            cpu.normalized(&policy, NonZeroU32::MIN).max_component()
-                + memory.normalized(&policy, NonZeroU32::MIN).max_component(),
+            cpu.normalized(&policy).max_component() + memory.normalized(&policy).max_component(),
             2.0,
         );
     }

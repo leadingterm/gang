@@ -169,7 +169,6 @@ pub struct Reconciler {
     first_pass: Option<Tick>,
     first_wall: Option<Timestamp>,
     scaling: Arc<ScalingConfig>,
-    cpu_oversubscription: NonZeroU32,
     running_reservations: Vec<crate::Demand>,
     planner: WorkPlanner,
     capacities: Vec<Capacity>,
@@ -185,7 +184,6 @@ impl Reconciler {
         fleets: &[FleetPolicy],
         scaling: Arc<ScalingConfig>,
         profiles: SourceProfiles,
-        cpu_oversubscription: NonZeroU32,
     ) -> Self {
         let capacity = fleets
             .iter()
@@ -201,8 +199,7 @@ impl Reconciler {
             repair_workers: Vec::with_capacity(capacity),
             first_pass: None,
             first_wall: None,
-            planner: WorkPlanner::new(fleets, Arc::clone(&scaling), profiles, cpu_oversubscription),
-            cpu_oversubscription,
+            planner: WorkPlanner::new(fleets, Arc::clone(&scaling), profiles),
             running_reservations: Vec::with_capacity(capacity),
             scaling,
             capacities: fleets
@@ -279,22 +276,17 @@ impl Reconciler {
                     fleet.outlook.candidates = fleet.outlook.candidates.saturating_add(1);
                 }
             }
-            let chosen = place(
-                action.candidates,
-                action.resources,
-                self.cpu_oversubscription,
-                |index| {
-                    fleets.get(index).map(|fleet| {
-                        let limit = if fleet.supply.launch_failure.is_some() {
-                            let capacity = &self.capacities[index];
-                            capacity.reliable.saturating_add(capacity.draining())
-                        } else {
-                            fleet.policy.instances.max().get()
-                        };
-                        (&fleet.policy, fleet.outlook.demand, limit)
-                    })
-                },
-            );
+            let chosen = place(action.candidates, action.resources, |index| {
+                fleets.get(index).map(|fleet| {
+                    let limit = if fleet.supply.launch_failure.is_some() {
+                        let capacity = &self.capacities[index];
+                        capacity.reliable.saturating_add(capacity.draining())
+                    } else {
+                        fleet.policy.instances.max().get()
+                    };
+                    (&fleet.policy, fleet.outlook.demand, limit)
+                })
+            });
             self.planner.attribute(chosen, action.candidates);
             if let Some(fleet) = chosen.and_then(|index| fleets.get_mut(index)) {
                 fleet.outlook.demand.add_queued(action.resources);
@@ -311,10 +303,7 @@ impl Reconciler {
                 supply: &fleet.supply,
                 needed: fleet.outlook.needed,
                 minimum: fleet.outlook.minimum,
-                ceiling: fleet
-                    .outlook
-                    .demand
-                    .instances(&fleet.policy, self.cpu_oversubscription),
+                ceiling: fleet.outlook.demand.instances(&fleet.policy),
                 need: if self.planner.work(index) < fleet.outlook.needed {
                     NeedCause::Minimum
                 } else {
@@ -369,8 +358,7 @@ impl Reconciler {
                     let mut resources = known.resources();
                     if known.actions() < u64::from(worker.running_actions) {
                         let cpu = u64::from(fleet.policy.vcpus_per_instance.get())
-                            .saturating_mul(gang_types::property::MILLICORES_PER_CORE)
-                            .saturating_mul(u64::from(self.cpu_oversubscription.get()));
+                            .saturating_mul(gang_types::property::MILLICORES_PER_CORE);
                         resources.cpu_millicores = resources.cpu_millicores.max(cpu);
                         resources.memory =
                             resources.memory.max(fleet.policy.memory_per_instance.get());
@@ -1062,12 +1050,7 @@ mod tests {
         policy.idle_timeout = Duration::from_hours(1);
         let scaling = Arc::new(ScalingConfig::default());
         let profiles = SourceProfiles::new(&scaling, gang_config::HistoryWindow::from_units(1));
-        let reconciler = Reconciler::new(
-            std::slice::from_ref(&policy),
-            scaling,
-            profiles,
-            gang_types::nonzero_u32(2),
-        );
+        let reconciler = Reconciler::new(std::slice::from_ref(&policy), scaling, profiles);
         let instance = InstanceId::try_new("i-0abc123")?;
         let mut fleet = FleetPass::new(policy.clone());
         fleet.supply.desired = 1;
@@ -1137,7 +1120,6 @@ mod tests {
             resources.cpu_millicores,
             u64::from(fleets[0].policy.vcpus_per_instance.get())
                 * gang_types::property::MILLICORES_PER_CORE
-                * 2
         );
         assert_eq!(resources.memory, fleets[0].policy.memory_per_instance.get());
         assert_eq!(resources.disk, fleets[0].policy.disk_per_instance.get());
@@ -1175,8 +1157,7 @@ mod tests {
             let policies: Vec<_> = fleets.iter().map(|fleet| fleet.policy.clone()).collect();
             let scaling = Arc::new(ScalingConfig::default());
             let profiles = SourceProfiles::new(&scaling, gang_config::HistoryWindow::from_units(1));
-            let factor = gang_types::nonzero_u32(2);
-            let mut reconciler = Reconciler::new(&policies, scaling, profiles, factor);
+            let mut reconciler = Reconciler::new(&policies, scaling, profiles);
             let mut plan = Plan::new();
             let observed = Resources {
                 vcpus: 8,
@@ -1190,7 +1171,7 @@ mod tests {
             };
             let resources = match dimension {
                 0 => ActionResources {
-                    cpu_millicores: 32_000,
+                    cpu_millicores: 16_000,
                     ..ActionResources::default()
                 },
                 1 => ActionResources {
@@ -1222,14 +1203,8 @@ mod tests {
             expected.disk_per_instance = NonZeroBytes::new(observed.disk).unwrap();
             assert_eq!(fleets[0].policy, expected);
             assert_eq!(fleets[1].policy, policies[1]);
-            assert_eq!(
-                fleets[0]
-                    .outlook
-                    .demand
-                    .instances(&fleets[0].policy, factor),
-                2
-            );
-            assert_eq!(fleets[0].outlook.demand.instances(&policies[0], factor), 1);
+            assert_eq!(fleets[0].outlook.demand.instances(&fleets[0].policy), 2);
+            assert_eq!(fleets[0].outlook.demand.instances(&policies[0]), 1);
 
             let mut snapshot = fleet_capacity_snapshot(&[(0, configured), (1, observed)], queued);
             hosted.replace(&mut snapshot);
@@ -1240,13 +1215,7 @@ mod tests {
             other_expected.memory_per_instance = NonZeroBytes::new(observed.memory).unwrap();
             other_expected.disk_per_instance = NonZeroBytes::new(observed.disk).unwrap();
             assert_eq!(fleets[1].policy, other_expected);
-            assert_eq!(
-                fleets[0]
-                    .outlook
-                    .demand
-                    .instances(&fleets[0].policy, factor),
-                1
-            );
+            assert_eq!(fleets[0].outlook.demand.instances(&fleets[0].policy), 1);
 
             let mut snapshot = gang_spi::SchedulerSnapshot::default();
             hosted.replace(&mut snapshot);

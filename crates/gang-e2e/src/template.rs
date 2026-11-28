@@ -811,9 +811,6 @@ fn render_control(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Res
 }
 
 fn render_control_cpu(document: &mut Document<Plugins>, knobs: &ControlKnobs) -> Result<()> {
-    if let Some(factor) = knobs.cpu_oversubscription {
-        document.actions.cpu_oversubscription = factor;
-    }
     if knobs.cold_start_full_fleet_cpu {
         let vcpus = document
             .fleets
@@ -866,20 +863,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn control_cpu_reservation_factor_renders_without_changing_other_action_policy() {
+    fn control_preserves_other_action_policy() {
         let path = std::env::var("GANG_E2E_BASE_CONFIG").expect("base config runfile");
         let config = std::fs::read_to_string(path).expect("base config");
-        for (knobs, expected) in [
-            (ControlKnobs::NONE, 3),
-            (ControlKnobs::LEADER_FAILOVER, 3),
-            (ControlKnobs::QUEUED_BEHIND_SHORT_WORK, 1),
-            (ControlKnobs::UTILIZATION_SCALE_IN, 1),
+        for knobs in [
+            ControlKnobs::NONE,
+            ControlKnobs::LEADER_FAILOVER,
+            ControlKnobs::QUEUED_BEHIND_SHORT_WORK,
+            ControlKnobs::UTILIZATION_SCALE_IN,
         ] {
             let mut document = Document::<Plugins>::parse(&config).expect("base config parses");
-            document.actions.cpu_oversubscription = NonZeroU32::new(3).expect("3 is nonzero");
-            let mut expected_actions = document.actions.clone();
-            expected_actions.cpu_oversubscription =
-                NonZeroU32::new(expected).expect("expected factor is nonzero");
+            let expected_actions = document.actions.clone();
             render_control(&mut document, &knobs).expect("control renders");
             let rendered = document.to_toml().expect("document serializes");
             let parsed = Document::<Plugins>::parse(&rendered).expect("rendered config parses");

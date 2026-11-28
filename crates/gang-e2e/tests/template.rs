@@ -440,13 +440,11 @@ fn rate_scaling_presets_render_typed_knobs() -> gang_e2e::Result<()> {
     );
     let fleet = &backlog.fleets[0];
     assert_eq!(fleet.vcpus_per_instance.get(), 1);
-    assert_eq!(backlog.actions.cpu_oversubscription.get(), 1);
     assert_eq!(fleet.max_instances.get(), 3);
     let millicores_per_core = gang_types::property::MILLICORES_PER_CORE;
     let held_cpu = 3 * u64::from(gang_e2e::HOLD_CPU_COUNT) * millicores_per_core;
     let physical_cpu = u64::from(fleet.vcpus_per_instance.get()) * millicores_per_core;
-    let worker_cpu = physical_cpu * u64::from(backlog.actions.cpu_oversubscription.get());
-    assert_eq!(held_cpu.div_ceil(worker_cpu), 3);
+    assert_eq!(held_cpu.div_ceil(physical_cpu), 3);
     for (control, idle) in [
         (
             ControlKnobs::BURST_FROM_ZERO,
@@ -1119,7 +1117,6 @@ fn fleets_preset_saturates_first_fleet() -> gang_e2e::Result<()> {
         assert_eq!(tuned.client_action_timeout, untuned.client_action_timeout);
         assert_eq!(tuned.fleets.len(), 3);
         assert!(tuned.actions.cold_start.enabled);
-        assert_eq!(tuned.actions.cpu_oversubscription.get(), 1);
         assert_eq!(tuned.fleets[0].vcpus_per_instance.get(), 4);
         assert_eq!(tuned.actions.cold_start.cpu_millicores.get(), 4000);
         assert_eq!(

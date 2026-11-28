@@ -93,6 +93,8 @@ pub enum Effect {
         operation: OperationKey,
         /// Out-of-band `cgroup` v2 `cpu.weight` derived from operation priority.
         cpu_weight: CpuWeight,
+        /// Monotonic sequence of this assignment on the worker.
+        assign_seq: u64,
         /// Resource reservation held for this attempt.
         reservation: ActionResources,
         /// Monotonic execution deadline (`dispatched_at.tick + attempt_budget`).

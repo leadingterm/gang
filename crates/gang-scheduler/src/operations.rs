@@ -293,6 +293,8 @@ pub struct NewOperation {
     pub candidates: FleetSet,
     /// Initial `ExecutionPolicy.priority`.
     pub priority: i32,
+    /// Whether the client supplied an explicit CPU floor.
+    pub has_explicit_cpu_floor: bool,
     /// Fitted resource reservation for this operation.
     pub reservation: ActionResources,
     /// Pre-fit learned resource reservation, if different from `reservation`.
@@ -326,6 +328,8 @@ pub struct Operation {
     pub candidates: FleetSet,
     /// Current effective priority (never lowered by deduplication).
     pub priority: i32,
+    /// Whether the client supplied an explicit CPU floor.
+    pub has_explicit_cpu_floor: bool,
     /// Current `cgroup` v2 `cpu.weight` derived from `priority`.
     pub cpu_weight: CpuWeight,
     /// Monotonic admission sequence number, preserved across promotions and requeues.
@@ -537,6 +541,7 @@ impl Operations {
             mnemonic: spec.mnemonic,
             candidates: spec.candidates,
             priority: spec.priority,
+            has_explicit_cpu_floor: spec.has_explicit_cpu_floor,
             cpu_weight,
             seq,
             reservation: spec.reservation,
@@ -950,6 +955,7 @@ mod tests {
             mnemonic: None,
             candidates: FleetSet::try_from_indices([0]).expect("valid fleet"),
             priority,
+            has_explicit_cpu_floor: false,
             reservation: ActionResources::default(),
             learned_reservation: None,
             initial_watchers: 1,

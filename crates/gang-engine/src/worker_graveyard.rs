@@ -533,7 +533,11 @@ mod tests {
         let tmp = TempDir::new()?;
         let work = tmp.path().canonicalize()?;
         let pending = Arc::new(GraveyardPending::new());
-        let sampling = SamplingRegistry::new(MemoryTuning::default(), DiskTuning::default());
+        let sampling = SamplingRegistry::new(
+            gang_config::CpuTuning::default(),
+            MemoryTuning::default(),
+            DiskTuning::default(),
+        );
 
         let graveyard = Graveyard::open(&work, nz(2), Arc::clone(&pending), Some(sampling)).await?;
         assert!(graveyard.dir().is_dir());
@@ -763,6 +767,8 @@ mod tests {
         };
         let mut sampler = WorkerSampler::new(
             SamplingConfig {
+                cpu: gang_config::CpuTuning::default(),
+                physical_cpu_millicores: 4_000,
                 memory: MemoryTuning::default(),
                 disk: disk_tuning,
                 memory_pool: None,
@@ -783,6 +789,7 @@ mod tests {
             attempt: attempt.clone(),
             attempt_dir: attempt_dir.clone(),
             side_channel_dir: work.join(".side_channels").join(attempt.as_str()),
+            reserved_cpu_millicores: 0,
             reserved_memory_bytes: 0,
             reserved_disk_bytes: 100,
             kill: tx,

@@ -3,7 +3,6 @@
 
 use std::fs::{self, DirBuilder};
 use std::io;
-use std::num::NonZeroU32;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::thread;
@@ -37,8 +36,6 @@ pub struct ControlKnobs {
     pub max_instances: Option<u32>,
     /// Virtual CPUs advertised per instance in every fleet.
     pub vcpus_per_instance: Option<u32>,
-    /// `[actions]` CPU reservation capacity multiplier.
-    pub cpu_oversubscription: Option<NonZeroU32>,
     /// Reserve the first fleet's physical CPU for each cold action.
     pub cold_start_full_fleet_cpu: bool,
     /// A `[[fleets.scheduled_minimum]]` window in force at every instant (all seven `days`,
@@ -85,7 +82,6 @@ impl ControlKnobs {
         min_instances: None,
         max_instances: None,
         vcpus_per_instance: None,
-        cpu_oversubscription: None,
         cold_start_full_fleet_cpu: false,
         scheduled_minimum: None,
         terminate_grace: None,
@@ -108,7 +104,6 @@ impl ControlKnobs {
     pub const FLEETS: Self = Self {
         idle_timeout: Some(Duration::from_secs(2)),
         terminate_grace: Some(Duration::from_secs(1)),
-        cpu_oversubscription: Some(NonZeroU32::MIN),
         cold_start_full_fleet_cpu: true,
         ..Self::NONE
     };
@@ -203,7 +198,6 @@ impl ControlKnobs {
         min_instances: Some(1),
         max_instances: Some(3),
         vcpus_per_instance: Some(2),
-        cpu_oversubscription: Some(NonZeroU32::MIN),
         holdable_launches: true,
         ..Self::NONE
     };
@@ -215,7 +209,6 @@ impl ControlKnobs {
         min_instances: Some(0),
         max_instances: Some(3),
         vcpus_per_instance: Some(1),
-        cpu_oversubscription: Some(NonZeroU32::MIN),
         holdable_launches: true,
         unknown_action_duration: Some(Duration::from_mins(10)),
         ..Self::NONE
@@ -254,7 +247,6 @@ impl ControlKnobs {
         unknown_action_duration: Some(Duration::from_mins(10)),
         min_instances: Some(1),
         vcpus_per_instance: Some(8),
-        cpu_oversubscription: Some(NonZeroU32::MIN),
         max_drain_wait: Some(Duration::from_mins(3)),
         ..Self::SUSTAINED_STREAM
     };

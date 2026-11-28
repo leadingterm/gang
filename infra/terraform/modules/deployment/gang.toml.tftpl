@@ -61,7 +61,17 @@ time_zone = ${jsonencode(w.time_zone)}
 %{ endfor }
 
 [actions]
-cpu_oversubscription = ${jsonencode(gang_settings.cpu_oversubscription)}
+
+[actions.cpu]
+headroom_percent = 15
+saturate_utilization_percent = 85
+clear_utilization_percent = 75
+saturate_psi_percent = 10
+clear_psi_percent = 5
+decay_window = "25s"
+sample_interval = "1s"
+inflight_report_delta_percent = 25
+max_reclaimed_cpu_ratio = 4
 
 [execution]
 input_links = ${jsonencode(gang_settings.input_links)}

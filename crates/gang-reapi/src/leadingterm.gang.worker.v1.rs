@@ -137,7 +137,7 @@ pub mod completed {
     }
 }
 /// Periodic worker liveness message carrying cache statistics and memory capacity.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KeepAlive {
     /// Cumulative fast/slow store counters and current cache occupancy.
     #[prost(message, optional, tag = "1")]
@@ -145,6 +145,47 @@ pub struct KeepAlive {
     /// Authoritative post-reserve action memory capacity in bytes, when available.
     #[prost(uint64, optional, tag = "2")]
     pub memory_capacity: ::core::option::Option<u64>,
+    /// Current sampled CPU load and reclamation capacity.
+    #[prost(message, optional, tag = "3")]
+    pub load: ::core::option::Option<WorkerLoad>,
+    /// Material increases in live attempt resource usage.
+    #[prost(message, repeated, tag = "4")]
+    pub inflight: ::prost::alloc::vec::Vec<AttemptUsageUpdate>,
+}
+/// Worker-wide CPU load derived from consecutive samples.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WorkerLoad {
+    /// Smoothed CPU use in millicores.
+    #[prost(uint64, tag = "1")]
+    pub observed_cpu_millicores: u64,
+    /// CPU pressure stall percentage over the sampling interval.
+    #[prost(uint32, tag = "2")]
+    pub cpu_psi_percent: u32,
+    /// Whether the saturation hysteresis latch is set.
+    #[prost(bool, tag = "3")]
+    pub cpu_saturated: bool,
+    /// CPU available for reclaimed reservations after host headroom.
+    #[prost(uint64, tag = "4")]
+    pub reclaimable_cpu_millicores: u64,
+    /// Monotonic sequence of this CPU sample.
+    #[prost(uint64, tag = "5")]
+    pub sample_seq: u64,
+    /// Highest assignment admitted before the sampling interval began.
+    #[prost(uint64, tag = "6")]
+    pub observed_assign_seq: u64,
+}
+/// Live lower-bound measurements for an active attempt.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AttemptUsageUpdate {
+    /// Attempt identifier.
+    #[prost(string, tag = "1")]
+    pub attempt: ::prost::alloc::string::String,
+    /// Smoothed CPU use in millicores.
+    #[prost(uint64, tag = "2")]
+    pub observed_cpu_millicores: u64,
+    /// Current working-set memory in bytes.
+    #[prost(uint64, tag = "3")]
+    pub working_set_memory_bytes: u64,
 }
 /// Signals that the worker is shutting down and will decline any further assignments.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -236,6 +277,9 @@ pub struct Assign {
     /// Out-of-band cgroup v2 `cpu.weight` (1..=10000); never part of platform or environment.
     #[prost(uint32, tag = "14")]
     pub cpu_weight: u32,
+    /// Scheduler assignment sequence within this worker session.
+    #[prost(uint64, tag = "15")]
+    pub assign_seq: u64,
 }
 /// Requests or reports termination of a running attempt.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -283,7 +327,7 @@ pub struct ResourceUsage {
     /// Cumulative CPU time consumed by the attempt, when measured.
     #[prost(message, optional, tag = "1")]
     pub cpu_time: ::core::option::Option<::prost_types::Duration>,
-    /// Peak memory usage observed in the attempt's cgroup or process tree, in bytes.
+    /// Peak sampled working-set memory, or the kernel peak if no working-set sample exists.
     #[prost(uint64, optional, tag = "2")]
     pub peak_memory_bytes: ::core::option::Option<u64>,
     /// Peak action work-directory disk usage observed for the attempt, in bytes.
@@ -295,6 +339,9 @@ pub struct ResourceUsage {
     /// Whether periodic resource sampling observed the running attempt.
     #[prost(bool, tag = "5")]
     pub sampled: bool,
+    /// Peak smoothed interval CPU burn in millicores, when measured.
+    #[prost(uint64, optional, tag = "6")]
+    pub peak_window_cpu_millicores: ::core::option::Option<u64>,
 }
 /// Measurements from one worker's local fast store and slow store.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -334,6 +381,8 @@ pub enum DeclineReason {
     DiskShortage = 1,
     /// Worker is draining or stopping and no longer admits new attempts.
     Draining = 2,
+    /// CPU pressure prevents accepting another attempt.
+    CpuPressure = 3,
 }
 impl DeclineReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -345,6 +394,7 @@ impl DeclineReason {
             Self::Unspecified => "DECLINE_REASON_UNSPECIFIED",
             Self::DiskShortage => "DECLINE_REASON_DISK_SHORTAGE",
             Self::Draining => "DECLINE_REASON_DRAINING",
+            Self::CpuPressure => "DECLINE_REASON_CPU_PRESSURE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -353,6 +403,7 @@ impl DeclineReason {
             "DECLINE_REASON_UNSPECIFIED" => Some(Self::Unspecified),
             "DECLINE_REASON_DISK_SHORTAGE" => Some(Self::DiskShortage),
             "DECLINE_REASON_DRAINING" => Some(Self::Draining),
+            "DECLINE_REASON_CPU_PRESSURE" => Some(Self::CpuPressure),
             _ => None,
         }
     }

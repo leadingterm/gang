@@ -10,7 +10,6 @@
 //! estimate for the pass; demand, rescue, N-1 and running completion stay exact.
 //! Scratch storage is retained and the allowance resets on the next pass.
 
-use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,12 +73,10 @@ impl Reservation {
         }
     }
 
-    fn capacity(policy: &FleetPolicy, factor: NonZeroU32) -> Self {
+    fn capacity(policy: &FleetPolicy) -> Self {
         Self {
             cpu: u128::from(
-                u64::from(policy.vcpus_per_instance.get())
-                    .saturating_mul(MILLICORES_PER_CORE)
-                    .saturating_mul(u64::from(factor.get())),
+                u64::from(policy.vcpus_per_instance.get()).saturating_mul(MILLICORES_PER_CORE),
             ),
             memory: u128::from(policy.memory_per_instance.get().get()),
             disk: u128::from(policy.disk_per_instance.get().get()),
@@ -485,7 +482,6 @@ fn pressure(load: CapacityVector, cap: CapacityVector) -> ScalingDimension {
 #[derive(Debug)]
 pub(crate) struct WorkPlanner {
     scaling: Arc<ScalingConfig>,
-    factor: NonZeroU32,
     rates: SourceRates,
     attribution: Vec<Option<usize>>,
     matching: Vec<FleetSet>,
@@ -510,13 +506,11 @@ impl WorkPlanner {
         fleets: &[FleetPolicy],
         scaling: Arc<ScalingConfig>,
         profiles: SourceProfiles,
-        factor: NonZeroU32,
     ) -> Self {
         let n = fleets.len();
         Self {
-            rates: SourceRates::new(fleets, Arc::clone(&scaling), profiles, factor),
+            rates: SourceRates::new(fleets, Arc::clone(&scaling), profiles),
             scaling,
-            factor,
             attribution: Vec::new(),
             matching: Vec::new(),
             work: vec![0; n],
@@ -695,7 +689,7 @@ impl WorkPlanner {
             if worker.running_actions > found {
                 self.releases.push(Release {
                     after: self.scaling.unknown_action_duration.get(),
-                    occupied: Reservation::capacity(&fleet.policy, self.factor).sub(known),
+                    occupied: Reservation::capacity(&fleet.policy).sub(known),
                 });
             }
         }
@@ -724,7 +718,7 @@ impl WorkPlanner {
                         } else {
                             Duration::ZERO
                         },
-                        Reservation::capacity(&fleet.policy, self.factor),
+                        Reservation::capacity(&fleet.policy),
                     );
                     record.dispatch = Some(dispatch_instance);
                     if resumable {
@@ -747,11 +741,8 @@ impl WorkPlanner {
                 }
             }
             for _ in 0..self.booting[index].saturating_sub(physical_booting) {
-                self.dispatch.add_instance(
-                    index,
-                    boot,
-                    Reservation::capacity(&fleet.policy, self.factor),
-                );
+                self.dispatch
+                    .add_instance(index, boot, Reservation::capacity(&fleet.policy));
             }
         }
     }
@@ -776,9 +767,9 @@ impl WorkPlanner {
         self.build_timeline(fleets, hosted, time);
         for (index, fleet) in fleets.iter_mut().enumerate() {
             let demand = ResourceVector::from_action(fleet.outlook.demand.resources())
-                .normalized(&fleet.policy, self.factor);
+                .normalized(&fleet.policy);
             self.demand[index] = demand;
-            self.work[index] = fleet.outlook.demand.instances(&fleet.policy, self.factor);
+            self.work[index] = fleet.outlook.demand.instances(&fleet.policy);
             fleet.outlook.needed = fleet.outlook.minimum.max(self.work[index]);
             let base = self.serving[index].saturating_add(self.booting[index]);
             let dimension = demand.max_dimension();
@@ -816,7 +807,7 @@ impl WorkPlanner {
                     self.dispatch.add_instance(
                         index,
                         self.horizons[index].readiness,
-                        Reservation::capacity(&fleet.policy, self.factor),
+                        Reservation::capacity(&fleet.policy),
                     );
                 }
             }
@@ -967,19 +958,13 @@ mod tests {
         fleets: Vec<FleetPass>,
         hosted: HostedSnapshot,
         planner: WorkPlanner,
-        profiles: SourceProfiles,
         capacities: Vec<Capacity>,
     }
 
     impl Scene {
         fn new(policies: Vec<FleetPolicy>, scaling: ScalingConfig) -> Self {
             let profiles = SourceProfiles::new(&scaling, HistoryWindow::from_units(7));
-            let planner = WorkPlanner::new(
-                &policies,
-                Arc::new(scaling),
-                profiles.clone(),
-                nonzero_u32(2),
-            );
+            let planner = WorkPlanner::new(&policies, Arc::new(scaling), profiles.clone());
             Self {
                 clock: TestClock::new(Timestamp::from_unix_millis(1_000_000)),
                 capacities: policies
@@ -994,7 +979,6 @@ mod tests {
                     .collect(),
                 fleets: policies.into_iter().map(FleetPass::new).collect(),
                 hosted: HostedSnapshot::default(),
-                profiles,
                 planner,
             }
         }
@@ -1108,12 +1092,12 @@ mod tests {
         assert_eq!(decision.reliable, 6);
         assert_eq!(decision.extra_instances, 14);
         assert_eq!(decision.dimension, ScalingDimension::Cpu);
-        assert_eq!(decision.demand.get().to_bits(), 31.0_f64.to_bits());
+        assert_eq!(decision.demand.get().to_bits(), 62.0_f64.to_bits());
         assert_eq!(decision.capacity.get().to_bits(), 6.0_f64.to_bits());
     }
 
     #[test]
-    fn cpu_factor_changes_needed_capacity() {
+    fn cpu_demand_uses_physical_capacity() {
         let p = policy("workers");
         let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
         let mut waiting = queued(&[0], None);
@@ -1126,19 +1110,6 @@ mod tests {
             &[Some(0); 4],
         );
         scene.run(&[None]);
-        assert_eq!(scene.planner.work(0), 2);
-        scene.planner = WorkPlanner::new(
-            &[p],
-            Arc::clone(&scene.planner.scaling),
-            scene.profiles.clone(),
-            nonzero_u32(1),
-        );
-        for _ in 0..4 {
-            scene
-                .planner
-                .attribute(Some(0), FleetSet::prefix(1).expect("one fleet"));
-        }
-        scene.run(&[None]);
         assert_eq!(scene.planner.work(0), 4);
     }
 
@@ -1146,12 +1117,12 @@ mod tests {
     fn cpu_budget_saturates_at_native_ledger_limit() {
         let mut p = policy("workers");
         p.vcpus_per_instance = nonzero_u32(u32::MAX);
-        let capacity = Reservation::capacity(&p, nonzero_u32(u32::MAX));
-        assert_eq!(capacity.cpu, u128::from(u64::MAX));
+        let capacity = Reservation::capacity(&p);
+        assert_eq!(capacity.cpu, u128::from(u32::MAX) * 1000);
         let mut dispatch = Dispatch::new(std::slice::from_ref(&p));
         let index = dispatch.add_instance(0, Duration::ZERO, capacity);
         let over = Reservation {
-            cpu: u128::from(u64::MAX) + 1,
+            cpu: capacity.cpu + 1,
             ..Reservation::default()
         };
         assert_eq!(
@@ -1256,7 +1227,7 @@ mod tests {
     fn resource_timeline_releases_complementary_reservations() {
         let p = policy("workers");
         let mut dispatch = Dispatch::new(std::slice::from_ref(&p));
-        let capacity = Reservation::capacity(&p, nonzero_u32(2));
+        let capacity = Reservation::capacity(&p);
         let instance = dispatch.add_instance(0, Duration::ZERO, capacity);
         let cpu = Reservation {
             cpu: capacity.cpu,
@@ -1297,7 +1268,7 @@ mod tests {
     fn serial_cpu_backlog_and_integer_boundaries() {
         let p = policy("workers");
         let mut dispatch = Dispatch::new(std::slice::from_ref(&p));
-        let capacity = Reservation::capacity(&p, nonzero_u32(2));
+        let capacity = Reservation::capacity(&p);
         let instance = dispatch.add_instance(0, Duration::ZERO, capacity);
         let worker = &mut dispatch.instances[instance];
         let full_cpu = Reservation {
@@ -1377,7 +1348,7 @@ mod tests {
         let mut scene = Scene::new(vec![p.clone()], ScalingConfig::default());
         scene.member(0, "busy", InstanceLifecycle::InService, true);
         let mut known = executing(0, Some(Duration::from_secs(100)));
-        known.resources.cpu_millicores = cpu(&p);
+        known.resources.cpu_millicores = cpu(&p) / 2;
         scene.snapshot(
             SchedulerSnapshot {
                 workers: vec![worker(&p, "busy", 2, 16)],
@@ -1388,7 +1359,7 @@ mod tests {
         );
         scene.run(&[Some(Duration::from_secs(90))]);
         let worker = &scene.planner.dispatch.instances[0];
-        let capacity = Reservation::capacity(&p, nonzero_u32(2));
+        let capacity = Reservation::capacity(&p);
         let half = Reservation {
             cpu: capacity.cpu / 2,
             ..Reservation::default()
@@ -1533,7 +1504,7 @@ mod tests {
         }
         scene.member(0, "pending", InstanceLifecycle::Pending, true);
         let mut waiting = queued(&[0], Some(Duration::from_secs(10)));
-        waiting.resources.cpu_millicores = cpu(&p);
+        waiting.resources.cpu_millicores = cpu(&p) / 2;
         let mut snapshot = SchedulerSnapshot {
             workers: vec![
                 worker(&p, "first", 0, 16),
@@ -2010,7 +1981,7 @@ mod tests {
         for _ in 0..3 {
             scene.run(&[Some(Duration::from_secs(45))]);
         }
-        assert_eq!(scene.planner.dispatch.active, 2);
+        assert_eq!(scene.planner.dispatch.active, 4);
         assert!(
             scene.planner.dispatch.instances[..scene.planner.dispatch.active]
                 .iter()
