@@ -82,7 +82,7 @@ run "rolling_service_and_network" {
     error_message = "Host-mode tasks must attach each existing instance target group to its configured port."
   }
   assert {
-    condition     = toset([for p in jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].portMappings : p.containerPort]) == toset([443, 8080, 9090]) && alltrue([for p in jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].portMappings : p.containerPort == p.hostPort && p.protocol == "tcp"]) && jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].stopTimeout == 2460
+    condition     = toset([for p in jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].portMappings : p.containerPort]) == toset([443, 8080, 9090]) && alltrue([for p in jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].portMappings : p.containerPort == p.hostPort && p.protocol == "tcp"]) && !contains(keys(jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0]), "stopTimeout")
     error_message = "Tasks must reserve fixed host ports and honor the configured stop budget."
   }
   assert {
@@ -136,6 +136,10 @@ run "secrets_and_roles" {
   assert {
     condition     = [for e in jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].environment : e.value if e.name == "GANG_SECRET_FILES"][0] == "0=a\n1=z" && [for s in jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].secrets : s.name] == ["GANG_CONFIG", "GANG_SECRET_0", "GANG_SECRET_1"]
     error_message = "Secret filenames and injected values must share deterministic order."
+  }
+  assert {
+    condition     = [for s in jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].secrets : s.valueFrom if s.name == "GANG_CONFIG"][0] == "arn:aws:ssm:eu-north-1:000000000000:parameter/gang/generations/config"
+    error_message = "ECS must receive the immutable configuration parameter ARN without a version suffix."
   }
   assert {
     condition     = !contains(keys(jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0]), "systemControls") && toset(jsondecode(aws_ecs_task_definition.controller[0].container_definitions)[0].dnsServers) == toset(["127.0.0.1"])
