@@ -4,8 +4,6 @@
 //! worker resource reports and optional peer-local facts, never rising above the configured
 //! estimate and keeping configured per-action ceilings independent.
 
-use std::num::NonZeroU32;
-
 use gang_spi::FleetResourceCapacity;
 use gang_types::Bytes;
 use gang_types::FleetCatalog;
@@ -66,7 +64,7 @@ pub struct FleetCapacity {
     pub physical_vcpus: u32,
     /// Physical per-instance CPU in millicores (`physical_vcpus * 1000`).
     pub physical_cpu_millicores: u64,
-    /// Aggregate oversubscribed CPU ledger capacity (`physical_cpu_millicores * cpu_oversubscription`).
+    /// Physical CPU ledger capacity in millicores.
     pub ledger_cpu_millicores: u64,
     /// Effective per-action CPU ceiling in millicores.
     pub cpu_ceiling_millicores: u64,
@@ -100,7 +98,6 @@ impl FleetCapacity {
 pub struct CapacityCatalog {
     estimates: FleetCatalog,
     current: FleetCatalog,
-    cpu_oversubscription: NonZeroU32,
     estimates_by_fleet: Vec<Resources>,
     local: Vec<Option<Resources>>,
     peer: Vec<Option<Resources>>,
@@ -111,7 +108,7 @@ pub struct CapacityCatalog {
 impl CapacityCatalog {
     /// Creates a capacity catalog initialized with the configured prelaunch `estimates`.
     #[must_use]
-    pub fn new(estimates: FleetCatalog, cpu_oversubscription: NonZeroU32) -> Self {
+    pub fn new(estimates: FleetCatalog) -> Self {
         let count = estimates.len();
         let estimates_by_fleet: Vec<Resources> =
             estimates.fleets().iter().map(physical_resources).collect();
@@ -119,7 +116,6 @@ impl CapacityCatalog {
         Self {
             current: estimates.clone(),
             estimates,
-            cpu_oversubscription,
             estimates_by_fleet,
             local: vec![None; count],
             peer: vec![None; count],
@@ -140,12 +136,6 @@ impl CapacityCatalog {
         &self.current
     }
 
-    /// Returns the configured aggregate CPU oversubscription factor.
-    #[must_use]
-    pub const fn cpu_oversubscription(&self) -> NonZeroU32 {
-        self.cpu_oversubscription
-    }
-
     /// Monotonic revision incremented whenever [`Self::current`] changes.
     #[must_use]
     pub const fn revision(&self) -> u64 {
@@ -161,8 +151,7 @@ impl CapacityCatalog {
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(0);
         let physical_cpu_millicores = props.capacity(property::CPU_MILLICORES).unwrap_or(0);
-        let ledger_cpu_millicores =
-            physical_cpu_millicores.saturating_mul(u64::from(self.cpu_oversubscription.get()));
+        let ledger_cpu_millicores = physical_cpu_millicores;
         let cpu_ceiling_millicores = props
             .limit(property::CPU_MILLICORES)
             .unwrap_or(physical_cpu_millicores);
@@ -188,9 +177,7 @@ impl CapacityCatalog {
     /// Recomputes physical capacity from connected workers, returning whether the catalog changed.
     pub fn refresh_local(&mut self, workers: &WorkerRegistry) -> bool {
         let mut observed = [None::<Resources>; MAX_FLEETS];
-        let oversubscription = u64::from(self.cpu_oversubscription.get());
-        let millicores_per_physical_vcpu =
-            property::MILLICORES_PER_CORE.saturating_mul(oversubscription);
+        let millicores_per_physical_vcpu = property::MILLICORES_PER_CORE;
         for (_, worker) in workers.workers_sorted() {
             if !worker.is_current_build() || worker.fleet >= self.estimates.len() {
                 continue;
@@ -445,7 +432,7 @@ mod tests {
                 gang_version: "0.3.9".to_owned(),
                 properties: BTreeMap::new(),
                 capacity: ActionResources {
-                    cpu_millicores: 32_000,
+                    cpu_millicores: 16_000,
                     memory: mem,
                     disk: Bytes::gib(100),
                 },
@@ -465,13 +452,13 @@ mod tests {
 
     #[test]
     fn local_and_peer_observations_lower_and_recover_within_estimate_keeping_ceilings() {
-        let mut cap = CapacityCatalog::new(two_fleets(), NonZeroU32::new(2).expect("nonzero"));
+        let mut cap = CapacityCatalog::new(two_fleets());
         assert_eq!(cap.revision(), 0);
         let alpha = cap.fleet(0).expect("alpha");
         assert_eq!(alpha.physical_memory_kb, 63 * 1024 * 1024);
         assert_eq!(alpha.memory_ceiling_kb, 4 * 1024 * 1024);
         assert!(alpha.memory_limited_by_policy());
-        assert_eq!(alpha.ledger_cpu_millicores, 32_000);
+        assert_eq!(alpha.ledger_cpu_millicores, 16_000);
         assert_eq!(alpha.cpu_ceiling_millicores, 16_000);
 
         let mut workers = WorkerRegistry::from_catalog(cap.estimates()).expect("workers");
@@ -539,7 +526,7 @@ mod tests {
 
     #[test]
     fn stale_generation_does_not_change_fleet_capacity() {
-        let mut cap = CapacityCatalog::new(two_fleets(), NonZeroU32::new(2).expect("nonzero"));
+        let mut cap = CapacityCatalog::new(two_fleets());
         let mut workers = WorkerRegistry::from_catalog(cap.estimates()).expect("workers");
         register_worker(&mut workers, "alpha", "i-1", 1, Bytes::gib(40));
         assert!(cap.refresh_local(&workers));
@@ -580,7 +567,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_fleet_and_sub_kib_observations() {
-        let mut cap = CapacityCatalog::new(two_fleets(), NonZeroU32::new(2).expect("nonzero"));
+        let mut cap = CapacityCatalog::new(two_fleets());
         assert!(matches!(
             cap.set_local_observations([FleetResourceCapacity {
                 fleet: 9,
@@ -606,7 +593,7 @@ mod tests {
     }
     #[test]
     fn all_dimensions_use_minimum_and_recover_after_peer_disconnect() {
-        let mut catalog = CapacityCatalog::new(two_fleets(), NonZeroU32::new(2).expect("nonzero"));
+        let mut catalog = CapacityCatalog::new(two_fleets());
         let entry = |vcpus, memory, disk| FleetResourceCapacity {
             fleet: 0,
             capacity: Resources {
@@ -670,10 +657,10 @@ mod tests {
     #[test]
     fn refresh_local_derives_cpu_and_disk_from_registered_capacity_and_preserves_generation_order()
     {
-        let mut cap = CapacityCatalog::new(two_fleets(), NonZeroU32::new(2).expect("nonzero"));
+        let mut cap = CapacityCatalog::new(two_fleets());
         let mut workers = WorkerRegistry::from_catalog(cap.estimates()).expect("workers");
 
-        // Generation 1 registers smaller CPU (16_000 / 2 = 8 vCPUs), memory (40 GiB), and disk (50 GiB).
+        // Generation 1 registers 8 vCPUs, 40 GiB memory, and 50 GiB disk.
         let gen1 = workers
             .register(
                 now(1),
@@ -685,7 +672,7 @@ mod tests {
                     gang_version: "0.3.9".to_owned(),
                     properties: BTreeMap::new(),
                     capacity: ActionResources {
-                        cpu_millicores: 16_000,
+                        cpu_millicores: 8_000,
                         memory: Bytes::gib(40),
                         disk: Bytes::gib(50),
                     },
@@ -705,7 +692,7 @@ mod tests {
         let alpha = cap.fleet(0).expect("alpha");
         assert_eq!(alpha.physical_vcpus, 8);
         assert_eq!(alpha.physical_cpu_millicores, 8_000);
-        assert_eq!(alpha.ledger_cpu_millicores, 16_000);
+        assert_eq!(alpha.ledger_cpu_millicores, 8_000);
         assert_eq!(alpha.physical_memory_kb, 40 * 1024 * 1024);
         assert_eq!(alpha.physical_disk_kb, 50 * 1024 * 1024);
 
@@ -721,7 +708,7 @@ mod tests {
                     gang_version: "0.3.9".to_owned(),
                     properties: BTreeMap::new(),
                     capacity: ActionResources {
-                        cpu_millicores: 24_000,
+                        cpu_millicores: 12_000,
                         memory: Bytes::gib(48),
                         disk: Bytes::gib(80),
                     },

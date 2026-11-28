@@ -203,6 +203,8 @@ async fn read_inbound(
             Some(scheduler_update::Update::KeepAlive(())) => WorkerEvent::KeepAlive {
                 cache: None,
                 memory_capacity: None,
+                load: None,
+                inflight: Vec::new(),
             },
             Some(scheduler_update::Update::GoingAway(going)) => {
                 if controller

@@ -574,6 +574,12 @@ pub struct Entry {
     pub period: u64,
     /// Whether this entry came from a hints seed (replaced whole by the first real sample).
     pub seeded: bool,
+    /// Transient lower bound from active attempts; not persisted in sampler v1 snapshots.
+    pub live_cpu_millicores: u64,
+    /// Transient working-set lower bound in KiB.
+    pub live_memory_kb: u64,
+    /// Timestamp of the last live lower-bound observation.
+    pub live_seen_s: u64,
 }
 
 /// One attempt's resource measurements passed to [`ResourceSketch::observe`].
@@ -919,6 +925,39 @@ impl ResourceSketch {
         self.record(key, observation, None)
     }
 
+    /// Records a transient lower bound without counting a completed sample.
+    pub fn observe_inflight(
+        &mut self,
+        key: SketchKey,
+        cpu_millicores: u64,
+        memory_kb: u64,
+        now_s: u64,
+    ) -> bool {
+        let memory_kb = self
+            .memory_ceiling_kb
+            .map_or(memory_kb, |ceiling| memory_kb.min(ceiling));
+        let window_s = self.window_s();
+        let family = key.family();
+        let inner = self.shard_mut(&key);
+        let map = &mut inner.families[family.index()];
+        if let Some(entry) = map.get_mut(&key) {
+            entry.settle(now_s, window_s);
+            entry.live_cpu_millicores = entry.live_cpu_millicores.max(cpu_millicores);
+            entry.live_memory_kb = entry.live_memory_kb.max(memory_kb);
+            entry.live_seen_s = entry.live_seen_s.max(now_s);
+            entry.last_seen_s = entry.last_seen_s.max(now_s);
+            return true;
+        }
+        let entry = Entry {
+            live_cpu_millicores: cpu_millicores,
+            live_memory_kb: memory_kb,
+            live_seen_s: now_s,
+            last_seen_s: now_s,
+            ..Entry::default()
+        };
+        inner.insert(key, entry)
+    }
+
     pub(crate) fn observe_with_memory_ceiling(
         &mut self,
         key: SketchKey,
@@ -989,6 +1028,11 @@ impl ResourceSketch {
             return None;
         }
         let mut entry = entry.clone();
+        if now_s.saturating_sub(entry.live_seen_s) > window_s {
+            entry.live_cpu_millicores = 0;
+            entry.live_memory_kb = 0;
+            entry.live_seen_s = 0;
+        }
         if now_s.saturating_sub(entry.killed_memory_s) > window_s {
             entry.killed_peak_memory_kb = 0;
             entry.killed_memory_s = 0;
@@ -1066,8 +1110,16 @@ impl ResourceSketch {
                 let map = &inner.families[family.index()];
                 entries.extend(
                     map.iter_rev()
-                        .filter(|(_, entry)| entry.seeded || entry.last_seen_s >= cutoff)
-                        .map(|(key, entry)| (key.clone(), entry.clone())),
+                        .filter(|(_, entry)| {
+                            entry.seeded || (entry.samples > 0 && entry.last_seen_s >= cutoff)
+                        })
+                        .map(|(key, entry)| {
+                            let mut entry = entry.clone();
+                            entry.live_cpu_millicores = 0;
+                            entry.live_memory_kb = 0;
+                            entry.live_seen_s = 0;
+                            (key.clone(), entry)
+                        }),
                 );
             }
         }
@@ -1101,7 +1153,7 @@ impl ResourceSketch {
         for inner in &self.shards {
             for map in &inner.families {
                 for (key, entry) in map.iter_rev() {
-                    if entry.seeded || entry.last_seen_s >= cutoff {
+                    if entry.seeded || (entry.samples > 0 && entry.last_seen_s >= cutoff) {
                         encode_entry(&mut bytes, key, entry);
                         count += 1;
                     }
@@ -1212,6 +1264,7 @@ impl Entry {
     /// Bounds both half-window maxima and the memory kill floor without altering raw histograms.
     pub(crate) fn clamp_memory_ceiling(&mut self, memory_ceiling_kb: Option<u64>) {
         if let Some(ceiling) = memory_ceiling_kb {
+            self.live_memory_kb = self.live_memory_kb.min(ceiling);
             // Histogram percentiles are bounded by these exact maxima.
             self.current.max_memory_kb = self.current.max_memory_kb.min(ceiling);
             self.previous.max_memory_kb = self.previous.max_memory_kb.min(ceiling);
@@ -1273,6 +1326,11 @@ impl Entry {
     /// Rotates half-windows to `now_s` and expires stale kill floors. Seeded entries are left
     /// intact until their first real observation.
     pub fn settle(&mut self, now_s: u64, window_s: u64) {
+        if now_s.saturating_sub(self.live_seen_s) > window_s {
+            self.live_cpu_millicores = 0;
+            self.live_memory_kb = 0;
+            self.live_seen_s = 0;
+        }
         if self.seeded {
             return;
         }
@@ -1408,7 +1466,9 @@ fn shape(policy: &Policy, entry: &Entry) -> Shaped {
         percentile_capped(entry.memory_p95_upper(), entry.max_memory_kb()),
         headroom,
     );
-    memory_kb = memory_kb.max(with_headroom(entry.killed_peak_memory_kb, headroom));
+    memory_kb = memory_kb
+        .max(with_headroom(entry.killed_peak_memory_kb, headroom))
+        .max(with_headroom(entry.live_memory_kb, headroom));
     let mut cpu = with_headroom(
         percentile_capped(
             entry
@@ -1423,6 +1483,7 @@ fn shape(policy: &Policy, entry: &Entry) -> Shaped {
         percentile_capped(entry.disk_p95_upper(), entry.max_disk_kb()),
         headroom,
     );
+    cpu = cpu.max(with_headroom(entry.live_cpu_millicores, headroom));
     disk_kb = disk_kb.max(with_headroom(entry.killed_peak_disk_kb, headroom));
     if !policy.reserve_cpu {
         cpu = 0;
@@ -1440,7 +1501,14 @@ fn shape(policy: &Policy, entry: &Entry) -> Shaped {
     let found = smallest_dominating_class(&policy.classes, memory_kb, cpu, disk_kb).or_else(|| {
         policy.classes.last().filter(|top| {
             (!policy.reserve_memory
-                || top.memory_kb >= with_headroom(entry.killed_peak_memory_kb, headroom))
+                || top.memory_kb
+                    >= with_headroom(
+                        entry.killed_peak_memory_kb.max(entry.live_memory_kb),
+                        headroom,
+                    ))
+                && (!policy.reserve_cpu
+                    || top.cpu_count == 0
+                    || top.cpu_count >= with_headroom(entry.live_cpu_millicores, headroom))
                 && (!policy.reserve_disk
                     || top.disk_kb >= with_headroom(entry.killed_peak_disk_kb, headroom))
         })
@@ -1576,6 +1644,9 @@ impl Snapshot {
                     last_seen_s,
                     period,
                     seeded,
+                    live_cpu_millicores: 0,
+                    live_memory_kb: 0,
+                    live_seen_s: 0,
                 },
             ));
         }
@@ -1754,6 +1825,74 @@ mod tests {
     }
 
     #[test]
+    fn inflight_lower_bound_changes_shape_without_completed_samples() {
+        let mut sketch = ResourceSketch::with_shards(
+            policy(0, 50, Vec::new()),
+            small_budget(),
+            Duration::from_secs(100),
+            1,
+        );
+        let key = SketchKey::for_attempt(Some("//pkg:heavy"), Some("Rustc"), "");
+        assert!(sketch.observe_inflight(key.clone(), 4_000, 2_000, 10));
+        let entry = sketch.lookup(&key, 10).expect("live entry");
+        assert_eq!(entry.samples, 0);
+        assert_eq!(entry.memory_samples(), 0);
+        let shaped = sketch.shape(&entry);
+        assert_eq!(shaped.cpu_count, 4_000);
+        assert_eq!(shaped.memory_kb, 2_000);
+        let bytes = sketch.encode_snapshot(10);
+        let decoded = Snapshot::decode(&bytes, usize::MAX).expect("sampler v1 snapshot");
+        assert_eq!(decoded.encode(), bytes);
+        assert_eq!(decoded, sketch.snapshot(10));
+        assert!(decoded.entries.is_empty());
+        assert!(sketch.lookup(&key, 111).is_none());
+    }
+
+    #[test]
+    fn seeded_history_drops_expired_inflight_floor() {
+        let mut sketch = ResourceSketch::with_shards(
+            policy(0, 50, Vec::new()),
+            small_budget(),
+            Duration::from_secs(100),
+            1,
+        );
+        let key = SketchKey::for_attempt(Some("//pkg:seeded"), Some("Rustc"), "");
+        assert!(sketch.seed(
+            key.clone(),
+            Entry {
+                seeded: true,
+                ..Entry::default()
+            }
+        ));
+        assert!(sketch.observe_inflight(key.clone(), 4_000, 0, 10));
+        assert!(sketch.observe_inflight(key.clone(), 1_000, 0, 111));
+        let entry = sketch.lookup(&key, 111).expect("seeded entry");
+        assert_eq!(entry.live_cpu_millicores, 1_000);
+    }
+
+    #[test]
+    fn inflight_floor_is_not_reduced_by_a_smaller_size_class() {
+        let classes = vec![SizeClass {
+            name: "small".to_owned(),
+            cpu_count: 2_000,
+            memory_kb: 1_000,
+            disk_kb: 0,
+        }];
+        let mut sketch = ResourceSketch::with_shards(
+            policy(0, 50, classes),
+            small_budget(),
+            Duration::from_secs(100),
+            1,
+        );
+        let key = SketchKey::for_attempt(Some("//pkg:heavy"), Some("Rustc"), "");
+        assert!(sketch.observe_inflight(key.clone(), 4_000, 2_000, 10));
+        let entry = sketch.lookup(&key, 10).expect("entry");
+        let shaped = sketch.shape(&entry);
+        assert!(shaped.cpu_count >= 4_000);
+        assert!(shaped.memory_kb >= 2_000);
+    }
+
+    #[test]
     fn bucket_edges_and_percentile_upper_match_spec() {
         assert_eq!(Hist::bucket(0), 0);
         assert_eq!(Hist::bucket(999), 0);
@@ -1905,7 +2044,15 @@ mod tests {
                 .is_some()
         );
 
+        assert!(sketch.observe_inflight(
+            SketchKey::for_attempt(Some("a"), Some("cc"), ""),
+            4_000,
+            2_000,
+            105,
+        ));
+        let snapshot = sketch.snapshot(105);
         let bytes = sketch.encode_snapshot(105);
+        assert_eq!(Snapshot::decode(&bytes, usize::MAX), Ok(snapshot));
         assert_eq!(Snapshot::compatible_written_at(&bytes), Ok(105));
         let decoded = Snapshot::decode(&bytes, usize::MAX).expect("valid snapshot");
         assert_eq!(decoded.encode(), bytes);

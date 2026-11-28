@@ -1733,12 +1733,7 @@ fn a_worker_of_another_fleet_does_not_host_the_instance() -> TestResult {
     let mut passes = world.passes();
     let scaling = Arc::new(ScalingConfig::default());
     let profiles = SourceProfiles::new(&scaling, ActionsConfig::default().history_window);
-    let mut reconciler = Reconciler::new(
-        &world.policies,
-        scaling,
-        profiles,
-        ActionsConfig::default().cpu_oversubscription,
-    );
+    let mut reconciler = Reconciler::new(&world.policies, scaling, profiles);
     let mut plan = Plan::new();
     let clock = TestClock::new(ts(100_000));
     let mut hosted = HostedSnapshot::default();
@@ -4708,12 +4703,7 @@ fn observer_preserves_reconciler_spill_attribution() -> TestResult {
     let mut passes = world.passes();
     let scaling = Arc::new(ScalingConfig::default());
     let profiles = SourceProfiles::new(&scaling, ActionsConfig::default().history_window);
-    let mut reconciler = Reconciler::new(
-        &world.policies,
-        scaling,
-        profiles,
-        gang_types::nonzero_u32(1),
-    );
+    let mut reconciler = Reconciler::new(&world.policies, scaling, profiles);
     let mut hosted = HostedSnapshot::default();
     hosted.replace(&mut world.snapshot.clone());
     let clock = TestClock::new(ts(1_000));

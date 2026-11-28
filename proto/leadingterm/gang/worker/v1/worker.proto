@@ -110,6 +110,36 @@ message KeepAlive {
   CacheStats cache = 1;
   // Authoritative post-reserve action memory capacity in bytes, when available.
   optional uint64 memory_capacity = 2;
+  // Current sampled CPU load and reclamation capacity.
+  optional WorkerLoad load = 3;
+  // Material increases in live attempt resource usage.
+  repeated AttemptUsageUpdate inflight = 4;
+}
+
+// Worker-wide CPU load derived from consecutive samples.
+message WorkerLoad {
+  // Smoothed CPU use in millicores.
+  uint64 observed_cpu_millicores = 1;
+  // CPU pressure stall percentage over the sampling interval.
+  uint32 cpu_psi_percent = 2;
+  // Whether the saturation hysteresis latch is set.
+  bool cpu_saturated = 3;
+  // CPU available for reclaimed reservations after host headroom.
+  uint64 reclaimable_cpu_millicores = 4;
+  // Monotonic sequence of this CPU sample.
+  uint64 sample_seq = 5;
+  // Highest assignment admitted before the sampling interval began.
+  uint64 observed_assign_seq = 6;
+}
+
+// Live lower-bound measurements for an active attempt.
+message AttemptUsageUpdate {
+  // Attempt identifier.
+  string attempt = 1;
+  // Smoothed CPU use in millicores.
+  uint64 observed_cpu_millicores = 2;
+  // Current working-set memory in bytes.
+  uint64 working_set_memory_bytes = 3;
 }
 
 // Signals that the worker is shutting down and will decline any further assignments.
@@ -170,6 +200,8 @@ message Assign {
   bool do_not_cache = 13;
   // Out-of-band cgroup v2 `cpu.weight` (1..=10000); never part of platform or environment.
   uint32 cpu_weight = 14;
+  // Scheduler assignment sequence within this worker session.
+  uint64 assign_seq = 15;
 }
 
 // Requests or reports termination of a running attempt.
@@ -209,7 +241,7 @@ message ActionEnvironment {
 message ResourceUsage {
   // Cumulative CPU time consumed by the attempt, when measured.
   google.protobuf.Duration cpu_time = 1;
-  // Peak memory usage observed in the attempt's cgroup or process tree, in bytes.
+  // Peak sampled working-set memory, or the kernel peak if no working-set sample exists.
   optional uint64 peak_memory_bytes = 2;
   // Peak action work-directory disk usage observed for the attempt, in bytes.
   optional uint64 peak_disk_bytes = 3;
@@ -217,6 +249,8 @@ message ResourceUsage {
   uint64 oom_kills = 4;
   // Whether periodic resource sampling observed the running attempt.
   bool sampled = 5;
+  // Peak smoothed interval CPU burn in millicores, when measured.
+  optional uint64 peak_window_cpu_millicores = 6;
 }
 
 // Measurements from one worker's local fast store and slow store.
@@ -247,6 +281,8 @@ enum DeclineReason {
   DECLINE_REASON_DISK_SHORTAGE = 1;
   // Worker is draining or stopping and no longer admits new attempts.
   DECLINE_REASON_DRAINING = 2;
+  // CPU pressure prevents accepting another attempt.
+  DECLINE_REASON_CPU_PRESSURE = 3;
 }
 
 // Classifications for controller-initiated or worker-enforced attempt termination.

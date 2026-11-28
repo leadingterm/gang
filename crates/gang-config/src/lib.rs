@@ -131,7 +131,7 @@ mod server_config;
 mod worker_config;
 
 pub use action_resources::{
-    ColdStartTuning, DiskEnforcement, DiskMinReservation, DiskTuning, EscalationError,
+    ColdStartTuning, CpuTuning, DiskEnforcement, DiskMinReservation, DiskTuning, EscalationError,
     EscalationPercent, MemoryEnforcement, MemoryTuning, MinReservation, WholeKib,
 };
 pub use actions::{ActionsConfig, HistoryWindow, WholeSeconds};

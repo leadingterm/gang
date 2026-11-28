@@ -1162,6 +1162,7 @@ impl<C: Clock> ControllerActor<C> {
                 attempt_id,
                 operation,
                 cpu_weight,
+                assign_seq,
                 reservation,
                 deadline_wall,
                 ..
@@ -1170,6 +1171,7 @@ impl<C: Clock> ControllerActor<C> {
                     &attempt_id,
                     operation,
                     cpu_weight,
+                    assign_seq,
                     reservation,
                     deadline_wall,
                 ) {
@@ -1219,6 +1221,7 @@ impl<C: Clock> ControllerActor<C> {
         attempt_id: &AttemptId,
         operation: OperationKey,
         cpu_weight: CpuWeight,
+        assign_seq: u64,
         reservation: ActionResources,
         deadline_wall: Timestamp,
     ) -> Option<proto::Assign> {
@@ -1283,6 +1286,7 @@ impl<C: Clock> ControllerActor<C> {
             skip_cache_lookup: op.skip_cache_lookup,
             do_not_cache: op.do_not_cache,
             cpu_weight: cpu_weight.get(),
+            assign_seq,
         })
     }
 
@@ -1643,6 +1647,8 @@ mod tests {
                     event: WorkerEvent::KeepAlive {
                         cache: None,
                         memory_capacity: None,
+                        load: None,
+                        inflight: Vec::new(),
                     },
                     completion: None,
                 })

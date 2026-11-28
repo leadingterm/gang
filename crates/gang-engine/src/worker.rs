@@ -223,11 +223,24 @@ impl<Conn: SessionConnector> SessionConnector for ChannelCapturingConnector<Conn
 struct WorkerTelemetry {
     disk_cas: DiskCas,
     memory_capacity: Option<u64>,
+    sampling: SamplingRegistry,
 }
 
 impl TelemetrySource for WorkerTelemetry {
+    fn start_session(&self) {
+        self.sampling.start_session();
+    }
+
     fn sample(&self) -> (gang_spi::WorkerCacheStats, Option<u64>) {
         (self.disk_cas.worker_cache_stats(), self.memory_capacity)
+    }
+
+    fn cpu_load(&self) -> Option<proto::WorkerLoad> {
+        self.sampling.cpu_load()
+    }
+
+    fn inflight(&self) -> Vec<proto::AttemptUsageUpdate> {
+        self.sampling.inflight_updates()
     }
 }
 
@@ -492,7 +505,7 @@ where
         .map_err(|err| WorkerError::Config(format!("work cleanup task failed: {err}")))??;
 
     let graveyard_pending = Arc::new(GraveyardPending::new());
-    let sampling = SamplingRegistry::new(spec.actions.memory, spec.actions.disk);
+    let sampling = SamplingRegistry::new(spec.actions.cpu, spec.actions.memory, spec.actions.disk);
     let graveyard = Graveyard::open(
         &spec.work_directory,
         spec.worker.graveyard_workers,
@@ -538,6 +551,11 @@ where
 
     let sampler = WorkerSampler::with_registry(
         SamplingConfig {
+            cpu: spec.actions.cpu,
+            physical_cpu_millicores: spec
+                .properties
+                .capacity(property::CPU_MILLICORES)
+                .unwrap_or(0),
             memory: spec.actions.memory,
             disk: spec.actions.disk,
             memory_pool: spec.memory_pool.as_ref().map(|pool| pool.cgroup.clone()),
@@ -551,6 +569,7 @@ where
     let telemetry = WorkerTelemetry {
         disk_cas: disk_cas.clone(),
         memory_capacity,
+        sampling: sampling.clone(),
     };
 
     let runtime = Arc::new(WorkerRuntime {
@@ -720,6 +739,15 @@ where
                                 .await;
                             continue;
                         }
+                        let saturated = runtime.sampling.cpu_load().is_some_and(|load| load.cpu_saturated);
+                        let has_running = !runtime.active_kills.lock().is_empty();
+                        if saturated && has_running {
+                            let free = free_work_bytes(&runtime.spec.work_directory);
+                            let _ = outbound
+                                .decline(&assign.attempt, proto::DeclineReason::CpuPressure, free)
+                                .await;
+                            continue;
+                        }
                         let requested_disk = assign.reservation.as_ref().map_or(0, |r| r.disk_bytes);
                         let reservation = match runtime
                             .disk_reservations
@@ -748,6 +776,7 @@ where
                             into_owned_reservation(reservation, &runtime.disk_reservations);
                         let (kill_trigger, kill_waiter) = kill_channel();
                         runtime.active_kills.lock().insert(assign.attempt.clone(), kill_trigger.clone());
+                        runtime.sampling.admit_assignment(assign.assign_seq);
                         let active_guard = ActiveAttemptGuard { attempt: assign.attempt.clone(), active_kills: Arc::clone(&runtime.active_kills) };
                         let rt = Arc::clone(runtime);
                         attempt_tasks.spawn(async move {
@@ -1153,8 +1182,7 @@ fn build_session_config(spec: &WorkerRuntimeSpec) -> SessionConfig {
         .properties
         .capacity(property::CPU_MILLICORES)
         .unwrap_or(0);
-    let cpu_millicores =
-        cpu_physical.saturating_mul(u64::from(spec.actions.cpu_oversubscription.get()));
+    let cpu_millicores = cpu_physical;
     let memory_bytes = spec.memory_pool.as_ref().map_or_else(
         || {
             spec.properties
@@ -1264,6 +1292,10 @@ fn build_run_spec(
             read_only_trees,
         },
         reserved_memory_bytes,
+        reserved_cpu_millicores: assign
+            .reservation
+            .as_ref()
+            .map_or(0, |res| res.cpu_millicores),
         reserved_disk_bytes,
         timeout,
         attempt_deadline,
@@ -1605,6 +1637,17 @@ mod tests {
         })
     }
 
+    #[test]
+    fn worker_registers_physical_cpu_capacity() -> TestResult {
+        let spec = test_spec(Path::new("/tmp"), WorkerLifetime::LongLived, false)?;
+        let config = build_session_config(&spec);
+        assert_eq!(
+            config.register.capacity.expect("capacity").cpu_millicores,
+            4_000
+        );
+        Ok(())
+    }
+
     fn registered_frame(worker_id: &str) -> proto::ControllerMessage {
         proto::ControllerMessage {
             kind: Some(ControllerKind::Registered(proto::Registered {
@@ -1701,6 +1744,7 @@ mod tests {
                 skip_cache_lookup: false,
                 do_not_cache: false,
                 cpu_weight: 100,
+                assign_seq: 1,
             })),
         })
     }

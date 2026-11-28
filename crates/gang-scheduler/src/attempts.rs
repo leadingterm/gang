@@ -69,6 +69,8 @@ pub enum DeclineReason {
     DiskShortage,
     /// Worker is draining or shutting down.
     Draining,
+    /// Worker is saturated by CPU pressure.
+    CpuPressure,
 }
 
 /// Reason the controller asks a worker to kill an attempt.
@@ -163,6 +165,8 @@ pub struct AttemptUsage {
     pub peak_disk: Option<Bytes>,
     /// Cumulative CPU time consumed by the action's processes.
     pub cpu_time: Duration,
+    /// Peak smoothed interval CPU burn in millicores, if sampled.
+    pub peak_window_cpu_millicores: Option<u64>,
     /// Wall-clock execution duration on the worker.
     pub wall_time: Duration,
     /// Kernel `cgroup` `oom_kill` counter observed on the action's scope.
@@ -227,6 +231,7 @@ pub struct Attempt {
     pub reservation: ActionResources,
     /// Whether this attempt counted against `worker.gate_running` at dispatch.
     pub is_gate: bool,
+    cpu_reservation: AttemptCpuReservation,
     /// Current attempt phase.
     pub phase: AttemptPhase,
     /// Monotonic and wall-clock time when the attempt was dispatched.
@@ -243,6 +248,23 @@ pub struct Attempt {
     owns_operation: bool,
     /// Whether the phase deadline already emitted its kill directive.
     deadline_expired: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttemptCpuReservation {
+    guaranteed: bool,
+    assign_seq: u64,
+}
+
+/// Live lower-bound measurements for an active attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptUsageUpdate {
+    /// Attempt identifier.
+    pub attempt_id: AttemptId,
+    /// Observed CPU burn in millicores.
+    pub cpu_millicores: u64,
+    /// Observed working-set memory.
+    pub memory: Bytes,
 }
 
 impl Attempt {
@@ -480,6 +502,52 @@ pub struct Attempts {
 }
 
 impl Attempts {
+    pub(crate) fn ratchet_inflight(
+        &mut self,
+        worker_key: WorkerKey,
+        update: &AttemptUsageUpdate,
+        workers: &mut WorkerRegistry,
+    ) -> Option<OperationKey> {
+        let key = self.lookup_id(&update.attempt_id)?;
+        let attempt = self.slab.get_mut(key.index, key.generation)?;
+        if attempt.worker != worker_key || attempt.phase == AttemptPhase::Executed {
+            return None;
+        }
+        let worker = workers.get_mut(worker_key)?;
+        let cpu = update
+            .cpu_millicores
+            .min(worker.ceilings.cpu_millicores)
+            .max(attempt.reservation.cpu_millicores);
+        let memory = update
+            .memory
+            .min(worker.ceilings.memory)
+            .max(attempt.reservation.memory);
+        let cpu_delta = cpu - attempt.reservation.cpu_millicores;
+        let memory_delta = memory.saturating_sub(attempt.reservation.memory);
+        if cpu_delta == 0 && memory_delta.get() == 0 {
+            return None;
+        }
+        worker
+            .ledger
+            .ratchet_compute(cpu_delta, memory_delta)
+            .ok()?;
+        if attempt.cpu_reservation.guaranteed {
+            worker.guaranteed_cpu_millicores =
+                worker.guaranteed_cpu_millicores.saturating_add(cpu_delta);
+        }
+        if let Some((_, pending)) = worker
+            .pending_cpu
+            .iter_mut()
+            .find(|(seq, _)| *seq == attempt.cpu_reservation.assign_seq)
+        {
+            *pending = pending.saturating_add(cpu_delta);
+            worker.dispatched_since_load_cpu =
+                worker.dispatched_since_load_cpu.saturating_add(cpu_delta);
+        }
+        attempt.reservation.cpu_millicores = cpu;
+        attempt.reservation.memory = memory;
+        Some(attempt.operation)
+    }
     /// Creates an empty attempt registry.
     #[must_use]
     pub fn new() -> Self {
@@ -572,6 +640,10 @@ impl Attempts {
             worker: assignment.worker,
             reservation: assignment.reservation,
             is_gate: crate::qos::is_gate(assignment.priority),
+            cpu_reservation: AttemptCpuReservation {
+                guaranteed: assignment.guaranteed,
+                assign_seq: assignment.assign_seq,
+            },
             phase: AttemptPhase::Offered,
             dispatched_at: now,
             ack_deadline: now.tick + ack_timeout,
@@ -656,7 +728,18 @@ impl Attempts {
             return DeclineOutcome::Ignored;
         };
 
-        let _ = workers.on_attempt_aborted(attempt.worker, attempt.reservation, attempt.is_gate);
+        let _ = workers.on_attempt_aborted(
+            attempt.worker,
+            attempt.reservation,
+            attempt.is_gate,
+            attempt.cpu_reservation.guaranteed,
+            attempt.cpu_reservation.assign_seq,
+        );
+        if reason == DeclineReason::CpuPressure
+            && let Some(worker) = workers.get_mut(attempt.worker)
+        {
+            worker.cpu_pressure_hold = true;
+        }
         let disk_hold_set = if reason == DeclineReason::DiskShortage {
             workers.set_disk_hold(attempt.worker)
         } else {
@@ -702,13 +785,13 @@ impl Attempts {
         let Some(key) = self.lookup_id(report.attempt_id) else {
             return ExecutedOutcome::Ignored;
         };
-        let Some((worker, operation, reservation, is_gate, owns_operation)) =
+        let Some((worker, operation, reservation, is_gate, guaranteed, assign_seq, owns_operation)) =
             self.mark_phase_executed(key)
         else {
             return ExecutedOutcome::Ignored;
         };
 
-        let _ = workers.on_attempt_executed(worker, reservation, is_gate);
+        let _ = workers.on_attempt_executed(worker, reservation, is_gate, guaranteed, assign_seq);
 
         let is_active_op = owns_operation
             && operations
@@ -724,7 +807,7 @@ impl Attempts {
         }
 
         let Some((sketch_key, action_name, candidates, retry_counts)) =
-            operation_exec_snapshot(operations, operation, &report.profile.command_digest)
+            operation_exec_snapshot(operations, operation, report.profile.history_key.as_ref())
         else {
             self.detach_operation(key, operation);
             return ExecutedOutcome::ReleasedComputeOnly {
@@ -799,7 +882,15 @@ impl Attempts {
     fn mark_phase_executed(
         &mut self,
         key: AttemptKey,
-    ) -> Option<(WorkerKey, OperationKey, ActionResources, bool, bool)> {
+    ) -> Option<(
+        WorkerKey,
+        OperationKey,
+        ActionResources,
+        bool,
+        bool,
+        u64,
+        bool,
+    )> {
         let attempt = self.slab.get_mut(key.index, key.generation)?;
         if attempt.phase == AttemptPhase::Executed {
             return None;
@@ -810,6 +901,8 @@ impl Attempts {
             attempt.operation,
             attempt.reservation,
             attempt.is_gate,
+            attempt.cpu_reservation.guaranteed,
+            attempt.cpu_reservation.assign_seq,
             attempt.owns_operation,
         ))
     }
@@ -849,8 +942,13 @@ impl Attempts {
         if attempt.phase == AttemptPhase::Executed {
             let _ = workers.on_attempt_completed(attempt.worker, attempt.reservation.disk);
         } else {
-            let _ =
-                workers.on_attempt_aborted(attempt.worker, attempt.reservation, attempt.is_gate);
+            let _ = workers.on_attempt_aborted(
+                attempt.worker,
+                attempt.reservation,
+                attempt.is_gate,
+                attempt.cpu_reservation.guaranteed,
+                attempt.cpu_reservation.assign_seq,
+            );
         }
 
         let is_active_op = attempt.owns_operation
@@ -912,7 +1010,13 @@ impl Attempts {
             return AckTimeoutOutcome::Stale;
         };
 
-        let _ = workers.on_attempt_aborted(attempt.worker, attempt.reservation, attempt.is_gate);
+        let _ = workers.on_attempt_aborted(
+            attempt.worker,
+            attempt.reservation,
+            attempt.is_gate,
+            attempt.cpu_reservation.guaranteed,
+            attempt.cpu_reservation.assign_seq,
+        );
         let kill = KillDirective {
             worker: attempt.worker,
             attempt_key,
@@ -1169,7 +1273,7 @@ fn usage_kib(bytes: Option<Bytes>) -> Option<u64> {
 fn operation_exec_snapshot(
     operations: &Operations,
     operation: OperationKey,
-    command_digest: &str,
+    history_key: Option<&SketchKey>,
 ) -> Option<(
     SketchKey,
     OperationName,
@@ -1178,11 +1282,13 @@ fn operation_exec_snapshot(
 )> {
     let op = operations.get(operation)?;
     Some((
-        SketchKey::for_attempt(
-            op.target.as_ref().map(gang_types::TargetLabel::as_str),
-            op.mnemonic.as_ref().map(gang_types::Mnemonic::as_str),
-            command_digest,
-        ),
+        history_key.cloned().unwrap_or_else(|| {
+            SketchKey::for_attempt(
+                op.target.as_ref().map(gang_types::TargetLabel::as_str),
+                op.mnemonic.as_ref().map(gang_types::Mnemonic::as_str),
+                "",
+            )
+        }),
         op.name.clone(),
         op.candidates,
         op.retry_counts,
@@ -1494,6 +1600,7 @@ mod tests {
                 mnemonic: Some(Mnemonic::try_new("Rustc").expect("mnemonic")),
                 candidates: gang_types::FleetSet::try_from_indices([0]).expect("candidates"),
                 priority,
+                has_explicit_cpu_floor: false,
                 reservation,
                 learned_reservation: None,
                 initial_watchers: 1,
@@ -1504,7 +1611,11 @@ mod tests {
             panic!("insert");
         };
         let profile = ActionProfile {
-            command_digest: "cmd".to_owned(),
+            history_key: Some(SketchKey::for_attempt(
+                Some("//pkg:target"),
+                Some("Rustc"),
+                "cmd",
+            )),
             floors: ClientFloors::default(),
             desired_reservation: reservation,
             cpu_before_memory_fit: reservation.cpu_millicores,
@@ -1596,6 +1707,7 @@ mod tests {
 
     fn normal_usage() -> AttemptUsage {
         AttemptUsage {
+            peak_window_cpu_millicores: None,
             peak_memory: Some(Bytes::gib(2)),
             peak_disk: Some(Bytes::gib(1)),
             cpu_time: Duration::from_secs(12),
@@ -1628,7 +1740,7 @@ mod tests {
 
     fn setup_env() -> TestEnv {
         let cat = catalog();
-        let cap = CapacityCatalog::new(cat.clone(), NonZeroU32::new(2).expect("2"));
+        let cap = CapacityCatalog::new(cat.clone());
         let mut workers = WorkerRegistry::from_catalog(&cat).expect("registry");
         let worker = register_worker(&mut workers, "i-1", 2);
         let (durations, rates) = estimators();
@@ -1851,7 +1963,7 @@ mod tests {
     #[test]
     fn oom_escalation_requeues_while_old_attempt_holds_disk_until_completed() {
         let cat = catalog();
-        let cap = CapacityCatalog::new(cat.clone(), NonZeroU32::new(2).expect("2"));
+        let cap = CapacityCatalog::new(cat.clone());
         let mut workers = WorkerRegistry::from_catalog(&cat).expect("registry");
         let w1 = register_worker(&mut workers, "i-1", 1);
         let w2 = register_worker(&mut workers, "i-2", 2);
@@ -1893,6 +2005,7 @@ mod tests {
                 attempt_id: &aid1,
                 now: now(5),
                 usage: AttemptUsage {
+                    peak_window_cpu_millicores: None,
                     peak_memory: Some(Bytes::gib(4)),
                     peak_disk: None,
                     cpu_time: Duration::from_secs(2),
@@ -2005,6 +2118,7 @@ mod tests {
                         mnemonic: None,
                         candidates: gang_types::FleetSet::try_from_indices([0]).expect("c"),
                         priority: 200,
+                        has_explicit_cpu_floor: false,
                         reservation: res,
                         learned_reservation: None,
                         initial_watchers: 1,

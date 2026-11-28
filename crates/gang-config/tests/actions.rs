@@ -2,10 +2,35 @@
 
 use gang_config::{ActionsConfig, DiskEnforcement, MemoryEnforcement};
 
+#[test]
+fn cpu_policy_accepts_configured_thresholds() {
+    let text = r#"
+[cpu]
+headroom_percent = 20
+saturate_utilization_percent = 90
+clear_utilization_percent = 70
+saturate_psi_percent = 15
+clear_psi_percent = 4
+decay_window = "30s"
+sample_interval = "2s"
+inflight_report_delta_percent = 30
+max_reclaimed_cpu_ratio = 3
+"#;
+    let config: ActionsConfig = toml::from_str(text).expect("CPU policy");
+    assert_eq!(config.cpu.headroom_percent, 20);
+    assert_eq!(config.cpu.saturate_utilization_percent.get(), 90);
+    assert_eq!(config.cpu.clear_utilization_percent.get(), 70);
+    assert_eq!(config.cpu.saturate_psi_percent.get(), 15);
+    assert_eq!(config.cpu.clear_psi_percent.get(), 4);
+    assert_eq!(config.cpu.decay_window.as_millis(), 30_000);
+    assert_eq!(config.cpu.sample_interval.as_millis(), 2_000);
+    assert_eq!(config.cpu.inflight_report_delta_percent.get(), 30);
+    assert_eq!(config.cpu.max_reclaimed_cpu_ratio.get(), 3);
+}
+
 const CUSTOM: &str = r#"
 reservation_headroom_percent = 25
 cpu_reservation_percentile = 75
-cpu_oversubscription = 3
 history_window = "9d"
 history_keys = 321
 history_memory_budget = "123MiB"
@@ -50,7 +75,15 @@ disk = "52MiB"
 fn memory_pressure_defaults_parse() {
     let config: ActionsConfig = toml::from_str("").expect("default action policy");
     assert_eq!(config.cpu_reservation_percentile.get(), 50);
-    assert_eq!(config.cpu_oversubscription.get(), 2);
+    assert_eq!(config.cpu.headroom_percent, 15);
+    assert_eq!(config.cpu.saturate_utilization_percent.get(), 85);
+    assert_eq!(config.cpu.clear_utilization_percent.get(), 75);
+    assert_eq!(config.cpu.saturate_psi_percent.get(), 10);
+    assert_eq!(config.cpu.clear_psi_percent.get(), 5);
+    assert_eq!(config.cpu.decay_window.as_millis(), 25_000);
+    assert_eq!(config.cpu.sample_interval.as_millis(), 1_000);
+    assert_eq!(config.cpu.inflight_report_delta_percent.get(), 25);
+    assert_eq!(config.cpu.max_reclaimed_cpu_ratio.get(), 4);
     assert_eq!(config.cold_start.cpu_millicores.get(), 250);
     assert_eq!(config.memory.pressure_stall_percent.get(), 10);
     assert_eq!(config.memory.pressure_poll_interval.as_millis(), 250);
@@ -62,7 +95,6 @@ fn all_action_fields_parse_with_nondefault_values() {
     let config: ActionsConfig = toml::from_str(CUSTOM).expect("valid action policy");
     assert_eq!(config.reservation_headroom_percent.get(), 25);
     assert_eq!(config.cpu_reservation_percentile.get(), 75);
-    assert_eq!(config.cpu_oversubscription.get(), 3);
     assert_eq!(config.history_window.as_units(), 9);
     assert_eq!(config.history_keys.get(), 321);
     assert_eq!(config.history_memory_budget.as_u64(), 123 * 1024 * 1024);
@@ -122,7 +154,10 @@ fn invalid_values_and_removed_fields_are_rejected() {
         "cpu_reservation_percentile = 101",
         "cpu_reservation_percentile = -1",
         "cpu_reservation_percentile = 50.5",
-        "cpu_oversubscription = 0",
+        "[cpu]\nmax_reclaimed_cpu_ratio = 0",
+        "[cpu]\nsample_interval = \"0s\"",
+        "[cpu]\ndecay_window = \"0s\"",
+        "[cpu]\nunknown = 1",
         "history_window = \"0d\"",
         "history_window = \"25h\"",
         "history_keys = 0",
@@ -268,6 +303,21 @@ transport = "plaintext"
 [authentication.clients.none]
 [authentication.workers.none]
 "#;
+
+#[test]
+fn cpu_policy_rejects_invalid_watermarks() {
+    for fields in [
+        "headroom_percent = 100",
+        "clear_utilization_percent = 91\nsaturate_utilization_percent = 90",
+        "clear_psi_percent = 11\nsaturate_psi_percent = 10",
+    ] {
+        let text = format!("{CONFIG}\n[actions.cpu]\n{fields}\n");
+        assert!(
+            text.parse::<gang_config::GangConfig<Plugins>>().is_err(),
+            "{fields}"
+        );
+    }
+}
 
 #[test]
 fn fleet_resource_validation_names_the_fleet_setting_and_values() {

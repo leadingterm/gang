@@ -203,6 +203,7 @@ mod tests {
                 mnemonic: Some(Mnemonic::try_new("Link").expect("mnemonic")),
                 candidates: FleetSet::try_from_indices([0]).expect("fleet"),
                 priority,
+                has_explicit_cpu_floor: false,
                 reservation: ActionResources {
                     cpu_millicores: 1_000,
                     memory: Bytes::gib(1),

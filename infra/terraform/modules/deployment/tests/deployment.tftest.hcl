@@ -769,10 +769,6 @@ run "renders_default_poll_interval" {
     error_message = "The default top-level poll interval must render as 2s."
   }
 
-  assert {
-    condition     = strcontains(output.gang_toml, "[actions]\ncpu_oversubscription = 2\n")
-    error_message = "The default shared actions CPU oversubscription must render as 2."
-  }
 }
 
 run "renders_gang_settings_override" {
@@ -780,8 +776,7 @@ run "renders_gang_settings_override" {
 
   variables {
     gang_settings = {
-      poll_interval        = "3s"
-      cpu_oversubscription = 3
+      poll_interval = "3s"
     }
   }
 
@@ -790,25 +785,6 @@ run "renders_gang_settings_override" {
     error_message = "gang_settings must override the rendered poll interval."
   }
 
-  assert {
-    condition     = strcontains(output.gang_toml, "[actions]\ncpu_oversubscription = 3\n")
-    error_message = "gang_settings must override the shared actions CPU oversubscription."
-  }
-}
-
-run "accepts_cpu_oversubscription_one" {
-  command = plan
-
-  variables {
-    gang_settings = {
-      cpu_oversubscription = 1
-    }
-  }
-
-  assert {
-    condition     = strcontains(output.gang_toml, "[actions]\ncpu_oversubscription = 1\n")
-    error_message = "CPU oversubscription of 1 must render as an integer."
-  }
 }
 
 run "pins_ca_to_signer_and_wires_endpoints" {
@@ -1421,38 +1397,6 @@ run "rejects_input_links_outside_keep_and_break" {
   expect_failures = [
     var.gang_settings,
   ]
-}
-
-run "rejects_zero_cpu_oversubscription" {
-  command = plan
-  variables {
-    gang_settings = { cpu_oversubscription = 0 }
-  }
-  expect_failures = [var.gang_settings]
-}
-
-run "rejects_negative_cpu_oversubscription" {
-  command = plan
-  variables {
-    gang_settings = { cpu_oversubscription = -1 }
-  }
-  expect_failures = [var.gang_settings]
-}
-
-run "rejects_fractional_cpu_oversubscription" {
-  command = plan
-  variables {
-    gang_settings = { cpu_oversubscription = 1.5 }
-  }
-  expect_failures = [var.gang_settings]
-}
-
-run "rejects_cpu_oversubscription_above_u32" {
-  command = plan
-  variables {
-    gang_settings = { cpu_oversubscription = 4294967296 }
-  }
-  expect_failures = [var.gang_settings]
 }
 
 run "rejects_zero_poll_interval" {

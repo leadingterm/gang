@@ -392,6 +392,7 @@ mod tests {
                 mnemonic: None,
                 candidates: FleetSet::try_from_indices([0]).expect("candidates"),
                 priority: 100,
+                has_explicit_cpu_floor: false,
                 reservation: ActionResources {
                     cpu_millicores: 2_000,
                     memory: Bytes::gib(2),

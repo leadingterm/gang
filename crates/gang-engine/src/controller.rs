@@ -1162,6 +1162,7 @@ mod tests {
                 WorkerEvent::Executed(WorkerExecuted {
                     attempt_id: attempt_id.clone(),
                     usage: AttemptUsage {
+                        peak_window_cpu_millicores: None,
                         peak_memory: Some(Bytes::mib(256)),
                         peak_disk: Some(Bytes::mib(32)),
                         cpu_time: Duration::from_secs(exec_secs),

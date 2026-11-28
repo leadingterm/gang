@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use gang_clock::{Clock, Tick};
+use gang_config::CpuTuning;
 use gang_config::DiskEnforcement;
 use gang_config::DiskTuning;
 use gang_config::MemoryEnforcement;
@@ -48,6 +49,7 @@ pub(crate) const REPORT_CGROUP_FILE: &str = "report.cgroup";
 const MEMORY_CURRENT_FILE: &str = "memory.current";
 /// `cgroup` v2 file reporting peak memory usage in bytes.
 const MEMORY_PEAK_FILE: &str = "memory.peak";
+const MEMORY_STAT_FILE: &str = "memory.stat";
 /// `cgroup` v2 file reporting memory `PSI` stall counters.
 const MEMORY_PRESSURE_FILE: &str = "memory.pressure";
 /// `cgroup` v2 file reporting hard memory limit (`"max"` or bytes).
@@ -58,12 +60,15 @@ const MEMORY_HIGH_FILE: &str = "memory.high";
 const MEMORY_EVENTS_FILE: &str = "memory.events";
 /// `cgroup` v2 file reporting `CPU` time counters (`usage_usec`).
 const CPU_STAT_FILE: &str = "cpu.stat";
+const CPU_PRESSURE_FILE: &str = "cpu.pressure";
 
 /// Measured resource usage accumulated for one execution attempt.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AttemptUsage {
     /// Cumulative `CPU` time consumed by the attempt, when measured.
     pub cpu_time: Option<Duration>,
+    /// Peak smoothed interval CPU burn in millicores.
+    pub peak_window_cpu_millicores: Option<u64>,
     /// Peak memory observed in the attempt's `cgroup` or side-channel report, in bytes.
     pub peak_memory_bytes: Option<u64>,
     /// Peak action work-directory disk usage observed for the attempt, in bytes.
@@ -72,12 +77,27 @@ pub struct AttemptUsage {
     pub oom_kills: u64,
     /// Whether periodic resource sampling observed the running attempt.
     pub sampled: bool,
+    working_set_observed: bool,
 }
 
 impl AttemptUsage {
     /// Records a memory observation in bytes, retaining the maximum peak.
     pub fn record_memory(&mut self, bytes: u64) {
+        if self.working_set_observed {
+            return;
+        }
         self.peak_memory_bytes = Some(self.peak_memory_bytes.map_or(bytes, |prev| prev.max(bytes)));
+    }
+
+    /// Records a sampled working set, replacing any earlier kernel peak fallback.
+    pub fn record_working_set(&mut self, bytes: u64) {
+        if self.working_set_observed {
+            self.peak_memory_bytes =
+                Some(self.peak_memory_bytes.map_or(bytes, |prev| prev.max(bytes)));
+        } else {
+            self.peak_memory_bytes = Some(bytes);
+            self.working_set_observed = true;
+        }
     }
 
     /// Records a disk usage observation in bytes, retaining the maximum peak.
@@ -100,8 +120,18 @@ impl AttemptUsage {
         if let Some(cpu) = other.cpu_time {
             self.record_cpu_time(cpu);
         }
+        if let Some(peak) = other.peak_window_cpu_millicores {
+            self.peak_window_cpu_millicores = Some(
+                self.peak_window_cpu_millicores
+                    .map_or(peak, |previous| previous.max(peak)),
+            );
+        }
         if let Some(mem) = other.peak_memory_bytes {
-            self.record_memory(mem);
+            if other.working_set_observed {
+                self.record_working_set(mem);
+            } else {
+                self.record_memory(mem);
+            }
         }
         if let Some(disk) = other.peak_disk_bytes {
             self.record_disk(disk);
@@ -115,6 +145,7 @@ impl AttemptUsage {
     pub fn to_proto(&self) -> proto::ResourceUsage {
         proto::ResourceUsage {
             cpu_time: self.cpu_time.map(duration_to_proto),
+            peak_window_cpu_millicores: self.peak_window_cpu_millicores,
             peak_memory_bytes: self.peak_memory_bytes,
             peak_disk_bytes: self.peak_disk_bytes,
             oom_kills: self.oom_kills,
@@ -270,6 +301,8 @@ impl GraveyardPending {
 pub struct AttemptCgroupSample {
     /// Current memory usage from `memory.current`, in bytes.
     pub current_memory_bytes: Option<u64>,
+    /// Current working set, excluding inactive file cache where available.
+    pub working_set_memory_bytes: Option<u64>,
     /// Peak memory usage from `memory.peak`, in bytes.
     pub peak_memory_bytes: Option<u64>,
     /// Cumulative `CPU` time from `cpu.stat` (`usage_usec`).
@@ -283,6 +316,7 @@ impl AttemptCgroupSample {
     #[must_use]
     pub const fn observed(&self) -> bool {
         self.current_memory_bytes.is_some()
+            || self.working_set_memory_bytes.is_some()
             || self.peak_memory_bytes.is_some()
             || self.cpu_time.is_some()
             || self.oom_kills > 0
@@ -296,6 +330,15 @@ pub struct MemoryPoolSample {
     pub psi_total_us: Option<u64>,
     /// Available bytes remaining in the pool (`min(memory.max, memory.high) - memory.current`).
     pub available_bytes: Option<u64>,
+}
+
+/// Cumulative CPU use and pressure counters from the action pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CpuPoolSample {
+    /// Cumulative CPU use in microseconds.
+    pub usage_usec: Option<u64>,
+    /// Cumulative CPU pressure stalls in microseconds.
+    pub psi_total_usec: Option<u64>,
 }
 
 /// Abstraction over OS/filesystem probes for sampling and pressure monitors.
@@ -325,6 +368,11 @@ pub trait SampleProbe: Send + Sync {
 
     /// Reads worker-wide memory `PSI` and pool availability from the action memory pool `cgroup`.
     fn read_memory_pool(&self, pool_cgroup: &Path) -> MemoryPoolSample;
+
+    /// Reads cumulative CPU use and pressure for the action pool.
+    fn read_cpu_pool(&self, _pool_cgroup: Option<&Path>) -> CpuPoolSample {
+        CpuPoolSample::default()
+    }
 
     /// Queries `statvfs` free/total space on `work_dir` alongside current graveyard pending bytes.
     fn read_disk_space(&self, work_dir: &Path) -> Option<DiskSample>;
@@ -376,6 +424,29 @@ impl SampleProbe for SystemProbe {
 
     fn read_memory_pool(&self, pool_cgroup: &Path) -> MemoryPoolSample {
         read_memory_pool_sample(pool_cgroup)
+    }
+
+    fn read_cpu_pool(&self, pool_cgroup: Option<&Path>) -> CpuPoolSample {
+        let pool = pool_cgroup.unwrap_or_else(|| Path::new("/sys/fs/cgroup"));
+        let usage_usec = gang_os::fs::read_to_string_optional(&pool.join(CPU_STAT_FILE))
+            .ok()
+            .flatten()
+            .and_then(|text| parse_cpu_stat_usage(&text))
+            .and_then(|duration| u64::try_from(duration.as_micros()).ok());
+        let psi = gang_os::fs::read_to_string_optional(&pool.join(CPU_PRESSURE_FILE))
+            .ok()
+            .flatten()
+            .and_then(|text| parse_psi_total_us(&text))
+            .or_else(|| {
+                gang_os::fs::read_to_string_optional(Path::new("/proc/pressure/cpu"))
+                    .ok()
+                    .flatten()
+                    .and_then(|text| parse_psi_total_us(&text))
+            });
+        CpuPoolSample {
+            usage_usec,
+            psi_total_usec: psi,
+        }
     }
 
     fn read_disk_space(&self, work_dir: &Path) -> Option<DiskSample> {
@@ -450,6 +521,12 @@ pub fn read_cgroup_sample(cgroup: &Path) -> AttemptCgroupSample {
             .ok()
             .flatten()
             .and_then(|text| parse_cgroup_u64(&text));
+    let working_set_memory_bytes =
+        gang_os::fs::read_to_string_optional(&cgroup.join(MEMORY_STAT_FILE))
+            .ok()
+            .flatten()
+            .and_then(|text| parse_working_set(&text, current_memory_bytes))
+            .or(current_memory_bytes);
     let peak_memory_bytes = gang_os::fs::read_to_string_optional(&cgroup.join(MEMORY_PEAK_FILE))
         .ok()
         .flatten()
@@ -465,9 +542,36 @@ pub fn read_cgroup_sample(cgroup: &Path) -> AttemptCgroupSample {
         .unwrap_or(0);
     AttemptCgroupSample {
         current_memory_bytes,
+        working_set_memory_bytes,
         peak_memory_bytes,
         cpu_time,
         oom_kills,
+    }
+}
+
+fn parse_working_set(text: &str, current: Option<u64>) -> Option<u64> {
+    let (mut anon, mut shmem, mut active, mut inactive) = (None, None, None, None);
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(name), Some(value)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Ok(value) = value.parse::<u64>() else {
+            continue;
+        };
+        match name {
+            "anon" => anon = Some(value),
+            "shmem" => shmem = Some(value),
+            "active_file" => active = Some(value),
+            "inactive_file" => inactive = Some(value),
+            _ => {}
+        }
+    }
+    match (anon, shmem, active) {
+        (Some(a), Some(s), Some(f)) => Some(a.saturating_add(s).saturating_add(f)),
+        _ => current
+            .zip(inactive)
+            .map(|(total, cache)| total.saturating_sub(cache)),
     }
 }
 
@@ -607,6 +711,10 @@ pub fn read_memory_pool_sample(pool_cgroup: &Path) -> MemoryPoolSample {
 /// Configuration for [`WorkerSampler`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SamplingConfig {
+    /// CPU sampling and reclamation policy.
+    pub cpu: CpuTuning,
+    /// Physical instance CPU capacity in millicores.
+    pub physical_cpu_millicores: u64,
     /// Memory sampling, pressure, and soft-ceiling policy.
     pub memory: MemoryTuning,
     /// Disk sampling, pressure, and soft-ceiling policy.
@@ -630,6 +738,8 @@ pub struct AttemptRegistration {
     pub side_channel_dir: PathBuf,
     /// Memory reservation in bytes (`0` when unreserved).
     pub reserved_memory_bytes: u64,
+    /// Initial reserved CPU in millicores.
+    pub reserved_cpu_millicores: u64,
     /// Disk reservation in bytes (`0` when unreserved).
     pub reserved_disk_bytes: u64,
     /// Kill handle used by pressure and soft-ceiling monitors to terminate this attempt.
@@ -646,6 +756,11 @@ struct TrackedAttempt {
     pgid: Option<u32>,
     accounting_pid: Option<u32>,
     reserved_memory_bytes: u64,
+    last_reported_cpu_millicores: u64,
+    last_reported_memory_bytes: u64,
+    last_working_set_bytes: u64,
+    cpu_previous: Option<(Tick, Duration)>,
+    observed_cpu_millicores: u64,
     reserved_disk_bytes: u64,
     last_memory_bytes: u64,
     last_disk_bytes: u64,
@@ -659,10 +774,14 @@ struct TrackedAttempt {
 /// Shared mutable state for active attempts and the post-kill quiescence gate.
 #[derive(Debug)]
 struct RegistryState {
+    cpu_policy: CpuTuning,
     memory_policy: MemoryTuning,
     disk_policy: DiskTuning,
     attempts: Vec<TrackedAttempt>,
     quiescence: QuiescenceGate<AttemptId>,
+    load: Option<proto::WorkerLoad>,
+    last_admitted_assign_seq: u64,
+    session_generation: u64,
 }
 
 /// Thread-safe handle connecting [`WorkerSampler`] with running attempt executions.
@@ -672,15 +791,78 @@ pub struct SamplingRegistry {
 }
 
 impl SamplingRegistry {
+    /// Starts a new worker session and invalidates prior telemetry.
+    pub fn start_session(&self) {
+        let mut state = self.state.lock();
+        state.session_generation = state.session_generation.saturating_add(1);
+        state.last_admitted_assign_seq = 0;
+        state.load = None;
+    }
+
+    /// Marks an assignment admitted before subsequent CPU sampling intervals.
+    pub fn admit_assignment(&self, assign_seq: u64) {
+        let mut state = self.state.lock();
+        state.last_admitted_assign_seq = state.last_admitted_assign_seq.max(assign_seq);
+    }
+
+    /// Returns the latest measured worker CPU load, if two samples were observed.
+    #[must_use]
+    pub fn cpu_load(&self) -> Option<proto::WorkerLoad> {
+        self.state.lock().load
+    }
+
+    /// Returns material increases in active attempt usage since the last report.
+    #[must_use]
+    pub fn inflight_updates(&self) -> Vec<proto::AttemptUsageUpdate> {
+        let mut state = self.state.lock();
+        let percent = u64::from(state.cpu_policy.inflight_report_delta_percent.get());
+        let mut updates = Vec::new();
+        for attempt in &mut state.attempts {
+            let cpu_delta = attempt
+                .observed_cpu_millicores
+                .saturating_sub(attempt.last_reported_cpu_millicores);
+            let memory_delta = attempt
+                .last_working_set_bytes
+                .saturating_sub(attempt.last_reported_memory_bytes);
+            let cpu_changed = cpu_delta > 0
+                && (cpu_delta >= 500
+                    || u128::from(cpu_delta) * 100
+                        >= u128::from(attempt.last_reported_cpu_millicores) * u128::from(percent));
+            let memory_changed = memory_delta > 0
+                && (memory_delta >= 256 * 1024 * 1024
+                    || u128::from(memory_delta) * 100
+                        >= u128::from(attempt.last_reported_memory_bytes) * u128::from(percent));
+            if !cpu_changed && !memory_changed {
+                continue;
+            }
+            updates.push(proto::AttemptUsageUpdate {
+                attempt: attempt.attempt.as_str().to_owned(),
+                observed_cpu_millicores: attempt.observed_cpu_millicores,
+                working_set_memory_bytes: attempt.last_working_set_bytes,
+            });
+            attempt.last_reported_cpu_millicores = attempt
+                .last_reported_cpu_millicores
+                .max(attempt.observed_cpu_millicores);
+            attempt.last_reported_memory_bytes = attempt
+                .last_reported_memory_bytes
+                .max(attempt.last_working_set_bytes);
+        }
+        updates
+    }
+
     /// Creates a new registry configured with `memory` and `disk` soft-ceiling policies.
     #[must_use]
-    pub fn new(memory: MemoryTuning, disk: DiskTuning) -> Self {
+    pub fn new(cpu: CpuTuning, memory: MemoryTuning, disk: DiskTuning) -> Self {
         Self {
             state: Arc::new(Mutex::new(RegistryState {
+                cpu_policy: cpu,
                 memory_policy: memory,
                 disk_policy: disk,
                 attempts: Vec::new(),
                 quiescence: QuiescenceGate::new(),
+                load: None,
+                last_admitted_assign_seq: 0,
+                session_generation: 0,
             })),
         }
     }
@@ -724,6 +906,11 @@ impl SamplingRegistry {
             pgid: None,
             accounting_pid: None,
             reserved_memory_bytes: registration.reserved_memory_bytes,
+            last_reported_cpu_millicores: registration.reserved_cpu_millicores,
+            last_reported_memory_bytes: registration.reserved_memory_bytes,
+            last_working_set_bytes: 0,
+            cpu_previous: None,
+            observed_cpu_millicores: 0,
             reserved_disk_bytes: registration.reserved_disk_bytes,
             last_memory_bytes: 0,
             last_disk_bytes: 0,
@@ -850,6 +1037,7 @@ impl Drop for TrackedAttemptGuard {
 
 /// Snapshot of one active attempt's paths collected under lock before performing filesystem I/O.
 struct SampleTarget {
+    index: usize,
     attempt: AttemptId,
     attempt_dir: PathBuf,
     side_channel_dir: PathBuf,
@@ -866,13 +1054,17 @@ pub struct WorkerSampler<P> {
     probe: P,
     memory_pressure: MemoryPressureMonitor,
     disk_pressure: DiskPressureMonitor,
+    cpu_previous: Option<(Tick, CpuPoolSample, u64)>,
+    cpu_load: Option<proto::WorkerLoad>,
+    cpu_sample_seq: u64,
+    cpu_session_generation: u64,
 }
 
 impl<P: SampleProbe> WorkerSampler<P> {
     /// Creates a new [`WorkerSampler`] with its own [`SamplingRegistry`].
     #[must_use]
     pub fn new(config: SamplingConfig, probe: P) -> Self {
-        let registry = SamplingRegistry::new(config.memory, config.disk);
+        let registry = SamplingRegistry::new(config.cpu, config.memory, config.disk);
         Self::with_registry(config, registry, probe)
     }
 
@@ -895,6 +1087,167 @@ impl<P: SampleProbe> WorkerSampler<P> {
             probe,
             memory_pressure,
             disk_pressure,
+            cpu_previous: None,
+            cpu_load: None,
+            cpu_sample_seq: 0,
+            cpu_session_generation: 0,
+        }
+    }
+
+    /// Samples CPU counters at the supplied monotonic time.
+    pub fn sample_cpu(&mut self, now: Tick) {
+        let (session_generation, admitted) = {
+            let state = self.registry.state.lock();
+            (state.session_generation, state.last_admitted_assign_seq)
+        };
+        if session_generation != self.cpu_session_generation {
+            self.cpu_previous = None;
+            self.cpu_load = None;
+            self.cpu_session_generation = session_generation;
+        }
+        let sample = self.probe.read_cpu_pool(self.config.memory_pool.as_deref());
+        self.sample_attempt_cpu(now);
+        if sample.usage_usec.is_none() {
+            self.cpu_previous = None;
+            self.registry.state.lock().load = None;
+            return;
+        }
+        let Some((previous_at, previous, observed_assign_seq)) =
+            self.cpu_previous.replace((now, sample, admitted))
+        else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(previous_at).as_micros();
+        let Some((current, before)) = sample.usage_usec.zip(previous.usage_usec) else {
+            self.registry.state.lock().load = None;
+            return;
+        };
+        let Some(delta) = current.checked_sub(before) else {
+            self.registry.state.lock().load = None;
+            return;
+        };
+        if elapsed == 0 {
+            return;
+        }
+        let instant =
+            u64::try_from(u128::from(delta).saturating_mul(1000) / elapsed).unwrap_or(u64::MAX);
+        let old = self
+            .cpu_load
+            .map_or(instant, |load| load.observed_cpu_millicores);
+        let window = self.config.cpu.decay_window.get().as_micros();
+        let observed = if instant >= old {
+            instant
+        } else {
+            let decay =
+                u128::from(old - instant).saturating_mul(elapsed) / window.saturating_add(elapsed);
+            old.saturating_sub(u64::try_from(decay).unwrap_or(u64::MAX))
+        };
+        let psi_delta = sample
+            .psi_total_usec
+            .zip(previous.psi_total_usec)
+            .and_then(|(current, before)| current.checked_sub(before))
+            .unwrap_or(0);
+        let psi = u32::try_from((u128::from(psi_delta).saturating_mul(100) / elapsed).min(100))
+            .unwrap_or(100);
+        let physical = self.config.physical_cpu_millicores;
+        let cpu = &self.config.cpu;
+        let was_saturated = self.cpu_load.is_some_and(|load| load.cpu_saturated);
+        let cpu_percent = u128::from(observed).saturating_mul(100);
+        let saturated = if was_saturated {
+            !(cpu_percent <= u128::from(physical) * u128::from(cpu.clear_utilization_percent.get())
+                && psi <= u32::from(cpu.clear_psi_percent.get()))
+        } else {
+            cpu_percent >= u128::from(physical) * u128::from(cpu.saturate_utilization_percent.get())
+                || psi >= u32::from(cpu.saturate_psi_percent.get())
+        };
+        let headroom = u64::try_from(u128::from(physical) * u128::from(cpu.headroom_percent) / 100)
+            .unwrap_or(u64::MAX);
+        self.cpu_sample_seq = self.cpu_sample_seq.saturating_add(1);
+        let load = proto::WorkerLoad {
+            observed_cpu_millicores: observed,
+            cpu_psi_percent: psi,
+            cpu_saturated: saturated,
+            reclaimable_cpu_millicores: if saturated {
+                0
+            } else {
+                physical.saturating_sub(observed).saturating_sub(headroom)
+            },
+            sample_seq: self.cpu_sample_seq,
+            observed_assign_seq,
+        };
+        self.cpu_load = Some(load);
+        let mut state = self.registry.state.lock();
+        if state.session_generation == session_generation {
+            state.load = Some(load);
+        }
+    }
+
+    fn sample_attempt_cpu(&self, now: Tick) {
+        for target in self.collect_targets() {
+            let Some(cgroup) = target.cgroup.or_else(|| {
+                self.probe
+                    .read_attempt_cgroup_path(&target.side_channel_dir)
+            }) else {
+                continue;
+            };
+            let sample = self.probe.read_attempt_cgroup(&cgroup);
+            let mut state = self.registry.state.lock();
+            let Some(entry) = state
+                .attempts
+                .get_mut(target.index)
+                .filter(|entry| entry.attempt == target.attempt)
+            else {
+                continue;
+            };
+            if sample.observed() {
+                entry.usage.sampled = true;
+            }
+            entry.cgroup = Some(cgroup);
+            entry.usage.record_oom_kills(sample.oom_kills);
+            if let Some(memory) = sample
+                .working_set_memory_bytes
+                .or(sample.current_memory_bytes)
+                .filter(|value| *value > 0)
+            {
+                entry.last_working_set_bytes = memory;
+                entry.usage.record_working_set(memory);
+            }
+            let Some(cpu) = sample.cpu_time else { continue };
+            entry.usage.record_cpu_time(cpu);
+            let Some((previous_at, previous)) = entry.cpu_previous.replace((now, cpu)) else {
+                continue;
+            };
+            let elapsed = now.saturating_duration_since(previous_at).as_micros();
+            let Some(delta) = cpu.checked_sub(previous) else {
+                continue;
+            };
+            if elapsed == 0 {
+                continue;
+            }
+            let instant =
+                u64::try_from(delta.as_micros().saturating_mul(1000) / elapsed).unwrap_or(u64::MAX);
+            let old = entry.observed_cpu_millicores;
+            entry.observed_cpu_millicores = if instant >= old {
+                instant
+            } else {
+                let decay = u128::from(old - instant).saturating_mul(elapsed)
+                    / self
+                        .config
+                        .cpu
+                        .decay_window
+                        .get()
+                        .as_micros()
+                        .saturating_add(elapsed);
+                old.saturating_sub(u64::try_from(decay).unwrap_or(u64::MAX))
+            };
+            entry.usage.peak_window_cpu_millicores = Some(
+                entry
+                    .usage
+                    .peak_window_cpu_millicores
+                    .map_or(entry.observed_cpu_millicores, |previous| {
+                        previous.max(entry.observed_cpu_millicores)
+                    }),
+            );
         }
     }
 
@@ -1029,6 +1382,7 @@ impl<P: SampleProbe> WorkerSampler<P> {
         let start = clock.monotonic();
         let mem_sample_every = self.config.memory.sample_interval.get();
         let disk_sample_every = self.config.disk.sample_interval.get();
+        let cpu_sample_every = self.config.cpu.sample_interval.get();
         let mem_pressure_every = (self.config.memory.enforcement == MemoryEnforcement::Pressure
             && self.config.memory_pool.is_some())
         .then(|| self.config.memory.pressure_poll_interval.get());
@@ -1037,11 +1391,12 @@ impl<P: SampleProbe> WorkerSampler<P> {
 
         let mut next_mem_sample = start + mem_sample_every;
         let mut next_disk_sample = start + disk_sample_every;
+        let mut next_cpu_sample = start + cpu_sample_every;
         let mut next_mem_pressure = mem_pressure_every.map(|interval| start + interval);
         let mut next_disk_pressure = disk_pressure_every.map(|interval| start + interval);
 
         loop {
-            let mut next_due = next_mem_sample.min(next_disk_sample);
+            let mut next_due = next_mem_sample.min(next_disk_sample).min(next_cpu_sample);
             if let Some(tick) = next_mem_pressure {
                 next_due = next_due.min(tick);
             }
@@ -1054,6 +1409,10 @@ impl<P: SampleProbe> WorkerSampler<P> {
                 () = clock.sleep_until(next_due) => {}
             }
             let now = clock.monotonic();
+            if now >= next_cpu_sample {
+                self.sample_cpu(now);
+                next_cpu_sample = advance_schedule(next_cpu_sample, now, cpu_sample_every);
+            }
             if now >= next_mem_sample {
                 let _ = self.sample_memory_attempts();
                 next_mem_sample = advance_schedule(next_mem_sample, now, mem_sample_every);
@@ -1082,7 +1441,9 @@ impl<P: SampleProbe> WorkerSampler<P> {
         state
             .attempts
             .iter()
-            .map(|entry| SampleTarget {
+            .enumerate()
+            .map(|(index, entry)| SampleTarget {
+                index,
                 attempt: entry.attempt.clone(),
                 attempt_dir: entry.attempt_dir.clone(),
                 side_channel_dir: entry.side_channel_dir.clone(),
@@ -1112,8 +1473,13 @@ impl<P: SampleProbe> WorkerSampler<P> {
                 return None;
             }
             entry.usage.sampled = true;
-            if let Some(current) = sample.current_memory_bytes {
-                entry.usage.record_memory(current);
+            if let Some(current) = sample
+                .working_set_memory_bytes
+                .or(sample.current_memory_bytes)
+                .filter(|value| *value > 0)
+            {
+                entry.usage.record_working_set(current);
+                entry.last_working_set_bytes = current;
             }
             if let Some(peak) = sample.peak_memory_bytes {
                 entry.usage.record_memory(peak);
@@ -1298,6 +1664,7 @@ mod tests {
         attempt_cgroup: HashMap<PathBuf, AttemptCgroupSample>,
         attempt_disk: HashMap<PathBuf, u64>,
         memory_pool: MemoryPoolSample,
+        cpu_pool: CpuPoolSample,
         disk_space: Option<DiskSample>,
     }
 
@@ -1332,6 +1699,10 @@ mod tests {
             self.state.lock().memory_pool = sample;
         }
 
+        fn set_cpu_pool(&self, sample: CpuPoolSample) {
+            self.state.lock().cpu_pool = sample;
+        }
+
         fn set_disk_space(&self, sample: Option<DiskSample>) {
             self.state.lock().disk_space = sample;
         }
@@ -1359,6 +1730,10 @@ mod tests {
             self.state.lock().memory_pool
         }
 
+        fn read_cpu_pool(&self, _pool_cgroup: Option<&Path>) -> CpuPoolSample {
+            self.state.lock().cpu_pool
+        }
+
         fn read_disk_space(&self, _work_dir: &Path) -> Option<DiskSample> {
             self.state.lock().disk_space
         }
@@ -1370,6 +1745,8 @@ mod tests {
 
     fn base_config() -> SamplingConfig {
         SamplingConfig {
+            cpu: CpuTuning::default(),
+            physical_cpu_millicores: 4_000,
             memory: MemoryTuning {
                 enforcement: MemoryEnforcement::Pressure,
                 reserve: NonZeroBytes::mib(100),
@@ -1398,6 +1775,102 @@ mod tests {
     }
 
     #[test]
+    fn cpu_load_reclaims_slack_and_uses_pressure_hysteresis() {
+        let probe = FakeProbe::default();
+        let mut sampler = WorkerSampler::new(base_config(), probe.clone());
+        let registry = sampler.registry();
+        probe.set_cpu_pool(CpuPoolSample {
+            usage_usec: Some(0),
+            psi_total_usec: Some(0),
+        });
+        sampler.sample_cpu(t(0));
+        assert!(registry.cpu_load().is_none());
+        registry.admit_assignment(7);
+        probe.set_cpu_pool(CpuPoolSample {
+            usage_usec: Some(1_000_000),
+            psi_total_usec: Some(0),
+        });
+        sampler.sample_cpu(t(1_000));
+        let cool = registry.cpu_load().expect("load");
+        assert_eq!(cool.observed_cpu_millicores, 1_000);
+        assert_eq!(cool.reclaimable_cpu_millicores, 2_400);
+        assert_eq!(cool.observed_assign_seq, 0);
+        assert!(!cool.cpu_saturated);
+        probe.set_cpu_pool(CpuPoolSample {
+            usage_usec: Some(2_000_000),
+            psi_total_usec: Some(100_000),
+        });
+        sampler.sample_cpu(t(2_000));
+        assert!(registry.cpu_load().expect("load").cpu_saturated);
+        assert_eq!(registry.cpu_load().expect("load").observed_assign_seq, 7);
+        probe.set_cpu_pool(CpuPoolSample {
+            usage_usec: Some(3_000_000),
+            psi_total_usec: Some(160_000),
+        });
+        sampler.sample_cpu(t(3_000));
+        assert!(registry.cpu_load().expect("load").cpu_saturated);
+        probe.set_cpu_pool(CpuPoolSample {
+            usage_usec: Some(4_000_000),
+            psi_total_usec: Some(200_000),
+        });
+        sampler.sample_cpu(t(4_000));
+        assert!(!registry.cpu_load().expect("load").cpu_saturated);
+        probe.set_cpu_pool(CpuPoolSample::default());
+        sampler.sample_cpu(t(5_000));
+        assert!(
+            registry.cpu_load().is_none(),
+            "missing counters must invalidate stale slack"
+        );
+        registry.start_session();
+        assert!(registry.cpu_load().is_none());
+    }
+
+    #[test]
+    fn inflight_reports_only_material_increases() -> Result<(), Box<dyn std::error::Error>> {
+        let probe = FakeProbe::default();
+        let mut sampler = WorkerSampler::new(base_config(), probe.clone());
+        let registry = sampler.registry();
+        let attempt = AttemptId::try_new("live-attempt")?;
+        let (kill, _receiver) = kill_channel();
+        let _guard = registry.register(AttemptRegistration {
+            attempt: attempt.clone(),
+            attempt_dir: PathBuf::from("/work/live"),
+            side_channel_dir: PathBuf::from("/side/live"),
+            reserved_cpu_millicores: 1_000,
+            reserved_memory_bytes: 1_000,
+            reserved_disk_bytes: 0,
+            kill,
+        });
+        probe.set_cgroup_path(Path::new("/side/live"), PathBuf::from("/cg/live"));
+        probe.set_attempt_cgroup(
+            Path::new("/cg/live"),
+            AttemptCgroupSample {
+                current_memory_bytes: Some(1_000),
+                cpu_time: Some(Duration::ZERO),
+                ..AttemptCgroupSample::default()
+            },
+        );
+        sampler.sample_cpu(t(0));
+        assert!(registry.inflight_updates().is_empty());
+        probe.set_attempt_cgroup(
+            Path::new("/cg/live"),
+            AttemptCgroupSample {
+                current_memory_bytes: Some(1_300),
+                cpu_time: Some(Duration::from_secs(2)),
+                ..AttemptCgroupSample::default()
+            },
+        );
+        sampler.sample_cpu(t(1_000));
+        let updates = registry.inflight_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].attempt, attempt.as_str());
+        assert_eq!(updates[0].observed_cpu_millicores, 2_000);
+        assert_eq!(updates[0].working_set_memory_bytes, 1_300);
+        assert!(registry.inflight_updates().is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn memory_psi_pressure_kills_greatest_excess_victim_and_honors_quiescence()
     -> Result<(), Box<dyn std::error::Error>> {
         let probe = FakeProbe::default();
@@ -1413,6 +1886,7 @@ mod tests {
             attempt: a1.clone(),
             attempt_dir: PathBuf::from("/work/attempt-1"),
             side_channel_dir: PathBuf::from("/work/.side_channels/attempt-1"),
+            reserved_cpu_millicores: 0,
             reserved_memory_bytes: 500_000,
             reserved_disk_bytes: 0,
             kill: tx1,
@@ -1421,6 +1895,7 @@ mod tests {
             attempt: a2.clone(),
             attempt_dir: PathBuf::from("/work/attempt-2"),
             side_channel_dir: PathBuf::from("/work/.side_channels/attempt-2"),
+            reserved_cpu_millicores: 0,
             reserved_memory_bytes: 100_000,
             reserved_disk_bytes: 0,
             kill: tx2,
@@ -1439,6 +1914,7 @@ mod tests {
             Path::new("/cg/a1"),
             AttemptCgroupSample {
                 current_memory_bytes: Some(400_000),
+                working_set_memory_bytes: None,
                 peak_memory_bytes: Some(420_000),
                 cpu_time: Some(Duration::from_millis(50)),
                 oom_kills: 0,
@@ -1448,6 +1924,7 @@ mod tests {
             Path::new("/cg/a2"),
             AttemptCgroupSample {
                 current_memory_bytes: Some(250_000),
+                working_set_memory_bytes: None,
                 peak_memory_bytes: Some(260_000),
                 cpu_time: Some(Duration::from_millis(80)),
                 oom_kills: 0,
@@ -1489,7 +1966,7 @@ mod tests {
         // Once a2 finishes, usage is captured and quiescence settles.
         let usage = g2.finish();
         assert!(usage.sampled);
-        assert_eq!(usage.peak_memory_bytes, Some(260_000));
+        assert_eq!(usage.peak_memory_bytes, Some(250_000));
         assert_eq!(usage.cpu_time, Some(Duration::from_millis(80)));
         assert!(registry.is_quiescence_settled());
         Ok(())
@@ -1511,6 +1988,7 @@ mod tests {
             attempt: a1.clone(),
             attempt_dir: PathBuf::from("/work/disk-small"),
             side_channel_dir: PathBuf::from("/work/.side_channels/disk-small"),
+            reserved_cpu_millicores: 0,
             reserved_memory_bytes: 0,
             reserved_disk_bytes: 500,
             kill: tx1,
@@ -1519,6 +1997,7 @@ mod tests {
             attempt: a2.clone(),
             attempt_dir: PathBuf::from("/work/disk-big"),
             side_channel_dir: PathBuf::from("/work/.side_channels/disk-big"),
+            reserved_cpu_millicores: 0,
             reserved_memory_bytes: 0,
             reserved_disk_bytes: 500,
             kill: tx2,
@@ -1572,6 +2051,7 @@ mod tests {
             attempt: attempt.clone(),
             attempt_dir: PathBuf::from("/work/unavailable-pss"),
             side_channel_dir: PathBuf::from("/work/.side_channels/unavailable-pss"),
+            reserved_cpu_millicores: 0,
             reserved_memory_bytes: 1,
             reserved_disk_bytes: 0,
             kill: tx,
@@ -1600,6 +2080,7 @@ mod tests {
             attempt: attempt.clone(),
             attempt_dir: PathBuf::from("/work/soft-disk"),
             side_channel_dir: PathBuf::from("/work/.side_channels/soft-disk"),
+            reserved_cpu_millicores: 0,
             reserved_memory_bytes: 0,
             reserved_disk_bytes: 1_000,
             kill: tx,
@@ -1627,6 +2108,10 @@ mod tests {
         std::fs::create_dir_all(&cgroup)?;
         std::fs::write(cgroup.join("memory.current"), "4096\n")?;
         std::fs::write(cgroup.join("memory.peak"), "8192\n")?;
+        std::fs::write(
+            cgroup.join("memory.stat"),
+            "anon 512\nshmem 128\nactive_file 128\ninactive_file 3328\n",
+        )?;
         std::fs::write(
             cgroup.join("cpu.stat"),
             "usage_usec 123456\nuser_usec 100\n",
@@ -1663,6 +2148,46 @@ mod tests {
         assert_eq!(cg_sample.cpu_time, Some(Duration::from_micros(123_456)));
         assert_eq!(cg_sample.oom_kills, 2);
 
+        let sampler = WorkerSampler::new(base_config(), probe.clone());
+        let registry = sampler.registry();
+        let (kill, _receiver) = kill_channel();
+        let guard = registry.register(AttemptRegistration {
+            attempt: AttemptId::try_new("working-set")?,
+            attempt_dir: dir.path().to_path_buf(),
+            side_channel_dir: side_channel.clone(),
+            reserved_cpu_millicores: 0,
+            reserved_memory_bytes: 10_000,
+            reserved_disk_bytes: 0,
+            kill,
+        });
+        assert!(sampler.sample_memory_attempts().is_empty());
+        assert_eq!(guard.finish().peak_memory_bytes, Some(768));
+
+        std::fs::write(cgroup.join("memory.stat"), "inactive_file 1024\n")?;
+        assert_eq!(
+            probe.read_attempt_cgroup(&cgroup).working_set_memory_bytes,
+            Some(3072)
+        );
+        std::fs::remove_file(cgroup.join("memory.stat"))?;
+        assert_eq!(
+            probe.read_attempt_cgroup(&cgroup).working_set_memory_bytes,
+            Some(4096)
+        );
+        std::fs::write(cgroup.join("memory.current"), "0\n")?;
+        let (kill, _receiver) = kill_channel();
+        let short = registry.register(AttemptRegistration {
+            attempt: AttemptId::try_new("short-attempt")?,
+            attempt_dir: dir.path().to_path_buf(),
+            side_channel_dir: side_channel.clone(),
+            reserved_cpu_millicores: 0,
+            reserved_memory_bytes: 10_000,
+            reserved_disk_bytes: 0,
+            kill,
+        });
+        assert!(sampler.sample_memory_attempts().is_empty());
+        assert_eq!(short.finish().peak_memory_bytes, Some(8192));
+        std::fs::write(cgroup.join("memory.current"), "4096\n")?;
+
         let pool = probe.read_memory_pool(&cgroup);
         assert_eq!(pool.psi_total_us, Some(98_765));
         assert_eq!(pool.available_bytes, Some(10_000 - 4_096));
@@ -1690,6 +2215,7 @@ mod tests {
             attempt: attempt.clone(),
             attempt_dir: PathBuf::from("/work/loop-attempt"),
             side_channel_dir: PathBuf::from("/work/.side_channels/loop-attempt"),
+            reserved_cpu_millicores: 0,
             reserved_memory_bytes: 1024,
             reserved_disk_bytes: 1024,
             kill: tx,
@@ -1702,6 +2228,7 @@ mod tests {
             Path::new("/cg/loop"),
             AttemptCgroupSample {
                 current_memory_bytes: Some(777),
+                working_set_memory_bytes: None,
                 peak_memory_bytes: Some(888),
                 cpu_time: Some(Duration::from_millis(12)),
                 oom_kills: 0,
@@ -1730,7 +2257,7 @@ mod tests {
 
         let usage = guard.finish();
         assert!(usage.sampled);
-        assert_eq!(usage.peak_memory_bytes, Some(888));
+        assert_eq!(usage.peak_memory_bytes, Some(777));
         assert_eq!(usage.peak_disk_bytes, Some(333));
         assert_eq!(usage.cpu_time, Some(Duration::from_millis(12)));
         Ok(())

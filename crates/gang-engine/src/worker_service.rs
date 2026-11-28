@@ -49,8 +49,8 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::actor::{CompletionPayload, WorkerOutbound};
 use crate::controller::{ControllerHandle, ControllerRegisterError};
 
-/// Default application `KeepAlive` cadence advertised in `ControllerMessage::Registered` (5 s).
-pub const DEFAULT_WORKER_KEEPALIVE_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(5);
+/// Default application `KeepAlive` cadence advertised in `ControllerMessage::Registered` (2 s).
+pub const DEFAULT_WORKER_KEEPALIVE_INTERVAL: NonZeroDuration = NonZeroDuration::from_secs(2);
 
 /// Default timeout for receiving a worker's initial `WorkerMessage::Register` frame (10 s).
 pub const DEFAULT_REGISTRATION_TIMEOUT: NonZeroDuration = NonZeroDuration::from_secs(10);
@@ -81,11 +81,13 @@ impl Default for WorkerServiceConfig {
 
 impl WorkerServiceConfig {
     /// Derives [`WorkerServiceConfig`] from `[server] worker_timeout`, advertising a `KeepAlive`
-    /// cadence of `worker_timeout / 2` (floored to 1 ms) and bounding handshake wait by
+    /// cadence of at most `worker_timeout / 2` and two seconds, and bounding handshake wait by
     /// `worker_timeout`.
     #[must_use]
     pub fn from_worker_timeout(worker_timeout: NonZeroDuration) -> Self {
-        let half = (worker_timeout.get() / 2).max(MIN_KEEPALIVE_INTERVAL);
+        let half = (worker_timeout.get() / 2)
+            .max(MIN_KEEPALIVE_INTERVAL)
+            .min(DEFAULT_WORKER_KEEPALIVE_INTERVAL.get());
         let keepalive_interval = NonZeroDuration::try_new(half).unwrap_or(worker_timeout);
         Self {
             keepalive_interval,
@@ -543,12 +545,34 @@ async fn dispatch_inbound_frame(
         WorkerKind::KeepAlive(keep_alive) => {
             let cache = keep_alive.cache.map(cache_stats_from_proto);
             let memory_capacity = keep_alive.memory_capacity.map(Bytes::new);
+            let inflight = keep_alive
+                .inflight
+                .into_iter()
+                .map(|update| {
+                    Ok(gang_scheduler::AttemptUsageUpdate {
+                        attempt_id: parse_attempt_id(update.attempt, "AttemptUsageUpdate.attempt")?,
+                        cpu_millicores: update.observed_cpu_millicores,
+                        memory: Bytes::new(update.working_set_memory_bytes),
+                    })
+                })
+                .collect::<Result<Vec<_>, InboundError>>()?;
             controller
                 .worker_event(
                     worker_key,
                     WorkerEvent::KeepAlive {
                         cache,
                         memory_capacity,
+                        load: keep_alive
+                            .load
+                            .map(|load| gang_scheduler::WorkerLoadSnapshot {
+                                observed_cpu_millicores: load.observed_cpu_millicores,
+                                cpu_psi_percent: load.cpu_psi_percent,
+                                cpu_saturated: load.cpu_saturated,
+                                reclaimable_cpu_millicores: load.reclaimable_cpu_millicores,
+                                sample_seq: load.sample_seq,
+                                observed_assign_seq: load.observed_assign_seq,
+                            }),
+                        inflight,
                     },
                 )
                 .await
@@ -656,6 +680,7 @@ fn parse_decline_reason(raw: i32) -> Result<DeclineReason, InboundError> {
     match proto::DeclineReason::try_from(raw) {
         Ok(proto::DeclineReason::DiskShortage) => Ok(DeclineReason::DiskShortage),
         Ok(proto::DeclineReason::Draining) => Ok(DeclineReason::Draining),
+        Ok(proto::DeclineReason::CpuPressure) => Ok(DeclineReason::CpuPressure),
         Ok(proto::DeclineReason::Unspecified) => Err(InboundError::Protocol(
             Status::invalid_argument("Decline.reason must not be DECLINE_REASON_UNSPECIFIED"),
         )),
@@ -674,19 +699,21 @@ fn parse_executed_frame(
     let timestamps = parse_timestamp_pair(started_proto, finished_proto);
     let wall_time = wall_duration_between(started_proto, finished_proto).unwrap_or(Duration::ZERO);
 
-    let (peak_memory, peak_disk, cpu_time, oom_kills) = match executed.usage {
-        Some(usage) => (
-            usage.peak_memory_bytes.map(Bytes::new),
-            usage.peak_disk_bytes.map(Bytes::new),
-            usage
-                .cpu_time
-                .as_ref()
-                .and_then(proto_to_duration)
-                .unwrap_or(Duration::ZERO),
-            usage.oom_kills,
-        ),
-        None => (None, None, Duration::ZERO, 0),
-    };
+    let (peak_memory, peak_disk, cpu_time, peak_window_cpu_millicores, oom_kills) =
+        match executed.usage {
+            Some(usage) => (
+                usage.peak_memory_bytes.map(Bytes::new),
+                usage.peak_disk_bytes.map(Bytes::new),
+                usage
+                    .cpu_time
+                    .as_ref()
+                    .and_then(proto_to_duration)
+                    .unwrap_or(Duration::ZERO),
+                usage.peak_window_cpu_millicores,
+                usage.oom_kills,
+            ),
+            None => (None, None, Duration::ZERO, None, 0),
+        };
 
     let kill = parse_executed_kill(executed.kill.as_ref(), &attempt_id, oom_kills)?;
     let had_error_status = executed.status.as_ref().is_some_and(|st| st.code != 0);
@@ -697,6 +724,7 @@ fn parse_executed_frame(
             peak_memory,
             peak_disk,
             cpu_time,
+            peak_window_cpu_millicores,
             wall_time,
             oom_kills,
         },
@@ -880,6 +908,25 @@ fn duration_to_proto(duration: Duration) -> prost_types::Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keepalive_interval_is_bounded_by_two_seconds_and_worker_timeout() {
+        use super::WorkerServiceConfig;
+        use gang_types::NonZeroDuration;
+        use std::time::Duration;
+
+        assert_eq!(
+            WorkerServiceConfig::from_worker_timeout(NonZeroDuration::from_secs(30))
+                .keepalive_interval
+                .get(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            WorkerServiceConfig::from_worker_timeout(NonZeroDuration::from_secs(2))
+                .keepalive_interval
+                .get(),
+            Duration::from_secs(1)
+        );
+    }
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::num::{NonZeroU32, NonZeroUsize};
@@ -914,6 +961,20 @@ mod tests {
     use crate::worker_session::{
         ConnectError, ConnectedChannel, SessionConfig, SessionConnector, SessionEvent, run_session,
     };
+
+    #[test]
+    fn sampled_peak_cpu_reaches_scheduler_executed_report() {
+        let mut usage = crate::worker_sampling::AttemptUsage::default();
+        usage.peak_window_cpu_millicores = Some(1_500);
+        let id = AttemptId::from_random_bytes([24; 16]);
+        let (executed, _) = parse_executed_frame(proto::Executed {
+            attempt: id.as_str().to_owned(),
+            usage: Some(usage.to_proto()),
+            ..Default::default()
+        })
+        .expect("executed");
+        assert_eq!(executed.usage.peak_window_cpu_millicores, Some(1_500));
+    }
 
     #[test]
     fn timeout_kills_are_reported_to_the_scheduler() {
@@ -1196,6 +1257,7 @@ mod tests {
                 peak_disk_bytes: Some(128 << 20),
                 oom_kills: 0,
                 sampled: true,
+                peak_window_cpu_millicores: Some(1_500),
             }),
             kill: None,
             status: None,

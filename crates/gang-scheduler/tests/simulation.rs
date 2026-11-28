@@ -359,8 +359,7 @@ mod harness {
         ) -> WorkerRegistration {
             let props = &self.catalog.fleets()[fleet_idx];
             let phys_vcpus = props.capacity(property::CPU_COUNT).unwrap_or(4);
-            let oversub = u64::from(self.scheduler.policy().actions.cpu_oversubscription.get());
-            let cap_cpu = phys_vcpus * property::MILLICORES_PER_CORE * oversub;
+            let cap_cpu = phys_vcpus * property::MILLICORES_PER_CORE;
             let cap_mem = Bytes::kib(
                 props
                     .capacity(property::MEMORY_KB)
@@ -784,6 +783,7 @@ mod harness {
                 self.metrics.executed_ok += 1;
             }
             let usage = AttemptUsage {
+                peak_window_cpu_millicores: None,
                 peak_memory: Some(Bytes::gib(peak_mem_gib)),
                 peak_disk: Some(Bytes::gib(peak_disk_gib)),
                 cpu_time: Duration::from_millis(self.rng.range_u64(500, 4_000)),
@@ -850,10 +850,20 @@ mod harness {
                     .unwrap_or(8 * 1024 * 1024);
                 let pct = self.rng.range_u64(75, 100);
                 let next = Bytes::kib((cap_kb * pct) / 100);
-                if let Some(w) = self.scheduler.workers().get(worker)
-                    && next < w.ledger.reserved().memory
-                {
-                    self.worker_lowered_mem.insert(worker);
+                if let Some(w) = self.scheduler.workers().get(worker) {
+                    let instance = Arc::clone(&w.instance);
+                    let affected: Vec<_> = self
+                        .scheduler
+                        .workers()
+                        .workers_sorted()
+                        .filter(|(_, candidate)| {
+                            candidate.fleet == fleet
+                                && candidate.instance == instance
+                                && next < candidate.ledger.reserved().memory
+                        })
+                        .map(|(key, _)| key)
+                        .collect();
+                    self.worker_lowered_mem.extend(affected);
                 }
                 Some(next)
             } else {
@@ -868,6 +878,8 @@ mod harness {
                         ..gang_spi::WorkerCacheStats::default()
                     }),
                     memory_capacity,
+                    load: None,
+                    inflight: Vec::new(),
                 },
                 "keepalive",
                 true,
@@ -1061,6 +1073,7 @@ mod harness {
                         reservation,
                         deadline,
                         deadline_wall,
+                        ..
                     } => {
                         self.verify_assign_effect(
                             worker,
@@ -1555,6 +1568,8 @@ mod harness {
                                 WorkerEvent::KeepAlive {
                                     cache: None,
                                     memory_capacity: None,
+                                    load: None,
+                                    inflight: Vec::new(),
                                 },
                                 "quiesce_keepalive",
                                 false,
@@ -1642,6 +1657,7 @@ mod harness {
             AttemptPhase::Running => WorkerEvent::Executed(WorkerExecuted {
                 attempt_id,
                 usage: AttemptUsage {
+                    peak_window_cpu_millicores: None,
                     peak_memory: Some(Bytes::gib(1)),
                     peak_disk: Some(Bytes::gib(1)),
                     cpu_time: Duration::from_secs(1),
@@ -1778,7 +1794,6 @@ mod harness {
             )])
             .expect("catalog");
             let mut policy = sim_policy(91);
-            policy.actions.cpu_oversubscription = NonZeroU32::MIN;
             policy.actions.cold_start.cpu_millicores = NonZeroU32::new(890).expect("cpu");
             policy.actions.cold_start.memory = WholeKib::from_units(10 * 1024);
             policy.actions.cold_start.disk = WholeKib::from_units(1024 * 1024);
@@ -2098,7 +2113,7 @@ mod harness {
         for &wk in &small_workers {
             let w = sim.scheduler.workers().get(wk).expect("worker");
             assert_eq!(w.inflight_attempts, 2);
-            assert_eq!(w.ledger.reserved().cpu_millicores, 4_000);
+            assert_eq!(w.ledger.reserved().cpu_millicores, 2_000);
         }
         assert_eq!(
             sim.scheduler
@@ -2130,7 +2145,9 @@ mod harness {
 
     #[test]
     fn adversarial_distributed_placement_and_dedup_promotion() {
-        let mut sim = Sim::new(42, multi_fleet_catalog(), sim_policy(42));
+        let mut policy = sim_policy(42);
+        policy.actions.cold_start.cpu_millicores = NonZeroU32::new(1_000).expect("nonzero");
+        let mut sim = Sim::new(42, multi_fleet_catalog(), policy);
         verify_even_spread_and_cordon(&mut sim);
 
         let op1 = exec_simple(&mut sim, "operations/p1", b"d1", 100, false);
@@ -2259,6 +2276,8 @@ mod harness {
             WorkerEvent::KeepAlive {
                 cache: None,
                 memory_capacity: None,
+                load: None,
+                inflight: Vec::new(),
             },
             "clear_disk_hold",
             true,
@@ -2315,6 +2334,7 @@ mod harness {
             WorkerEvent::Executed(WorkerExecuted {
                 attempt_id: att2_id.clone(),
                 usage: AttemptUsage {
+                    peak_window_cpu_millicores: None,
                     peak_memory: Some(Bytes::gib(18)),
                     peak_disk: Some(Bytes::gib(2)),
                     cpu_time: Duration::from_secs(2),
@@ -2526,6 +2546,7 @@ mod harness {
             WorkerEvent::Executed(WorkerExecuted {
                 attempt_id: att1.clone(),
                 usage: AttemptUsage {
+                    peak_window_cpu_millicores: None,
                     peak_memory: Some(Bytes::gib(10)),
                     peak_disk: Some(Bytes::gib(12)),
                     cpu_time: Duration::from_secs(14),
