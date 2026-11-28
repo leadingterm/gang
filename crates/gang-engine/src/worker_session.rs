@@ -144,8 +144,18 @@ where
 
 /// Samples periodic store and memory capacity telemetry for `KeepAlive` messages.
 pub trait TelemetrySource: Send + Sync {
+    /// Invalidates telemetry from the previous worker session.
+    fn start_session(&self) {}
     /// Returns current store measurements and optional observed post-reserve memory capacity.
     fn sample(&self) -> (WorkerCacheStats, Option<u64>);
+    /// Returns the latest available CPU sample.
+    fn cpu_load(&self) -> Option<proto::WorkerLoad> {
+        None
+    }
+    /// Returns material changes in active attempt usage.
+    fn inflight(&self) -> Vec<proto::AttemptUsageUpdate> {
+        Vec::new()
+    }
 }
 
 impl<F> TelemetrySource for F
@@ -497,6 +507,7 @@ async fn run_one_session<T: TelemetrySource, K: Clock>(
         }
     };
 
+    telemetry.start_session();
     if events
         .send(SessionEvent::Registered {
             worker_id: worker_id.clone(),
@@ -756,6 +767,8 @@ async fn drive_active_session<T: TelemetrySource, K: Clock>(
                     kind: Some(WorkerKind::KeepAlive(proto::KeepAlive {
                         cache: Some(cache_stats_to_proto(cache)),
                         memory_capacity,
+                        load: telemetry.cpu_load(),
+                        inflight: telemetry.inflight(),
                     })),
                 };
                 if out_tx.send(msg).await.is_err() {
@@ -892,6 +905,7 @@ const fn decline_reason_i32(reason: proto::DeclineReason) -> i32 {
         proto::DeclineReason::Unspecified => 0,
         proto::DeclineReason::DiskShortage => 1,
         proto::DeclineReason::Draining => 2,
+        proto::DeclineReason::CpuPressure => 3,
     }
 }
 
@@ -1103,6 +1117,8 @@ mod tests {
             skip_cache_lookup: false,
             do_not_cache: false,
             cpu_weight: 100,
+            assign_seq: 1,
+            guaranteed: false,
         }
     }
 

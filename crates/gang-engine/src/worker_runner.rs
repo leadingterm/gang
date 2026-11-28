@@ -589,6 +589,10 @@ pub struct RunSpec {
     pub side_channel: SideChannelInputs,
     /// Reserved memory in bytes for soft-ceiling and pressure-victim ranking.
     pub reserved_memory_bytes: u64,
+    /// Reserved CPU in millicores used as the initial live reporting threshold.
+    pub reserved_cpu_millicores: u64,
+    /// Whether the CPU reservation is guaranteed.
+    pub guaranteed: bool,
     /// Reserved disk in bytes for soft-ceiling and pressure-victim ranking.
     pub reserved_disk_bytes: u64,
     /// Action execution timeout starting when the process spawns.
@@ -599,6 +603,26 @@ pub struct RunSpec {
     pub kill_grace: NonZeroDuration,
     /// Maximum stdout/stderr bytes retained per stream in memory before spilling to a file.
     pub max_output_bytes: usize,
+}
+
+impl RunSpec {
+    fn registration(
+        &self,
+        attempt_dir: &Path,
+        side_channel_dir: &Path,
+        kill: KillTrigger,
+    ) -> AttemptRegistration {
+        AttemptRegistration {
+            attempt: self.attempt.clone(),
+            attempt_dir: attempt_dir.to_path_buf(),
+            side_channel_dir: side_channel_dir.to_path_buf(),
+            reserved_memory_bytes: self.reserved_memory_bytes,
+            reserved_cpu_millicores: self.reserved_cpu_millicores,
+            guaranteed: self.guaranteed,
+            reserved_disk_bytes: self.reserved_disk_bytes,
+            kill,
+        }
+    }
 }
 
 /// Executes one staged action attempt under `spec`, returning [`RunOutcome`] once the process and
@@ -637,14 +661,11 @@ pub async fn run_attempt<K: Clock>(
     );
 
     let tracked = sampler.map(|registry| {
-        registry.register(AttemptRegistration {
-            attempt: spec.attempt.clone(),
-            attempt_dir: dirs.attempt_dir.clone(),
-            side_channel_dir: side_channel.dir().to_path_buf(),
-            reserved_memory_bytes: spec.reserved_memory_bytes,
-            reserved_disk_bytes: spec.reserved_disk_bytes,
-            kill: kill_trigger.clone(),
-        })
+        registry.register(spec.registration(
+            &dirs.attempt_dir,
+            side_channel.dir(),
+            kill_trigger.clone(),
+        ))
     });
 
     let mut command = Command::new(&spec.entrypoint);
@@ -743,8 +764,12 @@ fn collect_final_usage(
     if let Some(sample) = final_cgroup_sample
         && sample.observed()
     {
-        if let Some(current) = sample.current_memory_bytes {
-            usage.record_memory(current);
+        if let Some(current) = sample
+            .working_set_memory_bytes
+            .or(sample.current_memory_bytes)
+            .filter(|value| *value > 0)
+        {
+            usage.record_working_set(current);
         }
         if let Some(peak) = sample.peak_memory_bytes {
             usage.record_memory(peak);
@@ -1428,6 +1453,8 @@ mod tests {
             output_paths: Vec::new(),
             side_channel: SideChannelInputs::default(),
             reserved_memory_bytes: 0,
+            reserved_cpu_millicores: 0,
+            guaranteed: false,
             reserved_disk_bytes: 0,
             timeout: Some(Duration::from_secs(15)),
             attempt_deadline: None,
@@ -1575,6 +1602,7 @@ mod tests {
         fn read_attempt_cgroup(&self, _cgroup: &Path) -> AttemptCgroupSample {
             AttemptCgroupSample {
                 current_memory_bytes: Some(256 * 1024 * 1024),
+                working_set_memory_bytes: None,
                 peak_memory_bytes: Some(300 * 1024 * 1024),
                 cpu_time: Some(Duration::from_millis(45)),
                 oom_kills: 0,
@@ -2077,6 +2105,8 @@ mod tests {
                 }),
             });
             let config = SamplingConfig {
+                cpu: gang_config::CpuTuning::default(),
+                physical_cpu_millicores: 4_000,
                 memory: MemoryTuning {
                     enforcement: MemoryEnforcement::Pressure,
                     reserve: NonZeroBytes::mib(100),
@@ -2137,7 +2167,7 @@ mod tests {
             let outcome = handle.await??;
             assert_eq!(outcome.kill, Some(KillReason::Memory));
             assert!(outcome.usage.sampled);
-            assert_eq!(outcome.usage.peak_memory_bytes, Some(300 * 1024 * 1024));
+            assert_eq!(outcome.usage.peak_memory_bytes, Some(256 * 1024 * 1024));
             assert_eq!(outcome.usage.cpu_time, Some(Duration::from_millis(45)));
             assert!(registry.is_quiescence_settled());
 

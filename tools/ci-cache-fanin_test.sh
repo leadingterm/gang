@@ -19,8 +19,8 @@ yq -o=json '.' "$repo/.github/workflows/cache-promotion.yml" | jq -e '
   [.jobs.promote.steps[] | select(.name == "Promote Bazel cache")] as $merge |
   ($download | length == 1) and
   ($download[0].uses | startswith("actions/download-artifact@")) and
-  ($download[0].with["artifact-ids"] == "${{ steps.queue.outputs.working-set-artifact-ids }}") and
-  ($download[0].with["run-id"] == "${{ steps.queue.outputs.run-id }}") and
+  ($download[0].with["artifact-ids"] == "${{ needs.select.outputs[matrix.arch] }}") and
+  ($download[0].with["run-id"] == "${{ needs.select.outputs.run-id }}") and
   ($download[0].with["github-token"] == "${{ github.token }}") and
   ($download[0].with["merge-multiple"] == false) and
   ($merge | length == 1) and
@@ -218,6 +218,16 @@ cmp "$producer/expected-used" "$RUNNER_TEMP/bazel-working-set/used"
 [[ -f $RUNNER_TEMP/bazel-working-set/files/disk/cas/00/$key5 ]]
 [[ ! -e $RUNNER_TEMP/bazel-working-set/files/repository/content_addressable/sha256/$key2 ]]
 cmp "$producer/restored-before" "$producer/restored"
+
+# A fully restored working set still produces a manifest artifact with no payload.
+zero_delta="$scratch/zero-delta"
+setup_case "$zero_delta"
+find "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" -type f -exec touch -t 202401010000.01 {} +
+tools/ci-cache.sh manifest "$BAZEL_DISK_CACHE" "$BAZEL_REPOSITORY_CACHE" >"$zero_delta/restored"
+export BAZEL_RESTORED_MANIFEST="$zero_delta/restored"
+bash -euo pipefail "$export_body"
+cmp "$zero_delta/restored" "$RUNNER_TEMP/bazel-working-set/used"
+[[ -z $(find "$RUNNER_TEMP/bazel-working-set/files" -type f -print -quit) ]]
 
 # With no restored snapshot (including forks), every used unit is exported.
 fresh_producer="$scratch/fresh-producer"

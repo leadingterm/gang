@@ -160,10 +160,6 @@ variable "database" {
     error_message = "database.postgres.external requires non-empty host, database, user and password_parameter, and a whole-number port from 1 to 65535."
   }
 
-  validation {
-    condition     = var.database.engine != "sqlite" || var.controller_count == 1
-    error_message = "sqlite requires controller_count to be 1."
-  }
 
   validation {
     condition     = var.database.engine == "sqlite" || var.load_balancer != null
@@ -178,18 +174,13 @@ variable "database" {
 
 variable "controller_count" {
   type        = number
-  description = "Number of controllers; more than one requires at least two availability zones."
+  description = "Number of controllers. Must be one because ECS health checks route only to the leader."
   default     = 1
   nullable    = false
 
   validation {
-    condition     = var.controller_count >= 1 && floor(var.controller_count) == var.controller_count
-    error_message = "controller_count must be a positive whole number."
-  }
-
-  validation {
-    condition     = var.controller_count <= 1 || coalesce(var.network.availability_zone_count, 3) >= 2
-    error_message = "controller_count greater than one requires at least two availability zones."
+    condition     = var.controller_count == 1
+    error_message = "controller_count must be 1."
   }
 }
 
@@ -265,7 +256,31 @@ variable "images" {
 
 variable "controller_instance_type" {
   type        = string
-  description = "EC2 instance type of the controller."
+  description = "EC2 instance type of the SQLite controller or ECS capacity host."
+  default     = "t4g.large"
+}
+
+variable "controller_image_digest" {
+  type        = string
+  description = "SHA-256 digest of the controller image in the deployment's private ECR repository, required for a shared database."
+  default     = null
+
+  validation {
+    condition     = !contains(["postgres", "dynamodb"], var.database.engine) || can(regex("^sha256:[0-9a-f]{64}$", var.controller_image_digest))
+    error_message = "controller_image_digest must be a sha256 digest for a shared database."
+  }
+}
+
+variable "controller_stop_timeout_seconds" {
+  type        = number
+  description = "Graceful controller drain timeout in seconds; also configures the ECS host stop timeout for a service."
+  default     = 2460
+  nullable    = false
+
+  validation {
+    condition     = var.controller_stop_timeout_seconds > 0 && floor(var.controller_stop_timeout_seconds) == var.controller_stop_timeout_seconds
+    error_message = "controller_stop_timeout_seconds must be a positive whole number."
+  }
 }
 
 variable "controller_root_volume_gib" {
@@ -473,9 +488,19 @@ variable "scratch_mount_point" {
 variable "gang_settings" {
   type = object({
     poll_interval         = optional(string, "2s")
-    cpu_oversubscription  = optional(number, 2)
     client_action_timeout = optional(string, "2m")
     input_links           = optional(string, "break")
+    cpu = optional(object({
+      headroom_percent              = optional(number)
+      saturate_utilization_percent  = optional(number)
+      clear_utilization_percent     = optional(number)
+      saturate_psi_percent          = optional(number)
+      clear_psi_percent             = optional(number)
+      decay_window                  = optional(string)
+      sample_interval               = optional(string)
+      inflight_report_delta_percent = optional(number)
+      max_reclaimed_cpu_ratio       = optional(number)
+    }))
   })
   nullable    = false
   default     = {}
@@ -483,19 +508,36 @@ variable "gang_settings" {
     Gang settings owned by the generated tables. poll_interval controls reconciliation and dashboard
     observation cadence; client_action_timeout bounds client action waits. The deployment supplies
     2s and 2m. input_links defaults to break rather than gang's keep to protect the CAS.
-    cpu_oversubscription renders as [actions] cpu_oversubscription = 2 by default; 1 disables
-    oversubscription.
     Each value must satisfy gang's own rule; the validations repeat it for plan-time feedback.
   EOT
 
   validation {
-    condition     = contains(["keep", "break"], var.gang_settings.input_links)
-    error_message = "gang_settings.input_links must be keep or break."
+    condition = var.gang_settings.cpu == null ? true : alltrue([
+      for key, value in var.gang_settings.cpu :
+      value == null ? true : (
+        contains(["decay_window", "sample_interval"], key) ?
+        try(
+          tonumber(regex("^(0*[1-9][0-9]*)(ms|s|m|h|d)$", tostring(value))[0]) *
+          { ms = 1, s = 1000, m = 60000, h = 3600000, d = 86400000 }[regex("^(0*[1-9][0-9]*)(ms|s|m|h|d)$", tostring(value))[1]] <= 18446744073709551615,
+          false
+        ) :
+        try(floor(tonumber(value)) == tonumber(value) && tonumber(value) >= (key == "max_reclaimed_cpu_ratio" ? 1 : 0) && tonumber(value) <= (key == "headroom_percent" ? 99 : key == "max_reclaimed_cpu_ratio" ? 4294967295 : 100), false)
+      )
+    ])
+    error_message = "gang_settings.cpu percentages must be whole numbers from 0 to 100 (headroom below 100), ratio a positive u32, and durations positive."
   }
 
   validation {
-    condition     = var.gang_settings.cpu_oversubscription >= 1 && var.gang_settings.cpu_oversubscription <= 4294967295 && floor(var.gang_settings.cpu_oversubscription) == var.gang_settings.cpu_oversubscription
-    error_message = "gang_settings.cpu_oversubscription must be an integer from 1 to 4294967295."
+    condition = var.gang_settings.cpu == null ? true : (
+      coalesce(var.gang_settings.cpu.clear_utilization_percent, 75) <= coalesce(var.gang_settings.cpu.saturate_utilization_percent, 85) &&
+      coalesce(var.gang_settings.cpu.clear_psi_percent, 5) <= coalesce(var.gang_settings.cpu.saturate_psi_percent, 10)
+    )
+    error_message = "gang_settings.cpu clear thresholds must not exceed saturation thresholds."
+  }
+
+  validation {
+    condition     = contains(["keep", "break"], var.gang_settings.input_links)
+    error_message = "gang_settings.input_links must be keep or break."
   }
 
   validation {

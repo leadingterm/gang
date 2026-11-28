@@ -15,7 +15,7 @@ module "gang" {
   cidr_block                   = "10.20.0.0/16"
   hostname                     = "gang.example.com"
   cache_bucket_name            = "example-gang-cache"
-  controller_instance_type     = "c7i.large"
+  controller_image_digest      = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   default_isa                  = "x86-64"
   trust_domain                 = "example.com"
   iam_name_prefix              = "example-"

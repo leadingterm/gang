@@ -1,6 +1,6 @@
 //! The error every port and plugin build returns.
 
-use gang_types::{CertSerial, Identity, InstanceId, ProviderName, WorkerId};
+use gang_types::{CertSerial, Digest, Identity, InstanceId, ProviderName, WorkerId};
 
 /// A boxed cause from a backend.
 pub type BoxedError = Box<dyn std::error::Error + Send + Sync>;
@@ -84,6 +84,9 @@ impl PortError {
 /// What a [`PortError::NotFound`] refers to.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Subject {
+    /// A content-addressed blob.
+    #[error("blob {0}")]
+    Blob(Digest),
     /// A provisioner instance.
     #[error("instance {0}")]
     Instance(InstanceId),

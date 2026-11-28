@@ -239,12 +239,12 @@ pub enum StagingError {
         reason: String,
     },
     /// A required CAS object was missing from both fast and slow stores.
-    #[error("missing {kind} blob {digest}")]
-    MissingBlob {
+    #[error("missing {kind} blobs")]
+    MissingBlobs {
         /// Kind of missing object (`Action`, `Command`, `Directory`, `input file`).
         kind: &'static str,
-        /// Missing blob digest.
-        digest: Digest,
+        /// Missing blob digests.
+        digests: Vec<Digest>,
     },
     /// A filesystem operation failed while materializing the attempt directory.
     #[error("filesystem error at `{}`: {source}", path.display())]
@@ -657,7 +657,16 @@ where
     for candidate in candidates {
         if let Some(lease) = cache
             .get_or_materialize_from(candidate.digest, dir_map, tiered)
-            .await?
+            .await
+            .map_err(|error| match error {
+                PortError::NotFound(gang_spi::Subject::Blob(digest)) => {
+                    StagingError::MissingBlobs {
+                        kind: "input file",
+                        digests: vec![digest],
+                    }
+                }
+                other => StagingError::Store(other),
+            })?
         {
             let relative_target = Path::new("work").join(&candidate.rel_path);
             let target = work_dir.join(&candidate.rel_path);
@@ -725,9 +734,9 @@ where
     let stream = tiered
         .read(digest, ByteRange::FULL)
         .await?
-        .ok_or(StagingError::MissingBlob {
+        .ok_or(StagingError::MissingBlobs {
             kind: "Action",
-            digest,
+            digests: vec![digest],
         })?;
     let bytes = stream.collect().await?;
     reapi::Action::decode(bytes).map_err(|source| StagingError::MalformedProto {
@@ -766,9 +775,9 @@ where
     let stream = tiered
         .read(digest, ByteRange::FULL)
         .await?
-        .ok_or(StagingError::MissingBlob {
+        .ok_or(StagingError::MissingBlobs {
             kind: "Command",
-            digest,
+            digests: vec![digest],
         })?;
     let bytes = stream.collect().await?;
     reapi::Command::decode(bytes).map_err(|source| StagingError::MalformedProto {
@@ -830,15 +839,12 @@ where
         }
 
         if !to_fetch.is_empty() {
-            let fetched: Vec<Result<(Digest, reapi::Directory), StagingError>> =
+            let fetched: Vec<Result<(Digest, Option<reapi::Directory>), StagingError>> =
                 futures::stream::iter(to_fetch)
                     .map(|digest| async move {
-                        let stream = tiered.read(digest, ByteRange::FULL).await?.ok_or(
-                            StagingError::MissingBlob {
-                                kind: "Directory",
-                                digest,
-                            },
-                        )?;
+                        let Some(stream) = tiered.read(digest, ByteRange::FULL).await? else {
+                            return Ok((digest, None));
+                        };
                         let bytes = stream.collect().await?;
                         let dir = reapi::Directory::decode(bytes).map_err(|source| {
                             StagingError::MalformedProto {
@@ -846,16 +852,27 @@ where
                                 source,
                             }
                         })?;
-                        Ok((digest, dir))
+                        Ok((digest, Some(dir)))
                     })
                     .buffer_unordered(concurrency.get())
                     .collect()
                     .await;
 
+            let mut missing = Vec::new();
             for item in fetched {
                 let (digest, dir) = item?;
+                let Some(dir) = dir else {
+                    record_missing(&mut missing, digest);
+                    continue;
+                };
                 dir_cache.insert(digest, Arc::new(dir.clone()));
                 dir_map.insert(digest, dir);
+            }
+            if !missing.is_empty() {
+                return Err(StagingError::MissingBlobs {
+                    kind: "Directory",
+                    digests: missing,
+                });
             }
         }
 
@@ -906,7 +923,7 @@ async fn fetch_tree_via_grpc(
     let mut page_token = String::new();
 
     loop {
-        let mut stream = client
+        let response = client
             .get_tree(reapi::GetTreeRequest {
                 instance_name: remote.instance_name.clone(),
                 root_digest: Some(proto_digest.clone()),
@@ -914,16 +931,27 @@ async fn fetch_tree_via_grpc(
                 page_token: page_token.clone(),
                 digest_function: reapi::digest_function::Value::Sha256 as i32,
             })
-            .await
-            .map_err(|status| PortError::backend(format!("GetTree failed: {status}")))?
-            .into_inner();
+            .await;
+        let mut stream = match response {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.code() == tonic::Code::NotFound => return Ok(()),
+            Err(status) => {
+                return Err(PortError::backend(format!("GetTree failed: {status}")).into());
+            }
+        };
 
         let mut next_token = String::new();
-        while let Some(resp) = stream
-            .message()
-            .await
-            .map_err(|status| PortError::backend(format!("GetTree stream failed: {status}")))?
-        {
+        loop {
+            let resp = match stream.message().await {
+                Ok(Some(resp)) => resp,
+                Ok(None) => break,
+                Err(status) if status.code() == tonic::Code::NotFound => return Ok(()),
+                Err(status) => {
+                    return Err(
+                        PortError::backend(format!("GetTree stream failed: {status}")).into(),
+                    );
+                }
+            };
             for dir in resp.directories {
                 let encoded = dir.encode_to_vec();
                 let digest = Digest::from_bytes(&encoded);
@@ -1453,6 +1481,7 @@ where
 
     let mut pins = Vec::new();
     let mut bypassed = HashSet::new();
+    let mut missing = Vec::new();
     for item in results {
         let (key, outcome) = item?;
         match outcome {
@@ -1462,15 +1491,24 @@ where
                 bypassed.insert(key);
             }
             FetchOutcome::Missing => {
-                return Err(StagingError::MissingBlob {
-                    kind: "input file",
-                    digest: key.digest,
-                });
+                record_missing(&mut missing, key.digest);
             }
         }
     }
 
+    if !missing.is_empty() {
+        return Err(StagingError::MissingBlobs {
+            kind: "input file",
+            digests: missing,
+        });
+    }
     Ok((pins, bypassed))
+}
+
+fn record_missing(missing: &mut Vec<Digest>, digest: Digest) {
+    if missing.len() < gang_reapi::MAX_REPORTED_MISSING_BLOBS {
+        missing.push(digest);
+    }
 }
 
 #[allow(deprecated)]
@@ -1560,9 +1598,9 @@ async fn materialize_workspace(
             let dest = work_dir.join(&file.rel_path);
             let linked = disk.hardlink_or_reflink_to(file.digest, file.executable, &dest)?;
             if !linked {
-                return Err(StagingError::MissingBlob {
+                return Err(StagingError::MissingBlobs {
                     kind: "input file",
-                    digest: file.digest,
+                    digests: vec![file.digest],
                 });
             }
         }
@@ -1651,9 +1689,9 @@ where
                 tiered.fetch_direct_to(digest, &dest, executable).await?
             };
             if !found {
-                return Err(StagingError::MissingBlob {
+                return Err(StagingError::MissingBlobs {
                     kind: "input file",
-                    digest,
+                    digests: vec![digest],
                 });
             }
             Ok(())
@@ -1760,6 +1798,80 @@ mod tests {
             tree_cache_min_files: NonZeroUsize::new(min_files).expect("min_files non-zero"),
             directory_cache_budget: NonZeroBytes::mib(8),
         }
+    }
+
+    #[tokio::test]
+    async fn staging_reports_missing_directory_and_input_files() -> TestResult {
+        let tmp = TempDir::new()?;
+        let slow = MemoryContentStore::new();
+        let disk = DiskCas::open(tmp.path().join("cas"), 1024 * 1024).await?;
+        let tiered = Tiered::new(disk.clone(), slow.clone());
+        let tree_cache = TreeCache::open(
+            tmp.path().join("trees"),
+            None,
+            disk,
+            TreeCacheConfig {
+                min_files: 1,
+                ..TreeCacheConfig::default()
+            },
+        )
+        .await?;
+        let command = reapi::Command {
+            arguments: vec!["true".to_owned()],
+            ..Default::default()
+        };
+        let command_digest = store_proto(&slow, &command);
+        let first = Digest::from_bytes(b"absent one");
+        let second = Digest::from_bytes(b"absent two");
+        for kind in 0..3 {
+            let child = if kind == 0 {
+                first
+            } else {
+                make_dir(
+                    &slow,
+                    vec![("one", first, false), ("two", second, false)],
+                    vec![],
+                    vec![],
+                )?
+            };
+            let root = if kind == 2 {
+                child
+            } else {
+                make_dir(&slow, vec![], vec![("sub", child)], vec![])?
+            };
+            let action = reapi::Action {
+                command_digest: Some(to_proto(&command_digest)?),
+                input_root_digest: Some(to_proto(&root)?),
+                ..Default::default()
+            };
+            let assign = make_assign(
+                AttemptId::generate()?.as_str(),
+                store_proto(&slow, &action),
+                Some(&action),
+                Some(&command),
+            )?;
+            let dir_cache = DirectoryCache::new(NonZeroBytes::mib(1));
+            let result = stage_attempt(
+                &assign,
+                &tmp.path().join("work"),
+                &tiered,
+                if kind == 1 { Some(&tree_cache) } else { None },
+                &dir_cache,
+                None,
+                &simple_config(1),
+            )
+            .await;
+            let Err(StagingError::MissingBlobs { digests, .. }) = result else {
+                return Err("expected missing blobs".into());
+            };
+            assert!(digests.contains(&first));
+            if kind == 2 {
+                assert!(digests.contains(&second));
+            }
+            let status = gang_reapi::missing_blobs_rpc_status(&digests, "missing");
+            assert_eq!(gang_reapi::extract_missing_blobs(&status), digests);
+        }
+        Ok(())
     }
 
     #[tokio::test]

@@ -161,6 +161,7 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
         } = self;
         Self::check_listener_collisions(listen, worker_listen, health_listen)?;
         Self::check_leadership(&server)?;
+        Self::check_cpu(&actions.cpu)?;
         let fleets = Fleets::resolve(fleets, &provisioner, &sandbox, actions.memory.reserve.get())?;
         Self::check_fleet_settings(&fleets, default_isa)?;
         if let Some(policy) = &execution.egress {
@@ -189,6 +190,7 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
                 worker_timeout: server.worker_timeout.get(),
             });
         }
+        Self::check_stop_timeout(&worker, &actions, &server)?;
         if let Some(name) = identity.providers.keys().find(|name| name.is_anonymous()) {
             return Err(ConfigError::ReservedProviderName(name.clone()));
         }
@@ -227,6 +229,40 @@ impl<P: PluginSet> GangConfig<P, Vec<RawFleet<P::SandboxKey>>> {
             sandbox,
             limits,
         })
+    }
+
+    fn check_stop_timeout(
+        worker: &WorkerConfig,
+        actions: &ActionsConfig,
+        server: &ServerConfig,
+    ) -> Result<(), ConfigError> {
+        let attempt_budget = worker.attempt_budget(actions.timeout);
+        if attempt_budget >= server.stop_timeout.get() {
+            return Err(ConfigError::StopTimeoutTooShort {
+                stop_timeout: server.stop_timeout.get(),
+                attempt_budget,
+            });
+        }
+        Ok(())
+    }
+
+    fn check_cpu(cpu: &crate::CpuTuning) -> Result<(), ConfigError> {
+        if cpu.headroom_percent >= 100 {
+            return Err(ConfigError::InvalidCpuWatermarks(
+                "headroom must be below 100",
+            ));
+        }
+        if cpu.clear_utilization_percent > cpu.saturate_utilization_percent {
+            return Err(ConfigError::InvalidCpuWatermarks(
+                "clear utilization exceeds saturation",
+            ));
+        }
+        if cpu.clear_psi_percent > cpu.saturate_psi_percent {
+            return Err(ConfigError::InvalidCpuWatermarks(
+                "clear PSI exceeds saturation",
+            ));
+        }
+        Ok(())
     }
 
     fn check_actions(fleets: &Fleets<P>, actions: &ActionsConfig) -> Result<(), ConfigError> {

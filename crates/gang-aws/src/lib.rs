@@ -41,7 +41,7 @@ mod events;
 mod fallback;
 mod fleet;
 mod group;
-mod host;
+mod identity;
 mod launch_failure;
 mod lifecycle;
 mod names;

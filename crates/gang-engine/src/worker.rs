@@ -11,7 +11,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -147,6 +147,12 @@ impl ControllerCas {
 }
 
 impl<C: ContentStore> ContentStore for WorkerContentStore<C> {
+    fn invalidate_existence(&self, digests: &[Digest]) {
+        if let Self::Direct(store) = self {
+            store.invalidate_existence(digests);
+        }
+    }
+
     async fn find_missing(
         &self,
         digests: &[Digest],
@@ -223,11 +229,24 @@ impl<Conn: SessionConnector> SessionConnector for ChannelCapturingConnector<Conn
 struct WorkerTelemetry {
     disk_cas: DiskCas,
     memory_capacity: Option<u64>,
+    sampling: SamplingRegistry,
 }
 
 impl TelemetrySource for WorkerTelemetry {
+    fn start_session(&self) {
+        self.sampling.start_session();
+    }
+
     fn sample(&self) -> (gang_spi::WorkerCacheStats, Option<u64>) {
         (self.disk_cas.worker_cache_stats(), self.memory_capacity)
+    }
+
+    fn cpu_load(&self) -> Option<proto::WorkerLoad> {
+        self.sampling.cpu_load()
+    }
+
+    fn inflight(&self) -> Vec<proto::AttemptUsageUpdate> {
+        self.sampling.inflight_updates()
     }
 }
 
@@ -342,15 +361,34 @@ struct WorkerRuntime<C, A, K> {
     shared_channel: Arc<Mutex<Option<Channel>>>,
     via_controller: bool,
     active_kills: Arc<Mutex<HashMap<String, KillTrigger>>>,
+    executing_attempts: Arc<AtomicUsize>,
+}
+
+struct AttemptControl {
+    trigger: KillTrigger,
+    waiter: KillWaiter,
+    active: ActiveAttemptGuard,
 }
 
 struct ActiveAttemptGuard {
     attempt: String,
     active_kills: Arc<Mutex<HashMap<String, KillTrigger>>>,
+    executing_attempts: Arc<AtomicUsize>,
+    computing: bool,
+}
+
+impl ActiveAttemptGuard {
+    fn finish_compute(&mut self) {
+        if self.computing {
+            self.computing = false;
+            self.executing_attempts.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl Drop for ActiveAttemptGuard {
     fn drop(&mut self) {
+        self.finish_compute();
         self.active_kills.lock().remove(&self.attempt);
     }
 }
@@ -405,6 +443,22 @@ where
 {
     start_orphan_reaper();
     let prepared = prepare_worker_runtime(spec, stores, clock).await?;
+    run_prepared_worker(spec, prepared, connector, clock, stop).await
+}
+
+async fn run_prepared_worker<Conn, C, A, K>(
+    spec: &WorkerRuntimeSpec,
+    prepared: PreparedWorker<C, A, K>,
+    connector: Conn,
+    clock: &K,
+    stop: impl Future<Output = ()> + Send,
+) -> Result<(), WorkerError>
+where
+    Conn: SessionConnector + 'static,
+    C: ContentStore,
+    A: ActionStore,
+    K: Clock + Clone + 'static,
+{
     let mut wrapped_connector = ChannelCapturingConnector {
         inner: connector,
         shared: Arc::clone(&prepared.runtime.shared_channel),
@@ -492,7 +546,7 @@ where
         .map_err(|err| WorkerError::Config(format!("work cleanup task failed: {err}")))??;
 
     let graveyard_pending = Arc::new(GraveyardPending::new());
-    let sampling = SamplingRegistry::new(spec.actions.memory, spec.actions.disk);
+    let sampling = SamplingRegistry::new(spec.actions.cpu, spec.actions.memory, spec.actions.disk);
     let graveyard = Graveyard::open(
         &spec.work_directory,
         spec.worker.graveyard_workers,
@@ -538,6 +592,11 @@ where
 
     let sampler = WorkerSampler::with_registry(
         SamplingConfig {
+            cpu: spec.actions.cpu,
+            physical_cpu_millicores: spec
+                .properties
+                .capacity(property::CPU_MILLICORES)
+                .unwrap_or(0),
             memory: spec.actions.memory,
             disk: spec.actions.disk,
             memory_pool: spec.memory_pool.as_ref().map(|pool| pool.cgroup.clone()),
@@ -551,6 +610,7 @@ where
     let telemetry = WorkerTelemetry {
         disk_cas: disk_cas.clone(),
         memory_capacity,
+        sampling: sampling.clone(),
     };
 
     let runtime = Arc::new(WorkerRuntime {
@@ -566,6 +626,7 @@ where
         shared_channel,
         via_controller,
         active_kills: Arc::new(Mutex::new(HashMap::new())),
+        executing_attempts: Arc::new(AtomicUsize::new(0)),
     });
 
     Ok(PreparedWorker {
@@ -720,6 +781,14 @@ where
                                 .await;
                             continue;
                         }
+                        let saturated = runtime.sampling.cpu_load().is_some_and(|load| load.cpu_saturated);
+                        if cpu_pressure_decline(saturated, &runtime.executing_attempts) {
+                            let free = free_work_bytes(&runtime.spec.work_directory);
+                            let _ = outbound
+                                .decline(&assign.attempt, proto::DeclineReason::CpuPressure, free)
+                                .await;
+                            continue;
+                        }
                         let requested_disk = assign.reservation.as_ref().map_or(0, |r| r.disk_bytes);
                         let reservation = match runtime
                             .disk_reservations
@@ -748,18 +817,22 @@ where
                             into_owned_reservation(reservation, &runtime.disk_reservations);
                         let (kill_trigger, kill_waiter) = kill_channel();
                         runtime.active_kills.lock().insert(assign.attempt.clone(), kill_trigger.clone());
-                        let active_guard = ActiveAttemptGuard { attempt: assign.attempt.clone(), active_kills: Arc::clone(&runtime.active_kills) };
+                        runtime.sampling.admit_assignment(assign.assign_seq);
+                        runtime.executing_attempts.fetch_add(1, Ordering::AcqRel);
+                        let active_guard = ActiveAttemptGuard { attempt: assign.attempt.clone(), active_kills: Arc::clone(&runtime.active_kills), executing_attempts: Arc::clone(&runtime.executing_attempts), computing: true };
                         let rt = Arc::clone(runtime);
                         attempt_tasks.spawn(async move {
-                            let _active_guard = active_guard;
                             execute_assigned_attempt(
                                 rt,
                                 *assign,
                                 worker_id,
                                 outbound,
                                 owned_reservation,
-                                kill_trigger,
-                                kill_waiter,
+                                AttemptControl {
+                                    trigger: kill_trigger,
+                                    waiter: kill_waiter,
+                                    active: active_guard,
+                                },
                             )
                             .await;
                         });
@@ -797,6 +870,10 @@ async fn drain_attempts(tasks: &mut JoinSet<()>) {
     while tasks.join_next().await.is_some() {}
 }
 
+fn cpu_pressure_decline(saturated: bool, executing_attempts: &AtomicUsize) -> bool {
+    saturated && executing_attempts.load(Ordering::Acquire) > 0
+}
+
 fn cancel_all_attempts(active_kills: &Mutex<HashMap<String, KillTrigger>>) {
     let triggers: Vec<KillTrigger> = active_kills.lock().values().cloned().collect();
     for trigger in triggers {
@@ -810,13 +887,17 @@ async fn execute_assigned_attempt<C, A, K>(
     worker_id: WorkerId,
     outbound: SessionOutbound,
     mut reservation: OwnedDiskReservation,
-    kill_trigger: KillTrigger,
-    kill_waiter: KillWaiter,
+    control: AttemptControl,
 ) where
     C: ContentStore,
     A: ActionStore,
     K: Clock + Clone + 'static,
 {
+    let AttemptControl {
+        trigger: kill_trigger,
+        waiter: kill_waiter,
+        active: mut active_guard,
+    } = control;
     let worker_start = runtime.clock.wall();
     let attempt_id = match AttemptId::try_from(assign.attempt.as_str()) {
         Ok(id) => id,
@@ -875,6 +956,9 @@ async fn execute_assigned_attempt<C, A, K>(
     // Release TreeLeases and input CasPins immediately on child exit BEFORE upload (`§6.3`).
     staged.release_for_upload();
     retire_guard.walk_bytes = run_outcome.usage.peak_disk_bytes.unwrap_or(0);
+
+    // Match the controller compute lifecycle before reporting process exit.
+    active_guard.finish_compute();
 
     // Emit `ConnectRequest::Executed` immediately before upload (`§6.4`).
     let executed_proto = run_outcome.to_executed_proto(&attempt_id);
@@ -1153,8 +1237,7 @@ fn build_session_config(spec: &WorkerRuntimeSpec) -> SessionConfig {
         .properties
         .capacity(property::CPU_MILLICORES)
         .unwrap_or(0);
-    let cpu_millicores =
-        cpu_physical.saturating_mul(u64::from(spec.actions.cpu_oversubscription.get()));
+    let cpu_millicores = cpu_physical;
     let memory_bytes = spec.memory_pool.as_ref().map_or_else(
         || {
             spec.properties
@@ -1264,6 +1347,11 @@ fn build_run_spec(
             read_only_trees,
         },
         reserved_memory_bytes,
+        reserved_cpu_millicores: assign
+            .reservation
+            .as_ref()
+            .map_or(0, |res| res.cpu_millicores),
+        guaranteed: assign.guaranteed,
         reserved_disk_bytes,
         timeout,
         attempt_deadline,
@@ -1339,6 +1427,12 @@ fn rpc_status(code: rpc_proto::Code, message: impl Into<String>) -> rpc_proto::S
 }
 
 fn staging_error_status(error: &StagingError) -> rpc_proto::Status {
+    if let StagingError::MissingBlobs { kind, digests } = error {
+        return gang_reapi::missing_blobs_rpc_status(
+            digests,
+            format!("missing {} {kind} blob(s)", digests.len()),
+        );
+    }
     let code = match error {
         StagingError::InvalidAttemptId(_)
         | StagingError::MissingField { .. }
@@ -1346,7 +1440,7 @@ fn staging_error_status(error: &StagingError) -> rpc_proto::Status {
         | StagingError::MalformedProto { .. }
         | StagingError::InvalidPath { .. }
         | StagingError::InvalidTree { .. } => rpc_proto::Code::InvalidArgument,
-        StagingError::MissingBlob { .. } => rpc_proto::Code::FailedPrecondition,
+        StagingError::MissingBlobs { .. } => rpc_proto::Code::FailedPrecondition,
         StagingError::Cancelled => rpc_proto::Code::Cancelled,
         StagingError::Io { .. } | StagingError::Store(_) => rpc_proto::Code::Internal,
     };
@@ -1378,7 +1472,7 @@ fn upload_error_status(error: &UploadError) -> rpc_proto::Status {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::num::NonZeroUsize;
@@ -1525,9 +1619,12 @@ mod tests {
                 let budget = InflightBlobBudget::new(NonZeroBytes::mib(64));
                 let cas =
                     CasService::new(Arc::clone(&content), budget.clone(), CasConfig::default());
-                let bytestream =
-                    ByteStreamService::new(content, budget, ByteStreamConfig::default());
-                let action_cache = ActionCacheService::new(ac);
+                let bytestream = ByteStreamService::new(
+                    Arc::clone(&content),
+                    budget,
+                    ByteStreamConfig::default(),
+                );
+                let action_cache = ActionCacheService::new(ac, content);
                 let _ = builder
                     .add_service(ContentAddressableStorageServer::new(cas))
                     .add_service(ByteStreamServer::new(bytestream))
@@ -1560,7 +1657,7 @@ mod tests {
         }
     }
 
-    fn test_spec(
+    pub(crate) fn test_spec(
         root: &Path,
         lifetime: WorkerLifetime,
         with_trees: bool,
@@ -1603,6 +1700,17 @@ mod tests {
             max_message_size: DEFAULT_WORKER_MAX_MESSAGE_SIZE,
             remote_compression: Compression::Identity,
         })
+    }
+
+    #[test]
+    fn worker_registers_physical_cpu_capacity() -> TestResult {
+        let spec = test_spec(Path::new("/tmp"), WorkerLifetime::LongLived, false)?;
+        let config = build_session_config(&spec);
+        assert_eq!(
+            config.register.capacity.expect("capacity").cpu_millicores,
+            4_000
+        );
+        Ok(())
     }
 
     fn registered_frame(worker_id: &str) -> proto::ControllerMessage {
@@ -1701,6 +1809,8 @@ mod tests {
                 skip_cache_lookup: false,
                 do_not_cache: false,
                 cpu_weight: 100,
+                assign_seq: 1,
+                guaranteed: false,
             })),
         })
     }
@@ -1729,7 +1839,7 @@ mod tests {
         runtime.block_on(future)
     }
 
-    fn spawn_direct_worker<C: ContentStore>(
+    pub(crate) fn spawn_direct_worker<C: ContentStore>(
         spec: WorkerRuntimeSpec,
         content: Arc<C>,
         actions: Arc<MemoryActionStore>,
@@ -1875,6 +1985,8 @@ mod tests {
         server: JoinHandle<()>,
         stop: oneshot::Sender<()>,
         attempt: &'static str,
+        executing_attempts: Arc<AtomicUsize>,
+        active_kills: Arc<Mutex<HashMap<String, KillTrigger>>>,
     }
 
     async fn start_blocked_upload(root: &Path) -> TestResult<UploadAttempt> {
@@ -1892,13 +2004,31 @@ mod tests {
         let (controller, mut sessions) = MockController::new();
         let (addr, server) = spawn_mock_server(controller, None).await?;
         let (stop, stop_rx) = oneshot::channel();
-        let worker = spawn_direct_worker(
-            spec.clone(),
-            Arc::clone(&content),
-            Arc::clone(&actions),
-            addr,
-            stop_rx,
-        );
+        start_orphan_reaper();
+        let prepared = prepare_worker_runtime(
+            &spec,
+            WorkerStores::Direct {
+                content: Arc::clone(&content),
+                actions: Arc::clone(&actions),
+            },
+            &SystemClock::new(),
+        )
+        .await?;
+        let executing_attempts = Arc::clone(&prepared.runtime.executing_attempts);
+        let active_kills = Arc::clone(&prepared.runtime.active_kills);
+        let worker_spec = spec.clone();
+        let worker = tokio::spawn(async move {
+            run_prepared_worker(
+                &worker_spec,
+                prepared,
+                endpoint_connector(addr),
+                &SystemClock::new(),
+                async move {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+        });
         let (mut session, _) = expect_register_and_ack(
             &mut sessions,
             "inst-e5-00000000-0000-4000-8000-000000000024",
@@ -1936,6 +2066,22 @@ mod tests {
             server,
             stop,
             attempt,
+            executing_attempts,
+            active_kills,
+        })
+    }
+
+    #[test]
+    fn upload_does_not_trigger_cpu_pressure_decline() -> TestResult {
+        run_gated(async {
+            let tmp = TempDir::new()?;
+            let upload = start_blocked_upload(&tmp.path().canonicalize()?).await?;
+            assert!(upload.active_kills.lock().contains_key(upload.attempt));
+            assert!(!cpu_pressure_decline(true, &upload.executing_attempts));
+            let _ = upload.stop.send(());
+            tokio::time::timeout(Duration::from_secs(5), upload.worker).await???;
+            upload.server.abort();
+            Ok(())
         })
     }
 
@@ -2381,6 +2527,86 @@ mod tests {
                 WorkerKind::GoingAway(_)
             ));
             server.abort();
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn missing_inputs_produce_rich_worker_status() -> TestResult {
+        run_gated(async {
+            for kind in 0..3 {
+                let tmp = TempDir::new()?;
+                let root = tmp.path().canonicalize()?;
+                let mut spec = test_spec(&root, WorkerLifetime::LongLived, kind == 1)?;
+                spec.worker.tree_cache_min_files = NonZeroUsize::MIN;
+                let content = Arc::new(MemoryContentStore::new());
+                let actions = Arc::new(MemoryActionStore::new());
+                let (action_digest, action_bytes, command) = seed_action_in_store(
+                    &content,
+                    WRITE_OUTPUT_CHILD,
+                    Vec::new(),
+                    Vec::new(),
+                    vec![("input".to_owned(), Bytes::from_static(b"missing-input"))],
+                )
+                .await?;
+                let missing_file = Digest::from_bytes(b"missing-input");
+                let mut action = reapi::Action::decode(action_bytes)?;
+                let directory = from_proto(action.input_root_digest.as_ref().ok_or("root")?)?;
+                let missing = if kind == 0 {
+                    let _ = content.remove(directory);
+                    directory
+                } else {
+                    if kind == 1 {
+                        let parent = reapi::Directory {
+                            directories: vec![reapi::DirectoryNode {
+                                name: "sub".to_owned(),
+                                digest: Some(to_proto(&directory)?),
+                            }],
+                            ..Default::default()
+                        };
+                        let parent_digest = content.insert(Bytes::from(parent.encode_to_vec()));
+                        action.input_root_digest = Some(to_proto(&parent_digest)?);
+                    }
+                    let _ = content.remove(missing_file);
+                    missing_file
+                };
+                let (controller, mut sessions) = MockController::new();
+                let (addr, server) = spawn_mock_server(controller, None).await?;
+                let (stop_tx, stop_rx) = oneshot::channel();
+                let worker = spawn_direct_worker(spec, content, actions, addr, stop_rx);
+                let (mut session, _) = expect_register_and_ack(
+                    &mut sessions,
+                    "inst-e5-00000000-0000-4000-8000-000000000001",
+                )
+                .await?;
+                let attempt = "00000000-0000-4000-8000-000000000101";
+                session
+                    .outbound_tx
+                    .send(Ok(assign_frame(
+                        attempt,
+                        action_digest,
+                        Some(Bytes::from(action.encode_to_vec())),
+                        Some(command),
+                        1024,
+                    )?))
+                    .await?;
+                assert!(matches!(
+                    next_non_keepalive(&mut session.inbound_rx).await?,
+                    WorkerKind::Accept(_)
+                ));
+                let WorkerKind::Completed(completed) =
+                    next_non_keepalive(&mut session.inbound_rx).await?
+                else {
+                    return Err("expected failed completion".into());
+                };
+                let Some(proto::completed::Outcome::Status(status)) = completed.outcome else {
+                    return Err("expected rich status".into());
+                };
+                assert_eq!(gang_reapi::extract_missing_blobs(&status), vec![missing]);
+                let _ = stop_tx.send(());
+                worker.await??;
+                server.abort();
+            }
             Ok(())
         })
     }

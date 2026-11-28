@@ -477,12 +477,7 @@ mod tests {
         let scaling = Arc::new(gang_config::ScalingConfig::default());
         let actions = gang_config::ActionsConfig::default();
         let profiles = SourceProfiles::new(&scaling, actions.history_window);
-        let mut reconciler = Reconciler::new(
-            &policies,
-            Arc::clone(&scaling),
-            profiles.clone(),
-            actions.cpu_oversubscription,
-        );
+        let mut reconciler = Reconciler::new(&policies, Arc::clone(&scaling), profiles.clone());
         let mut hosted = HostedSnapshot::default();
         hosted.replace(&mut snapshot);
         let mut plan = Plan::new();
@@ -495,12 +490,7 @@ mod tests {
         );
         let mut limited = fleets.clone();
         limited[0].policy.instances = gang_config::InstanceBounds::up_to(std::num::NonZeroU32::MIN);
-        let mut capped = Reconciler::new(
-            &[limited[0].policy.clone()],
-            scaling,
-            profiles,
-            actions.cpu_oversubscription,
-        );
+        let mut capped = Reconciler::new(&[limited[0].policy.clone()], scaling, profiles);
         let mut capped_plan = Plan::new();
         capped.reconcile(
             &mut limited,

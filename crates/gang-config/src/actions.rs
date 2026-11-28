@@ -8,7 +8,7 @@ use gang_types::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{ColdStartTuning, DiskTuning, MemoryTuning};
+use crate::{ColdStartTuning, CpuTuning, DiskTuning, MemoryTuning};
 
 const NANOS_PER_DAY: u64 = 86_400 * NANOS_PER_SECOND;
 /// A positive whole number of days.
@@ -29,8 +29,6 @@ pub struct ActionsConfig {
     /// Percentile (1–100) of completed attempts' lifetime-average CPU used for reservations.
     /// Default: 50 (median).
     pub cpu_reservation_percentile: Percent,
-    /// Multiplier for the worker's physical CPU reservation capacity. Default: 2.
-    pub cpu_oversubscription: NonZeroU32,
     /// History retention, in whole days, at least one day. Default: `7d`.
     pub history_window: HistoryWindow,
     /// Maximum target/mnemonic duration-cache keys, at least one. Default: 65536.
@@ -49,6 +47,8 @@ pub struct ActionsConfig {
     pub timeout: WholeSeconds,
     /// Grace before forced termination, nonzero whole milliseconds. Default: `5s`.
     pub kill_grace: NonZeroDuration,
+    /// CPU reclamation policy.
+    pub cpu: CpuTuning,
     /// Memory policy; each setting uses its documented default when omitted.
     pub memory: MemoryTuning,
     /// Disk policy; each setting uses its documented default when omitted.
@@ -62,7 +62,6 @@ impl Default for ActionsConfig {
             environment: EnvironmentName::default(),
             reservation_headroom_percent: HeadroomPercent::from_percent(20),
             cpu_reservation_percentile: Percent::from_percent(50),
-            cpu_oversubscription: NonZeroU32::MIN.saturating_add(1),
             history_window: HistoryWindow::from_units(7),
             history_keys: NonZeroUsize::MIN.saturating_add(65_535),
             history_memory_budget: NonZeroBytes::mib(512),
@@ -72,6 +71,7 @@ impl Default for ActionsConfig {
             max_worker_loss_retries: NonZeroU32::MIN.saturating_add(9),
             timeout: WholeSeconds::from_units(1200),
             kill_grace: NonZeroDuration::from_secs(5),
+            cpu: CpuTuning::default(),
             memory: MemoryTuning::default(),
             disk: DiskTuning::default(),
             cold_start: ColdStartTuning::default(),

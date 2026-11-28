@@ -13,8 +13,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  select:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      run-id: ${{ steps.queue.outputs.run-id }}
+      x86: ${{ steps.queue.outputs.x86-working-set-artifact-ids }}
+      arm: ${{ steps.queue.outputs.arm-working-set-artifact-ids }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Select qualified queue run
+        id: queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          SHA: ${{ github.sha }}
+        run: python3 tools/queue_ci.py --sha "$SHA" --github-output "$GITHUB_OUTPUT" --require-working-sets
+
   promote:
-    runs-on: ${{ github.event.repository.private && format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id) || 'ubuntu-24.04' }}
+    needs: [select]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            cache-job: linux-x86_64
+          - arch: arm
+            cache-job: linux-arm64
+    runs-on: ${{ github.event.repository.private && (matrix.arch == 'arm' && format('runs-on={0}/runner=4cpu-linux-arm64/ram=16/image=ubuntu24-full-arm64', github.run_id) || format('runs-on={0}/runner=4cpu-linux-x64/ram=16/image=ubuntu24-full-x64', github.run_id)) || (matrix.arch == 'arm' && 'ubuntu-24.04-arm' || 'ubuntu-24.04') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -26,20 +56,12 @@ jobs:
           cache-save: 'true'
       - uses: ./.github/actions/setup-bazel
         with:
-          cache-job: linux-x86_64
-      - name: Select qualified queue run
-        id: queue
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          GITHUB_API_URL: ${{ github.api_url }}
-          SHA: ${{ github.sha }}
-        run: python3 tools/queue_ci.py --sha "$SHA" --github-output "$GITHUB_OUTPUT" --require-working-sets
+          cache-job: ${{ matrix.cache-job }}
       - name: Download validated working sets
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          artifact-ids: ${{ steps.queue.outputs.working-set-artifact-ids }}
-          run-id: ${{ steps.queue.outputs.run-id }}
+          artifact-ids: ${{ needs.select.outputs[matrix.arch] }}
+          run-id: ${{ needs.select.outputs.run-id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/bazel-working-sets
           merge-multiple: false

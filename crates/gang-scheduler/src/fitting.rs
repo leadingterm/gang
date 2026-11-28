@@ -571,7 +571,6 @@ fn floor_refusal(catalog: &FleetCatalog, admitted: FleetSet, floors: ClientFloor
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
     use std::time::Duration;
 
     use gang_types::{
@@ -971,10 +970,5 @@ mod tests {
         assert_eq!(tagged.cpu_millicores, 250);
         assert_eq!(tagged.memory, Bytes::new(0));
         assert_eq!(tagged.disk, Bytes::gib(4));
-    }
-
-    #[test]
-    fn cpu_oversubscription_constant_unused_warning_free() {
-        assert_eq!(NonZeroU32::MIN.get(), 1);
     }
 }

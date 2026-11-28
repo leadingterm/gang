@@ -1,7 +1,15 @@
-//! Rolling controller replacement while a build has executing and queued actions.
+//! Rolling controller replacement both idle and with executing and queued actions.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
+
+use gang_client::{ClientOptions, ServerApi};
+use gang_clock::SystemClock;
+use gang_tls::ServerTrust;
 
 use crate::build_output::BuildOutcome;
 use crate::check::Check;
@@ -15,6 +23,7 @@ use crate::system::Probe;
 use crate::upgrade_evidence::BuildEvidence;
 
 const EXECUTING: usize = 2;
+const IDLE_CLIENTS: u16 = 4;
 const PROBES: [Probe; 8] = [
     Probe::ControllerLoss0,
     Probe::ControllerLoss1,
@@ -102,18 +111,244 @@ fn held_attempts(journal: &Journal, run: &Run, attempts: &mut Attempts) -> Resul
         .count())
 }
 
-fn retire_original_hosts(
+fn server_config(config: &str) -> Result<gang_config::ServerConfig> {
+    let document: toml::Value = toml::from_str(config).map_err(crate::template::template_error)?;
+    document
+        .get("server")
+        .cloned()
+        .ok_or_else(|| E2eError::system("missing controller server configuration"))?
+        .try_into()
+        .map_err(crate::template::template_error)
+}
+
+fn idle_client_interval(limits: &gang_config::RateLimitConfig) -> Duration {
+    // All clients share a source address; reserve half the tighter sustained budget.
+    limits
+        .client
+        .refill_interval
+        .get()
+        .max(limits.global.refill_interval.get())
+        .saturating_mul(u32::from(IDLE_CLIENTS))
+        .saturating_mul(2)
+}
+
+fn observe_stable_host_priority(cluster: &Cluster<'_>) -> Result<()> {
+    let old = cluster.wait_for_leader()?;
+    let original_pid = cluster.controller_pid(old)?;
+    let successor = cluster.start_controller()?;
+    cluster
+        .wait_for_controller_leader_within(successor, cluster.stack().settings().startup_timeout)?;
+    cluster.wait_for_controller_health(successor)?;
+    cluster.observe_restarted_standby(old, successor, original_pid)?;
+    cluster.deregister_controller(old)?;
+    cluster.retire(old)?;
+    Ok(())
+}
+
+fn idle_client_requests(
     cluster: &Cluster<'_>,
-    leader: usize,
-    natural: ExitStatus,
-) -> Result<Vec<ExitStatus>> {
-    let mut statuses = Vec::with_capacity(2);
-    for index in [0, 1] {
-        cluster.deregister_controller(index)?;
-        let stopped = cluster.retire(index)?;
-        statuses.push(if index == leader { natural } else { stopped });
+    stop: &AtomicBool,
+    ready: &mpsc::Sender<()>,
+    interval: Duration,
+) -> Result<usize> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(E2eError::io("starting idle rolling-deploy client"))?;
+    let endpoint = cluster.stack().endpoint()?;
+    let pin = cluster.stack().ca_pin()?;
+    let mut completed = 0;
+    loop {
+        // Every caller also starts one final request after the observed NLB transition.
+        let finishing = stop.load(Ordering::Acquire);
+        // A new client forces a fresh public TCP/TLS connection on every request. Only the
+        // production API's existing not-started retry policy may recover a refusal.
+        let client = ServerApi::try_new(
+            &endpoint,
+            ServerTrust::Pin(&pin),
+            &ClientOptions::default(),
+            Arc::new(SystemClock::new()),
+        )
+        .map_err(E2eError::system_from("creating idle rolling-deploy client"))?;
+        runtime
+            .block_on(client.server(None))
+            .map_err(E2eError::system_from("idle public TLS request"))?;
+        completed += 1;
+        if completed == 1 {
+            ready
+                .send(())
+                .map_err(E2eError::system_from("announcing idle client readiness"))?;
+        }
+        if finishing {
+            return Ok(completed);
+        }
+        // Test-traffic pacing only, not a handover wait or retry. An unpark permit also
+        // makes a stop signalled before this park advance immediately to the final request.
+        std::thread::park_timeout(interval);
     }
-    Ok(statuses)
+}
+
+fn idle_replacement(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
+    let stack = cluster.stack();
+    // No build has been launched: neither an executing attempt nor a held action can keep
+    // the outgoing process alive and conceal premature listener shutdown.
+    stack.wait_live_state(stack.settings().history_timeout, |state| {
+        state.queue.total == 0 && state.workers.iter().all(|worker| worker.running == 0)
+    })?;
+    let old = cluster.wait_for_leader()?;
+    let original_pid = cluster.suppress_controller_restart(old)?;
+    let config = fs::read_to_string(cluster.release_config_path(old)?)
+        .map_err(E2eError::io("reading idle controller configuration"))?;
+    let config = server_config(&config)?;
+    let stop_timeout = config.stop_timeout.get();
+    let interval = idle_client_interval(&config.rate_limit);
+    let stop = AtomicBool::new(false);
+    let completed = std::thread::scope(|scope| -> Result<usize> {
+        let (ready, receivers) = mpsc::channel();
+        let clients: Vec<_> = (0..IDLE_CLIENTS)
+            .map(|_| {
+                let ready = ready.clone();
+                let stop = &stop;
+                scope.spawn(move || {
+                    let result = idle_client_requests(cluster, stop, &ready, interval);
+                    if result.is_err() {
+                        stop.store(true, Ordering::Release);
+                    }
+                    result
+                })
+            })
+            .collect();
+        drop(ready);
+        let observation = (|| -> Result<()> {
+            for _ in 0..IDLE_CLIENTS {
+                receivers
+                    .recv_timeout(stack.settings().startup_timeout)
+                    .map_err(E2eError::system_from("waiting for idle public TLS clients"))?;
+            }
+            let successor = cluster.start_controller()?;
+            cluster
+                .wait_for_controller_leader_within(successor, stack.settings().startup_timeout)?;
+            cluster.wait_for_controller_health(successor)?;
+            // Observe the actual NLB threshold transition, not a guessed routing delay.
+            cluster.wait_for_serving(&[successor])?;
+            let credentials = stack.administrator()?.credentials(&stack.ca_pin()?)?;
+            crate::upgrade_probe::probe_refusal(
+                &stack.endpoint()?,
+                &credentials,
+                cluster.controller_public_target(old)?,
+                bytes::Bytes::from_static(b"{}"),
+                stack.settings().handshake_timeout,
+            )?;
+            cluster.observe_yielded_controller(old, original_pid)?;
+            Ok(())
+        })();
+        stop.store(true, Ordering::Release);
+        for client in &clients {
+            client.thread().unpark();
+        }
+        let mut completed = 0;
+        let mut client_error = None;
+        for client in clients {
+            match client
+                .join()
+                .map_err(|_| E2eError::system("idle public TLS client panicked"))
+                .and_then(|result| result)
+            {
+                Ok(count) => completed += count,
+                Err(error) => {
+                    client_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = client_error {
+            return Err(error);
+        }
+        observation?;
+        Ok(completed)
+    })?;
+    // The supervisor still owns this exact child. Only now deliver real SIGTERM and
+    // require its successful, naturally reaped exit within the configured stop budget.
+    cluster.observe_yielded_controller(old, original_pid)?;
+    let retiring = cluster.begin_retire(old)?;
+    let status = cluster.finish_retire_within(&retiring, stop_timeout)?;
+    cluster.deregister_controller(old)?;
+    Ok(vec![
+        Check::expect(
+            "rolling deploy idle: concurrent public TLS requests have zero transport errors",
+            completed >= usize::from(IDLE_CLIENTS) * 2,
+            || format!("{completed} requests completed across {IDLE_CLIENTS} clients"),
+        ),
+        Check::passed(
+            "rolling deploy idle: original PID serves complete refusal and health until SIGTERM",
+        ),
+        Check::expect(
+            "rolling deploy idle: original controller exits successfully after SIGTERM",
+            status.success(),
+            || format!("original PID {original_pid} retirement status: {status}"),
+        ),
+    ])
+}
+
+fn replace_controllers(
+    cluster: &Cluster<'_>,
+    attempts: &Attempts,
+    work_is_held: impl Fn() -> Result<bool>,
+    release: impl FnOnce() -> Result<()>,
+) -> Result<(bool, Vec<ExitStatus>)> {
+    let initial_leader = cluster.wait_for_leader()?;
+    let config = fs::read_to_string(cluster.release_config_path(initial_leader)?)
+        .map_err(E2eError::io("reading original controller configuration"))?;
+    let stop_timeout = server_config(&config)?.stop_timeout.get();
+    let original_holder = cluster.controller_identity(initial_leader)?;
+    let original_attempts: BTreeMap<_, _> = attempts
+        .iter()
+        .map(|(key, attempt)| (key.clone(), (attempt.worker, attempt.start)))
+        .collect();
+    cluster.observe_unprepared_candidate(initial_leader, &work_is_held)?;
+    if !cluster.controller_is_leader(initial_leader)?
+        || !cluster.controller_is_healthy(initial_leader)?
+    {
+        return Err(E2eError::system(
+            "original controller lost leadership after unprepared candidate collection",
+        ));
+    }
+    let retired_leader = cluster.controller_is_leader(initial_leader)?;
+    let next = cluster.start_controller()?;
+    let mut retiring = None;
+    release_after_promotion(
+        || {
+            cluster
+                .wait_for_leader_matching(cluster.stack().settings().startup_timeout, |leader| {
+                    leader == next
+                })?;
+            cluster.wait_for_controller_health(next)
+        },
+        || {
+            if !work_is_held()?
+                || cluster.controller_identity(initial_leader)? != original_holder
+                || original_attempts.iter().any(|(key, &(worker, start))| {
+                    !attempts.get(key).is_some_and(|attempt| {
+                        attempt.worker == worker && attempt.start == start && attempt.end.is_none()
+                    })
+                })
+            {
+                return Err(E2eError::system(
+                    "original controller/worker/timestamp changed while work was held",
+                ));
+            }
+            Ok(())
+        },
+        || {
+            retiring = Some(cluster.begin_retire(initial_leader)?);
+            release()
+        },
+    )?;
+    let retiring = retiring.ok_or_else(|| E2eError::system("missing retirement signal"))?;
+    let natural = cluster.finish_retire_within(&retiring, stop_timeout)?;
+    let other = usize::from(initial_leader == 0);
+    cluster.deregister_controller(initial_leader)?;
+    cluster.deregister_controller(other)?;
+    Ok((retired_leader, vec![natural, cluster.retire(other)?]))
 }
 
 /// Replaces the initial controllers while the build is held, then judges its journal.
@@ -121,6 +356,8 @@ fn retire_original_hosts(
 /// # Errors
 /// Returns an error if the cluster, journal, or build cannot be observed.
 pub fn rolling_deploy(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
+    observe_stable_host_priority(cluster)?;
+    let idle_checks = idle_replacement(cluster)?;
     let signal = cluster.stack().signal_path();
     let journal = Journal::create(
         &signal.with_file_name("journal"),
@@ -150,46 +387,12 @@ pub fn rolling_deploy(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
                 .wait_live_state(cluster.stack().settings().history_timeout, |state| {
                     state.queue.total > 0
                 })?;
-            let initial_leader = cluster.wait_for_leader()?;
-            let original_pid = cluster.controller_pid(initial_leader)?;
-            let original_holder = cluster.controller_identity(initial_leader)?;
-            let original_attempts: BTreeMap<_, _> = attempts
-                .iter()
-                .map(|(key, attempt)| (key.clone(), (attempt.worker, attempt.start)))
-                .collect();
-            let next = cluster.start_controller()?;
-            let retired_leader = initial_leader == 0 || initial_leader == 1;
-            release_after_promotion(
-                || {
-                    cluster.wait_for_leader_matching(
-                        cluster.stack().settings().startup_timeout,
-                        |leader| leader == next,
-                    )?;
-                    cluster.wait_for_controller_health(next)
-                },
-                || {
-                    if build.is_finished()
-                        || !pending.is_held()?
-                        || cluster.controller_pid(initial_leader)? != original_pid
-                        || original_attempts.iter().any(|(key, &(worker, start))| {
-                            !attempts.get(key).is_some_and(|attempt| {
-                                attempt.worker == worker
-                                    && attempt.start == start
-                                    && attempt.end.is_none()
-                            })
-                        })
-                    {
-                        return Err(E2eError::system(
-                            "original controller/worker/timestamp changed while work was held",
-                        ));
-                    }
-                    Ok(())
-                },
+            let (retired_leader, statuses) = replace_controllers(
+                cluster,
+                &attempts,
+                || Ok(!build.is_finished() && pending.is_held()?),
                 || pending.release(),
             )?;
-            let natural = cluster.wait_exit(initial_leader)?;
-            cluster.wait_for_host_restart(initial_leader, original_pid, &original_holder)?;
-            let statuses = retire_original_hosts(cluster, initial_leader, natural)?;
             Ok((held, retired_leader, statuses))
         })();
         let settled = pending.settle(observation, || {
@@ -213,6 +416,7 @@ pub fn rolling_deploy(cluster: &Cluster<'_>) -> Result<Vec<Check>> {
             evidence.finished_success && evidence.failed_actions == 0,
             || format!("build evidence: {evidence:?}"),
         ));
+        checks.extend(idle_checks);
         Ok(checks)
     })
 }
@@ -222,6 +426,41 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
+
+    #[test]
+    fn stop_budget_comes_from_rendered_server_configuration() {
+        let default = server_config("[server]\ntransport = 'plaintext'\n")
+            .expect("default server configuration")
+            .stop_timeout
+            .get();
+        let configured = server_config("[server]\ntransport = 'plaintext'\nstop_timeout = '43m'\n")
+            .expect("configured stop timeout")
+            .stop_timeout
+            .get();
+        assert_eq!(configured, Duration::from_mins(43));
+        assert_ne!(default, configured);
+        assert!(server_config("[server]\ntransport = 'plaintext'\nstop_timeout = '0s'\n").is_err());
+    }
+
+    #[test]
+    fn idle_client_cadence_reserves_half_of_both_installed_budgets() {
+        assert_eq!(
+            idle_client_interval(&gang_config::RateLimitConfig::default()),
+            Duration::from_secs(16),
+        );
+        for (client, global, expected) in [("3s", "1s", 24), ("1s", "5s", 40)] {
+            let configuration = format!(
+                "[server]\ntransport = 'plaintext'\n\
+                 [server.rate_limit.client]\nburst = 30\nrefill_interval = '{client}'\n\
+                 [server.rate_limit.global]\nburst = 500\nrefill_interval = '{global}'\n"
+            );
+            let config = server_config(&configuration).expect("installed rate limits");
+            assert_eq!(
+                idle_client_interval(&config.rate_limit),
+                Duration::from_secs(expected),
+            );
+        }
+    }
 
     #[test]
     fn successor_health_and_original_identity_precede_release() {

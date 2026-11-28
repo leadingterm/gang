@@ -50,8 +50,8 @@ pub enum ServerError {
     #[error("another controller took the leader lease; this controller handed off")]
     LeadershipLost,
 
-    /// The controller's immutable host identity could not be obtained.
-    #[error("cannot identify the controller host")]
+    /// The controller's stable incarnation could not be obtained.
+    #[error("cannot identify the controller incarnation")]
     HostIdentity(#[source] PortError),
 
     /// The controller's candidate could not be registered.
@@ -61,6 +61,20 @@ pub enum ServerError {
     /// A bounded preparation or promotion phase exceeded its lease-call budget.
     #[error("the controller handoff phase timed out")]
     HandoffTimedOut(#[source] gang_clock::Elapsed),
+    /// Graceful shutdown exceeded its configured deadline.
+    #[error("graceful shutdown timed out")]
+    ShutdownTimedOut(#[source] gang_clock::Elapsed),
+
+    /// The shutdown deadline must exceed the longest possible worker attempt.
+    #[error(
+        "whole-attempt budget {attempt_budget:?} must be less than shutdown timeout {stop_timeout:?}"
+    )]
+    InvalidStopTimeout {
+        /// The configured whole-attempt budget.
+        attempt_budget: std::time::Duration,
+        /// The configured graceful shutdown timeout.
+        stop_timeout: std::time::Duration,
+    },
 
     /// The certificate authority could not be established from the signer.
     #[error("cannot establish the certificate authority")]

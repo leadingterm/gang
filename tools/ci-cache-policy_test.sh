@@ -57,8 +57,9 @@ yq -o=json '.' "$promotion" | jq -e '
   ([.jobs.promote.steps[] | select(.uses == "./.github/actions/setup-nix") |
     .with["cache-save"]] == ["true"]) and
   ([.jobs.promote.steps[] | select(.uses == "./.github/actions/setup-bazel") |
-    .with["cache-job"]] == ["linux-x86_64"]) and
-  ([.jobs.promote.steps[] | select(.name == "Select qualified queue run") |
+    .with["cache-job"]] == ["${{ matrix.cache-job }}"]) and
+  (.jobs.promote.strategy.matrix.include == [{"arch":"x86", "cache-job":"linux-x86_64"}, {"arch":"arm", "cache-job":"linux-arm64"}]) and
+  ([.jobs.select.steps[] | select(.name == "Select qualified queue run") |
     .run | contains("--require-working-sets")] == [true]) and
   ([.jobs.promote.steps[] | .run // "" | select(test("bazel (build|test)"))] | length == 0)
 ' >/dev/null
@@ -251,7 +252,7 @@ CACHE_HIT=false PR_CACHE_HIT=false
 export MODE=export PRUNE=true VALIDATE_OUTCOME=success SAVE=false CURRENT_CACHE_HIT=false
 for HEAD_REPO in "$REPO" example-fork/gang; do
   for CURRENT_CACHE_HIT in true false '' prefix-match; do
-    if [[ $CURRENT_CACHE_HIT == true ]]; then expected=false; else expected=true; fi
+    expected=true
     check "Bazel export exact-hit=$CURRENT_CACHE_HIT head=$HEAD_REPO" "$bazel_export" "$expected"
     check "Bazel upload exact-hit=$CURRENT_CACHE_HIT head=$HEAD_REPO" "$bazel_upload" "$expected"
     check "Bazel shutdown export exact-hit=$CURRENT_CACHE_HIT head=$HEAD_REPO" "$bazel_shutdown" "$expected"
@@ -300,6 +301,21 @@ for EVENT in push workflow_dispatch; do
   check "Bazel Linux $EVENT does not restore a base cache" "$bazel_base" false
   check "Bazel Linux $EVENT does not restore a PR cache" "$bazel_pr" false
   check "Bazel Linux $EVENT restores a current cache" "$bazel_restore" true
+done
+
+# The architecture and cache identity must match for every cache operation.
+OS=Linux EVENT=merge_group REF=$DEFAULT_REF MODE=export PRUNE=true VALIDATE_OUTCOME=success SAVE=false CURRENT_CACHE_HIT=true
+for pair in 'ARM64 linux-arm64 true' 'ARM64 linux-x86_64 false' 'X64 linux-arm64 false' 'X64 linux-x86_64 true'; do
+  read -r ARCH BAZEL_CACHE_JOB eligible <<< "$pair"
+  check "Bazel $ARCH/$BAZEL_CACHE_JOB restore" "$bazel_restore" "$eligible"
+  check "Bazel $ARCH/$BAZEL_CACHE_JOB export" "$bazel_export" "$eligible"
+  check "Bazel $ARCH/$BAZEL_CACHE_JOB upload" "$bazel_upload" "$eligible"
+  check "Bazel $ARCH/$BAZEL_CACHE_JOB merge group never saves directly" "$bazel" false
+  EVENT=push
+  check "Bazel $ARCH/$BAZEL_CACHE_JOB promotion" "$bazel" "$eligible"
+  EVENT=pull_request HEAD_REPO=example-fork/gang
+  check "Bazel $ARCH/$BAZEL_CACHE_JOB fork never saves" "$bazel" false
+  EVENT=merge_group HEAD_REPO=$REPO
 done
 
 for kind in root checkout-child checkout-parent home-child home-parent target-child target-parent; do

@@ -34,6 +34,10 @@ pub struct PlacedAssignment {
     pub priority: i32,
     /// Out-of-band `cgroup` v2 `cpu.weight` for this attempt.
     pub cpu_weight: gang_types::CpuWeight,
+    /// Whether physical CPU is protected for this attempt.
+    pub guaranteed: bool,
+    /// Monotonic assignment sequence for this worker.
+    pub assign_seq: u64,
 }
 
 /// Returns `true` when `worker` is eligible to execute `op` right now.
@@ -43,28 +47,47 @@ pub fn is_eligible(worker: &Worker, op: &Operation) -> bool {
         || !worker.is_current_build()
         || worker.has_disk_hold()
         || worker.is_single_use_exhausted()
+        || (worker.cpu_pressure_hold && worker.inflight_attempts > 0)
         || !matches!(op.stage, OperationStage::Queued)
         || !op.candidates.contains(worker.fleet)
     {
         return false;
     }
-    worker.has_inflight_slot() && worker.ledger.fits(op.reservation)
+    let free = worker.ledger.free();
+    let guaranteed = qos::is_gate(op.priority) || op.has_explicit_cpu_floor;
+    worker.has_inflight_slot()
+        && op.reservation.memory <= free.memory
+        && op.reservation.disk <= free.disk
+        && op.reservation.cpu_millicores <= worker.effective_cpu_free(guaranteed)
 }
 
 /// Ranks two eligible workers within the same candidate fleet (smaller = more preferred).
 ///
 /// Order:
-/// 1. Lowest reserved CPU fraction (exact `u128` cross-product)
+/// 1. Lowest effective reserved or observed CPU fraction (exact `u128` cross-product)
 /// 2. Fewest running gate-tier attempts
 /// 3. Least recently assigned (`last_assigned_seq`)
 /// 4. Ascending `WorkerId`
 #[must_use]
 pub fn compare_workers(left: &Worker, right: &Worker) -> Ordering {
-    left.ledger
-        .cmp_cpu_fraction(&right.ledger)
-        .then_with(|| left.gate_running.cmp(&right.gate_running))
-        .then_with(|| left.last_assigned_seq.cmp(&right.last_assigned_seq))
-        .then_with(|| left.id.cmp(&right.id))
+    let load = |worker: &Worker| {
+        let reserved = worker.ledger.reserved().cpu_millicores;
+        worker.live_load.map_or(reserved, |load| {
+            reserved.max(
+                load.observed_cpu_millicores
+                    .saturating_add(worker.dispatched_since_load_cpu),
+            )
+        })
+    };
+    crate::ledger::cmp_reserved_cpu_fraction(
+        load(left),
+        left.ledger.capacity().cpu_millicores,
+        load(right),
+        right.ledger.capacity().cpu_millicores,
+    )
+    .then_with(|| left.gate_running.cmp(&right.gate_running))
+    .then_with(|| left.last_assigned_seq.cmp(&right.last_assigned_seq))
+    .then_with(|| left.id.cmp(&right.id))
 }
 
 /// Selects the best eligible worker for `op` across its candidate fleets in preference order.
@@ -229,14 +252,16 @@ fn commit_operation(
     let priority = op.priority;
     let cpu_weight = op.cpu_weight;
     let is_gate = qos::is_gate(priority);
+    let guaranteed = is_gate || op.has_explicit_cpu_floor;
 
     if workers
-        .commit_assignment(worker_key, reservation, is_gate)
+        .commit_assignment(worker_key, reservation, is_gate, guaranteed)
         .is_err()
     {
         return None;
     }
     operations.mark_running(op_key, queue);
+    let assign_seq = workers.get(worker_key)?.last_assigned_seq;
 
     Some(PlacedAssignment {
         operation: op_key,
@@ -244,6 +269,8 @@ fn commit_operation(
         reservation,
         priority,
         cpu_weight,
+        guaranteed,
+        assign_seq,
     })
 }
 
@@ -405,6 +432,7 @@ mod tests {
                 candidates: FleetSet::try_from_indices(candidates.iter().copied())
                     .expect("candidates"),
                 priority,
+                has_explicit_cpu_floor: false,
                 reservation: ActionResources {
                     cpu_millicores,
                     memory: Bytes::gib(mem_gib),
@@ -419,6 +447,250 @@ mod tests {
             panic!("expected insert");
         };
         key
+    }
+
+    #[test]
+    fn quiet_worker_reclaims_cpu_for_normal_actions() {
+        let cat = two_fleet_catalog();
+        let mut workers = WorkerRegistry::from_catalog(&cat).expect("registry");
+        let worker = register_worker(&mut workers, "preferred", "quiet", 1, 8_000, 32);
+        let existing = ActionResources {
+            cpu_millicores: 7_000,
+            memory: Bytes::gib(1),
+            disk: Bytes::gib(1),
+        };
+        workers
+            .commit_assignment(worker, existing, false, false)
+            .expect("initial reservation");
+        let quiet = workers.get_mut(worker).expect("worker");
+        let observed_assign_seq = quiet.last_assigned_seq;
+        quiet.accept_load(crate::workers::WorkerLoadSnapshot {
+            non_guaranteed_observed_cpu_millicores: 0,
+            observed_cpu_millicores: 2_000,
+            cpu_psi_percent: 0,
+            cpu_saturated: false,
+            reclaimable_cpu_millicores: 4_800,
+            sample_seq: 1,
+            observed_assign_seq,
+        });
+        let mut ops = Operations::default();
+        let mut queue = OperationQueue::new(cat.len()).expect("queue");
+        let key = admit_op(
+            &mut ops,
+            &mut queue,
+            "operations/reclaim",
+            &[0],
+            100,
+            2_000,
+            1,
+        );
+        assert!(is_eligible(
+            workers.get(worker).expect("worker"),
+            ops.get(key).expect("operation")
+        ));
+        assert!(place_operation(key, &mut ops, &mut queue, &mut workers).is_some());
+        assert_eq!(
+            workers
+                .get(worker)
+                .expect("worker")
+                .ledger
+                .reserved()
+                .cpu_millicores,
+            9_000
+        );
+        let next = admit_op(&mut ops, &mut queue, "operations/next", &[0], 100, 3_000, 1);
+        assert!(!is_eligible(
+            workers.get(worker).expect("worker"),
+            ops.get(next).expect("operation")
+        ));
+    }
+
+    #[test]
+    fn delayed_and_duplicate_load_samples_do_not_forget_dispatches() {
+        let cat = two_fleet_catalog();
+        let mut workers = WorkerRegistry::from_catalog(&cat).expect("registry");
+        let key = register_worker(&mut workers, "preferred", "worker", 1, 8_000, 32);
+        let reservation = ActionResources {
+            cpu_millicores: 2_000,
+            memory: Bytes::gib(1),
+            disk: Bytes::gib(1),
+        };
+        let sample = crate::workers::WorkerLoadSnapshot {
+            non_guaranteed_observed_cpu_millicores: 0,
+            observed_cpu_millicores: 0,
+            cpu_psi_percent: 0,
+            cpu_saturated: false,
+            reclaimable_cpu_millicores: 6_800,
+            sample_seq: 1,
+            observed_assign_seq: 0,
+        };
+        workers.get_mut(key).expect("worker").accept_load(sample);
+        workers
+            .commit_assignment(key, reservation, false, false)
+            .expect("assignment");
+        let worker = workers.get_mut(key).expect("worker");
+        let assign_seq = worker.last_assigned_seq;
+        worker.accept_load(crate::workers::WorkerLoadSnapshot {
+            sample_seq: 2,
+            ..sample
+        });
+        assert_eq!(worker.dispatched_since_load_cpu, 2_000);
+        worker.accept_load(crate::workers::WorkerLoadSnapshot {
+            sample_seq: 2,
+            observed_assign_seq: assign_seq,
+            ..sample
+        });
+        assert_eq!(worker.dispatched_since_load_cpu, 2_000);
+        worker.accept_load(crate::workers::WorkerLoadSnapshot {
+            sample_seq: 3,
+            observed_assign_seq: assign_seq,
+            ..sample
+        });
+        assert_eq!(worker.dispatched_since_load_cpu, 0);
+    }
+
+    #[test]
+    fn guaranteed_reservation_blocks_reclaimed_backfill() {
+        let cat = two_fleet_catalog();
+        let mut workers = WorkerRegistry::from_catalog(&cat).expect("registry");
+        let worker = register_worker(&mut workers, "preferred", "worker", 1, 8_000, 32);
+        let mut ops = Operations::new();
+        let mut queue = OperationQueue::new(cat.len()).expect("queue");
+        let gate = admit_op(&mut ops, &mut queue, "operations/gate", &[0], 200, 8_000, 1);
+        assert!(place_operation(gate, &mut ops, &mut queue, &mut workers).is_some());
+        let entry = workers.get_mut(worker).expect("worker");
+        entry.accept_load(crate::workers::WorkerLoadSnapshot {
+            non_guaranteed_observed_cpu_millicores: 0,
+            observed_cpu_millicores: 0,
+            cpu_psi_percent: 0,
+            cpu_saturated: false,
+            reclaimable_cpu_millicores: 6_800,
+            sample_seq: 1,
+            observed_assign_seq: 0,
+        });
+        let normal = admit_op(
+            &mut ops,
+            &mut queue,
+            "operations/normal",
+            &[0],
+            100,
+            1_000,
+            1,
+        );
+        assert!(!is_eligible(
+            workers.get(worker).expect("worker"),
+            ops.get(normal).expect("operation")
+        ));
+    }
+
+    #[test]
+    fn normal_cpu_burn_cannot_invade_guaranteed_headroom() {
+        let cat = two_fleet_catalog();
+        let mut workers = WorkerRegistry::from_catalog(&cat).expect("registry");
+        let worker = register_worker(&mut workers, "preferred", "worker", 1, 16_000, 32);
+        for (cpu, guaranteed) in [(8_000, true), (6_000, false)] {
+            workers
+                .commit_assignment(
+                    worker,
+                    ActionResources {
+                        cpu_millicores: cpu,
+                        memory: Bytes::gib(1),
+                        disk: Bytes::gib(1),
+                    },
+                    false,
+                    guaranteed,
+                )
+                .expect("reservation");
+        }
+        let entry = workers.get_mut(worker).expect("worker");
+        let seq = entry.last_assigned_seq;
+        entry.accept_load(crate::workers::WorkerLoadSnapshot {
+            observed_cpu_millicores: 6_000,
+            non_guaranteed_observed_cpu_millicores: 6_000,
+            cpu_psi_percent: 0,
+            cpu_saturated: false,
+            reclaimable_cpu_millicores: 7_600,
+            sample_seq: 1,
+            observed_assign_seq: seq,
+        });
+        // Only the 2 unreserved physical cores remain; reclamation cannot invade guaranteed capacity.
+        assert_eq!(entry.effective_cpu_free(false), 2_000);
+        entry.accept_load(crate::workers::WorkerLoadSnapshot {
+            observed_cpu_millicores: 8_000,
+            non_guaranteed_observed_cpu_millicores: 8_000,
+            cpu_psi_percent: 0,
+            cpu_saturated: false,
+            reclaimable_cpu_millicores: 5_600,
+            sample_seq: 2,
+            observed_assign_seq: seq,
+        });
+        assert_eq!(entry.effective_cpu_free(false), 0);
+        entry.accept_load(crate::workers::WorkerLoadSnapshot {
+            observed_cpu_millicores: 8_000,
+            non_guaranteed_observed_cpu_millicores: 0,
+            cpu_psi_percent: 0,
+            cpu_saturated: false,
+            reclaimable_cpu_millicores: 5_600,
+            sample_seq: 3,
+            observed_assign_seq: seq,
+        });
+        assert_eq!(entry.effective_cpu_free(false), 5_600);
+    }
+
+    #[test]
+    fn idle_worker_preserves_full_physical_cpu_after_load_sample() {
+        let cat = two_fleet_catalog();
+        let mut workers = WorkerRegistry::from_catalog(&cat).expect("registry");
+        let worker = register_worker(&mut workers, "preferred", "worker", 1, 8_000, 32);
+        let entry = workers.get_mut(worker).expect("worker");
+        entry.accept_load(crate::workers::WorkerLoadSnapshot {
+            observed_cpu_millicores: 200,
+            non_guaranteed_observed_cpu_millicores: 0,
+            cpu_psi_percent: 0,
+            cpu_saturated: false,
+            reclaimable_cpu_millicores: 6_600,
+            sample_seq: 1,
+            observed_assign_seq: 0,
+        });
+        assert_eq!(entry.effective_cpu_free(false), 8_000);
+        let mut ops = Operations::new();
+        let mut queue = OperationQueue::new(cat.len()).expect("queue");
+        let big = admit_op(&mut ops, &mut queue, "operations/big", &[0], 100, 8_000, 1);
+        let placed = place_operation(big, &mut ops, &mut queue, &mut workers);
+        assert!(placed.is_some());
+    }
+
+    #[test]
+    fn ranking_accounts_for_observed_cpu_spikes() {
+        let cat = two_fleet_catalog();
+        let mut workers = WorkerRegistry::from_catalog(&cat).expect("registry");
+        let hot = register_worker(&mut workers, "preferred", "hot", 1, 8_000, 32);
+        let cool = register_worker(&mut workers, "preferred", "cool", 2, 8_000, 32);
+        let load = crate::workers::WorkerLoadSnapshot {
+            non_guaranteed_observed_cpu_millicores: 0,
+            observed_cpu_millicores: 6_000,
+            cpu_psi_percent: 0,
+            cpu_saturated: false,
+            reclaimable_cpu_millicores: 800,
+            sample_seq: 1,
+            observed_assign_seq: 0,
+        };
+        workers.get_mut(hot).expect("hot").accept_load(load);
+        workers
+            .get_mut(cool)
+            .expect("cool")
+            .accept_load(crate::workers::WorkerLoadSnapshot {
+                non_guaranteed_observed_cpu_millicores: 0,
+                observed_cpu_millicores: 1_000,
+                ..load
+            });
+        assert!(
+            compare_workers(
+                workers.get(cool).expect("cool"),
+                workers.get(hot).expect("hot")
+            )
+            .is_lt()
+        );
     }
 
     #[test]
@@ -440,6 +712,7 @@ mod tests {
                     memory: Bytes::gib(1),
                     disk: Bytes::gib(1),
                 },
+                false,
                 false,
             )
             .expect("reserve");
@@ -492,13 +765,19 @@ mod tests {
             disk: Bytes::gib(1),
         };
 
-        workers.commit_assignment(w_b, r4k, false).expect("b");
-        workers.commit_assignment(w_c, r1k, true).expect("c");
-        workers.commit_assignment(w_d, r2k, false).expect("d");
+        workers
+            .commit_assignment(w_b, r4k, false, false)
+            .expect("b");
+        workers.commit_assignment(w_c, r1k, true, true).expect("c");
+        workers
+            .commit_assignment(w_d, r2k, false, false)
+            .expect("d");
         // Keep w_a at 25% with seq=4? No, give w_a 0 gate_running and assign it BEFORE w_d?
         // Actually w_d got seq=3 above; let's assign w_a BEFORE w_d by committing w_a then w_d?
         // Here w_d already got seq=3, so if w_a gets seq=4, w_d has lower last_assigned_seq (LRU)!
-        workers.commit_assignment(w_a, r2k, false).expect("a");
+        workers
+            .commit_assignment(w_a, r2k, false, false)
+            .expect("a");
 
         // w_b has 50%; w_c has 25% + 1 gate; w_d and w_a have 25% + 0 gate, w_d has seq=3 < w_a seq=4.
         let op1 = admit_op(&mut ops, &mut queue, "operations/t1", &[0], 100, 1_000, 1);
@@ -530,7 +809,7 @@ mod tests {
         };
         for worker in [first, second] {
             workers
-                .commit_assignment(worker, busy, false)
+                .commit_assignment(worker, busy, false, false)
                 .expect("busy");
         }
         let head = admit_op(
@@ -552,10 +831,11 @@ mod tests {
                     disk: Bytes::gib(1),
                 },
                 false,
+                false,
             )
             .expect("remaining work");
         workers
-            .on_attempt_executed(second, busy, false)
+            .on_attempt_executed(second, busy, false, false, 0)
             .expect("release");
         // The second worker is now emptier, but the hold must stay on the first.
         assert!(place_operation(head, &mut ops, &mut queue, &mut workers).is_none());
@@ -607,7 +887,7 @@ mod tests {
         };
         for worker in [first, second] {
             workers
-                .commit_assignment(worker, busy, false)
+                .commit_assignment(worker, busy, false, false)
                 .expect("busy");
         }
         let head = admit_op(
@@ -641,7 +921,7 @@ mod tests {
             "replacement worker must drain"
         );
         workers
-            .on_attempt_executed(second, busy, false)
+            .on_attempt_executed(second, busy, false, false, 0)
             .expect("release");
         scan_queue_for_worker(
             second,
@@ -755,7 +1035,7 @@ mod tests {
 
         // Disk hold blocks dispatch until keepalive clears it.
         workers
-            .on_attempt_aborted(good, p1.reservation, false)
+            .on_attempt_aborted(good, p1.reservation, false, false, 0)
             .expect("abort");
         assert!(workers.set_disk_hold(good));
         assert!(place_operation(op2, &mut ops, &mut queue, &mut workers).is_none());

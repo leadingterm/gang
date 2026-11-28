@@ -203,6 +203,25 @@ pub enum RegistrationError {
 }
 
 /// A connected worker generation tracked by [`WorkerRegistry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerLoadSnapshot {
+    /// Smoothed observed CPU burn.
+    pub observed_cpu_millicores: u64,
+    /// Smoothed CPU use by non-guaranteed attempts.
+    pub non_guaranteed_observed_cpu_millicores: u64,
+    /// CPU pressure percentage.
+    pub cpu_psi_percent: u32,
+    /// Whether CPU pressure is latched.
+    pub cpu_saturated: bool,
+    /// CPU available for reclamation.
+    pub reclaimable_cpu_millicores: u64,
+    /// Monotonic sequence of this sample.
+    pub sample_seq: u64,
+    /// Highest assignment active at the start of the sampled interval.
+    pub observed_assign_seq: u64,
+}
+
+/// A connected worker generation tracked by [`WorkerRegistry`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worker {
     /// Controller-minted identifier starting with `{instance}-`.
@@ -241,10 +260,93 @@ pub struct Worker {
     pub registered_at: Now,
     /// Latest store counters reported in `KeepAlive`.
     pub cache_stats: Option<WorkerCacheStats>,
+    /// Last sampled load from this worker.
+    pub live_load: Option<WorkerLoadSnapshot>,
+    /// CPU pressure reported by a declined assignment.
+    pub cpu_pressure_hold: bool,
+    /// CPU dispatched since the latest load sample.
+    pub dispatched_since_load_cpu: u64,
+    /// CPU reserved by guaranteed actions.
+    pub guaranteed_cpu_millicores: u64,
+    /// Assignments not yet reflected in a CPU sample.
+    pub pending_cpu: std::collections::VecDeque<(u64, u64)>,
+    /// Last accepted CPU sample sequence.
+    pub last_load_sample_seq: u64,
+    cpu_tuning: gang_config::CpuTuning,
     flags: WorkerFlags,
 }
 
 impl Worker {
+    fn release_pending(&mut self, assign_seq: u64) {
+        if let Some(index) = self
+            .pending_cpu
+            .iter()
+            .position(|(seq, _)| *seq == assign_seq)
+            && let Some((_, cpu)) = self.pending_cpu.remove(index)
+        {
+            self.dispatched_since_load_cpu = self.dispatched_since_load_cpu.saturating_sub(cpu);
+        }
+    }
+
+    pub(crate) fn accept_load(&mut self, load: WorkerLoadSnapshot) -> bool {
+        if load.sample_seq <= self.last_load_sample_seq {
+            return false;
+        }
+        self.last_load_sample_seq = load.sample_seq;
+        while self
+            .pending_cpu
+            .front()
+            .is_some_and(|(seq, _)| *seq <= load.observed_assign_seq)
+        {
+            if let Some((_, cpu)) = self.pending_cpu.pop_front() {
+                self.dispatched_since_load_cpu = self.dispatched_since_load_cpu.saturating_sub(cpu);
+            }
+        }
+        let can_dispatch = !load.cpu_saturated;
+        self.cpu_pressure_hold = load.cpu_saturated;
+        self.live_load = Some(load);
+        can_dispatch
+    }
+
+    /// Returns the CPU reservation available under the latest load sample.
+    #[must_use]
+    pub fn effective_cpu_free(&self, guaranteed: bool) -> u64 {
+        let physical = self.ledger.capacity().cpu_millicores;
+        let physical_free = self.ledger.free().cpu_millicores;
+        if guaranteed || self.inflight_attempts == 0 {
+            return physical_free;
+        }
+        let headroom = u64::try_from(
+            u128::from(physical) * u128::from(self.cpu_tuning.headroom_percent) / 100,
+        )
+        .unwrap_or(u64::MAX);
+        let used = self.live_load.map_or(0, |load| {
+            load.observed_cpu_millicores
+                .max(
+                    self.guaranteed_cpu_millicores
+                        .saturating_add(load.non_guaranteed_observed_cpu_millicores),
+                )
+                .saturating_add(self.dispatched_since_load_cpu)
+        });
+        let base_free = self.live_load.map_or(physical_free, |_| {
+            physical_free.min(physical.saturating_sub(used))
+        });
+        let protected_free = physical.saturating_sub(headroom).saturating_sub(used);
+        let reclaimed = self
+            .live_load
+            .filter(|load| !load.cpu_saturated && !self.cpu_pressure_hold)
+            .map_or(0, |load| {
+                load.reclaimable_cpu_millicores
+                    .saturating_sub(self.dispatched_since_load_cpu)
+                    .min(protected_free)
+            });
+        let ceiling =
+            physical.saturating_mul(u64::from(self.cpu_tuning.max_reclaimed_cpu_ratio.get()));
+        base_free
+            .max(reclaimed)
+            .min(ceiling.saturating_sub(self.ledger.reserved().cpu_millicores))
+    }
+
     /// Returns `true` when the worker's `gang_version` matches the controller's build.
     #[must_use]
     pub const fn is_current_build(&self) -> bool {
@@ -288,6 +390,7 @@ impl Worker {
         !self.drain.blocks_assignment()
             && self.is_current_build()
             && !self.has_disk_hold()
+            && (!self.cpu_pressure_hold || self.inflight_attempts == 0)
             && self.has_inflight_slot()
     }
 }
@@ -335,6 +438,7 @@ pub struct WorkerRegistry {
     instances: BTreeMap<(usize, Arc<InstanceId>), InstanceState>,
     fleet_lookup: HashMap<String, usize>,
     next_assign_seq: u64,
+    cpu_tuning: gang_config::CpuTuning,
 }
 
 impl Default for WorkerRegistry {
@@ -346,11 +450,15 @@ impl Default for WorkerRegistry {
             instances: BTreeMap::new(),
             fleet_lookup: HashMap::new(),
             next_assign_seq: 1,
+            cpu_tuning: gang_config::CpuTuning::default(),
         }
     }
 }
 
 impl WorkerRegistry {
+    pub(crate) fn set_cpu_tuning(&mut self, tuning: gang_config::CpuTuning) {
+        self.cpu_tuning = tuning;
+    }
     /// Creates an empty registry matching the fleets in `catalog`.
     ///
     /// # Errors
@@ -372,6 +480,7 @@ impl WorkerRegistry {
             instances: BTreeMap::new(),
             fleet_lookup,
             next_assign_seq: 1,
+            cpu_tuning: gang_config::CpuTuning::default(),
         })
     }
 
@@ -493,6 +602,13 @@ impl WorkerRegistry {
             last_seen: now,
             registered_at: now,
             cache_stats: None,
+            live_load: None,
+            cpu_pressure_hold: false,
+            dispatched_since_load_cpu: 0,
+            guaranteed_cpu_millicores: 0,
+            pending_cpu: std::collections::VecDeque::new(),
+            last_load_sample_seq: 0,
+            cpu_tuning: self.cpu_tuning,
             flags,
         };
 
@@ -697,12 +813,26 @@ impl WorkerRegistry {
         key: WorkerKey,
         reservation: ActionResources,
         is_gate: bool,
+        guaranteed: bool,
     ) -> Result<(), LedgerError> {
         let seq = self.next_assign_seq;
         let Some(worker) = self.get_mut(key) else {
             return Err(LedgerError::InsufficientCapacity { resource: "worker" });
         };
-        worker.ledger.try_reserve(reservation)?;
+        worker
+            .ledger
+            .try_reserve_with_cpu_free(reservation, worker.effective_cpu_free(guaranteed))?;
+        worker.dispatched_since_load_cpu = worker
+            .dispatched_since_load_cpu
+            .saturating_add(reservation.cpu_millicores);
+        worker
+            .pending_cpu
+            .push_back((seq, reservation.cpu_millicores));
+        if guaranteed {
+            worker.guaranteed_cpu_millicores = worker
+                .guaranteed_cpu_millicores
+                .saturating_add(reservation.cpu_millicores);
+        }
         worker.inflight_attempts = worker.inflight_attempts.saturating_add(1);
         if is_gate {
             worker.gate_running = worker.gate_running.saturating_add(1);
@@ -723,11 +853,19 @@ impl WorkerRegistry {
         key: WorkerKey,
         reservation: ActionResources,
         is_gate: bool,
+        guaranteed: bool,
+        assign_seq: u64,
     ) -> Result<(), LedgerError> {
         let Some(worker) = self.get_mut(key) else {
             return Err(LedgerError::Underflow { resource: "worker" });
         };
         worker.ledger.release_compute(reservation)?;
+        if guaranteed {
+            worker.guaranteed_cpu_millicores = worker
+                .guaranteed_cpu_millicores
+                .saturating_sub(reservation.cpu_millicores);
+        }
+        worker.release_pending(assign_seq);
         worker.inflight_attempts = worker.inflight_attempts.saturating_sub(1);
         if is_gate {
             worker.gate_running = worker.gate_running.saturating_sub(1);
@@ -761,11 +899,19 @@ impl WorkerRegistry {
         key: WorkerKey,
         reservation: ActionResources,
         is_gate: bool,
+        guaranteed: bool,
+        assign_seq: u64,
     ) -> Result<(), LedgerError> {
         let Some(worker) = self.get_mut(key) else {
             return Err(LedgerError::Underflow { resource: "worker" });
         };
         worker.ledger.release_all(reservation)?;
+        if guaranteed {
+            worker.guaranteed_cpu_millicores = worker
+                .guaranteed_cpu_millicores
+                .saturating_sub(reservation.cpu_millicores);
+        }
+        worker.release_pending(assign_seq);
         worker.inflight_attempts = worker.inflight_attempts.saturating_sub(1);
         if is_gate {
             worker.gate_running = worker.gate_running.saturating_sub(1);
@@ -928,11 +1074,12 @@ mod tests {
             disk: Bytes::gib(5),
         };
         assert!(reg.get(w).expect("w").is_available_for_dispatch());
-        reg.commit_assignment(w, req, true).expect("assign");
+        reg.commit_assignment(w, req, true, true).expect("assign");
         assert!(!reg.get(w).expect("w").has_inflight_slot());
         assert_eq!(reg.get(w).expect("w").gate_running, 1);
 
-        reg.on_attempt_executed(w, req, true).expect("executed");
+        reg.on_attempt_executed(w, req, true, true, 0)
+            .expect("executed");
         assert_eq!(reg.get(w).expect("w").gate_running, 0);
         assert!(reg.get(w).expect("w").is_single_use_exhausted());
         assert!(!reg.get(w).expect("w").is_available_for_dispatch());

@@ -11,6 +11,10 @@ use gang_types::{FleetName, Isa, MAX_FLEETS, ProviderName, RoleName, Url};
 /// helps is [`gang_types::Fix::fix`].
 #[derive(Debug, thiserror::Error, gang_types::Fix)]
 pub enum ConfigError {
+    /// CPU reclamation watermarks are inconsistent.
+    #[error("invalid actions.cpu watermarks: {0}")]
+    #[fix("adjust the CPU headroom and saturation watermarks")]
+    InvalidCpuWatermarks(&'static str),
     /// The `gang.toml` text is not valid TOML or does not match the configuration schema;
     /// unknown backends and unknown fields are reported here with the accepted keys.
     #[error("invalid gang.toml")]
@@ -252,6 +256,19 @@ pub enum ConfigError {
         /// Controller worker eviction timeout.
         worker_timeout: Duration,
     },
+    /// The controller cannot drain one complete worker attempt before shutdown expires.
+    #[error(
+        "server.stop_timeout {stop_timeout:?} must be greater than actions.timeout plus worker.download_timeout and worker.upload_timeout ({attempt_budget:?})"
+    )]
+    #[fix(
+        "set server.stop_timeout above the sum of actions.timeout, worker.download_timeout and worker.upload_timeout"
+    )]
+    StopTimeoutTooShort {
+        /// Controller graceful shutdown timeout.
+        stop_timeout: Duration,
+        /// Maximum duration of download, execution and upload for one attempt.
+        attempt_budget: Duration,
+    },
     /// A planned handover must leave a call timeout before the oldest supported CLI's final retry.
     #[error(
         "planned handover {window:?} plus call timeout {call_timeout:?} must be below the minimum CLI last retry {last_attempt:?}"
@@ -457,6 +474,10 @@ mod tests {
             ConfigError::WorkerConnectTimeoutTooLong {
                 connect_timeout: Duration::from_secs(20),
                 worker_timeout: Duration::from_secs(10),
+            },
+            ConfigError::StopTimeoutTooShort {
+                stop_timeout: Duration::from_mins(1),
+                attempt_budget: Duration::from_mins(1),
             },
             ConfigError::HandoverOutlastsCli {
                 window: Duration::from_secs(15),

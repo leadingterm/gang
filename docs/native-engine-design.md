@@ -327,7 +327,7 @@ operation and worker records live in slabs addressed by generation-checked `u32`
   one physical instance (overlapping mTLS renewal generations), its cordon/drain intent, and its
   one capacity fact (latest generation's report wins; deduplicated per `InstanceId`).
 - `ledger`: per worker `capacity − reserved`, CPU in millicores =
-  `physical vCPU × 1000 × cpu_oversubscription` (SPEC §3.2), memory = registered post-reserve pool
+  `physical vCPU × 1000` (SPEC §3.2), memory = registered post-reserve pool
   capacity, disk = `disk_per_instance`.
 - `attempts: Slab<Attempt>`: `AttemptId` (fresh UUIDv4 per dispatch), operation, worker,
   `dispatched_at`, `ack_deadline`, `attempt_deadline = dispatched_at + attempt_budget`, phase

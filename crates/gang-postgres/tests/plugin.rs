@@ -36,42 +36,87 @@ fn host(name: &str) -> Result<ControllerHostIdentity, Box<dyn Error>> {
 }
 
 #[tokio::test]
-async fn legacy_writer_epoch_invalidates_priority_binding() -> Result<(), Box<dyn Error>> {
-    let server = shared_postgres()?;
-    let config = support::database(&server).await?;
-    let db = support::build(config.clone())?;
-    let older = db
-        .register_candidate(&ControllerId::new("older"), &host("older-host")?)
+async fn legacy_writer_cannot_be_asked_to_yield() -> Result<(), Box<dyn Error>> {
+    for stale_marker in [false, true] {
+        let server = shared_postgres()?;
+        let config = support::database(&server).await?;
+        let db = support::build(config.clone())?;
+        let older = db
+            .register_candidate(&ControllerId::new("older"), &host("older-host")?)
+            .await?;
+        let newer = db
+            .register_candidate(&ControllerId::new("newer"), &host("newer-host")?)
+            .await?;
+        let now = Timestamp::from_unix_millis(1);
+        let expires = Timestamp::from_unix_millis(1000);
+        let Acquisition::Acquired(lease) = db
+            .acquire(&older, now, now, expires, Takeover::Observe)
+            .await?
+        else {
+            return Err("older candidate did not acquire".into());
+        };
+        db.release(&lease).await?;
+        let raw = support::raw(&server, &config.database).await?;
+        if !stale_marker {
+            raw.execute(
+                "UPDATE leases SET safe_yield_epoch = NULL WHERE name = 'leader'",
+                &[],
+            )
+            .await?;
+        }
+        // An old writer increments the epoch but does not touch the capability marker.
+        raw.execute(
+            "UPDATE leases SET holder = 'legacy', epoch = epoch + 1, holder_priority = 'invalid', pending_holder = 'newer', pending_priority = $1, pending_epoch = epoch, pending_expires_at = expires_at WHERE name = 'leader'",
+            &[&newer.priority.as_str()],
+        )
         .await?;
-    let newer = db
-        .register_candidate(&ControllerId::new("newer"), &host("newer-host")?)
+        let Acquisition::Contending(legacy) = db
+            .acquire(&newer, now, now, expires, Takeover::Request)
+            .await?
+        else {
+            return Err("newer candidate did not contend with legacy holder".into());
+        };
+        assert_eq!(legacy.holder, ControllerId::new("legacy"));
+        assert_eq!(
+            db.renew(&legacy, now, expires).await?,
+            Renewal::Renewed(legacy.clone())
+        );
+        db.release(&legacy).await?;
+        let Acquisition::Acquired(successor) = db
+            .acquire(&newer, now, now, expires, Takeover::Request)
+            .await?
+        else {
+            return Err("successor did not acquire released lease".into());
+        };
+        let row = raw
+            .query_one(
+                "SELECT epoch, safe_yield_epoch FROM leases WHERE name = 'leader'",
+                &[],
+            )
+            .await?;
+        assert_eq!(
+            row.get::<_, Option<i64>>("safe_yield_epoch"),
+            Some(row.get("epoch"))
+        );
+        db.release(&successor).await?;
+        raw.execute(
+            "UPDATE leases SET holder = 'legacy', epoch = epoch + 1 WHERE name = 'leader'",
+            &[],
+        )
         .await?;
-    let now = Timestamp::from_unix_millis(1);
-    let expires = Timestamp::from_unix_millis(1000);
-    let Acquisition::Acquired(lease) = db
-        .acquire(&newer, now, now, expires, Takeover::Observe)
-        .await?
-    else {
-        return Err("newer candidate did not acquire".into());
-    };
-    db.release(&lease).await?;
-    let raw = support::raw(&server, &config.database).await?;
-    raw.execute(
-        "UPDATE leases SET holder = 'legacy', epoch = epoch + 1, holder_priority = 'invalid', pending_holder = 'newer', pending_priority = $1, pending_epoch = epoch, pending_expires_at = expires_at WHERE name = 'leader'",
-        &[&newer.priority.as_str()],
-    )
-    .await?;
-    let Acquisition::Contending(legacy) = db
-        .acquire(&older, now, now, expires, Takeover::Request)
-        .await?
-    else {
-        return Err("older candidate did not contend with legacy holder".into());
-    };
-    assert_eq!(legacy.holder, ControllerId::new("legacy"));
-    assert!(matches!(
-        db.renew(&legacy, now, expires).await?,
-        gang_spi::Renewal::YieldRequested(_)
-    ));
+        let later = Timestamp::from_unix_millis(1001);
+        assert!(matches!(
+            db.acquire(
+                &newer,
+                later,
+                later,
+                Timestamp::from_unix_millis(2000),
+                Takeover::Observe
+            )
+            .await?,
+            Acquisition::Acquired(_)
+        ));
+    }
     Ok(())
 }
 
@@ -419,6 +464,61 @@ async fn concurrent_plugins_initialize_one_database() -> Result<(), Box<dyn Erro
     let a = support::build(config.clone())?;
     let b = support::build(config)?;
     tokio::try_join!(a.revocation_epoch(), b.revocation_epoch())?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn schema_four_adds_nullable_safe_yield_marker_compatibly() -> Result<(), Box<dyn Error>> {
+    let server = shared_postgres()?;
+    let config = support::database(&server).await?;
+    let db = support::build(config.clone())?;
+    db.revocation_epoch().await?;
+    let raw = support::raw(&server, &config.database).await?;
+    let column = raw.query_one(
+        "SELECT data_type, is_nullable FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'leases' AND column_name = 'safe_yield_epoch'",
+        &[],
+    ).await?;
+    assert_eq!(column.get::<_, &str>("data_type"), "bigint");
+    assert_eq!(column.get::<_, &str>("is_nullable"), "YES");
+
+    // Recreate a preexisting version-four database and a row written by an old binary.
+    raw.batch_execute(
+        "ALTER TABLE leases DROP COLUMN safe_yield_epoch;
+         INSERT INTO leases (name, holder, epoch, expires_at) VALUES ('leader', 'legacy', 7, '2030-01-01 UTC');",
+    ).await?;
+    drop(db);
+    let first = support::build(config.clone())?;
+    let second = support::build(config.clone())?;
+    tokio::try_join!(first.revocation_epoch(), second.revocation_epoch())?;
+    let row = raw
+        .query_one(
+            "SELECT holder, epoch, safe_yield_epoch FROM leases WHERE name = 'leader'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>("holder"), "legacy");
+    assert_eq!(row.get::<_, i64>("epoch"), 7);
+    assert_eq!(row.get::<_, Option<i64>>("safe_yield_epoch"), None);
+    let version = raw
+        .query_one("SELECT current, oldest_compatible FROM schema_version", &[])
+        .await?;
+    assert_eq!(version.get::<_, i32>("current"), 4);
+    assert_eq!(version.get::<_, i32>("oldest_compatible"), 2);
+
+    // The legacy insert and update statements continue to work after migration.
+    raw.batch_execute(
+        "INSERT INTO leases (name, holder, epoch, expires_at) VALUES ('other', NULL, 0, '2030-01-01 UTC');
+         UPDATE leases SET holder = 'old-again', epoch = epoch + 1 WHERE name = 'leader';",
+    ).await?;
+    let row = raw
+        .query_one(
+            "SELECT holder, epoch, safe_yield_epoch FROM leases WHERE name = 'leader'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>("holder"), "old-again");
+    assert_eq!(row.get::<_, i64>("epoch"), 8);
+    assert_eq!(row.get::<_, Option<i64>>("safe_yield_epoch"), None);
     Ok(())
 }
 

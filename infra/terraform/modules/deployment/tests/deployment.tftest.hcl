@@ -769,9 +769,31 @@ run "renders_default_poll_interval" {
     error_message = "The default top-level poll interval must render as 2s."
   }
 
+}
+
+run "cpu_defaults_allow_extra_config" {
+  command = plan
+
+  variables {
+    extra_config_toml = "[actions.cpu]\nmax_reclaimed_cpu_ratio = 1\n"
+  }
+
   assert {
-    condition     = strcontains(output.gang_toml, "[actions]\ncpu_oversubscription = 2\n")
-    error_message = "The default shared actions CPU oversubscription must render as 2."
+    condition     = length(regexall("\\[actions\\.cpu\\]", output.gang_toml)) == 1
+    error_message = "The generated defaults must not reopen the extra CPU table."
+  }
+}
+
+run "cpu_settings_render_only_overrides" {
+  command = plan
+
+  variables {
+    gang_settings = { cpu = { max_reclaimed_cpu_ratio = 1 } }
+  }
+
+  assert {
+    condition     = strcontains(output.gang_toml, "[actions.cpu]\nmax_reclaimed_cpu_ratio = 1") && !strcontains(output.gang_toml, "headroom_percent =")
+    error_message = "Only specified CPU settings should be rendered."
   }
 }
 
@@ -780,8 +802,7 @@ run "renders_gang_settings_override" {
 
   variables {
     gang_settings = {
-      poll_interval        = "3s"
-      cpu_oversubscription = 3
+      poll_interval = "3s"
     }
   }
 
@@ -790,25 +811,6 @@ run "renders_gang_settings_override" {
     error_message = "gang_settings must override the rendered poll interval."
   }
 
-  assert {
-    condition     = strcontains(output.gang_toml, "[actions]\ncpu_oversubscription = 3\n")
-    error_message = "gang_settings must override the shared actions CPU oversubscription."
-  }
-}
-
-run "accepts_cpu_oversubscription_one" {
-  command = plan
-
-  variables {
-    gang_settings = {
-      cpu_oversubscription = 1
-    }
-  }
-
-  assert {
-    condition     = strcontains(output.gang_toml, "[actions]\ncpu_oversubscription = 1\n")
-    error_message = "CPU oversubscription of 1 must render as an integer."
-  }
 }
 
 run "pins_ca_to_signer_and_wires_endpoints" {
@@ -1423,38 +1425,6 @@ run "rejects_input_links_outside_keep_and_break" {
   ]
 }
 
-run "rejects_zero_cpu_oversubscription" {
-  command = plan
-  variables {
-    gang_settings = { cpu_oversubscription = 0 }
-  }
-  expect_failures = [var.gang_settings]
-}
-
-run "rejects_negative_cpu_oversubscription" {
-  command = plan
-  variables {
-    gang_settings = { cpu_oversubscription = -1 }
-  }
-  expect_failures = [var.gang_settings]
-}
-
-run "rejects_fractional_cpu_oversubscription" {
-  command = plan
-  variables {
-    gang_settings = { cpu_oversubscription = 1.5 }
-  }
-  expect_failures = [var.gang_settings]
-}
-
-run "rejects_cpu_oversubscription_above_u32" {
-  command = plan
-  variables {
-    gang_settings = { cpu_oversubscription = 4294967296 }
-  }
-  expect_failures = [var.gang_settings]
-}
-
 run "rejects_zero_poll_interval" {
   command = plan
 
@@ -1524,6 +1494,21 @@ run "sqlite_instance_shape" {
     condition     = output.controller_config_digest == null
     error_message = "SQLite must not pass a group configuration digest to its controller."
   }
+  assert {
+    condition     = output.controller_count == 1 && output.controller_service_name == null && output.controller_cluster_name == null && output.controller_task_definition_arn == null && output.controller_capacity_asg_name == null && contains(keys(output.images), "controller") && strcontains(output.gang_toml, "stop_timeout = \"2460s\"")
+    error_message = "SQLite must retain its controller AMI and standalone shape and render the default drain timeout."
+  }
+}
+
+run "sqlite_renders_custom_stop_timeout" {
+  command = plan
+  variables {
+    controller_stop_timeout_seconds = 3600
+  }
+  assert {
+    condition     = strcontains(output.gang_toml, "stop_timeout = \"3600s\"")
+    error_message = "A SQLite controller must receive its configured drain timeout."
+  }
 }
 
 run "rejects_unknown_database_engine" {
@@ -1538,7 +1523,7 @@ run "rejects_multiple_sqlite_controllers" {
     controller_count = 2
     nat_mode         = "per_az"
   }
-  expect_failures = [var.database]
+  expect_failures = [var.controller_count]
 }
 
 # Correctness: Defaults resolve each used architecture from this module's release.

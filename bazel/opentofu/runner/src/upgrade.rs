@@ -13,9 +13,23 @@ use std::process::Command;
 
 use base64::Engine as _;
 use serde::Serialize;
+use serde::ser::SerializeMap;
 use serde_json::Value;
 
 const TEST: &str = "tests/upgrade.tftest.hcl";
+const MIGRATION_TEST: &str = "tests/ecs_migration.tftest.hcl";
+const MIGRATION_RUNS: [&str; 10] = [
+    "baseline",
+    "bootstrap_plan",
+    "bootstrap_apply",
+    "bootstrap_converge",
+    "worker_plan",
+    "worker_apply",
+    "worker_converge",
+    "handoff_plan",
+    "handoff_apply",
+    "handoff_converge",
+];
 const RUNS: [&str; 5] = ["seed", "transition", "promote", "upgrade", "retention"];
 type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
 
@@ -35,7 +49,6 @@ struct Frontend {
     preserve_client_ip: Option<bool>,
     health: Health,
 }
-#[derive(Serialize)]
 struct Controller {
     instances: u32,
     health_check_type: String,
@@ -43,6 +56,42 @@ struct Controller {
     max_healthy_percentage: u32,
     warmup_seconds: u64,
     deregistration_delay_seconds: u64,
+    mode: Option<&'static str>,
+    image: Option<String>,
+    stop_timeout_seconds: Option<u64>,
+    network_mode: Option<String>,
+    circuit_breaker_enable: Option<bool>,
+    circuit_breaker_rollback: Option<bool>,
+    target_type: Option<String>,
+}
+
+impl Serialize for Controller {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("instances", &self.instances)?;
+        map.serialize_entry("min_healthy_percentage", &self.min_healthy_percentage)?;
+        map.serialize_entry("max_healthy_percentage", &self.max_healthy_percentage)?;
+        map.serialize_entry(
+            "deregistration_delay_seconds",
+            &self.deregistration_delay_seconds,
+        )?;
+        if let Some(mode) = self.mode {
+            map.serialize_entry("mode", mode)?;
+            map.serialize_entry("image", &self.image)?;
+            map.serialize_entry("stop_timeout_seconds", &self.stop_timeout_seconds)?;
+            map.serialize_entry("network_mode", &self.network_mode)?;
+            map.serialize_entry("circuit_breaker_enable", &self.circuit_breaker_enable)?;
+            map.serialize_entry("circuit_breaker_rollback", &self.circuit_breaker_rollback)?;
+            map.serialize_entry("target_type", &self.target_type)?;
+        } else {
+            map.serialize_entry("health_check_type", &self.health_check_type)?;
+            map.serialize_entry("warmup_seconds", &self.warmup_seconds)?;
+        }
+        map.end()
+    }
 }
 #[derive(Serialize)]
 struct Fixture {
@@ -53,6 +102,30 @@ struct Fixture {
     controller: Controller,
     configuration: Configuration,
     seed: SeedConfiguration,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HandoffProtocol {
+    DrainBeforeRelease,
+    ReleaseBeforeDrain,
+}
+
+impl HandoffProtocol {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "drain_before_release" => Ok(Self::DrainBeforeRelease),
+            "release_before_drain" => Ok(Self::ReleaseBeforeDrain),
+            _ => Err("unknown handoff protocol".into()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct FixtureDocument<'a> {
+    handoff_protocol: HandoffProtocol,
+    #[serde(flatten)]
+    fixture: &'a Fixture,
 }
 
 #[derive(Serialize)]
@@ -93,7 +166,9 @@ pub fn upgrade_fixture(
     tofu: &Path,
     mirror: &Path,
     output: &Path,
+    handoff_protocol: &str,
 ) -> Result<()> {
+    let handoff_protocol = HandoffProtocol::parse(handoff_protocol)?;
     let source = fs::canonicalize(source)?;
     let test = fs::canonicalize(test)?;
     let tofu = fs::canonicalize(tofu)?;
@@ -101,8 +176,7 @@ pub fn upgrade_fixture(
     let work = tempfile::tempdir()?;
     crate::contract::stage(&source, work.path())?;
     let root = work.path().join("infra/terraform/modules/deployment");
-    fs::create_dir_all(root.join("tests"))?;
-    fs::copy(test, root.join(TEST))?;
+    let ecs = stage_upgrade_test(&root, &test)?;
     let local = fs::read_to_string(work.path().join("configs/gang.local.toml"))?;
     let _: toml::Value = toml::from_str(&local)?;
     let command = || {
@@ -149,14 +223,390 @@ pub fn upgrade_fixture(
         .into());
     }
     let fixture = extract(&result.stdout, local)?;
-    fs::write(output, serde_json::to_vec(&fixture)?)?;
+    if ecs {
+        let result = command()
+            .args([
+                "test",
+                "-json",
+                "-verbose",
+                "-filter=tests/ecs_migration.tftest.hcl",
+            ])
+            .output()?;
+        if !result.status.success() {
+            return Err(format!(
+                "tofu migration test failed: {}\n{}",
+                String::from_utf8_lossy(&result.stderr),
+                String::from_utf8_lossy(&result.stdout)
+            )
+            .into());
+        }
+        validate_migration_evidence(&result.stdout, &fixture.gang_toml)?;
+    }
+    let document = FixtureDocument {
+        handoff_protocol,
+        fixture: &fixture,
+    };
+    fs::write(output, serde_json::to_vec(&document)?)?;
+    Ok(())
+}
+
+fn stage_upgrade_test(root: &Path, test: &Path) -> Result<bool> {
+    fs::create_dir_all(root.join("tests"))?;
+    let mut test_content = fs::read_to_string(test)?;
+    let variables = fs::read_to_string(root.join("variables.tf"))?;
+    let ecs = variables.contains("variable \"controller_image_digest\"");
+    if ecs {
+        test_content = test_content.replace(
+            "# CONTROLLER_INSTANCE_TYPE",
+            "controller_instance_type = \"t4g.large\"",
+        );
+        test_content = test_content.replace(
+            "# CONTROLLER_ECS_INPUTS",
+            "controller_image_digest = \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n  controller_stop_timeout_seconds = 2460",
+        );
+        test_content = test_content.replace(
+            "# CONTROLLER_ECS_OVERRIDES",
+            r#"override_data {
+  target = module.controller.data.aws_ec2_instance_type.this
+  values = { supported_architectures = ["arm64"], burstable_performance_supported = true, memory_size = 8192, default_vcpus = 2, boot_modes = ["uefi"] }
+}
+override_resource {
+  target = module.controller.aws_ecr_repository.controller[0]
+  values = { repository_url = "000000000000.dkr.ecr.eu-north-1.amazonaws.com/gang-controller", arn = "arn:aws:ecr:eu-north-1:000000000000:repository/gang-controller" }
+}
+override_resource {
+  target = module.controller.aws_autoscaling_group.capacity[0]
+  values = { arn = "arn:aws:autoscaling:eu-north-1:000000000000:autoScalingGroup:00000000-0000-0000-0000-000000000000:autoScalingGroupName/gang-capacity" }
+}
+override_resource {
+  target = module.controller.aws_iam_role.execution[0]
+  values = { arn = "arn:aws:iam::000000000000:role/gang-ecs-execution" }
+}
+override_resource {
+  target = module.controller.aws_ecs_cluster.controller[0]
+  values = { arn = "arn:aws:ecs:eu-north-1:000000000000:cluster/gang-controller" }
+}
+override_resource {
+  target = module.controller.aws_ecs_task_definition.controller[0]
+  values = { arn = "arn:aws:ecs:eu-north-1:000000000000:task-definition/gang-controller:1" }
+}
+override_resource {
+  target = module.load_balancer[0].aws_lb_target_group.this
+  values = { arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/public/0000000000000001" }
+}
+override_resource {
+  target = module.load_balancer[0].aws_lb_target_group.internal["serve"]
+  values = { arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/serve/0000000000000002" }
+}
+override_resource {
+  target = module.load_balancer[0].aws_lb_target_group.internal["workers"]
+  values = { arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/workers/0000000000000003" }
+}"#,
+        );
+    } else {
+        test_content = test_content.replace(
+            "# CONTROLLER_INSTANCE_TYPE",
+            "controller_instance_type = \"c7i.large\"",
+        );
+        test_content = test_content.replace(
+            "# CONTROLLER_ECS_OVERRIDES",
+            r#"override_resource {
+  target = module.load_balancer[0].aws_lb_target_group.this
+  values = { arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/public/0000000000000001" }
+}
+override_resource {
+  target = module.load_balancer[0].aws_lb_target_group.internal["serve"]
+  values = { arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/serve/0000000000000002" }
+}
+override_resource {
+  target = module.load_balancer[0].aws_lb_target_group.internal["workers"]
+  values = { arn = "arn:aws:elasticloadbalancing:eu-north-1:000000000000:targetgroup/workers/0000000000000003" }
+}"#,
+        );
+    }
+    if ecs {
+        stage_migration_test(root, &test_content)?;
+    }
+    test_content = test_content
+        .replace("# LAUNCH_TEMPLATE_DEFAULTS", "defaults = { id = \"lt-0123456789abcdef0\" }")
+        .replace("# IMAGE_OVERRIDES", r#"override_data {
+  target = data.aws_ami.image
+  values = {
+    name = "gang-x86_64-aaaaaaaaaaaaaaaa"
+    boot_mode = "uefi"
+    tags = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+    deprecation_time = ""
+  }
+}"#);
+    fs::write(root.join(TEST), &test_content)?;
+    Ok(ecs)
+}
+
+// This isolated baseline is new-source infrastructure without ECS resources,
+// not a simulation of historical ASG state.
+fn stage_migration_test(root: &Path, content: &str) -> Result<()> {
+    let (prefix, _) = content
+        .split_once("run \"seed\" {")
+        .ok_or("missing seed run")?;
+    let image_overrides = r#"override_data {
+  target = data.aws_ami.image["072320588884/x86_64/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+  values = { id = "ami-00000000000000002", name = "new-image", boot_mode = "uefi", tags = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, deprecation_time = "" }
+}
+override_data {
+  target = data.aws_ami.image["072320588884/x86_64/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+  values = { id = "ami-00000000000000001", name = "old-image", boot_mode = "uefi", tags = { "ec2:SharedTag/ImageSha256" = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, deprecation_time = "" }
+}"#;
+    let prefix = prefix
+        .replace("# IMAGE_OVERRIDES", image_overrides)
+        .replace(
+            "# LAUNCH_TEMPLATE_DEFAULTS",
+            "defaults = { id = \"lt-0123456789abcdef0\", latest_version = 2, default_version = 2 }",
+        );
+    let runs = r#"
+run "baseline" {
+  command = apply
+  variables {
+    gang_settings = { poll_interval = "100ms" }
+    images = { x86_64 = { owner = "072320588884", sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } }
+  }
+  plan_options {
+    target = [module.network, module.storage, module.load_balancer, module.worker_fleet, module.controller.module.instance_role, aws_ssm_parameter.config_generation]
+  }
+  override_resource {
+    target = module.worker_fleet.aws_launch_template.this
+    values = { id = "lt-0123456789abcdef0", latest_version = 1, default_version = 1 }
+  }
+}
+run "bootstrap_plan" {
+  command = plan
+  plan_options { target = [module.controller.aws_ecr_repository.controller, aws_ssm_parameter.config_generation] }
+}
+run "bootstrap_apply" {
+  command = apply
+  plan_options { target = [module.controller.aws_ecr_repository.controller, aws_ssm_parameter.config_generation] }
+}
+run "bootstrap_converge" {
+  command = plan
+  plan_options { target = [module.controller.aws_ecr_repository.controller, aws_ssm_parameter.config_generation] }
+}
+run "worker_plan" {
+  command = plan
+  plan_options { target = [module.worker_fleet.aws_launch_template.this, module.worker_fleet.aws_autoscaling_group.this, aws_ssm_parameter.config_generation] }
+}
+run "worker_apply" {
+  command = apply
+  plan_options { target = [module.worker_fleet.aws_launch_template.this, module.worker_fleet.aws_autoscaling_group.this, aws_ssm_parameter.config_generation] }
+  override_resource {
+    target = module.worker_fleet.aws_launch_template.this
+    values = { id = "lt-0123456789abcdef0", latest_version = 2, default_version = 2 }
+  }
+}
+run "worker_converge" {
+  command = plan
+  plan_options { target = [module.worker_fleet.aws_launch_template.this, module.worker_fleet.aws_autoscaling_group.this, aws_ssm_parameter.config_generation] }
+}
+run "handoff_plan" {
+  command = plan
+  plan_options { target = [module.controller.aws_ecs_service.controller, aws_ssm_parameter.config_generation] }
+}
+run "handoff_apply" {
+  command = apply
+  plan_options { target = [module.controller.aws_ecs_service.controller, aws_ssm_parameter.config_generation] }
+}
+run "handoff_converge" {
+  command = plan
+  plan_options { target = [module.controller.aws_ecs_service.controller, aws_ssm_parameter.config_generation] }
+}
+"#;
+    fs::write(root.join(MIGRATION_TEST), format!("{prefix}{runs}"))?;
+    Ok(())
+}
+
+fn validate_migration_evidence(stdout: &[u8], gang: &str) -> Result<()> {
+    let mut runs = [false; 10];
+    let mut payloads: [Option<Value>; 10] = std::array::from_fn(|_| None);
+    let mut abstract_seen = false;
+    let mut file_seen = false;
+    let mut summary_seen = false;
+    let mut forgotten = false;
+    for line in stdout
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let mut event: Value = serde_json::from_slice(line)?;
+        let kind = string(&event, "type")?.to_owned();
+        if forgotten && matches!(kind.as_str(), "test_run" | "test_plan" | "test_state") {
+            return Err("migration run evidence follows cleanup notice".into());
+        }
+        if kind == "diagnostic" {
+            let complete = runs.iter().all(|run| *run) && payloads.iter().all(Option::is_some);
+            migration_diagnostic(&event, &mut forgotten, complete)?;
+            continue;
+        }
+        if matches!(event["@level"].as_str(), Some("error" | "warn" | "warning")) {
+            return Err("unexpected migration warning or error".into());
+        }
+        match kind.as_str() {
+            "test_abstract" => {
+                if abstract_seen
+                    || event[&kind] != serde_json::json!({(MIGRATION_TEST): MIGRATION_RUNS})
+                {
+                    return Err("unexpected migration abstract".into());
+                }
+                abstract_seen = true;
+            }
+            "test_run" | "test_plan" | "test_state" => {
+                let index = MIGRATION_RUNS
+                    .iter()
+                    .position(|name| event["@testrun"] == *name)
+                    .ok_or("unexpected migration run")?;
+                if event["@testfile"] != MIGRATION_TEST {
+                    return Err("unexpected migration test file".into());
+                }
+                if kind == "test_run" {
+                    if runs[index]
+                        || event[&kind]["path"] != MIGRATION_TEST
+                        || event[&kind]["run"] != MIGRATION_RUNS[index]
+                        || event[&kind]["status"] != "pass"
+                    {
+                        return Err("invalid migration run".into());
+                    }
+                    runs[index] = true;
+                } else {
+                    let expected = if matches!(index, 0 | 2 | 5 | 8) {
+                        "test_state"
+                    } else {
+                        "test_plan"
+                    };
+                    if kind != expected || payloads[index].is_some() || !event[&kind].is_object() {
+                        return Err("invalid migration payload".into());
+                    }
+                    payloads[index] = Some(event[&kind].take());
+                }
+            }
+            "test_file" => {
+                if file_seen
+                    || event["@testfile"] != MIGRATION_TEST
+                    || event[&kind]["path"] != MIGRATION_TEST
+                    || event[&kind]["status"] != "pass"
+                {
+                    return Err("invalid migration file".into());
+                }
+                file_seen = true;
+            }
+            "test_summary" => {
+                let summary = &event[&kind];
+                if summary_seen
+                    || summary["status"] != "pass"
+                    || summary["passed"] != MIGRATION_RUNS.len()
+                    || summary["failed"] != 0
+                    || summary["errored"] != 0
+                    || summary["skipped"] != 0
+                {
+                    return Err("invalid migration summary".into());
+                }
+                summary_seen = true;
+            }
+            other if other.starts_with("test_") => return Err("unexpected migration event".into()),
+            _ => {}
+        }
+    }
+    if !abstract_seen
+        || !file_seen
+        || !summary_seen
+        || !forgotten
+        || !runs.into_iter().all(|run| run)
+        || !payloads.iter().all(Option::is_some)
+    {
+        return Err("incomplete migration evidence".into());
+    }
+    validate_migration_payloads(&payloads, gang)
+}
+
+fn migration_diagnostic(event: &Value, forgotten: &mut bool, complete: bool) -> Result<()> {
+    if event["@testfile"] != MIGRATION_TEST {
+        return Err("unbound migration diagnostic".into());
+    }
+    let severity = event["diagnostic"]["severity"].as_str();
+    let summary = event["diagnostic"]["summary"].as_str();
+    if severity == Some("warning")
+        && MIGRATION_RUNS.contains(&event["@testrun"].as_str().unwrap_or(""))
+        && matches!(
+            summary,
+            Some("Resource targeting is in effect" | "Applied changes may be incomplete")
+        )
+    {
+        return Ok(());
+    }
+    if !*forgotten && complete && crate::contract::is_successful_forget_notice(event) {
+        *forgotten = true;
+        return Ok(());
+    }
+    Err(format!(
+        "unexpected migration diagnostic {}: {}",
+        severity.unwrap_or("unknown"),
+        summary.unwrap_or("unknown")
+    )
+    .into())
+}
+
+fn validate_migration_payloads(payloads: &[Option<Value>; 10], gang: &str) -> Result<()> {
+    let get = |index: usize| payloads[index].as_ref().ok_or("missing migration payload");
+    for index in [1, 3, 4, 6, 7, 9] {
+        validate_target_plan_phase(get(index)?, gang, matches!(index, 3 | 6 | 9), index == 4)?;
+    }
+    if !has_actions(
+        get(1)?,
+        "aws_ssm_parameter.config_generation",
+        &["forget", "create"],
+    )? || !has_actions(
+        get(1)?,
+        "terraform_data.config_generation",
+        &["delete", "create"],
+    )? || !has_actions(
+        get(1)?,
+        "module.controller.aws_ecr_repository.controller[0]",
+        &["create"],
+    )? || !has_actions(
+        get(7)?,
+        "module.controller.aws_ecs_service.controller[0]",
+        &["create"],
+    )? {
+        return Err("migration plans lack expected actions".into());
+    }
+    for index in [0, 2, 5, 8] {
+        let resources = state_resources(get(index)?)?;
+        let config = &resource(&resources, "aws_ssm_parameter.config_generation")?["values"];
+        if (index == 0 && string(config, "value")? == gang)
+            || (index != 0 && string(config, "value")? != gang)
+        {
+            return Err("migration applied incorrect configuration".into());
+        }
+        for address in [
+            "module.controller.aws_ecs_service.controller[0]",
+            "module.controller.aws_ecs_task_definition.controller[0]",
+            "module.controller.aws_autoscaling_group.capacity[0]",
+        ] {
+            let exists = resources.iter().any(|r| r["address"] == address);
+            if exists != (index == 8) {
+                return Err(format!("migration applied {address} in wrong phase").into());
+            }
+        }
+        let repository = resources
+            .iter()
+            .any(|r| r["address"] == "module.controller.aws_ecr_repository.controller[0]");
+        if repository != (index != 0) {
+            return Err("migration repository exists in wrong phase".into());
+        }
+    }
+    validate_worker_transition(get(0)?, get(4)?, get(5)?)?;
     Ok(())
 }
 
 fn selected_evidence(stdout: &[u8]) -> Result<Evidence> {
-    let names = RUNS;
-    let mut runs = [false; 5];
-    let mut payloads: [Option<Value>; 5] = [None, None, None, None, None];
+    let names = &RUNS;
+    let mut runs = vec![false; names.len()];
+    let mut payloads = vec![None; names.len()];
     let mut summary = false;
     let mut file = false;
     let mut abstract_seen = false;
@@ -185,13 +635,13 @@ fn selected_evidence(stdout: &[u8]) -> Result<Evidence> {
         }
         let kind = string(&event, "type")?;
         match kind {
-            "test_run" => record_run(&event, &names, &mut runs)?,
-            "test_state" | "test_plan" => record_payload(event, &names, &mut payloads)?,
+            "test_run" => record_run(&event, names, &mut runs)?,
+            "test_state" | "test_plan" => record_payload(event, names, &mut payloads)?,
             "test_summary" => {
                 let s = &event[kind];
                 if summary
                     || s["status"] != "pass"
-                    || s["passed"] != 5
+                    || s["passed"] != names.len()
                     || s["failed"] != 0
                     || s["errored"] != 0
                     || s["skipped"] != 0
@@ -224,13 +674,18 @@ fn selected_evidence(stdout: &[u8]) -> Result<Evidence> {
     if !runs.into_iter().all(|run| run) || !summary || !file || !abstract_seen {
         return Err("missing test envelope".into());
     }
-    let [seed, transition, promote, upgrade, retention] = payloads;
+    let mut take = |name: &str| {
+        names
+            .iter()
+            .position(|candidate| *candidate == name)
+            .and_then(|index| payloads[index].take())
+    };
     let evidence = Evidence {
-        seed: seed.ok_or("missing seed state")?,
-        transition: transition.ok_or("missing transition plan")?,
-        promote: promote.ok_or("missing promote state")?,
-        upgrade: upgrade.ok_or("missing upgrade plan")?,
-        retention: retention.ok_or("missing retention plan")?,
+        seed: take("seed").ok_or("missing seed state")?,
+        transition: take("transition").ok_or("missing transition plan")?,
+        promote: take("promote").ok_or("missing promote state")?,
+        upgrade: take("upgrade").ok_or("missing upgrade plan")?,
+        retention: take("retention").ok_or("missing retention plan")?,
     };
     validate_retention(&evidence, forgotten_notice)?;
     Ok(evidence)
@@ -327,7 +782,7 @@ fn validate_retention(evidence: &Evidence, forgotten_notice: bool) -> Result<()>
     Ok(())
 }
 
-fn record_run(event: &Value, names: &[&str; 5], runs: &mut [bool; 5]) -> Result<()> {
+fn record_run(event: &Value, names: &[&str], runs: &mut [bool]) -> Result<()> {
     let status = &event["test_run"];
     let index = names
         .iter()
@@ -345,16 +800,12 @@ fn record_run(event: &Value, names: &[&str; 5], runs: &mut [bool; 5]) -> Result<
     Ok(())
 }
 
-fn record_payload(
-    mut event: Value,
-    names: &[&str; 5],
-    payloads: &mut [Option<Value>; 5],
-) -> Result<()> {
+fn record_payload(mut event: Value, names: &[&str], payloads: &mut [Option<Value>]) -> Result<()> {
     let index = names
         .iter()
         .position(|name| event["@testrun"] == *name)
         .ok_or("unexpected verbose run")?;
-    let expected = if index == 0 || index == 2 {
+    let expected = if matches!(names[index], "seed" | "promote") {
         "test_state"
     } else {
         "test_plan"
@@ -398,8 +849,14 @@ fn extract(stdout: &[u8], local_config: String) -> Result<Fixture> {
             .ok_or("missing planned root module")?,
         &mut resources,
     )?;
-    let (public, public_delay) = frontend(plan, &resources, public_port, "TLS")?;
-    let (workers, workers_delay) = frontend(plan, &resources, worker_port, "TCP")?;
+    let ecs = resources
+        .iter()
+        .any(|r| r["address"] == "module.controller.aws_ecs_service.controller[0]");
+    let (public, public_delay) = frontend(plan, &resources, public_port, "TLS", ecs)?;
+    let (workers, workers_delay) = frontend(plan, &resources, worker_port, "TCP", ecs)?;
+    if ecs {
+        frontend(plan, &resources, public_port, "TCP", true)?;
+    }
     let deregistration_delay_seconds = public_delay.max(workers_delay);
     let configuration = configuration(&evidence, &config)?;
     let seed_gang = state_output(&evidence.seed, "gang_toml")?;
@@ -417,10 +874,211 @@ fn extract(stdout: &[u8], local_config: String) -> Result<Fixture> {
         local_config,
         public,
         workers,
-        controller: controller(plan, &resources, deregistration_delay_seconds)?,
+        controller: controller(plan, &resources, deregistration_delay_seconds, &config)?,
         configuration,
         seed,
     })
+}
+
+#[cfg(test)]
+fn validate_target_plan(plan: &Value, gang: &str, convergence: bool) -> Result<()> {
+    validate_target_plan_phase(plan, gang, convergence, false)
+}
+
+fn validate_target_plan_phase(
+    plan: &Value,
+    gang: &str,
+    convergence: bool,
+    worker_update: bool,
+) -> Result<()> {
+    let changes = plan["resource_changes"]
+        .as_array()
+        .ok_or("missing targeted resource changes")?;
+    let mut seen = std::collections::HashSet::new();
+    let mut config_seen = false;
+    for resource in changes {
+        let address = string(resource, "address")?;
+        if !seen.insert(address) {
+            return Err("duplicate targeted resource change".into());
+        }
+        let actions = resource["change"]["actions"]
+            .as_array()
+            .ok_or("missing targeted actions")?;
+        let is = |expected: &[&str]| {
+            actions.len() == expected.len()
+                && actions
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, b)| a.as_str() == Some(*b))
+        };
+        let protected = address.starts_with("module.worker_fleet.")
+            || address.contains(".aws_lb_listener.")
+            || address.contains(".aws_lb_target_group.");
+        let worker_version_update = worker_update
+            && is(&["update"])
+            && (address.starts_with("module.worker_fleet.aws_launch_template.this[")
+                && worker_template_image_only(&resource["change"])?
+                || address.starts_with("module.worker_fleet.aws_autoscaling_group.this[")
+                    && worker_asg_version_only(&resource["change"])?);
+        let unchanged = is(&["no-op"]) || (resource["mode"] == "data" && is(&["read"]));
+        if protected && !(worker_version_update || unchanged) {
+            return Err(format!("targeted plan mutates protected resource {address}").into());
+        }
+        if convergence && !is(&["no-op"]) && !(resource["mode"] == "data" && is(&["read"])) {
+            return Err(format!("targeted plan did not converge for {address}").into());
+        }
+        if !(worker_version_update
+            || is(&["no-op"])
+            || is(&["create"])
+            || (resource["mode"] == "data" && is(&["read"]))
+            || (address == "terraform_data.config_generation" && is(&["delete", "create"]))
+            || (address == "aws_ssm_parameter.config_generation" && is(&["forget", "create"])))
+        {
+            return Err(format!("unsafe targeted action for {address}").into());
+        }
+        if address == "aws_ssm_parameter.config_generation" {
+            config_seen = true;
+            let change = &resource["change"];
+            if change["after"]["value"].as_str() != Some(gang)
+                || change["after_unknown"]
+                    .as_object()
+                    .is_none_or(|unknown| unknown.get("value").is_some_and(|value| value != false))
+            {
+                return Err(
+                    "targeted configuration value is unknown or differs from generated config"
+                        .into(),
+                );
+            }
+        }
+    }
+    if !config_seen {
+        return Err("targeted plan omits configuration generation".into());
+    }
+    Ok(())
+}
+
+fn worker_template_image_only(change: &Value) -> Result<bool> {
+    let mut before = change["before"].clone();
+    let mut after = change["after"].clone();
+    let old = string(&before, "image_id")?.to_owned();
+    let new = string(&after, "image_id")?;
+    if old.is_empty() || new.is_empty() || old == new {
+        return Ok(false);
+    }
+    for field in ["image_id", "user_data", "latest_version", "default_version"] {
+        before
+            .as_object_mut()
+            .ok_or("invalid old worker template")?
+            .remove(field);
+        after
+            .as_object_mut()
+            .ok_or("invalid new worker template")?
+            .remove(field);
+    }
+    Ok(before == after)
+}
+
+fn worker_asg_version_only(change: &Value) -> Result<bool> {
+    const VERSION: &str =
+        "/mixed_instances_policy/0/launch_template/0/launch_template_specification/0/version";
+    let mut before = change["before"].clone();
+    let mut after = change["after"].clone();
+    let old = before
+        .pointer(VERSION)
+        .and_then(Value::as_str)
+        .ok_or("missing old worker ASG version")?
+        .to_owned();
+    let new = after.pointer(VERSION).and_then(Value::as_str);
+    if new == Some(old.as_str()) {
+        return Ok(false);
+    }
+    *before
+        .pointer_mut(VERSION)
+        .ok_or("missing old worker ASG version")? = Value::Null;
+    *after
+        .pointer_mut(VERSION)
+        .ok_or("missing new worker ASG version")? = Value::Null;
+    Ok(before == after)
+}
+
+fn validate_worker_transition(baseline: &Value, plan: &Value, applied: &Value) -> Result<()> {
+    let old = state_resources(baseline)?;
+    let new = state_resources(applied)?;
+    let templates: Vec<_> = old
+        .iter()
+        .filter(|r| {
+            r["address"]
+                .as_str()
+                .is_some_and(|a| a.starts_with("module.worker_fleet.aws_launch_template.this["))
+        })
+        .collect();
+    let groups: Vec<_> = old
+        .iter()
+        .filter(|r| {
+            r["address"]
+                .as_str()
+                .is_some_and(|a| a.starts_with("module.worker_fleet.aws_autoscaling_group.this["))
+        })
+        .collect();
+    if templates.is_empty() || groups.is_empty() {
+        return Err("missing baseline worker templates or groups".into());
+    }
+    for template in templates {
+        let address = string(template, "address")?;
+        let before = &template["values"];
+        let after = &resource(&new, address)?["values"];
+        let old_image = string(before, "image_id")?;
+        let new_image = string(after, "image_id")?;
+        let old_version = before["latest_version"]
+            .as_i64()
+            .ok_or("missing old worker template version")?;
+        let new_version = after["latest_version"]
+            .as_i64()
+            .ok_or("missing new worker template version")?;
+        if string(before, "id")? != string(after, "id")?
+            || old_image.is_empty()
+            || new_image.is_empty()
+            || old_image == new_image
+            || new_version <= old_version
+            || !has_actions(plan, address, &["update"])?
+        {
+            return Err(
+                format!("worker template did not update its image in place: {address}").into(),
+            );
+        }
+    }
+    for group in groups {
+        let address = string(group, "address")?;
+        let after = &resource(&new, address)?["values"];
+        let before = &group["values"];
+        let old_specification = before
+            .pointer("/mixed_instances_policy/0/launch_template/0/launch_template_specification/0")
+            .ok_or("missing old worker ASG launch template")?;
+        let specification = after
+            .pointer("/mixed_instances_policy/0/launch_template/0/launch_template_specification/0")
+            .ok_or("missing worker ASG launch template")?;
+        let id = string(specification, "launch_template_id")?;
+        let version = string(specification, "version")?;
+        let template =
+            new.iter()
+                .find(|r| {
+                    r["address"].as_str().is_some_and(|a| {
+                        a.starts_with("module.worker_fleet.aws_launch_template.this[")
+                    }) && r["values"]["id"] == id
+                })
+                .ok_or("worker ASG does not reference an updated template")?;
+        let latest = template["values"]["latest_version"]
+            .as_i64()
+            .ok_or("missing worker template version")?;
+        if string(old_specification, "launch_template_id")? != id
+            || string(old_specification, "version")? == version
+            || version != latest.to_string()
+            || !has_actions(plan, address, &["update"])?
+        {
+            return Err(format!("worker ASG did not adopt the latest template: {address}").into());
+        }
+    }
+    Ok(())
 }
 
 fn state_resources(state: &Value) -> Result<Vec<&Value>> {
@@ -506,13 +1164,20 @@ fn state_configuration(
         .ok_or("invalid generation name")?;
     let namespace = format!("{arn_prefix}:parameter{name_prefix}/generations/*");
     validate_reference(active, &resources, state_output(state, "gang_toml")?)?;
-    let controller = role_access(
-        &resources,
-        "module.controller",
-        "controller",
-        active,
-        &namespace,
-    )?;
+    let controller = if resources
+        .iter()
+        .any(|r| r["address"] == "module.controller.aws_ecs_task_definition.controller[0]")
+    {
+        ecs_access(&resources, active, &namespace, arn_prefix)?
+    } else {
+        role_access(
+            &resources,
+            "module.controller",
+            "controller",
+            active,
+            &namespace,
+        )?
+    };
     let workers = worker_access(&resources, config, active, &namespace)?;
     Ok(Configuration {
         controller,
@@ -656,6 +1321,87 @@ fn role_access(
     let mut access = instance_access(instance, resources, module, role, active)?;
     validate_namespace(&mut access, namespace)?;
     Ok(access)
+}
+
+fn ecs_container(resources: &[&Value]) -> Result<Value> {
+    let task = &resource(
+        resources,
+        "module.controller.aws_ecs_task_definition.controller[0]",
+    )?["values"];
+    let containers: Value = serde_json::from_str(string(task, "container_definitions")?)?;
+    let mut matching = containers
+        .as_array()
+        .ok_or("missing containers")?
+        .iter()
+        .filter(|container| container["name"] == "controller");
+    let container = matching.next().ok_or("missing controller container")?;
+    if matching.next().is_some() {
+        return Err("ambiguous controller container".into());
+    }
+    Ok(container.clone())
+}
+
+fn ecs_access(
+    resources: &[&Value],
+    active: &str,
+    namespace: &str,
+    arn_prefix: &str,
+) -> Result<Access> {
+    let task = &resource(
+        resources,
+        "module.controller.aws_ecs_task_definition.controller[0]",
+    )?["values"];
+    let execution = &resource(resources, "module.controller.aws_iam_role.execution[0]")?["values"];
+    let attached = &resource(
+        resources,
+        "module.controller.aws_iam_role_policy.execution_secrets[0]",
+    )?["values"];
+    let policy = &resource(
+        resources,
+        "module.controller.data.aws_iam_policy_document.execution_secrets",
+    )?["values"];
+    if string(task, "execution_role_arn")? != string(execution, "arn")?
+        || string(attached, "role")? != string(execution, "id")?
+        || string(attached, "policy")? != string(policy, "json")?
+    {
+        return Err("controller task execution policy binding mismatch".into());
+    }
+    let container = ecs_container(resources)?;
+    let mut selectors = container["secrets"]
+        .as_array()
+        .ok_or("missing ECS secrets")?
+        .iter()
+        .filter(|secret| secret["name"] == "GANG_CONFIG");
+    let selector = selectors
+        .next()
+        .ok_or("missing ECS configuration selector")?;
+    if selectors.next().is_some()
+        || string(selector, "valueFrom")? != format!("{arn_prefix}:parameter{active}")
+    {
+        return Err("ECS configuration selector does not use active generation".into());
+    }
+    let statements = policy["statement"]
+        .as_array()
+        .ok_or("missing execution IAM statements")?;
+    let mut readable_resources = policy_resources(
+        statements,
+        "ReadParameters",
+        "Allow",
+        "resources",
+        &["ssm:GetParameters"],
+    )?;
+    if !readable_resources
+        .iter()
+        .any(|resource| resource == namespace)
+    {
+        return Err("execution role cannot read generation namespace".into());
+    }
+    readable_resources.retain(|resource| resource == namespace);
+    Ok(Access {
+        reference: active.into(),
+        readable_resources,
+        excluded_from_deny: Vec::new(),
+    })
 }
 
 fn instance_access(
@@ -814,7 +1560,14 @@ fn controller(
     plan: &Value,
     resources: &[&Value],
     deregistration_delay_seconds: u64,
+    config: &toml::Value,
 ) -> Result<Controller> {
+    if resources
+        .iter()
+        .any(|r| r["address"] == "module.controller.aws_ecs_service.controller[0]")
+    {
+        return ecs_controller(resources, deregistration_delay_seconds, config);
+    }
     let asgs: Vec<_> = resources
         .iter()
         .filter(|r| {
@@ -847,11 +1600,102 @@ fn controller(
         max_healthy_percentage: number(prefs, "max_healthy_percentage")?.try_into()?,
         warmup_seconds: warmup_seconds(plan, asgs[0], prefs)?,
         deregistration_delay_seconds,
+        mode: None,
+        image: None,
+        stop_timeout_seconds: None,
+        network_mode: None,
+        circuit_breaker_enable: None,
+        circuit_breaker_rollback: None,
+        target_type: None,
     };
     if controller.min_healthy_percentage != 100 || controller.max_healthy_percentage != 200 {
         return Err("unexpected controller refresh percentages".into());
     }
     Ok(controller)
+}
+
+fn ecs_controller(
+    resources: &[&Value],
+    deregistration_delay_seconds: u64,
+    config: &toml::Value,
+) -> Result<Controller> {
+    let service =
+        &resource(resources, "module.controller.aws_ecs_service.controller[0]")?["values"];
+    let task = &resource(
+        resources,
+        "module.controller.aws_ecs_task_definition.controller[0]",
+    )?["values"];
+    let capacity = &resource(
+        resources,
+        "module.controller.aws_launch_template.capacity[0]",
+    )?["values"];
+    let breaker = single(&service["deployment_circuit_breaker"])?;
+    let instances = number(service, "desired_count")?;
+    let min = number(service, "deployment_minimum_healthy_percent")?;
+    let max = number(service, "deployment_maximum_percent")?;
+    let network = string(task, "network_mode")?;
+    if instances != 1
+        || min != 100
+        || max != 200
+        || network != "host"
+        || breaker["enable"] != true
+        || breaker["rollback"] != true
+    {
+        return Err("invalid ECS deployment policy".into());
+    }
+    let container = ecs_container(resources)?;
+    let image = string(&container, "image")?;
+    let (repository, digest) = image
+        .rsplit_once("@sha256:")
+        .ok_or("image is not digest pinned")?;
+    if repository.is_empty()
+        || repository.chars().any(|c| c == '@' || c.is_whitespace())
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("malformed ECS image digest".into());
+    }
+    let user_data = decode_base64(string(capacity, "user_data")?)?;
+    let mut budgets = user_data
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("ECS_CONTAINER_STOP_TIMEOUT="));
+    let raw = budgets.next().ok_or("missing ECS host stop budget")?;
+    if budgets.next().is_some() {
+        return Err("ambiguous ECS host stop budget".into());
+    }
+    let host_timeout_seconds: u64 = raw
+        .strip_suffix('s')
+        .ok_or("invalid ECS host stop budget")?
+        .parse()?;
+    let stop_timeout_seconds = number(&container, "stopTimeout")?;
+    if stop_timeout_seconds == 0 || host_timeout_seconds != stop_timeout_seconds {
+        return Err("ECS task and host stop budgets are invalid or differ".into());
+    }
+    if config
+        .get("server")
+        .and_then(|server| server.get("stop_timeout"))
+        .and_then(toml::Value::as_str)
+        != Some(format!("{stop_timeout_seconds}s").as_str())
+    {
+        return Err("ECS host stop budget differs from controller shutdown timeout".into());
+    }
+    Ok(Controller {
+        instances: instances.try_into()?,
+        health_check_type: String::new(),
+        min_healthy_percentage: min.try_into()?,
+        max_healthy_percentage: max.try_into()?,
+        warmup_seconds: 0,
+        deregistration_delay_seconds,
+        mode: Some("ecs"),
+        image: Some(image.into()),
+        stop_timeout_seconds: Some(stop_timeout_seconds),
+        network_mode: Some(network.into()),
+        circuit_breaker_enable: Some(true),
+        circuit_breaker_rollback: Some(true),
+        target_type: Some("instance".into()),
+    })
 }
 
 fn warmup_seconds(plan: &Value, resource: &Value, preferences: &Value) -> Result<u64> {
@@ -1080,6 +1924,7 @@ fn frontend(
     resources: &[&Value],
     port: u16,
     protocol: &str,
+    ecs: bool,
 ) -> Result<(Frontend, u64)> {
     let listeners: Vec<_> = resources
         .iter()
@@ -1094,20 +1939,38 @@ fn frontend(
     }
     let listener = listeners[0];
     let address = string(listener, "address")?;
-    let target_address = address.replace(".aws_lb_listener.", ".aws_lb_target_group.");
+    let action = single(&listener["values"]["default_action"])?;
+    if string(action, "type")? != "forward" {
+        return Err("listener does not forward to a target group".into());
+    }
+    let target_arn = string(action, "target_group_arn")?;
     let targets: Vec<_> = resources
         .iter()
-        .filter(|r| r["type"] == "aws_lb_target_group" && r["address"] == target_address)
+        .filter(|r| {
+            r["type"] == "aws_lb_target_group" && r["values"]["arn"].as_str() == Some(target_arn)
+        })
         .collect();
     if targets.len() != 1 {
         return Err(format!("missing or ambiguous target group for {address}").into());
     }
     let target = &targets[0]["values"];
-    let action = single(&listener["values"]["default_action"])?;
-    if string(action, "type")? != "forward"
-        || string(action, "target_group_arn")? != string(target, "arn")?
-    {
-        return Err("listener target group mismatch".into());
+    if ecs {
+        let expected_target = match address {
+            "module.load_balancer[0].aws_lb_listener.this" => {
+                "module.load_balancer[0].aws_lb_target_group.this"
+            }
+            "module.load_balancer[0].aws_lb_listener.internal[\"serve\"]" => {
+                "module.load_balancer[0].aws_lb_target_group.internal[\"serve\"]"
+            }
+            "module.load_balancer[0].aws_lb_listener.internal[\"workers\"]" => {
+                "module.load_balancer[0].aws_lb_target_group.internal[\"workers\"]"
+            }
+            _ => return Err("unexpected ECS listener address".into()),
+        };
+        if targets[0]["address"] != expected_target || string(target, "target_type")? != "instance"
+        {
+            return Err("ECS listener must use its original instance target group".into());
+        }
     }
     let health = single(&target["health_check"])?;
     if string(health, "protocol")? != "HTTP" {
@@ -1263,6 +2126,25 @@ mod tests {
         })
     }
 
+    #[test]
+    fn migration_cleanup_notice_requires_completed_runs_and_exact_success() {
+        let mut notice = forgotten_event();
+        notice["@testfile"] = json!(MIGRATION_TEST);
+        notice["@testrun"] = json!("baseline");
+        let mut forgotten = false;
+        assert!(migration_diagnostic(&notice, &mut forgotten, false).is_err());
+        assert!(!forgotten);
+        assert!(migration_diagnostic(&notice, &mut forgotten, true).is_ok());
+        assert!(forgotten);
+        assert!(migration_diagnostic(&notice, &mut forgotten, true).is_err());
+        let mut other = notice.clone();
+        other["@testfile"] = json!("tests/unrelated.tftest.hcl");
+        assert!(migration_diagnostic(&other, &mut false, true).is_err());
+        let mut failed = notice;
+        failed["diagnostic"]["detail"] = json!("cleanup failed");
+        assert!(migration_diagnostic(&failed, &mut false, true).is_err());
+    }
+
     fn event_payload<'a>(events: &'a mut [Value], run: &str, kind: &str) -> &'a mut Value {
         &mut events
             .iter_mut()
@@ -1340,6 +2222,438 @@ mod tests {
             .iter_mut()
             .find(|r| r["address"] == address)
             .expect("applied resource")
+    }
+
+    fn ecs_events() -> Vec<Value> {
+        let mut candidate = plan(GANG);
+        candidate["output_changes"]["gang_toml"]["after"] = json!(format!(
+            "{}\n[server]\nstop_timeout = \"2460s\"\n",
+            candidate["output_changes"]["gang_toml"]["after"]
+                .as_str()
+                .expect("gang")
+        ));
+        let entries = resources(&mut candidate);
+        entries.retain(|r| r["type"] != "aws_autoscaling_group");
+        for index in [1, 5] {
+            entries[index]["values"]["target_type"] = json!("instance");
+        }
+        entries[4]["address"] =
+            json!("module.load_balancer[0].aws_lb_listener.internal[\"workers\"]");
+        entries[5]["address"] =
+            json!("module.load_balancer[0].aws_lb_target_group.internal[\"workers\"]");
+        let mut serve_listener = entries[4].clone();
+        serve_listener["address"] =
+            json!("module.load_balancer[0].aws_lb_listener.internal[\"serve\"]");
+        serve_listener["values"]["port"] = json!(443);
+        serve_listener["values"]["default_action"][0]["target_group_arn"] = json!("serve");
+        let mut serve_target = entries[5].clone();
+        serve_target["address"] =
+            json!("module.load_balancer[0].aws_lb_target_group.internal[\"serve\"]");
+        serve_target["values"]["arn"] = json!("serve");
+        serve_target["values"]["port"] = json!(443);
+        entries.push(serve_listener);
+        entries.push(serve_target);
+        entries.push(json!({"address":"module.controller.aws_autoscaling_group.capacity[0]","type":"aws_autoscaling_group",
+            "values":{"min_size":1,"desired_capacity":1,"max_size":2}}));
+        entries.push(json!({"address":"module.controller.aws_ecs_service.controller[0]","type":"aws_ecs_service",
+            "values":{"desired_count":1,"deployment_minimum_healthy_percent":100,"deployment_maximum_percent":200,
+                "deployment_circuit_breaker":[{"enable":true,"rollback":true}]}}));
+        entries.push(json!({"address":"module.controller.aws_ecs_task_definition.controller[0]","type":"aws_ecs_task_definition",
+            "values":{"network_mode":"host","container_definitions":json!([{"name":"controller",
+                "stopTimeout":2460,
+                "image":format!("000000000000.dkr.ecr.eu-north-1.amazonaws.com/gang-controller@sha256:{}", "a".repeat(64))}]).to_string()}}));
+        entries.push(json!({"address":"module.controller.aws_launch_template.capacity[0]","type":"aws_launch_template",
+            "values":{"user_data":base64::engine::general_purpose::STANDARD.encode("ECS_CONTAINER_STOP_TIMEOUT=2460s")}}));
+        let mut events = synthetic_events(&candidate, false);
+        for run in ["seed", "promote"] {
+            let state = event_payload(&mut events, run, "test_state");
+            let active = state["values"]["outputs"]["config_parameter_reference"]["value"]
+                .as_str()
+                .expect("selector")
+                .to_owned();
+            let entries = state["values"]["root_module"]["resources"]
+                .as_array_mut()
+                .expect("resources");
+            entries
+                .retain(|r| r["address"] != "module.controller.aws_launch_template.controller[0]");
+            let container = json!([{"name":"controller", "secrets":[{"name":"GANG_CONFIG",
+                "valueFrom":format!("arn:aws:ssm:eu-north-1:000000000000:parameter{active}")}]}]);
+            entries.push(json!({"address":"module.controller.aws_ecs_task_definition.controller[0]","type":"aws_ecs_task_definition",
+                "values":{"execution_role_arn":"execution-arn","container_definitions":container.to_string()}}));
+            entries.push(json!({"address":"module.controller.aws_iam_role.execution[0]","type":"aws_iam_role",
+                "values":{"arn":"execution-arn","id":"execution"}}));
+            entries.push(json!({"address":"module.controller.aws_iam_role_policy.execution_secrets[0]","type":"aws_iam_role_policy",
+                "values":{"role":"execution","policy":"{}"}}));
+            entries.push(json!({"address":"module.controller.data.aws_iam_policy_document.execution_secrets","type":"aws_iam_policy_document",
+                "values":{"json":"{}","statement":[{"sid":"ReadParameters","effect":"Allow","actions":["ssm:GetParameters"],
+                    "resources":["arn:aws:ssm:eu-north-1:000000000000:parameter/gang/gang.toml/generations/*"]}]}}));
+        }
+        events
+    }
+
+    #[test]
+    fn targeted_plans_reject_mutations_and_require_convergence() {
+        let base = json!({"resource_changes":[{
+            "address":"aws_ssm_parameter.config_generation","mode":"managed",
+            "change":{"actions":["no-op"],"after":{"value":"config"},"after_unknown":{}}
+        }]});
+        assert!(validate_target_plan(&base, "config", true).is_ok());
+        for (address, actions) in [
+            (
+                "module.worker_fleet.aws_autoscaling_group.this",
+                json!(["create"]),
+            ),
+            (
+                "module.load_balancer[0].aws_lb_listener.this",
+                json!(["update"]),
+            ),
+            (
+                "module.controller.aws_ecs_task_definition.controller[0]",
+                json!(["delete", "create"]),
+            ),
+        ] {
+            let mut plan = base.clone();
+            plan["resource_changes"]
+                .as_array_mut()
+                .expect("changes")
+                .push(json!({"address":address,"mode":"managed","change":{"actions":actions}}));
+            assert!(validate_target_plan(&plan, "config", false).is_err());
+        }
+        let mut plan = base.clone();
+        plan["resource_changes"][0]["change"]["actions"] = json!(["forget", "create"]);
+        assert!(validate_target_plan(&plan, "config", false).is_ok());
+        assert!(validate_target_plan(&plan, "config", true).is_err());
+        plan["resource_changes"][0]["change"]["after_unknown"]["value"] = json!(true);
+        assert!(validate_target_plan(&plan, "config", false).is_err());
+    }
+
+    #[test]
+    fn handoff_allows_worker_version_update_without_capacity_changes() {
+        let plan = json!({"resource_changes":[
+            {"address":"aws_ssm_parameter.config_generation","mode":"managed",
+             "change":{"actions":["no-op"],"after":{"value":"config"},"after_unknown":{}}},
+            {"address":"module.worker_fleet.aws_launch_template.this[\"fleet\"]","mode":"managed",
+             "change":{"actions":["update"],"before":{"image_id":"ami-old"},"after":{"image_id":"ami-new"}}},
+            {"address":"module.worker_fleet.aws_autoscaling_group.this[\"fleet\"]","mode":"managed",
+             "change":{"actions":["update"],"before":{"min_size":0,"max_size":2,"desired_capacity":1,"mixed_instances_policy":[{"launch_template":[{"launch_template_specification":[{"launch_template_id":"lt-1","version":"1"}]}]}]},"after":{"min_size":0,"max_size":2,"desired_capacity":1,"mixed_instances_policy":[{"launch_template":[{"launch_template_specification":[{"launch_template_id":"lt-1","version":"2"}]}]}]}}}
+        ]});
+        assert!(validate_target_plan_phase(&plan, "config", false, true).is_ok());
+        assert!(validate_target_plan(&plan, "config", false).is_err());
+        for (field, value) in [
+            ("min_size", json!(1)),
+            ("max_size", json!(1)),
+            ("desired_capacity", json!(0)),
+        ] {
+            let mut unsafe_plan = plan.clone();
+            unsafe_plan["resource_changes"][2]["change"]["after"][field] = value;
+            assert!(validate_target_plan_phase(&unsafe_plan, "config", false, true).is_err());
+        }
+        let mut unsafe_template = plan.clone();
+        unsafe_template["resource_changes"][1]["change"]["after"]["vpc_security_group_ids"] =
+            json!(["sg-unexpected"]);
+        assert!(validate_target_plan_phase(&unsafe_template, "config", false, true).is_err());
+        let mut unsafe_plan = plan;
+        unsafe_plan["resource_changes"][2]["change"]["actions"] = json!(["delete", "create"]);
+        assert!(validate_target_plan_phase(&unsafe_plan, "config", false, true).is_err());
+    }
+
+    #[test]
+    fn fixture_document_requires_explicit_known_handoff_protocol() {
+        let fixture = extract(&stream(GANG), "local".into()).expect("historical fixture");
+        for name in ["drain_before_release", "release_before_drain"] {
+            let document = FixtureDocument {
+                handoff_protocol: HandoffProtocol::parse(name).expect("protocol"),
+                fixture: &fixture,
+            };
+            let json = serde_json::to_value(document).expect("document");
+            assert_eq!(json["handoff_protocol"], name);
+            assert!(json["controller"].is_object());
+        }
+        for invalid in ["", "asg", "DRAIN_BEFORE_RELEASE"] {
+            assert!(HandoffProtocol::parse(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn migration_requires_applied_states_and_post_apply_convergence() {
+        let config = |value| {
+            json!({"address":"aws_ssm_parameter.config_generation",
+            "values":{"value":value}})
+        };
+        let ecr = json!({"address":"module.controller.aws_ecr_repository.controller[0]"});
+        let service = json!({"address":"module.controller.aws_ecs_service.controller[0]"});
+        let task = json!({"address":"module.controller.aws_ecs_task_definition.controller[0]"});
+        let asg = json!({"address":"module.controller.aws_autoscaling_group.capacity[0]"});
+        let state =
+            |resources: Vec<Value>| json!({"values":{"root_module":{"resources":resources}}});
+        let config_change = |actions| {
+            json!({"address":"aws_ssm_parameter.config_generation",
+            "mode":"managed","change":{"actions":actions,"after":{"value":"new"},"after_unknown":{}}})
+        };
+        let no_op = json!({"resource_changes":[config_change(json!(["no-op"]))]});
+        let bootstrap = json!({"resource_changes":[
+            config_change(json!(["forget","create"])),
+            {"address":"terraform_data.config_generation","change":{"actions":["delete","create"]}},
+            {"address":"module.controller.aws_ecr_repository.controller[0]","change":{"actions":["create"]}}
+        ]});
+        let handoff = json!({"resource_changes":[config_change(json!(["no-op"])),
+            {"address":"module.controller.aws_ecs_service.controller[0]","change":{"actions":["create"]}}
+        ]});
+        let template = |image: &str, version: i64| json!({"address":"module.worker_fleet.aws_launch_template.this[\"fleet\"]", "values":{"id":"lt-1", "image_id":image, "latest_version":version}});
+        let group = |version: &str| json!({"address":"module.worker_fleet.aws_autoscaling_group.this[\"fleet\"]", "values":{"mixed_instances_policy":[{"launch_template":[{"launch_template_specification":[{"launch_template_id":"lt-1", "version":version}]}]}]}});
+        let old_group = group("1");
+        let new_group = group("2");
+        let worker_plan = json!({"resource_changes":[config_change(json!(["no-op"])),
+            {"address":"module.worker_fleet.aws_launch_template.this[\"fleet\"]","mode":"managed","change":{"actions":["update"],"before":{"image_id":"ami-old"},"after":{"image_id":"ami-new"}}},
+            {"address":"module.worker_fleet.aws_autoscaling_group.this[\"fleet\"]","mode":"managed","change":{"actions":["update"],"before":old_group["values"],"after":new_group["values"]}}
+        ]});
+        let mut payloads = [
+            Some(state(vec![
+                config("old"),
+                template("ami-old", 1),
+                old_group,
+            ])),
+            Some(bootstrap),
+            Some(state(vec![config("new"), ecr.clone()])),
+            Some(no_op.clone()),
+            Some(worker_plan),
+            Some(state(vec![
+                config("new"),
+                ecr.clone(),
+                template("ami-new", 2),
+                new_group,
+            ])),
+            Some(no_op.clone()),
+            Some(handoff),
+            Some(state(vec![config("new"), ecr, service, task, asg])),
+            Some(no_op),
+        ];
+        assert!(validate_migration_payloads(&payloads, "new").is_ok());
+        let mut outdated = payloads.clone();
+        outdated[5].as_mut().expect("state")["values"]["root_module"]["resources"][3]["values"]["mixed_instances_policy"]
+            [0]["launch_template"][0]["launch_template_specification"][0]["version"] = json!("1");
+        assert!(validate_migration_payloads(&outdated, "new").is_err());
+        let mut unchanged = payloads.clone();
+        unchanged[5].as_mut().expect("state")["values"]["root_module"]["resources"][2]["values"]
+            ["image_id"] = json!("ami-old");
+        assert!(validate_migration_payloads(&unchanged, "new").is_err());
+        payloads[3] = payloads[1].clone();
+        assert!(validate_migration_payloads(&payloads, "new").is_err());
+    }
+
+    #[test]
+    fn extracts_ecs_service_and_execution_role_evidence() {
+        let fixture = extract(&encode_events(&ecs_events()), "local".into()).expect("ECS fixture");
+        let controller = serde_json::to_value(&fixture.controller).expect("controller JSON");
+        assert_eq!(controller["mode"], "ecs");
+        assert_eq!(
+            controller["image"],
+            format!(
+                "000000000000.dkr.ecr.eu-north-1.amazonaws.com/gang-controller@sha256:{}",
+                "a".repeat(64)
+            )
+        );
+        assert_eq!(controller["network_mode"], "host");
+        assert_eq!(controller["target_type"], "instance");
+        assert_eq!(controller["stop_timeout_seconds"], 2460);
+        assert_eq!(controller["circuit_breaker_enable"], true);
+        assert_eq!(controller["circuit_breaker_rollback"], true);
+        assert!(controller.get("warmup_seconds").is_none());
+        assert!(controller.get("health_check_type").is_none());
+        assert!(
+            fixture
+                .configuration
+                .controller
+                .excluded_from_deny
+                .is_empty()
+        );
+        assert_eq!(fixture.configuration.controller.readable_resources.len(), 1);
+        assert_eq!(
+            fixture.configuration.controller.reference,
+            fixture.configuration.workers[0].reference
+        );
+        let old = extract(&stream(GANG), "local".into()).expect("historical fixture");
+        let old = serde_json::to_value(old.controller).expect("historical JSON");
+        assert!(old.get("mode").is_none());
+        assert_eq!(old["health_check_type"], "EC2");
+        assert_eq!(old["warmup_seconds"], 300);
+    }
+
+    #[test]
+    fn rejects_unresolved_or_ambiguous_listener_targets() {
+        for duplicate in [false, true] {
+            let mut events = ecs_events();
+            let plan = event_payload(&mut events, "upgrade", "test_plan");
+            let entries = resources(plan);
+            if duplicate {
+                entries[3]["values"]["arn"] = entries[1]["values"]["arn"].clone();
+            } else {
+                entries[0]["values"]["default_action"][0]["target_group_arn"] = json!("missing");
+            }
+            assert!(extract(&encode_events(&events), "local".into()).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_abandoned_target_group_addresses() {
+        for (original, abandoned) in [
+            ("this", "service[0]"),
+            ("internal[\"serve\"]", "service_internal[\"serve\"]"),
+            ("internal[\"workers\"]", "service_internal[\"workers\"]"),
+        ] {
+            let mut events = ecs_events();
+            let plan = event_payload(&mut events, "upgrade", "test_plan");
+            let original = format!("module.load_balancer[0].aws_lb_target_group.{original}");
+            let abandoned = format!("module.load_balancer[0].aws_lb_target_group.{abandoned}");
+            resources(plan)
+                .iter_mut()
+                .find(|resource| resource["address"] == original)
+                .expect("target group")["address"] = json!(abandoned);
+            assert!(extract(&encode_events(&events), "local".into()).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_missing_invalid_or_mismatched_task_stop_timeout() {
+        for value in [Value::Null, json!(0), json!(2459), json!("2460")] {
+            let mut events = ecs_events();
+            let plan = event_payload(&mut events, "upgrade", "test_plan");
+            let task = resources(plan)
+                .iter_mut()
+                .find(|r| r["address"] == "module.controller.aws_ecs_task_definition.controller[0]")
+                .expect("task");
+            let mut containers: Value = serde_json::from_str(
+                task["values"]["container_definitions"]
+                    .as_str()
+                    .expect("definitions"),
+            )
+            .expect("container JSON");
+            containers[0]["stopTimeout"] = value;
+            task["values"]["container_definitions"] = json!(containers.to_string());
+            assert!(extract(&encode_events(&events), "local".into()).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_or_ambiguous_host_stop_timeout() {
+        for user_data in [
+            "",
+            "ECS_CONTAINER_STOP_TIMEOUT=0s",
+            "ECS_CONTAINER_STOP_TIMEOUT=2459s",
+            "ECS_CONTAINER_STOP_TIMEOUT=2460",
+            "ECS_CONTAINER_STOP_TIMEOUT=2460s\nECS_CONTAINER_STOP_TIMEOUT=2460s",
+        ] {
+            let mut events = ecs_events();
+            let plan = event_payload(&mut events, "upgrade", "test_plan");
+            resources(plan)
+                .iter_mut()
+                .find(|r| r["address"] == "module.controller.aws_launch_template.capacity[0]")
+                .expect("capacity")["values"]["user_data"] =
+                json!(base64::engine::general_purpose::STANDARD.encode(user_data));
+            assert!(extract(&encode_events(&events), "local".into()).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_ecs_service_evidence() {
+        for (address, field, invalid) in [
+            (
+                "module.controller.aws_ecs_service.controller[0]",
+                "deployment_circuit_breaker",
+                json!([{"enable":true}]),
+            ),
+            (
+                "module.controller.aws_ecs_service.controller[0]",
+                "deployment_circuit_breaker",
+                json!([{"enable":true,"rollback":false}]),
+            ),
+            (
+                "module.controller.aws_ecs_task_definition.controller[0]",
+                "network_mode",
+                json!("awsvpc"),
+            ),
+            (
+                "module.controller.aws_ecs_task_definition.controller[0]",
+                "container_definitions",
+                json!("[{\"name\":\"controller\"}]"),
+            ),
+            (
+                "module.controller.aws_ecs_task_definition.controller[0]",
+                "container_definitions",
+                json!("[{\"name\":\"controller\",\"image\":\"example:latest\"}]"),
+            ),
+            (
+                "module.controller.aws_ecs_task_definition.controller[0]",
+                "container_definitions",
+                json!("[{\"name\":\"controller\",\"image\":\"example@sha256:abc\"}]"),
+            ),
+            (
+                "module.controller.aws_launch_template.capacity[0]",
+                "user_data",
+                json!(
+                    base64::engine::general_purpose::STANDARD
+                        .encode("ECS_CONTAINER_STOP_TIMEOUT=1s")
+                ),
+            ),
+            (
+                "module.load_balancer[0].aws_lb_target_group.this",
+                "target_type",
+                json!("ip"),
+            ),
+            (
+                "module.load_balancer[0].aws_lb_target_group.internal[\"workers\"]",
+                "target_type",
+                json!("ip"),
+            ),
+            (
+                "module.load_balancer[0].aws_lb_target_group.internal[\"serve\"]",
+                "target_type",
+                json!("ip"),
+            ),
+        ] {
+            let mut events = ecs_events();
+            let plan = event_payload(&mut events, "upgrade", "test_plan");
+            resources(plan)
+                .iter_mut()
+                .find(|r| r["address"] == address)
+                .expect("resource")["values"][field] = invalid;
+            assert!(
+                extract(&encode_events(&events), "local".into()).is_err(),
+                "{address} {field}"
+            );
+        }
+        for (address, field, invalid) in [
+            (
+                "module.controller.data.aws_iam_policy_document.execution_secrets",
+                "statement",
+                json!([{"sid":"ReadParameters","effect":"Allow","actions":["ssm:GetParameter"],"resources":["*"]}]),
+            ),
+            (
+                "module.controller.aws_ecs_task_definition.controller[0]",
+                "container_definitions",
+                json!(
+                    "[{\"name\":\"controller\",\"secrets\":[{\"name\":\"GANG_CONFIG\",\"valueFrom\":\"wrong\"}]}]"
+                ),
+            ),
+            (
+                "module.controller.aws_iam_role_policy.execution_secrets[0]",
+                "role",
+                json!("wrong"),
+            ),
+        ] {
+            let mut events = ecs_events();
+            let state = event_payload(&mut events, "promote", "test_state");
+            state["values"]["root_module"]["resources"]
+                .as_array_mut()
+                .expect("resources")
+                .iter_mut()
+                .find(|r| r["address"] == address)
+                .expect("resource")["values"][field] = invalid;
+            assert!(
+                extract(&encode_events(&events), "local".into()).is_err(),
+                "{address} {field}"
+            );
+        }
     }
 
     #[test]

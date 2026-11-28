@@ -233,6 +233,7 @@ impl S3ContentStore {
     }
 
     async fn head_blob(&self, digest: Digest, now: Timestamp) -> Result<Option<u64>, PortError> {
+        let generation = self.backend.existence.generation();
         let key = self.key(digest);
         let output = self
             .backend
@@ -282,7 +283,7 @@ impl S3ContentStore {
 
         self.backend
             .existence
-            .record_head(digest, last_modified, now);
+            .record_head(digest, last_modified, now, generation);
         Ok(Some(content_length))
     }
 
@@ -522,6 +523,12 @@ async fn upload_one_part(
 }
 
 impl ContentStore for S3ContentStore {
+    fn invalidate_existence(&self, digests: &[Digest]) {
+        for digest in digests {
+            self.backend.existence.invalidate(digest);
+        }
+    }
+
     async fn find_missing(
         &self,
         digests: &[Digest],
@@ -597,6 +604,7 @@ impl ContentStore for S3ContentStore {
         let is_full_read =
             range.offset == 0 && range.limit.is_none_or(|limit| limit.get() >= digest.size());
         let key = self.key(digest);
+        let generation = self.backend.existence.generation();
 
         let mut request = self
             .backend
@@ -641,8 +649,16 @@ impl ContentStore for S3ContentStore {
             .and_then(|length| u64::try_from(length).ok());
 
         if is_full_read {
+            let observation = ReadObservation { now, generation };
             return self
-                .full_read_stream(digest, key, output.body, content_length, last_modified, now)
+                .full_read_stream(
+                    digest,
+                    key,
+                    output.body,
+                    content_length,
+                    last_modified,
+                    observation,
+                )
                 .map(Some);
         }
 
@@ -689,6 +705,12 @@ impl ContentStore for S3ContentStore {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ReadObservation {
+    now: Timestamp,
+    generation: u64,
+}
+
 impl S3ContentStore {
     fn full_read_stream(
         &self,
@@ -697,7 +719,7 @@ impl S3ContentStore {
         body: ByteStream,
         content_length: Option<u64>,
         last_modified: Option<Timestamp>,
-        now: Timestamp,
+        observation: ReadObservation,
     ) -> Result<BlobStream, PortError> {
         if let Some(len) = content_length
             && len != digest.size()
@@ -726,7 +748,8 @@ impl S3ContentStore {
             key,
             Arc::clone(&self.backend.existence),
             last_modified,
-            now,
+            observation.now,
+            observation.generation,
         );
         Ok(BlobStream {
             size: digest.size(),
@@ -745,6 +768,7 @@ struct VerifiedReadState {
     existence: Arc<S3ExistenceCache>,
     last_modified: Option<Timestamp>,
     now: Timestamp,
+    generation: u64,
     done: bool,
 }
 
@@ -755,6 +779,7 @@ fn verified_read_stream(
     existence: Arc<S3ExistenceCache>,
     last_modified: Option<Timestamp>,
     now: Timestamp,
+    generation: u64,
 ) -> BoxStream<'static, Result<Bytes, PortError>> {
     let state = VerifiedReadState {
         body,
@@ -765,6 +790,7 @@ fn verified_read_stream(
         existence,
         last_modified,
         now,
+        generation,
         done: false,
     };
     Box::pin(stream::unfold(state, |mut state| async move {
@@ -810,9 +836,12 @@ fn verified_read_stream(
                             state,
                         ));
                     }
-                    state
-                        .existence
-                        .record_head(state.expected, state.last_modified, state.now);
+                    state.existence.record_head(
+                        state.expected,
+                        state.last_modified,
+                        state.now,
+                        state.generation,
+                    );
                     return None;
                 }
             }
@@ -1020,6 +1049,7 @@ mod tests {
         in_flight_heads: Arc<AtomicUsize>,
         max_concurrent_heads: Arc<AtomicUsize>,
         head_delay: Duration,
+        head_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
 
     impl FakeS3State {
@@ -1041,6 +1071,7 @@ mod tests {
                 in_flight_heads: Arc::new(AtomicUsize::new(0)),
                 max_concurrent_heads: Arc::new(AtomicUsize::new(0)),
                 head_delay: Duration::ZERO,
+                head_gate: None,
             }
         }
     }
@@ -1150,7 +1181,7 @@ mod tests {
         Path((bucket, key)): Path<(String, String)>,
         State(state): State<Arc<Mutex<FakeS3State>>>,
     ) -> Response {
-        let (delay, in_flight, max_concurrent, expected_bucket) = {
+        let (delay, in_flight, max_concurrent, expected_bucket, gate, object) = {
             let mut guard = state.lock();
             guard.head_requests += 1;
             (
@@ -1158,10 +1189,16 @@ mod tests {
                 Arc::clone(&guard.in_flight_heads),
                 Arc::clone(&guard.max_concurrent_heads),
                 guard.bucket.clone(),
+                guard.head_gate.clone(),
+                guard.objects.get(&key).cloned(),
             )
         };
         let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         max_concurrent.fetch_max(active, Ordering::SeqCst);
+        if let Some((started, release)) = gate {
+            started.notify_one();
+            release.notified().await;
+        }
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
@@ -1170,7 +1207,6 @@ mod tests {
         if bucket != expected_bucket {
             return StatusCode::NOT_FOUND.into_response();
         }
-        let object = state.lock().objects.get(&key).cloned();
         match object {
             Some(obj) => {
                 let mut headers = HeaderMap::new();
@@ -1783,6 +1819,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalidation_during_head_does_not_restore_cached_presence() -> TestResult {
+        let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(
+            1_794_960_000_000,
+        )));
+        let fake = FakeS3::start("example-bucket", Arc::clone(&clock)).await?;
+        let cache = make_cache(&fake, Arc::clone(&clock), json!({})).await?;
+        let content = cache.s3_content_store();
+        let bytes = Bytes::from_static(b"stale head");
+        let digest = Digest::from_bytes(&bytes);
+        content.write(digest, BlobStream::from_bytes(bytes)).await?;
+        content.invalidate_existence(&[digest]);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        fake.state.lock().head_gate = Some((Arc::clone(&started), Arc::clone(&release)));
+        let check = content.clone();
+        let task = tokio::spawn(async move {
+            let mut missing = Vec::new();
+            check
+                .find_missing(&[digest], &mut missing)
+                .await
+                .map(|()| missing)
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.notified()).await?;
+        fake.state.lock().objects.remove(&content.key(digest));
+        content.invalidate_existence(&[digest]);
+        fake.state.lock().head_gate = None;
+        release.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await???
+                .is_empty()
+        );
+        let mut missing = Vec::new();
+        content.find_missing(&[digest], &mut missing).await?;
+        assert_eq!(missing, vec![digest]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn find_missing_bounds_head_concurrency_and_uses_existence_cache() -> TestResult {
         let clock = Arc::new(TestClock::new(Timestamp::from_unix_millis(
             1_794_960_000_000,
@@ -1839,12 +1914,16 @@ mod tests {
         assert_eq!(missing, digests[5..]);
         assert_eq!(fake.state.lock().head_requests, 15);
 
-        // Removing an existing blob from S3 and reading it invalidates the existence cache.
+        // A worker observation invalidates a positive entry without a controller read.
         let key0 = content.key(digests[0]);
         fake.state.lock().objects.remove(&key0);
-        assert!(content.read(digests[0], ByteRange::FULL).await?.is_none());
+        content.find_missing(&[digests[0]], &mut missing).await?;
+        assert!(missing.is_empty());
+        let heads_before = fake.state.lock().head_requests;
+        content.invalidate_existence(&[digests[0]]);
         content.find_missing(&[digests[0]], &mut missing).await?;
         assert_eq!(missing, vec![digests[0]]);
+        assert_eq!(fake.state.lock().head_requests, heads_before + 1);
         Ok(())
     }
 

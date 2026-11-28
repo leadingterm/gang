@@ -61,8 +61,8 @@ pub struct AdmissionRequest {
 /// for retries, escalation, and sketch observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionProfile {
-    /// Command digest string used for nameless sketch fallback.
-    pub command_digest: String,
+    /// Identity of this action's resource history.
+    pub history_key: Option<crate::sketch::SketchKey>,
     /// Immutable original client resource floors.
     pub floors: ClientFloors,
     /// Pre-fit desired reservation (after configured minima raising).
@@ -169,7 +169,11 @@ pub fn admit_action(
     let platform_key = operation_platform_key(&request.platform_properties);
 
     let profile = ActionProfile {
-        command_digest: request.command_digest,
+        history_key: Some(crate::sketch::SketchKey::for_attempt(
+            request.target.as_ref().map(TargetLabel::as_str),
+            request.mnemonic.as_ref().map(Mnemonic::as_str),
+            &request.command_digest,
+        )),
         floors: validated.floors,
         desired_reservation: fit.desired,
         cpu_before_memory_fit: fit.cpu_before_memory_fit,
@@ -190,6 +194,7 @@ pub fn admit_action(
             mnemonic: request.mnemonic,
             candidates: validated.candidates,
             priority: request.priority,
+            has_explicit_cpu_floor: validated.floors.cpu_millicores.is_some(),
             reservation: fit.reservation,
             learned_reservation: fit.learned_reservation,
             initial_watchers: request.initial_watchers,
@@ -242,7 +247,6 @@ fn operation_platform_key(properties: &BTreeMap<String, String>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
     use std::time::Duration;
 
     use gang_clock::{Tick, Timestamp};
@@ -301,7 +305,7 @@ mod tests {
 
     #[test]
     fn admit_action_inserts_with_gate_audit_and_deduplicates_with_promotion() {
-        let cap = CapacityCatalog::new(catalog(), NonZeroU32::new(2).expect("nonzero"));
+        let cap = CapacityCatalog::new(catalog());
         let mut sk = sketch();
         let mut ops = Operations::new();
         let mut queue = OperationQueue::new(1).expect("queue");
@@ -390,7 +394,7 @@ mod tests {
 
     #[test]
     fn admit_action_refuses_unknown_property() {
-        let cap = CapacityCatalog::new(catalog(), NonZeroU32::new(2).expect("nonzero"));
+        let cap = CapacityCatalog::new(catalog());
         let mut sk = sketch();
         let mut ops = Operations::new();
         let mut queue = OperationQueue::new(1).expect("queue");

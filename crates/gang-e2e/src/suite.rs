@@ -993,23 +993,6 @@ fn required_cluster_variant(scenario: Scenario, baseline: &Variant) -> Result<Va
         .ok_or_else(|| crate::errors::E2eError::system("not a cluster scenario"))
 }
 
-/// Bounds held one-CPU probes by the workers' physical CPU reservation budget.
-fn single_cpu_reservation_factor(mut inputs: DeploymentInputs) -> Result<DeploymentInputs> {
-    let mut document: toml::Value =
-        toml::from_str(&inputs.base_config).map_err(crate::template::template_error)?;
-    let root = document
-        .as_table_mut()
-        .ok_or_else(|| crate::errors::E2eError::system("missing configuration table"))?;
-    let actions = root
-        .entry("actions")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| crate::errors::E2eError::system("invalid actions configuration"))?;
-    actions.insert("cpu_oversubscription".into(), toml::Value::Integer(1));
-    inputs.base_config = toml::to_string(&document).map_err(crate::template::template_error)?;
-    Ok(inputs)
-}
-
 fn controller_loss_inputs(inputs: &DeploymentInputs) -> Result<DeploymentInputs> {
     let mut invocation = inputs.clone();
     let mut document: toml::Value =
@@ -1031,7 +1014,7 @@ fn controller_loss_inputs(inputs: &DeploymentInputs) -> Result<DeploymentInputs>
             .map_err(crate::template::template_error)?;
     server.insert("leadership".into(), leadership);
     invocation.base_config = toml::to_string(&document).map_err(crate::template::template_error)?;
-    single_cpu_reservation_factor(invocation)
+    Ok(invocation)
 }
 
 /// Runs the leader and follower variants in independent deployments.
@@ -1080,7 +1063,7 @@ fn cluster_inputs(ctx: &RunContext<'_>, min: i64, max: i64) -> Result<Deployment
 
 /// Runs the leader-loss and zombie variants on separate deployments.
 fn leader_failover_checks(ctx: &RunContext<'_>, engine: Engine) -> Result<Vec<Check>> {
-    let invocation = single_cpu_reservation_factor(cluster_inputs(ctx, 1, 2)?)?;
+    let invocation = cluster_inputs(ctx, 1, 2)?;
     let variant = required_cluster_variant(Scenario::LeaderFailover, &ctx.baseline)?;
     Ok(parallel_variant_checks([false, true], |zombie| {
         prefix_checks(
@@ -1096,7 +1079,7 @@ fn leader_failover_checks(ctx: &RunContext<'_>, engine: Engine) -> Result<Vec<Ch
 
 /// Runs the outage scenario with one and two controllers on separate deployments.
 fn database_outage_checks(ctx: &RunContext<'_>, engine: Engine) -> Result<Vec<Check>> {
-    let invocation = single_cpu_reservation_factor(cluster_inputs(ctx, 1, 3)?)?;
+    let invocation = cluster_inputs(ctx, 1, 3)?;
     let variant = required_cluster_variant(Scenario::DatabaseOutage, &ctx.baseline)?;
     Ok(parallel_variant_checks([1, 2], |count| {
         prefix_checks(
@@ -1169,7 +1152,7 @@ fn cluster_scenario_engine_checks(
     }
     attempt(scenario, || match scenario {
         Scenario::RollingDeploy => {
-            let invocation = single_cpu_reservation_factor(cluster_inputs(ctx, 0, 1)?)?;
+            let invocation = cluster_inputs(ctx, 0, 1)?;
             let variant = required_cluster_variant(scenario, &ctx.baseline)?;
             let cluster =
                 crate::cluster::Cluster::start(&invocation, &variant, ctx.issuer, 2, engine)?;
@@ -1617,7 +1600,7 @@ mod tests {
             gang: PathBuf::default(),
             bazel: PathBuf::default(),
             postgres: PathBuf::default(),
-            base_config: "[actions]\ncpu_oversubscription = 3\nhistory_keys = 42\n[actions.cold_start]\ncpu_millicores = 250\n[server]\n[[fleets]]\nmax_instances = 4\nvcpus_per_instance = 4\n".into(),
+            base_config: "[actions]\nhistory_keys = 42\n[actions.cold_start]\ncpu_millicores = 250\n[server]\n[[fleets]]\nmax_instances = 4\nvcpus_per_instance = 4\n".into(),
             sample: PathBuf::default(),
             configs: PathBuf::default(),
             settings: Settings::default(),
@@ -1635,12 +1618,8 @@ mod tests {
         let fleet = &document["fleets"][0];
         let workers = fleet["max_instances"].as_integer().expect("max instances");
         let cpus = fleet["vcpus_per_instance"].as_integer().expect("vCPUs");
-        let factor = document["actions"]["cpu_oversubscription"]
-            .as_integer()
-            .expect("CPU oversubscription");
         assert_eq!(workers, 2);
-        assert_eq!(factor, 1);
-        assert_eq!(workers * cpus * factor, 2);
+        assert_eq!(workers * cpus, 2);
         assert_eq!(document["actions"]["history_keys"].as_integer(), Some(42));
         assert_eq!(
             document["actions"]["cold_start"]["cpu_millicores"].as_integer(),

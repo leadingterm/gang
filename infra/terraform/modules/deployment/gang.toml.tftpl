@@ -61,7 +61,15 @@ time_zone = ${jsonencode(w.time_zone)}
 %{ endfor }
 
 [actions]
-cpu_oversubscription = ${jsonencode(gang_settings.cpu_oversubscription)}
+
+%{ if gang_settings.cpu == null ? false : length([for value in values(gang_settings.cpu) : value if value != null]) > 0 ~}
+[actions.cpu]
+%{ for key, value in gang_settings.cpu ~}
+%{ if value != null ~}
+${key} = ${jsonencode(value)}
+%{ endif ~}
+%{ endfor ~}
+%{ endif ~}
 
 [execution]
 input_links = ${jsonencode(gang_settings.input_links)}
@@ -129,6 +137,7 @@ root = "/etc/gang/action-rootfs"
 trust_domain = ${jsonencode(trust_domain)}
 # Workers trust this deployment's signer as their CA.
 ca_pin = "signer"
+stop_timeout = ${jsonencode("${controller_stop_timeout_seconds}s")}
 %{ if endpoint_trust != null ~}
 # A load balancer presents a publicly trusted certificate for endpoint, so clients use their system roots.
 endpoint_trust = ${jsonencode(endpoint_trust)}

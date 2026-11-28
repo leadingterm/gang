@@ -53,6 +53,12 @@ context, and full qualification succeeded in a queue context; PR success does
 not mean ARM, cross or E2E ran. Failure, cancellation, skipped or missing
 producers cannot pass.
 
+Local `tools/lint.sh --nix-vm`, full `tools/lint.sh`, and `tools/gate.sh` runs
+require `GANG_CONTROLLER_BINARY` to point to a qualified same-commit ARM64
+static `gang` binary. CI obtains it from the same run's ARM bundle. The other
+Nix checks use the native x86 binary built from source; portable-only lint does
+not need the ARM binary.
+
 `gh pr checks <number> --required --watch` follows the PR's latest commit, not
 its prepared merge-group commit. A successful PR check watch is therefore not
 evidence that queue validation has finished. Follow the PR's queue entry and

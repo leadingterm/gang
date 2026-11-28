@@ -47,7 +47,7 @@
 //!
 //! let scaling = Arc::new(ScalingConfig::default());
 //! let profiles = SourceProfiles::new(&scaling, HistoryWindow::from_units(1));
-//! let mut reconciler = Reconciler::new(std::slice::from_ref(&policy), scaling, profiles, nonzero_u32(2));
+//! let mut reconciler = Reconciler::new(std::slice::from_ref(&policy), scaling, profiles);
 //! let mut plan = Plan::new();
 //! reconciler.reconcile(&mut fleets, &hosted, PassTime::read(&clock), &mut plan);
 //! assert!(matches!(

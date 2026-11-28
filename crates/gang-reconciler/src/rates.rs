@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -316,7 +315,6 @@ pub(crate) struct SourceRates {
     profiles: SourceProfiles,
     kappa: f64,
     fleet_count: usize,
-    cpu_oversubscription: NonZeroU32,
     index: HashMap<SourceId, usize>,
     sources: Vec<SourceState>,
     cells: Vec<Cell>,
@@ -350,7 +348,6 @@ impl SourceRates {
         policies: &[FleetPolicy],
         scaling: Arc<ScalingConfig>,
         profiles: SourceProfiles,
-        cpu_oversubscription: NonZeroU32,
     ) -> Self {
         let source_count = scaling.max_sources.get();
         let fleet_count = policies.len();
@@ -362,7 +359,6 @@ impl SourceRates {
             scaling,
             profiles,
             fleet_count,
-            cpu_oversubscription,
             index: HashMap::with_capacity(source_count),
             sources,
             cells: vec![Cell::default(); slots.saturating_mul(fleet_count)],
@@ -546,9 +542,8 @@ impl SourceRates {
                 continue;
             }
             let policy = &fleets[fleet].policy;
-            let cpu = u64::from(policy.vcpus_per_instance.get())
-                .saturating_mul(MILLICORES_PER_CORE)
-                .saturating_mul(u64::from(self.cpu_oversubscription.get()));
+            let cpu =
+                u64::from(policy.vcpus_per_instance.get()).saturating_mul(MILLICORES_PER_CORE);
             let budget = ResourceVector {
                 cpu_millicores: u64_to_f64(cpu),
                 memory: u64_to_f64(policy.memory_per_instance.get().get()),
@@ -696,8 +691,7 @@ impl SourceRates {
         for (fleet, pass) in fleets.iter().enumerate().take(self.fleet_count) {
             let scratch = &mut self.fleet_scratch[fleet];
             let cap = capacities.get(fleet).copied().unwrap_or_default();
-            let normalize =
-                |vector: ResourceVector| vector.normalized(&pass.policy, self.cpu_oversubscription);
+            let normalize = |vector: ResourceVector| vector.normalized(&pass.policy);
             let persistent = normalize(scratch.preferred_persistent)
                 .component_min(cap)
                 .component_max(normalize(scratch.preferred_persistent_actual))
@@ -1045,7 +1039,7 @@ mod tests {
                 })
                 .collect();
             let profiles = SourceProfiles::new(&scaling, HistoryWindow::from_units(7));
-            let rates = SourceRates::new(&policies, Arc::new(scaling), profiles, nonzero_u32(1));
+            let rates = SourceRates::new(&policies, Arc::new(scaling), profiles);
             Self {
                 clock: TestClock::new(Timestamp::default()),
                 rates,
@@ -1823,9 +1817,8 @@ mod tests {
     }
 
     #[test]
-    fn cpu_oversubscription_normalizes_running_load_but_not_memory() {
+    fn physical_cpu_normalizes_running_load() {
         let mut world = World::new(1, 2);
-        world.rates.cpu_oversubscription = nonzero_u32(2);
         world
             .snapshot
             .workers
@@ -1835,7 +1828,7 @@ mod tests {
         world.snapshot.executing.push(row);
         world.observe(0);
         let load = world.rates.fleet(0).serving_load;
-        exact(load.cpu, 0.5);
+        exact(load.cpu, 1.0);
         exact(load.memory, 1.0);
         exact(
             load.utilization(CapacityVector::ONE.scaled(2.0)).unwrap(),

@@ -45,7 +45,7 @@ capacity = "spot"
 
 
 [actions]
-cpu_oversubscription = 2
+
 
 [execution]
 input_links = "break"
@@ -82,6 +82,7 @@ root = "/etc/gang/action-rootfs"
 trust_domain = "example.com"
 # Workers trust this deployment's signer as their CA.
 ca_pin = "signer"
+stop_timeout = "2460s"
 # A load balancer presents a publicly trusted certificate for endpoint, so clients use their system roots.
 endpoint_trust = "system"
 

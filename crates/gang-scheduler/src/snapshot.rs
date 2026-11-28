@@ -272,6 +272,7 @@ mod tests {
                 mnemonic: Some(Mnemonic::try_new("Rustc").expect("mnemonic")),
                 candidates: FleetSet::try_from_indices([0, 1]).expect("fleets"),
                 priority,
+                has_explicit_cpu_floor: false,
                 reservation: ActionResources {
                     cpu_millicores: 2_000,
                     memory: Bytes::gib(2),
@@ -309,7 +310,7 @@ mod tests {
         let cat = catalog();
         let mut workers = WorkerRegistry::from_catalog(&cat).expect("workers");
         let mut cordons = CordonRegistry::from_catalog(&cat).expect("cordons");
-        let mut capacity = CapacityCatalog::new(cat.clone(), NonZeroU32::new(2).expect("2"));
+        let mut capacity = CapacityCatalog::new(cat.clone());
         let mut ops = Operations::new();
         let mut queue = OperationQueue::new(cat.len()).expect("queue");
         let mut attempts = Attempts::new();

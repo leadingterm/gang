@@ -11,10 +11,11 @@ use crate::gate::Caller;
 use crate::{Deployment, Parts, Server, ServerError};
 use gang_clock::{Clock, Timestamp};
 use gang_spi::{
-    ApiResponseBody, CertStatus, ControllerReady, IssuedCertRecord, Peer, PortError, Rejection,
-    StateRepositoryPort,
+    Acquisition, ApiResponseBody, CertStatus, ControllerId, ControllerReady, IssuedCertRecord,
+    LeaderLeasePort, Lease, LeaseCandidate, Peer, PortError, Rejection, StateRepositoryPort,
+    Takeover,
 };
-use gang_testkit::{Controller, FakeScheduler, Received, Side};
+use gang_testkit::{Controller, FakeRepository, FakeScheduler, Received, Side};
 use gang_tls::{TransportError, ca_pin_of_certificate};
 use gang_types::{AccessToken, CertSerial, Identity, Permission, Principal, ProviderName};
 use gang_wire::routes::{
@@ -54,6 +55,28 @@ async fn prepare_tls(parts: Parts<TlsDeployment>) -> Server<TlsDeployment> {
         Ok(server) => server,
         Err(error) => panic!("server prepares: {error}"),
     }
+}
+
+async fn hold_leader(repository: &FakeRepository, now: Timestamp) -> Lease {
+    let result = repository
+        .acquire(
+            &LeaseCandidate {
+                holder: ControllerId::new("old-controller"),
+                priority: gang_spi::CandidatePriority::registered(
+                    gang_spi::CandidateGeneration::new(0),
+                ),
+            },
+            now,
+            now,
+            now + Duration::from_mins(1),
+            Takeover::Observe,
+        )
+        .await
+        .expect("old lease acquisition succeeds");
+    let Acquisition::Acquired(lease) = result else {
+        panic!("old lease is available");
+    };
+    lease
 }
 
 /// Runs `server` while `body` executes, then stops it and asserts that the run ended with Ok.
@@ -999,8 +1022,8 @@ async fn promotion_reloads_revocations_committed_after_passive_preparation() {
     let alice_token = alice_token.expect("the first server mints alice's token");
 
     let (parts, _dials, handles) = tls_parts();
-    let host = parts.provisioner.clone();
-    let release_prepared = host.hold_prepared();
+    let old_lease = hold_leader(&handles.repository, handles.clock.wall()).await;
+    let interval = tls_settings().leadership.renew_interval.get();
     let ca = authority(&handles.clock).await;
     let (issued, _key) = client_certificate(&ca, WORKER_PROVIDER, WORKER).await;
     handles.repository.insert(record(
@@ -1017,55 +1040,72 @@ async fn promotion_reloads_revocations_committed_after_passive_preparation() {
     let server = Server::prepare(parts, settings)
         .await
         .expect("server prepares with an empty revocation snapshot");
+    let readiness = server.readiness();
     let cookie = session_token(&handles.clock, &identity(ALICE)).await;
 
-    Box::pin(run_until(server, async {
-        let controller = handles
-            .scheduler
-            .controller()
-            .await
-            .expect("controller is published");
-        host.prepared_attempts().reached(1).await;
-        handles
-            .repository
-            .revoke_principal(&identity(ALICE), handles.clock.wall())
-            .await
-            .expect("old leader commits principal revocation after successor preparation");
-        handles
-            .repository
-            .revoke(&issued.serial, handles.clock.wall())
-            .await
-            .expect("old leader commits certificate revocation before successor acquisition");
-        release_prepared
-            .send(())
-            .expect("routing preparation is waiting");
-        handles.scheduler.snapshots().reached(1).await;
-        let mut leader = request_parts(GET_SERVER.template, None);
-        assert!(
-            matches!(
-                controller
-                    .admit_public(
-                        gang_spi::RequestScope::Controller,
-                        &Peer::default(),
-                        &mut leader,
-                    )
-                    .await,
-                Ok(gang_spi::GateDecision::Admit(_))
-            ),
-            "controller has opened leader admission"
-        );
-        assert_revoked_credentials(
-            &controller,
-            &alice_token,
-            cookie.expose(),
-            &Peer {
-                certificate: Some(issued.serial.clone()),
-                ..Peer::default()
+    let (ready, prepared) = ControllerReady::channel();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let (result, ()) = tokio::join!(
+        server.run(
+            async {
+                let _ = stopped.await;
             },
-        )
-        .await;
-    }))
-    .await;
+            ready
+        ),
+        async {
+            prepared.await.expect("standby preparation completes");
+            let controller = handles
+                .scheduler
+                .controller()
+                .await
+                .expect("controller is published");
+            assert!(!readiness.ready());
+            assert!(!readiness.is_leading());
+            handles
+                .repository
+                .revoke_principal(&identity(ALICE), handles.clock.wall())
+                .await
+                .expect("old leader commits principal revocation after successor preparation");
+            handles
+                .repository
+                .revoke(&issued.serial, handles.clock.wall())
+                .await
+                .expect("old leader commits certificate revocation before successor acquisition");
+            handles
+                .repository
+                .release(&old_lease)
+                .await
+                .expect("old leader releases");
+            handles.clock.advance(interval);
+            handles.scheduler.snapshots().reached(1).await;
+            let mut leader = request_parts(GET_SERVER.template, None);
+            assert!(
+                matches!(
+                    controller
+                        .admit_public(
+                            gang_spi::RequestScope::Controller,
+                            &Peer::default(),
+                            &mut leader,
+                        )
+                        .await,
+                    Ok(gang_spi::GateDecision::Admit(_))
+                ),
+                "controller has opened leader admission"
+            );
+            assert_revoked_credentials(
+                &controller,
+                &alice_token,
+                cookie.expose(),
+                &Peer {
+                    certificate: Some(issued.serial.clone()),
+                    ..Peer::default()
+                },
+            )
+            .await;
+            stop.send(()).expect("server remains running");
+        }
+    );
+    assert!(result.is_ok(), "server shuts down: {result:?}");
 }
 
 async fn assert_revoked_credentials(
@@ -1102,8 +1142,8 @@ async fn assert_revoked_credentials(
 async fn post_acquire_revocation_failure_never_opens_admission() {
     for fail_principals in [true, false] {
         let (parts, _dials, handles) = tls_parts();
-        let host = parts.provisioner.clone();
-        let release = host.hold_prepared();
+        let old_lease = hold_leader(&handles.repository, handles.clock.wall()).await;
+        let interval = tls_settings().leadership.renew_interval.get();
         let mut settings = tls_settings();
         settings.dashboard.enabled = false;
         settings.revocation_refresh_interval = gang_types::NonZeroDuration::from_hours(1);
@@ -1113,21 +1153,22 @@ async fn post_acquire_revocation_failure_never_opens_admission() {
         let readiness = server.readiness();
         let mut run = Box::pin(server.run(pending(), ControllerReady::channel().0));
         assert!(futures::poll!(run.as_mut()).is_pending());
-        assert_eq!(host.prepared_attempts().get(), 1);
+        assert!(!readiness.ready());
+        assert!(!readiness.is_leading());
         if fail_principals {
             handles.repository.fail_principals(true);
         } else {
             handles.repository.fail_revoked_reads(true);
         }
-        release.send(()).expect("passive preparation is held");
+        handles
+            .repository
+            .release(&old_lease)
+            .await
+            .expect("old leader releases");
+        handles.clock.advance(interval);
         let result = run.await;
         assert!(matches!(result, Err(ServerError::Revocations(_))));
-        assert!(!readiness.ready());
-        assert!(
-            !host
-                .milestones()
-                .contains(&gang_spi::HostMilestone::Serving)
-        );
+        assert!(!readiness.is_leading());
         assert_eq!(handles.scheduler.snapshots().get(), 0);
     }
 }
@@ -1136,7 +1177,6 @@ async fn post_acquire_revocation_failure_never_opens_admission() {
 async fn promotion_fails_closed_when_revocations_cannot_be_reloaded() {
     for fail_principals in [true, false] {
         let (parts, _dials, handles) = tls_parts();
-        let host = parts.provisioner.clone();
         let release_ready = handles.scheduler.hold_ready();
         let mut settings = tls_settings();
         settings.dashboard.enabled = false;
@@ -1171,13 +1211,6 @@ async fn promotion_fails_closed_when_revocations_cannot_be_reloaded() {
         assert!(
             matches!(result, Err(ServerError::Revocations(_))),
             "takeover preparation fails on the revocation read: {result:?}"
-        );
-        assert!(
-            !host.milestones().iter().any(|milestone| matches!(
-                milestone,
-                gang_spi::HostMilestone::Prepared | gang_spi::HostMilestone::Serving
-            )),
-            "authorization preparation must finish before routing registration or launch completion"
         );
         assert_eq!(
             handles.scheduler.snapshots().get(),

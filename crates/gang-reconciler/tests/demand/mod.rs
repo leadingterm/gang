@@ -51,7 +51,7 @@ fn zero_resource_actions_share_one_instance() -> Result<(), Box<dyn std::error::
         demand.add_queued(ActionResources::default());
     }
 
-    assert_eq!(demand.instances(&policy()?, NonZeroU32::MIN), 1);
+    assert_eq!(demand.instances(&policy()?), 1);
     Ok(())
 }
 
@@ -62,7 +62,7 @@ fn zero_resource_actions_need_one_instance() -> Result<(), Box<dyn std::error::E
         demand.add_queued(ActionResources::default());
     }
 
-    assert_eq!(demand.instances(&policy()?, NonZeroU32::MIN), 1);
+    assert_eq!(demand.instances(&policy()?), 1);
     Ok(())
 }
 
@@ -71,7 +71,7 @@ fn running_action_counts_do_not_imply_capacity() -> Result<(), Box<dyn std::erro
     let mut demand = Demand::default();
     demand.add_running(17);
 
-    assert_eq!(demand.instances(&policy()?, NonZeroU32::MIN), 1);
+    assert_eq!(demand.instances(&policy()?), 1);
     Ok(())
 }
 
@@ -82,7 +82,7 @@ fn vcpus_dominate_other_resources() -> Result<(), Box<dyn std::error::Error>> {
         demand.add_queued(resources(10000, Bytes::gib(1)));
     }
 
-    assert_eq!(demand.instances(&policy()?, NonZeroU32::MIN), 2);
+    assert_eq!(demand.instances(&policy()?), 2);
     Ok(())
 }
 
@@ -91,7 +91,7 @@ fn memory_dominates_vcpus() -> Result<(), Box<dyn std::error::Error>> {
     let mut demand = Demand::default();
     demand.add_queued(resources(1000, Bytes::gib(30)));
 
-    assert_eq!(demand.instances(&policy()?, NonZeroU32::MIN), 2);
+    assert_eq!(demand.instances(&policy()?), 2);
     Ok(())
 }
 
@@ -108,7 +108,7 @@ fn memory_only_actions_each_requiring_one_instance_need_sixteen_instances()
         });
     }
 
-    assert_eq!(demand.instances(&policy, NonZeroU32::MIN), 16);
+    assert_eq!(demand.instances(&policy), 16);
     Ok(())
 }
 
@@ -123,7 +123,7 @@ fn actions_without_resource_requests_add_no_vcpus() -> Result<(), Box<dyn std::e
         demand.add_queued(ActionResources::default());
     }
 
-    assert_eq!(demand.instances(&policy, NonZeroU32::MIN), 1);
+    assert_eq!(demand.instances(&policy), 1);
     Ok(())
 }
 
@@ -136,7 +136,7 @@ fn instances_ignore_the_minimum() -> Result<(), Box<dyn std::error::Error>> {
     let mut demand = Demand::default();
     demand.add_queued(ActionResources::default());
 
-    assert_eq!(demand.instances(&policy, NonZeroU32::MIN), 1);
+    assert_eq!(demand.instances(&policy), 1);
     Ok(())
 }
 
@@ -149,7 +149,7 @@ fn max_instances_cap_beats_huge_demand() -> Result<(), Box<dyn std::error::Error
     let mut demand = Demand::default();
     demand.add_queued(resources(100_000, Bytes::new(0)));
 
-    assert_eq!(demand.instances(&policy, NonZeroU32::MIN), 5);
+    assert_eq!(demand.instances(&policy), 5);
     Ok(())
 }
 
@@ -159,7 +159,7 @@ fn running_actions_saturate_without_overflow() -> Result<(), Box<dyn std::error:
     demand.add_running(u32::MAX);
     demand.add_queued(ActionResources::default());
 
-    assert_eq!(demand.instances(&policy()?, NonZeroU32::MIN), 1);
+    assert_eq!(demand.instances(&policy()?), 1);
     Ok(())
 }
 
@@ -174,7 +174,7 @@ fn fits_at_exactly_max_instances() -> Result<(), Box<dyn std::error::Error>> {
         demand.add_queued(resources(937, Bytes::new(0)));
     }
 
-    assert!(demand.fits(&policy, NonZeroU32::MIN));
+    assert!(demand.fits(&policy));
     Ok(())
 }
 
@@ -187,7 +187,7 @@ fn fits_fails_one_action_over_max_instances() -> Result<(), Box<dyn std::error::
     let mut demand = Demand::default();
     demand.add_queued(resources(30_001, Bytes::new(0)));
 
-    assert!(!demand.fits(&policy, NonZeroU32::MIN));
+    assert!(!demand.fits(&policy));
     Ok(())
 }
 
@@ -198,7 +198,7 @@ fn fits_ignores_min_instances() -> Result<(), Box<dyn std::error::Error>> {
         ..policy()?
     };
 
-    assert!(Demand::default().fits(&policy, NonZeroU32::MIN));
+    assert!(Demand::default().fits(&policy));
     Ok(())
 }
 
@@ -213,8 +213,8 @@ fn fits_counts_measured_vcpus() -> Result<(), Box<dyn std::error::Error>> {
     let mut over_limit = Demand::default();
     over_limit.add_queued(resources(16000, Bytes::new(0)));
 
-    assert!(at_limit.fits(&policy, NonZeroU32::MIN));
-    assert!(!over_limit.fits(&policy, NonZeroU32::MIN));
+    assert!(at_limit.fits(&policy));
+    assert!(!over_limit.fits(&policy));
     Ok(())
 }
 
@@ -229,12 +229,12 @@ fn disk_alone_drives_the_instance_count() -> Result<(), Box<dyn std::error::Erro
         });
     }
 
-    assert_eq!(demand.instances(&policy()?, NonZeroU32::MIN), 2);
+    assert_eq!(demand.instances(&policy()?), 2);
     Ok(())
 }
 
 #[test]
-fn fractional_cpu_and_oversubscription_are_summed_before_rounding() -> TestResult {
+fn fractional_cpu_is_summed_before_rounding() -> TestResult {
     let mut demand = Demand::default();
     for _ in 0..61 {
         demand.add_queued(ActionResources {
@@ -242,8 +242,7 @@ fn fractional_cpu_and_oversubscription_are_summed_before_rounding() -> TestResul
             ..ActionResources::default()
         });
     }
-    let factor = NonZeroU32::new(2).ok_or("nonzero factor")?;
-    assert_eq!(demand.instances(&policy()?, factor), 2);
+    assert_eq!(demand.instances(&policy()?), 3);
     Ok(())
 }
 
@@ -260,7 +259,7 @@ fn complementary_reservations_sum_per_dimension() -> TestResult {
         memory: Bytes::gib(10),
         disk: Bytes::new(0),
     });
-    assert_eq!(demand.instances(&policy()?, NonZeroU32::MIN), 2);
+    assert_eq!(demand.instances(&policy()?), 2);
     Ok(())
 }
 
@@ -270,8 +269,8 @@ fn instance_demand_tracks_live_maximum_changes() -> TestResult {
     let mut demand = Demand::default();
     demand.add_queued(resources(150_000, Bytes::new(0)));
     policy.instances = InstanceBounds::up_to(NonZeroU32::new(4).ok_or("nonzero max")?);
-    assert_eq!(demand.instances(&policy, NonZeroU32::MIN), 4);
+    assert_eq!(demand.instances(&policy), 4);
     policy.instances = InstanceBounds::up_to(NonZeroU32::new(8).ok_or("nonzero max")?);
-    assert_eq!(demand.instances(&policy, NonZeroU32::MIN), 8);
+    assert_eq!(demand.instances(&policy), 8);
     Ok(())
 }

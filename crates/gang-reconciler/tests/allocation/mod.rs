@@ -49,12 +49,7 @@ impl World {
             snapshot,
             hosted,
             clock: TestClock::new(h.clock.wall()),
-            reconciler: Reconciler::new(
-                &policies,
-                Arc::clone(&h.scaling),
-                h.profiles.clone(),
-                std::num::NonZeroU32::MIN,
-            ),
+            reconciler: Reconciler::new(&policies, Arc::clone(&h.scaling), h.profiles.clone()),
             plan: Plan::new(),
         }
     }

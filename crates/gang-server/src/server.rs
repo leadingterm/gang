@@ -15,10 +15,10 @@ use gang_mtls::SubjectName;
 use gang_reconciler::{PassTime, SourceProfiles};
 use gang_spi::{
     AuthenticationPort, CacheStorePort, ClientCertificates, ControllerConnections, ControllerDrain,
-    ControllerHostIdentity, ControllerHostPort, ControllerHostState, ControllerId, ControllerReady,
-    ControllerSpec, ControllerStores, CredentialLifecyclePort, HostMilestone, Lease, Listening,
-    ObservationSink, Observations, PortError, ProvisionerPort, RevocationEpoch, SchedulerPort,
-    SchedulerSnapshot, Scheme, ServerEndpoints, StateRepositoryPort,
+    ControllerHostIdentity, ControllerId, ControllerIdentityPort, ControllerReady, ControllerSpec,
+    ControllerStores, CredentialLifecyclePort, Lease, Listening, ObservationSink, Observations,
+    PortError, ProvisionerPort, RevocationEpoch, SchedulerPort, SchedulerSnapshot, Scheme,
+    ServerEndpoints, StateRepositoryPort,
 };
 use gang_state::CacheBaseline;
 use gang_tls::{Alpn, ClientAuth, RevocationSet};
@@ -264,7 +264,6 @@ async fn run_leader<D: Deployment>(
         () = shutdown.clone() => return Ok(()),
         prepared = prepared => if !prepared { return Err(ServerError::ControllerEnded); },
     }
-    context.readiness.serve();
     let profiles = SourceProfiles::new(context.scaling, context.actions.history_window);
     let mut history = tokio::select! {
         biased;
@@ -284,30 +283,24 @@ async fn run_leader<D: Deployment>(
     let host = tokio::select! {
         biased;
         () = shutdown.clone() => return Ok(()),
-        result = host_identity(context.provisioner, &*context.core.host.clock, context.sidecar_retry_interval.get(), context.leadership.host_call_timeout()) => result.map_err(ServerError::HostIdentity)?,
+        result = controller_identity(
+            context.provisioner,
+            &*context.core.host.clock,
+            context.sidecar_retry_interval.get(),
+            context.leadership.incarnation_timeout(),
+        ) => result.map_err(ServerError::HostIdentity)?,
     };
-    let state = tokio::select! {
-        biased;
-        () = shutdown.clone() => return Ok(()),
-        state = report_prepared(context.provisioner, &*context.core.host.clock,
-            context.sidecar_retry_interval.get(), context.leadership.host_call_timeout()) => state,
-    };
-    if state == ControllerHostState::Retiring {
-        return Ok(());
-    }
     let candidate = tokio::select! {
         biased;
         () = shutdown.clone() => return Ok(()),
         result = context.leadership.register_candidate(&host) => result.map_err(ServerError::CandidateRegistration)?,
     };
+    context.readiness.serve();
     ready.signal();
     let lease = tokio::select! {
         biased;
         () = shutdown.clone() => return Ok(()),
-        result = context.leadership.acquire(&candidate, context.provisioner) => match result.map_err(ServerError::HostIdentity)? {
-            Some(lease) => lease,
-            None => return Ok(()),
-        },
+        result = context.leadership.acquire(&candidate) => result.map_err(ServerError::CandidateRegistration)?,
     };
     let mut renewing = lease.clone();
     let result = activate_and_serve(
@@ -403,23 +396,6 @@ async fn freeze_and_release<D: Deployment>(
         }
     };
     let preparation = async {
-        // History preparation is still on the prepared old host, before visible freeze.
-        if let Some((store, records)) = history {
-            match context
-                .core
-                .host
-                .clock
-                .timeout(
-                    context.leadership.call_timeout(),
-                    flush_history(context, lease, profiles, store, records),
-                )
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "handoff learned history snapshot failed"),
-                Err(error) => tracing::warn!(%error, "handoff learned history snapshot timed out"),
-            }
-        }
         // Finish complete old revocations; queued handlers recheck readiness under this guard.
         let _revocations = context.core.revocation_lock.lock().await;
         context.readiness.stop();
@@ -448,7 +424,7 @@ async fn freeze_and_release<D: Deployment>(
                 .timeout(context.leadership.call_timeout(), prepare)
                 .await
             {
-                Ok(Ok(())) => return,
+                Ok(Ok(())) => break,
                 Ok(Err(error)) => {
                     tracing::warn!(%error, "handoff protection unavailable; retaining authority and retrying");
                 }
@@ -463,6 +439,23 @@ async fn freeze_and_release<D: Deployment>(
                 .sleep(context.leadership.renew_interval())
                 .await;
         }
+        // Snapshot after dispatch freezes and before releasing authority.
+        if let Some((store, records)) = history {
+            match context
+                .core
+                .host
+                .clock
+                .timeout(
+                    context.leadership.call_timeout(),
+                    flush_history(context, lease, profiles, store, records),
+                )
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "handoff learned history snapshot failed"),
+                Err(error) => tracing::warn!(%error, "handoff learned history snapshot timed out"),
+            }
+        }
     };
     tokio::pin!(keep_authority, preparation);
     tokio::select! {
@@ -473,7 +466,7 @@ async fn freeze_and_release<D: Deployment>(
     Ok(())
 }
 
-/// Completes read-only import before launch completion or a visible takeover request.
+/// Completes read-only import before reporting readiness or acquiring leadership.
 async fn prepare_history<D: Deployment>(
     context: &LeadContext<'_, D>,
     profiles: &SourceProfiles,
@@ -527,10 +520,16 @@ async fn prepare_history<D: Deployment>(
     synchronize_revocations(context.core, context.revoked_certificates)
         .await
         .map_err(ServerError::Revocations)?;
-    if let Some(dashboard) = context.dashboard
-        && let Err(error) = dashboard.reload_from(&context.core.host.repository).await
-    {
-        tracing::warn!(%error, "dashboard history reload failed during preparation");
+    if let Some(dashboard) = context.dashboard {
+        loop {
+            match dashboard.reload_from(&context.core.host.repository).await {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "dashboard history reload failed during preparation");
+                }
+            }
+            clock.sleep(context.leadership.renew_interval()).await;
+        }
     }
     Ok((store, records))
 }
@@ -593,77 +592,23 @@ async fn flush_history_periodically<D: Deployment>(
     }
 }
 
-async fn host_identity<H: ControllerHostPort, C: Clock>(
+async fn controller_identity<H: ControllerIdentityPort, C: Clock>(
     host: &H,
     clock: &C,
     interval: Duration,
-    host_call_timeout: Duration,
+    incarnation_timeout: Duration,
 ) -> Result<ControllerHostIdentity, PortError> {
     loop {
         let started = clock.monotonic();
-        match clock.timeout(host_call_timeout, host.incarnation()).await {
+        match clock.timeout(incarnation_timeout, host.incarnation()).await {
             Ok(Ok(identity)) => return Ok(identity),
             Ok(Err(error @ PortError::Unavailable(_))) => {
-                tracing::warn!(%error, "cannot identify controller host");
+                tracing::warn!(%error, "cannot identify controller incarnation");
             }
             Ok(Err(error)) => return Err(error),
-            Err(error) => tracing::warn!(%error, "timed out identifying controller host"),
+            Err(error) => tracing::warn!(%error, "timed out identifying controller incarnation"),
         }
         clock.sleep_until(started + interval).await;
-    }
-}
-
-/// Passive registration can take longer than the handover window. No takeover is
-/// requested until it completes; shutdown/retirement cancels the caller's future.
-async fn report_prepared<H: ControllerHostPort, C: Clock>(
-    host: &H,
-    clock: &C,
-    interval: Duration,
-    host_call_timeout: Duration,
-) -> ControllerHostState {
-    loop {
-        let attempt = async {
-            let state = clock
-                .timeout(host_call_timeout, host.state())
-                .await
-                .map_err(PortError::unavailable)??;
-            if state == ControllerHostState::Retiring {
-                return Ok::<_, PortError>(state);
-            }
-            host.reached(HostMilestone::Prepared).await?;
-            Ok(ControllerHostState::Active)
-        }
-        .await;
-        match attempt {
-            Ok(state) => return state,
-            Err(error) => {
-                tracing::warn!(%error, "cannot prepare controller host; retrying before takeover");
-            }
-        }
-        clock.sleep(interval).await;
-    }
-}
-
-async fn report_serving<H: ControllerHostPort, C: Clock>(
-    host: &H,
-    clock: &C,
-    interval: Duration,
-    host_call_timeout: Duration,
-) -> Infallible {
-    loop {
-        match clock
-            .timeout(host_call_timeout, host.reached(HostMilestone::Serving))
-            .await
-        {
-            Ok(Ok(())) => std::future::pending().await,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "failed to report serving milestone; retrying");
-            }
-            Err(error) => {
-                tracing::warn!(%error, "timed out reporting serving milestone; retrying");
-            }
-        }
-        clock.sleep(interval).await;
     }
 }
 
@@ -702,7 +647,6 @@ async fn lead_work<D: Deployment>(
         context.control_settings,
         Arc::clone(context.scaling),
         profiles.clone(),
-        context.actions.cpu_oversubscription,
         &crate::control::ControlPorts {
             provisioner: context.provisioner,
             scheduler: context.scheduler,
@@ -722,12 +666,6 @@ async fn lead_work<D: Deployment>(
     tokio::select! {
         biased;
         () = stop => Ok(()),
-        never = report_serving(
-            context.provisioner,
-            &**clock,
-            context.sidecar_retry_interval.get(),
-            context.leadership.host_call_timeout(),
-        ) => match never {},
         never = sidecar => match never {},
         never = control.run() => match never {},
         never = dashboard_tasks(context) => match never {},
@@ -870,12 +808,7 @@ async fn drain_original<D: Deployment>(
             }
             Ok::<(), PortError>(())
         });
-        // This joined call must not delay the next worker-protection renewal.
-        let heartbeat = clock.timeout(
-            context.leadership.call_timeout(),
-            context.provisioner.heartbeat(),
-        );
-        let (observed, protected, heartbeat) = tokio::join!(observation, protection, heartbeat);
+        let (observed, protected) = tokio::join!(observation, protection);
         match observed {
             Ok(Ok(())) => {
                 std::mem::swap(&mut drain, &mut incoming);
@@ -889,11 +822,6 @@ async fn drain_original<D: Deployment>(
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::warn!(%error, "cannot renew old-worker protection"),
             Err(error) => tracing::warn!(%error, "old-worker protection renewal timed out"),
-        }
-        match heartbeat {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(%error, "cannot heartbeat controller retirement"),
-            Err(error) => tracing::warn!(%error, "controller heartbeat timed out"),
         }
         if drain.complete {
             if let Some(protection) = outgoing.as_mut() {
@@ -924,43 +852,7 @@ async fn drain_original<D: Deployment>(
     }
 }
 
-/// Routing queries and completion may span lifecycle transitions; heartbeat while awaiting
-/// the platform and retry an unavailable response without pretending that it succeeded.
-async fn finish_host<D: Deployment>(
-    context: &LeadContext<'_, D>,
-    milestone: HostMilestone,
-) -> Result<(), ServerError> {
-    loop {
-        let reached = context.provisioner.reached(milestone);
-        tokio::pin!(reached);
-        let outcome = loop {
-            tokio::select! {
-                outcome = &mut reached => break outcome,
-                () = context.core.host.clock.sleep(context.leadership.renew_interval()) => {
-                    if let Err(error) = context.provisioner.heartbeat().await {
-                        tracing::warn!(%error, "cannot heartbeat controller retirement");
-                    }
-                }
-            }
-        };
-        match outcome {
-            Ok(()) => return Ok(()),
-            Err(error @ PortError::Unavailable(_)) => {
-                tracing::warn!(%error, ?milestone, "controller milestone unavailable; retrying");
-                context
-                    .core
-                    .host
-                    .clock
-                    .sleep(context.leadership.renew_interval())
-                    .await;
-            }
-            Err(error) => return Err(ServerError::HostIdentity(error)),
-        }
-    }
-}
-
-/// Drives one original engine for the full process lifetime, including passive refusal,
-/// authority transfer, old work completion and actual platform routing-away.
+/// Drains the original engine, retaining refusal listeners until actual shutdown after a yield.
 async fn drive_original<D: Deployment>(
     context: &LeadContext<'_, D>,
     spec: &ControllerSpec<'_>,
@@ -988,7 +880,7 @@ async fn drive_original<D: Deployment>(
     ));
     let mut outgoing = None;
     let result = {
-        let leader = run_leader(context, prepared, ready, shutdown, &mut outgoing);
+        let leader = run_leader(context, prepared, ready, shutdown.clone(), &mut outgoing);
         tokio::pin!(leader);
         tokio::select! {
             biased;
@@ -1004,15 +896,26 @@ async fn drive_original<D: Deployment>(
         dashboard.shutdown();
     }
     if observed.load(Ordering::Acquire) {
-        let drain = async {
-            drain_original(context, &mut outgoing).await?;
-            finish_host(context, HostMilestone::Unrouted).await
-        };
+        let drain = drain_original(context, &mut outgoing);
         tokio::pin!(drain);
         tokio::select! {
             result = &mut controller => return result.map_err(ServerError::Controller).and(Err(ServerError::ControllerEnded)),
+            error = listener_stopped("public", &mut ends.public) => return Err(error),
+            error = listener_stopped("worker", &mut ends.worker) => return Err(error),
             result = &mut drain => result?,
             never = &mut background => match never {},
+        }
+        if result.is_ok() {
+            // A cooperative yield releases authority, not the process or its load-balancer
+            // connections. Keep serving explicit refusals even when no original work remains.
+            tokio::select! {
+                biased;
+                result = &mut controller => return result.map_err(ServerError::Controller).and(Err(ServerError::ControllerEnded)),
+                error = listener_stopped("public", &mut ends.public) => return Err(error),
+                error = listener_stopped("worker", &mut ends.worker) => return Err(error),
+                () = shutdown => {}
+                never = &mut background => match never {},
+            }
         }
         let _ = stop_sender.send(());
         tokio::select! {
@@ -1020,7 +923,6 @@ async fn drive_original<D: Deployment>(
             never = &mut background => match never {},
         }
     }
-    finish_host(context, HostMilestone::HandedOff).await?;
     result
 }
 
@@ -1050,6 +952,7 @@ pub struct Server<D: Deployment> {
     scaling: Arc<gang_config::ScalingConfig>,
     accept_error_backoff: NonZeroDuration,
     attempt_budget: Duration,
+    stop_timeout: NonZeroDuration,
     health_limits: HealthLimits,
     dashboard: Option<Dashboard>,
     builds: BuildsCell,
@@ -1070,10 +973,17 @@ impl<D: Deployment> Server<D> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the worker URL has the wrong scheme, a TLS listener has no usable
-    /// host name, the certificate authority cannot be established, the revoked principals or
-    /// certificates cannot be loaded from the ports, or the server information cannot be built.
+    /// Returns an error when the attempt budget is not shorter than the shutdown timeout, the
+    /// worker URL has the wrong scheme, a TLS listener has no usable host name, the certificate
+    /// authority cannot be established, revoked principals or certificates cannot be loaded, or
+    /// the server information cannot be built.
     pub async fn prepare(parts: Parts<D>, settings: ServerSettings) -> Result<Self, ServerError> {
+        if settings.attempt_budget >= settings.stop_timeout.get() {
+            return Err(ServerError::InvalidStopTimeout {
+                attempt_budget: settings.attempt_budget,
+                stop_timeout: settings.stop_timeout.get(),
+            });
+        }
         let endpoint_trust = settings.transport.endpoint_trust();
         let health_limits = HealthLimits::from(&settings);
         let (worker_endpoint, security, signer) = prepare_transport::<D>(
@@ -1147,6 +1057,7 @@ impl<D: Deployment> Server<D> {
             scaling: settings.scaling,
             accept_error_backoff: settings.accept_error_backoff,
             attempt_budget: settings.attempt_budget,
+            stop_timeout: settings.stop_timeout,
             health_limits,
             dashboard,
             builds,
@@ -1195,6 +1106,8 @@ impl<D: Deployment> Server<D> {
     /// the returned future stops every connection and task the server started.
     /// `ready` is signalled once the embedded controller is built and serves; a run that fails
     /// first drops it unsent.
+    /// After a cooperative yield, the original controller drains its admitted work and remains
+    /// nonleading with live refusal and health listeners until `shutdown` completes.
     ///
     /// Under plaintext, and for every surface whose authentication plugin presents
     /// [`Scheme::None`], a warning is logged once at start.
@@ -1203,7 +1116,8 @@ impl<D: Deployment> Server<D> {
     /// # Errors
     ///
     /// Returns an error when the stores cannot be described, a TLS listener cannot be secured,
-    /// or the controller fails or returns without being asked to stop.
+    /// the shutdown deadline expires, or the controller fails or returns without being asked
+    /// to stop.
     /// A listener that stops accepting connections before shutdown ends the run with
     /// [`ServerError::ListenerEnded`].
     pub fn run(
@@ -1211,12 +1125,29 @@ impl<D: Deployment> Server<D> {
         shutdown: impl Future<Output = ()> + Send + 'static,
         ready: ControllerReady,
     ) -> impl Future<Output = Result<(), ServerError>> {
-        Box::pin(self.run_inner(shutdown, ready))
+        let clock = Arc::clone(&self.core.host.clock);
+        let timeout = self.stop_timeout.get();
+        let readiness = self.readiness.clone();
+        Box::pin(async move {
+            let shutdown = async move {
+                shutdown.await;
+                readiness.stop();
+            }
+            .shared();
+            let run = self.run_inner(shutdown.clone(), ready);
+            tokio::pin!(run);
+            tokio::select! {
+                biased;
+                () = shutdown => clock.timeout(timeout, &mut run)
+                    .await.map_err(ServerError::ShutdownTimedOut)?,
+                result = &mut run => result,
+            }
+        })
     }
 
     async fn run_inner(
         self,
-        shutdown: impl Future<Output = ()> + Send + 'static,
+        shutdown: impl Future<Output = ()> + Clone + Send + 'static,
         ready: ControllerReady,
     ) -> Result<(), ServerError> {
         let core = &*self.core;
@@ -1233,17 +1164,6 @@ impl<D: Deployment> Server<D> {
             clock: core.host.clock.clone(),
             observations: &self.observation_sink,
         };
-        let retirement_error = parking_lot::Mutex::new(None);
-        let provisioner = &self.provisioner;
-        let shutdown = async {
-            tokio::select! {
-                () = shutdown => {}
-                result = provisioner.retiring() => if let Err(error) = result {
-                    *retirement_error.lock() = Some(error);
-                }
-            }
-        }
-        .shared();
         let readiness = self.readiness;
         // Every controller refreshes revocations and drains its admitted observations.
         let mut background = Box::pin(run_background(
@@ -1296,7 +1216,7 @@ impl<D: Deployment> Server<D> {
             scaling: &self.scaling,
             sidecar_retry_interval: self.leadership.renew_interval,
         };
-        let result = drive_original(
+        drive_original(
             &context,
             &spec,
             stores,
@@ -1305,11 +1225,7 @@ impl<D: Deployment> Server<D> {
             shutdown,
             background.as_mut(),
         )
-        .await;
-        if let Some(error) = retirement_error.lock().take() {
-            return Err(ServerError::HostIdentity(error));
-        }
-        result
+        .await
     }
 }
 
@@ -1626,544 +1542,6 @@ mod tests {
     use super::{UnauthenticatedListeners, unauthenticated_listeners};
     use crate::endpoint::EndpointRole;
 
-    // The account budget is shared by the simulated v0.3.5 read workload and
-    // the candidate's lifecycle calls, not partitioned by controller host.
-    #[derive(Clone, Copy, Default, PartialEq, Eq)]
-    enum ServingMode {
-        #[default]
-        Succeed,
-        Held,
-        Transient,
-        Backend,
-        Completed,
-    }
-
-    #[derive(Default)]
-    struct AccountBudget {
-        second: u64,
-        used: u32,
-        next_candidate: Option<gang_clock::Tick>,
-        old_requests: u64,
-        candidate_requests: u64,
-        throttled: u32,
-        held_state_attempts: u32,
-        hold_state: bool,
-        prepared_attempts: u32,
-        prepared_backend_failures: u32,
-        prepared_transient_failures: u32,
-        serving_attempts: u32,
-        serving_transient_errors: u32,
-        serving_backend_errors: u32,
-        serving_mode: ServingMode,
-        prepared: bool,
-    }
-
-    #[derive(Clone)]
-    struct AccountHost {
-        inner: gang_testkit::FakeProvisioner,
-        clock: Arc<gang_clock::TestClock>,
-        account: Arc<parking_lot::Mutex<AccountBudget>>,
-    }
-
-    impl AccountHost {
-        async fn request(&self) -> Result<(), gang_spi::PortError> {
-            use gang_clock::Clock;
-            let now = self.clock.monotonic();
-            let due = self.account.lock().next_candidate.unwrap_or(now).max(now);
-            self.clock.sleep_until(due).await;
-            let started = self.clock.monotonic();
-            let second = started.elapsed().as_secs();
-            let mut account = self.account.lock();
-            account.next_candidate = Some(started + std::time::Duration::from_millis(500));
-            if account.second != second {
-                account.second = second;
-                account.used = 0;
-            }
-            account.candidate_requests += 1;
-            if account.used >= 4 {
-                account.throttled += 1;
-                return Err(gang_spi::PortError::unavailable("account throttled"));
-            }
-            account.used += 1;
-            Ok(())
-        }
-    }
-
-    impl gang_spi::ControllerHostPort for AccountHost {
-        async fn state(&self) -> Result<gang_spi::ControllerHostState, gang_spi::PortError> {
-            let held = {
-                let mut account = self.account.lock();
-                if account.hold_state {
-                    account.held_state_attempts += 1;
-                    true
-                } else {
-                    false
-                }
-            };
-            if held {
-                return std::future::pending().await;
-            }
-            self.request().await?;
-            gang_spi::ControllerHostPort::state(&self.inner).await
-        }
-        async fn drain_limit(&self) -> Result<Option<std::time::Duration>, gang_spi::PortError> {
-            gang_spi::ControllerHostPort::drain_limit(&self.inner).await
-        }
-        async fn heartbeat(&self) -> Result<(), gang_spi::PortError> {
-            gang_spi::ControllerHostPort::heartbeat(&self.inner).await
-        }
-        async fn incarnation(
-            &self,
-        ) -> Result<gang_spi::ControllerHostIdentity, gang_spi::PortError> {
-            gang_spi::ControllerHostPort::incarnation(&self.inner).await
-        }
-        async fn retiring(&self) -> Result<(), gang_spi::PortError> {
-            gang_spi::ControllerHostPort::retiring(&self.inner).await
-        }
-        async fn reached(
-            &self,
-            milestone: gang_spi::HostMilestone,
-        ) -> Result<(), gang_spi::PortError> {
-            if matches!(
-                milestone,
-                gang_spi::HostMilestone::Prepared | gang_spi::HostMilestone::Serving
-            ) {
-                if milestone == gang_spi::HostMilestone::Serving {
-                    let held = {
-                        let mut account = self.account.lock();
-                        account.serving_attempts += 1;
-                        account.serving_mode == ServingMode::Held
-                    };
-                    if held {
-                        return std::future::pending().await;
-                    }
-                }
-                self.request().await?;
-                if milestone == gang_spi::HostMilestone::Prepared {
-                    let mut account = self.account.lock();
-                    account.prepared_attempts += 1;
-                    if account.prepared_backend_failures > 0 {
-                        account.prepared_backend_failures -= 1;
-                        return Err(gang_spi::PortError::backend("prepared backend failure"));
-                    }
-                    if account.prepared_transient_failures > 0 {
-                        account.prepared_transient_failures -= 1;
-                        return Err(gang_spi::PortError::unavailable("prepared throttled"));
-                    }
-                }
-                if milestone == gang_spi::HostMilestone::Serving {
-                    let mut account = self.account.lock();
-                    match account.serving_mode {
-                        ServingMode::Transient => {
-                            account.serving_transient_errors += 1;
-                            return Err(gang_spi::PortError::unavailable("lifecycle throttled"));
-                        }
-                        ServingMode::Backend => {
-                            account.serving_backend_errors += 1;
-                            return Err(gang_spi::PortError::backend("lifecycle failure"));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            gang_spi::ControllerHostPort::reached(&self.inner, milestone).await?;
-            let mut account = self.account.lock();
-            if milestone == gang_spi::HostMilestone::Prepared {
-                account.prepared = true;
-            } else if milestone == gang_spi::HostMilestone::Serving {
-                account.serving_mode = ServingMode::Completed;
-            }
-            Ok(())
-        }
-    }
-
-    impl gang_spi::ProvisionerPort for AccountHost {
-        type FleetOptions = gang_testkit::Opaque;
-        async fn supply(
-            &self,
-            fleet: gang_types::Fleet<'_, Self::FleetOptions>,
-            into: &mut gang_spi::FleetSupply,
-        ) -> Result<(), gang_spi::PortError> {
-            gang_spi::ProvisionerPort::supply(&self.inner, fleet, into).await
-        }
-        async fn converge(
-            &self,
-            held: &gang_spi::Held,
-            fleet: gang_types::Fleet<'_, Self::FleetOptions>,
-        ) -> Result<(), gang_spi::PortError> {
-            gang_spi::ProvisionerPort::converge(&self.inner, held, fleet).await
-        }
-        async fn set_desired_capacity(
-            &self,
-            held: &gang_spi::Held,
-            fleet: gang_types::Fleet<'_, Self::FleetOptions>,
-            desired: u32,
-        ) -> Result<(), gang_spi::PortError> {
-            gang_spi::ProvisionerPort::set_desired_capacity(&self.inner, held, fleet, desired).await
-        }
-        async fn terminate(
-            &self,
-            held: &gang_spi::Held,
-            fleet: gang_types::Fleet<'_, Self::FleetOptions>,
-            instance: &gang_types::InstanceId,
-            mode: gang_spi::TerminationMode,
-        ) -> Result<(), gang_spi::PortError> {
-            gang_spi::ProvisionerPort::terminate(&self.inner, held, fleet, instance, mode).await
-        }
-        fn worker_lifetime(&self) -> gang_types::WorkerLifetime {
-            gang_spi::ProvisionerPort::worker_lifetime(&self.inner)
-        }
-    }
-
-    struct AccountDeployment;
-    impl crate::deployment::Stack for AccountDeployment {
-        type Signer =
-            <crate::test_support_deployment::PlainDeployment as crate::deployment::Stack>::Signer;
-        type Clock = gang_clock::TestClock;
-        type Repository = <crate::test_support_deployment::PlainDeployment as crate::deployment::Stack>::Repository;
-        type Identity =
-            <crate::test_support_deployment::PlainDeployment as crate::deployment::Stack>::Identity;
-        type Clients =
-            <crate::test_support_deployment::PlainDeployment as crate::deployment::Stack>::Clients;
-        type Workers =
-            <crate::test_support_deployment::PlainDeployment as crate::deployment::Stack>::Workers;
-    }
-    impl crate::deployment::Deployment for AccountDeployment {
-        type Provisioner = AccountHost;
-        type Cache = <crate::test_support_deployment::PlainDeployment as crate::deployment::Deployment>::Cache;
-        type Scheduler = <crate::test_support_deployment::PlainDeployment as crate::deployment::Deployment>::Scheduler;
-        type Listener = <crate::test_support_deployment::PlainDeployment as crate::deployment::Deployment>::Listener;
-        type Plugins = <crate::test_support_deployment::PlainDeployment as crate::deployment::Deployment>::Plugins;
-    }
-
-    fn account_parts(
-        parts: crate::deployment::Parts<crate::test_support_deployment::PlainDeployment>,
-        account: Arc<parking_lot::Mutex<AccountBudget>>,
-    ) -> crate::deployment::Parts<AccountDeployment> {
-        crate::deployment::Parts {
-            provisioner: AccountHost {
-                inner: parts.provisioner,
-                clock: parts.clock.clone(),
-                account,
-            },
-            fleets: parts.fleets,
-            cache: parts.cache,
-            signer: parts.signer,
-            scheduler: parts.scheduler,
-            repository: parts.repository,
-            providers: parts.providers,
-            clock: parts.clock,
-            listeners: parts.listeners,
-            controller: parts.controller,
-            clients: parts.clients,
-            workers: parts.workers,
-        }
-    }
-
-    #[tokio::test]
-    async fn shared_account_throttle_preserves_handover_and_serving() -> gang_testkit::TestResult {
-        // This test drives both servers with a manual clock, not an executor turn per tick.
-        tokio::task::unconstrained(account_handover()).await
-    }
-
-    async fn account_handover() -> gang_testkit::TestResult {
-        use gang_clock::Clock;
-        use gang_spi::{ControllerHostIdentity, ControllerId, ControllerReady};
-        use std::time::Duration;
-
-        let (mut old_parts, _, old) = crate::test_support::plain_parts();
-        let (mut new_parts, _, replacement) = crate::test_support::plain_parts();
-        old_parts.provisioner =
-            old_parts
-                .provisioner
-                .with_host_identity(ControllerHostIdentity::Launched {
-                    at: old.clock.wall(),
-                    instance: gang_types::InstanceId::try_new("old-account-host")?,
-                });
-        new_parts.provisioner =
-            new_parts
-                .provisioner
-                .with_host_identity(ControllerHostIdentity::Launched {
-                    at: old.clock.wall() + Duration::from_secs(1),
-                    instance: gang_types::InstanceId::try_new("new-account-host")?,
-                });
-        new_parts.repository = old_parts.repository.clone();
-        new_parts.clock = old_parts.clock.clone();
-        new_parts.controller = ControllerId::new("account-successor");
-        let settings = crate::test_support::plain_settings();
-        let renew = settings.leadership.renew_interval.get();
-        let bound =
-            gang_types::handover::handover_window(renew, settings.leadership.call_timeout.get());
-        let host_timeout = settings.leadership.host_call_timeout.get();
-        let cleanup_bound =
-            bound + settings.leadership.ttl.get() + settings.leadership.host_call_timeout.get();
-        let account = Arc::new(parking_lot::Mutex::new(AccountBudget::default()));
-        let new_parts = account_parts(new_parts, account.clone());
-        let old_server = super::Server::prepare(old_parts, settings.clone()).await?;
-        let new_server = super::Server::prepare(new_parts, settings).await?;
-        let old_ready = old_server.readiness.clone();
-        let new_ready = new_server.readiness.clone();
-        let release_drain = old.scheduler.hold_drain();
-        let (old_stop, old_stopped) = super::stop_channel();
-        let (new_stop, new_stopped) = super::stop_channel();
-        let mut first = Box::pin(old_server.run(old_stopped, ControllerReady::channel().0));
-        assert!(futures::poll!(first.as_mut()).is_pending());
-        assert!(old_ready.ready());
-        let mut second = Box::pin(new_server.run(new_stopped, ControllerReady::channel().0));
-        assert_account_preparation(
-            (&old, &account),
-            (&old_ready, &new_ready),
-            (first.as_mut(), second.as_mut()),
-            bound,
-            host_timeout,
-        )
-        .await;
-        assert_account_serving(
-            (&old, &replacement, &account),
-            &new_ready,
-            (first.as_mut(), second.as_mut()),
-            (host_timeout, renew),
-        )
-        .await;
-
-        new_stop.send(()).map_err(|()| "new server stopped early")?;
-        release_drain
-            .send(())
-            .map_err(|()| "old drain ended early")?;
-        drop(old_stop);
-        finish_account_handover(&old.clock, (first.as_mut(), second.as_mut()), cleanup_bound)
-            .await?;
-        Ok(())
-    }
-
-    async fn finish_account_handover(
-        clock: &gang_clock::TestClock,
-        runs: (
-            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-        ),
-        bound: std::time::Duration,
-    ) -> gang_testkit::TestResult {
-        let (mut old, mut new) = runs;
-        let mut old_done = false;
-        let mut new_done = false;
-        for _ in 0..=bound.as_secs() {
-            if !old_done && let std::task::Poll::Ready(result) = futures::poll!(old.as_mut()) {
-                result?;
-                old_done = true;
-            }
-            if !new_done && let std::task::Poll::Ready(result) = futures::poll!(new.as_mut()) {
-                result?;
-                new_done = true;
-            }
-            if old_done && new_done {
-                return Ok(());
-            }
-            clock.advance(std::time::Duration::from_secs(1));
-        }
-        assert!(
-            old_done,
-            "old controller did not finish draining after release"
-        );
-        assert!(new_done, "successor did not finish shutdown after stop");
-        Ok(())
-    }
-
-    async fn assert_account_preparation(
-        handles: (
-            &crate::test_support_deployment::Handles,
-            &parking_lot::Mutex<AccountBudget>,
-        ),
-        states: (&crate::health::Readiness, &crate::health::Readiness),
-        runs: (
-            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-        ),
-        bound: std::time::Duration,
-        host_timeout: std::time::Duration,
-    ) {
-        use gang_clock::Clock;
-        use std::time::Duration;
-        let (old, account) = handles;
-        let (old_ready, new_ready) = states;
-        let (mut first, mut second) = runs;
-        let old_snapshots = old.scheduler.snapshots().get();
-        // Model v0.3.5's unpaced DescribeAutoScalingGroups/Activities reads.
-        let steps = bound.as_secs() + 4;
-        for _ in 0..steps {
-            {
-                let mut budget = account.lock();
-                budget.second = old.clock.monotonic().elapsed().as_secs();
-                budget.used = 4;
-                budget.old_requests += 4;
-            }
-            assert!(futures::poll!(first.as_mut()).is_pending());
-            assert!(futures::poll!(second.as_mut()).is_pending());
-            assert!(old_ready.ready());
-            assert!(!new_ready.ready());
-            assert_eq!(old.scheduler.drains().get(), 0);
-            old.clock.advance(Duration::from_secs(1));
-        }
-        assert!(old.scheduler.snapshots().get() > old_snapshots);
-        {
-            let budget = account.lock();
-            assert_eq!(budget.old_requests, steps * 4);
-            assert!(budget.candidate_requests > 0);
-            assert!(budget.throttled > 0);
-        }
-        account.lock().hold_state = true;
-        for _ in 0..=bound.as_secs() {
-            old.clock.advance(Duration::from_secs(1));
-            assert!(futures::poll!(first.as_mut()).is_pending());
-            assert!(futures::poll!(second.as_mut()).is_pending());
-            if account.lock().held_state_attempts > 0 {
-                break;
-            }
-        }
-        assert_eq!(account.lock().held_state_attempts, 1);
-        for _ in 0..host_timeout.as_secs() {
-            old.clock.advance(Duration::from_secs(1));
-            assert!(futures::poll!(first.as_mut()).is_pending());
-            assert!(futures::poll!(second.as_mut()).is_pending());
-            assert!(old_ready.ready());
-            assert!(!new_ready.ready());
-            assert_eq!(old.scheduler.drains().get(), 0);
-        }
-        account.lock().hold_state = false;
-        {
-            let mut budget = account.lock();
-            budget.prepared_backend_failures = 1;
-            budget.prepared_transient_failures = 1;
-        }
-        for _ in 0..20 {
-            old.clock.advance(Duration::from_secs(1));
-            assert!(futures::poll!(first.as_mut()).is_pending());
-            assert!(futures::poll!(second.as_mut()).is_pending());
-            assert!(old_ready.ready());
-            assert!(!new_ready.ready());
-            assert_eq!(old.scheduler.drains().get(), 0);
-            let budget = account.lock();
-            if budget.prepared_attempts >= 2 {
-                break;
-            }
-        }
-        assert_eq!(account.lock().prepared_attempts, 2);
-    }
-
-    async fn assert_account_serving(
-        handles: (
-            &crate::test_support_deployment::Handles,
-            &crate::test_support_deployment::Handles,
-            &parking_lot::Mutex<AccountBudget>,
-        ),
-        new_ready: &crate::health::Readiness,
-        runs: (
-            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-        ),
-        timing: (std::time::Duration, std::time::Duration),
-    ) {
-        use std::time::Duration;
-        let (old, replacement, account) = handles;
-        let (mut first, mut second) = runs;
-        account.lock().serving_mode = ServingMode::Held;
-        for _ in 0..40 {
-            old.clock.advance(Duration::from_secs(1));
-            assert!(futures::poll!(first.as_mut()).is_pending());
-            assert!(futures::poll!(second.as_mut()).is_pending());
-            if new_ready.ready() {
-                break;
-            }
-        }
-        assert!(new_ready.ready(), "candidate must eventually take over");
-        assert!(account.lock().prepared);
-        assert_eq!(account.lock().serving_attempts, 1);
-        let snapshots = replacement.scheduler.snapshots().get();
-        observe_serving(
-            (old, account),
-            new_ready,
-            (first.as_mut(), second.as_mut()),
-            timing,
-            ServingObservation::HeldRetry,
-        )
-        .await;
-        assert!(replacement.scheduler.snapshots().get() > snapshots);
-        account.lock().serving_mode = ServingMode::Transient;
-        observe_serving(
-            (old, account),
-            new_ready,
-            (first.as_mut(), second.as_mut()),
-            timing,
-            ServingObservation::TransientFailure,
-        )
-        .await;
-        account.lock().serving_mode = ServingMode::Backend;
-        observe_serving(
-            (old, account),
-            new_ready,
-            (first.as_mut(), second.as_mut()),
-            timing,
-            ServingObservation::BackendFailure,
-        )
-        .await;
-        account.lock().serving_mode = ServingMode::Succeed;
-        observe_serving(
-            (old, account),
-            new_ready,
-            (first.as_mut(), second.as_mut()),
-            timing,
-            ServingObservation::Complete,
-        )
-        .await;
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    enum ServingObservation {
-        HeldRetry,
-        TransientFailure,
-        BackendFailure,
-        Complete,
-    }
-
-    async fn observe_serving(
-        handles: (
-            &crate::test_support_deployment::Handles,
-            &parking_lot::Mutex<AccountBudget>,
-        ),
-        readiness: &crate::health::Readiness,
-        runs: (
-            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-        ),
-        timing: (std::time::Duration, std::time::Duration),
-        expected: ServingObservation,
-    ) {
-        use gang_clock::Clock;
-        let (old, account) = handles;
-        let (mut first, mut second) = runs;
-        let (host_timeout, renew) = timing;
-        let deadline = old.clock.monotonic() + host_timeout + renew + renew;
-        while old.clock.monotonic() <= deadline {
-            assert!(futures::poll!(first.as_mut()).is_pending());
-            assert!(futures::poll!(second.as_mut()).is_pending());
-            assert!(readiness.ready());
-            let observed = {
-                let budget = account.lock();
-                match expected {
-                    ServingObservation::HeldRetry => budget.serving_attempts >= 2,
-                    ServingObservation::TransientFailure => budget.serving_transient_errors > 0,
-                    ServingObservation::BackendFailure => budget.serving_backend_errors > 0,
-                    ServingObservation::Complete => budget.serving_mode == ServingMode::Completed,
-                }
-            };
-            if observed {
-                return;
-            }
-            old.clock.advance(renew);
-        }
-        panic!("serving phase did not reach {expected:?} within its host-call budget");
-    }
-
     fn passive_candidate(holder: &gang_spi::ControllerId) -> gang_spi::LeaseCandidate {
         gang_spi::LeaseCandidate {
             holder: holder.clone(),
@@ -2173,103 +1551,96 @@ mod tests {
         }
     }
 
-    struct IdentityHost {
-        calls: std::sync::atomic::AtomicUsize,
-        mode: u8,
-    }
+    struct RetryingIdentity(std::sync::atomic::AtomicUsize);
 
-    impl gang_spi::ControllerHostPort for IdentityHost {
-        async fn state(&self) -> Result<gang_spi::ControllerHostState, gang_spi::PortError> {
-            Ok(gang_spi::ControllerHostState::Active)
-        }
-        async fn drain_limit(&self) -> Result<Option<std::time::Duration>, gang_spi::PortError> {
-            Ok(None)
-        }
-        async fn heartbeat(&self) -> Result<(), gang_spi::PortError> {
-            Ok(())
-        }
-
+    impl gang_spi::ControllerIdentityPort for RetryingIdentity {
         async fn incarnation(
             &self,
         ) -> Result<gang_spi::ControllerHostIdentity, gang_spi::PortError> {
-            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            match self.mode {
-                0 if call == 0 => Err(gang_spi::PortError::unavailable("temporary")),
-                1 => Err(gang_spi::PortError::backend("permanent")),
-                2 => std::future::pending().await,
-                _ => Ok(gang_spi::ControllerHostIdentity::Persistent(
-                    gang_types::InstanceId::try_new("host").map_err(gang_spi::PortError::config)?,
-                )),
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err(gang_spi::PortError::unavailable("temporary"));
             }
-        }
-
-        async fn retiring(&self) -> Result<(), gang_spi::PortError> {
-            std::future::pending().await
-        }
-
-        async fn reached(&self, _: gang_spi::HostMilestone) -> Result<(), gang_spi::PortError> {
-            Ok(())
+            Ok(gang_spi::ControllerHostIdentity::Persistent(
+                gang_types::InstanceId::try_new("stable-host")
+                    .map_err(gang_spi::PortError::config)?,
+            ))
         }
     }
 
     #[tokio::test]
-    async fn host_identity_retries_transient_and_returns_permanent_failures()
-    -> gang_testkit::TestResult {
+    async fn controller_identity_retries_unavailable() -> gang_testkit::TestResult {
         let clock = gang_clock::TestClock::default();
-        let interval = std::time::Duration::from_secs(3);
-        let host = IdentityHost {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            mode: 0,
-        };
-        let mut identity = Box::pin(super::host_identity(&host, &clock, interval, interval));
+        let interval = std::time::Duration::from_secs(1);
+        let host = RetryingIdentity(std::sync::atomic::AtomicUsize::new(0));
+        let mut identity = Box::pin(super::controller_identity(
+            &host, &clock, interval, interval,
+        ));
         assert!(futures::poll!(identity.as_mut()).is_pending());
-        assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         clock.advance(interval);
         assert!(matches!(
             futures::poll!(identity.as_mut()),
             std::task::Poll::Ready(Ok(gang_spi::ControllerHostIdentity::Persistent(id)))
-                if id == gang_types::InstanceId::try_new("host")?
+                if id == gang_types::InstanceId::try_new("stable-host")?
         ));
-        assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-        let host = IdentityHost {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            mode: 1,
-        };
-        assert!(matches!(
-            super::host_identity(&host, &clock, interval, interval).await,
-            Err(gang_spi::PortError::Backend(_))
-        ));
-        assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 2);
         Ok(())
     }
 
-    #[tokio::test]
-    async fn host_identity_bounds_hung_attempts_and_can_be_cancelled() {
-        let clock = gang_clock::TestClock::default();
-        let interval = std::time::Duration::from_secs(3);
-        let host_timeout = std::time::Duration::from_secs(10);
-        let host = IdentityHost {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            mode: 2,
-        };
-        {
-            let mut identity =
-                Box::pin(super::host_identity(&host, &clock, interval, host_timeout));
-            assert!(futures::poll!(identity.as_mut()).is_pending());
-            clock.advance(interval);
-            assert!(futures::poll!(identity.as_mut()).is_pending());
-            assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-            clock.advance(host_timeout.saturating_sub(interval));
-            assert!(futures::poll!(identity.as_mut()).is_pending());
-            assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    struct StalledIdentity(std::sync::atomic::AtomicUsize);
+
+    impl gang_spi::ControllerIdentityPort for StalledIdentity {
+        async fn incarnation(
+            &self,
+        ) -> Result<gang_spi::ControllerHostIdentity, gang_spi::PortError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending().await
         }
-        clock.advance(interval);
-        assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
-    async fn persistent_old_host_restart_cannot_reverse_handoff() -> gang_testkit::TestResult {
-        old_host_restart_cannot_reverse_handoff(
+    async fn controller_identity_bounds_hung_attempts_and_can_be_cancelled() {
+        let clock = gang_clock::TestClock::default();
+        let interval = std::time::Duration::from_secs(3);
+        let timeout = std::time::Duration::from_secs(10);
+        let host = StalledIdentity(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let mut identity =
+                Box::pin(super::controller_identity(&host, &clock, interval, timeout));
+            assert!(futures::poll!(identity.as_mut()).is_pending());
+            clock.advance(interval);
+            assert!(futures::poll!(identity.as_mut()).is_pending());
+            assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+            clock.advance(timeout.saturating_sub(interval));
+            assert!(futures::poll!(identity.as_mut()).is_pending());
+            assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+        clock.advance(interval);
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    struct FailedIdentity;
+
+    impl gang_spi::ControllerIdentityPort for FailedIdentity {
+        async fn incarnation(
+            &self,
+        ) -> Result<gang_spi::ControllerHostIdentity, gang_spi::PortError> {
+            Err(gang_spi::PortError::backend("identity backend failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn controller_identity_propagates_backend_errors() {
+        let clock = gang_clock::TestClock::default();
+        let interval = std::time::Duration::from_secs(3);
+        assert!(matches!(
+            super::controller_identity(&FailedIdentity, &clock, interval, interval).await,
+            Err(gang_spi::PortError::Backend(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn restarted_incarnation_does_not_preempt_its_successor() -> gang_testkit::TestResult {
+        restarted_identity_does_not_preempt_successor(
             gang_testkit::FakeProvisioner::default(),
             gang_testkit::FakeProvisioner::default(),
         )
@@ -2277,7 +1648,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launched_old_host_restart_cannot_reverse_handoff() -> gang_testkit::TestResult {
+    async fn restarted_launched_incarnation_does_not_preempt_its_successor()
+    -> gang_testkit::TestResult {
         let host = |at, id| -> gang_testkit::TestResult<_> {
             Ok(gang_testkit::FakeProvisioner::default().with_host_identity(
                 gang_spi::ControllerHostIdentity::Launched {
@@ -2286,384 +1658,162 @@ mod tests {
                 },
             ))
         };
-        old_host_restart_cannot_reverse_handoff(host(1, "old")?, host(2, "new")?).await
+        restarted_identity_does_not_preempt_successor(host(1, "old")?, host(2, "new")?).await
     }
 
-    async fn old_host_restart_cannot_reverse_handoff(
-        old_host: gang_testkit::FakeProvisioner,
-        new_host: gang_testkit::FakeProvisioner,
+    async fn restarted_identity_does_not_preempt_successor(
+        old_identity: gang_testkit::FakeProvisioner,
+        new_identity: gang_testkit::FakeProvisioner,
     ) -> gang_testkit::TestResult {
-        use crate::test_support::{plain_parts, plain_settings};
         use gang_spi::{ControllerId, ControllerReady};
-
-        let (mut first, _dials, old) = plain_parts();
-        first.provisioner = old_host.clone();
-        first.controller = ControllerId::new("old-process");
-        let (mut second, _dials, replacement) = plain_parts();
-        second.provisioner = new_host;
-        second.repository = first.repository.clone();
-        second.clock = first.clock.clone();
-        second.controller = ControllerId::new("replacement-process");
-        let settings = plain_settings();
+        let (mut original, _, old) = crate::test_support::plain_parts();
+        original.provisioner = old_identity;
+        let identity = original.provisioner.clone();
+        original.controller = ControllerId::new("old-process");
+        let (mut successor, _, _) = crate::test_support::plain_parts();
+        successor.provisioner = new_identity;
+        successor.repository = original.repository.clone();
+        successor.clock = original.clock.clone();
+        successor.controller = ControllerId::new("new-process");
+        let settings = crate::test_support::plain_settings();
         let interval = settings.leadership.renew_interval.get();
-        let first = super::Server::prepare(first, settings).await?;
-        let first_state = first.readiness.clone();
-        let second = super::Server::prepare(second, plain_settings()).await?;
-        let second_state = second.readiness.clone();
-        let (stop_first, stopped_first) = tokio::sync::oneshot::channel::<()>();
-        let (stop_second, stopped_second) = tokio::sync::oneshot::channel::<()>();
-        let (ready_first, mut first_ready) = ControllerReady::channel();
-        let (ready_second, mut second_ready) = ControllerReady::channel();
-        let mut first = Box::pin(first.run(
-            async {
-                let _ = stopped_first.await;
-            },
-            ready_first,
-        ));
+        let original = super::Server::prepare(original, settings.clone()).await?;
+        let successor = super::Server::prepare(successor, settings.clone()).await?;
+        let successor_ready = successor.readiness.clone();
+        let (stop_old, stopped_old) = super::stop_channel();
+        let (stop_new, stopped_new) = super::stop_channel();
+        let mut first = Box::pin(original.run(stopped_old, ControllerReady::channel().0));
         assert!(futures::poll!(first.as_mut()).is_pending());
-        first_ready.try_recv()?;
-        assert!(first_state.is_leading());
-        let mut second = Box::pin(second.run(
-            async {
-                let _ = stopped_second.await;
-            },
-            ready_second,
-        ));
+        let mut second = Box::pin(successor.run(stopped_new, ControllerReady::channel().0));
         assert!(futures::poll!(second.as_mut()).is_pending());
-        second_ready.try_recv()?;
-        assert!(!second_state.ready());
-        assert!(!second_state.is_leading());
         old.clock.advance(interval);
-        first.await?;
-        drop(stop_first);
-        assert_eq!(old.scheduler.controller_runs().get(), 1);
-        assert!(!first_state.ready());
+        assert!(futures::poll!(first.as_mut()).is_pending());
         assert!(futures::poll!(second.as_mut()).is_pending());
-        assert!(second_state.is_leading());
+        assert!(successor_ready.is_leading());
 
-        assert_restarted_host_stays_passive(
-            old_host,
-            &old,
-            &replacement,
-            &second_state,
-            &mut second,
-            interval,
-        )
-        .await?;
-        stop_second
-            .send(())
-            .map_err(|()| "replacement stopped early")?;
-        second.await?;
-        Ok(())
-    }
-
-    async fn assert_restarted_host_stays_passive(
-        old_host: gang_testkit::FakeProvisioner,
-        old: &crate::test_support_deployment::Handles,
-        replacement: &crate::test_support_deployment::Handles,
-        second_state: &crate::health::Readiness,
-        second: &mut std::pin::Pin<Box<impl Future<Output = Result<(), super::ServerError>>>>,
-        interval: std::time::Duration,
-    ) -> gang_testkit::TestResult {
-        use crate::test_support::{plain_parts, plain_settings};
-        use gang_spi::{ControllerId, ControllerReady};
-        let (mut restarted, _dials, restart) = plain_parts();
-        restarted.provisioner = old_host;
+        stop_old.send(()).map_err(|()| "original stopped early")?;
+        first.await?;
+        let (mut restarted, _, _) = crate::test_support::plain_parts();
+        restarted.provisioner = identity;
         restarted.repository = old.repository.clone();
         restarted.clock = old.clock.clone();
         restarted.controller = ControllerId::new("restarted-old-process");
-        let mut settings = plain_settings();
-        // Here snapshot counts mean control passes, not optional dashboard observation.
-        settings.dashboard.enabled = false;
         let restarted = super::Server::prepare(restarted, settings).await?;
-        let restarted_state = restarted.readiness.clone();
-        let (stop_restart, stopped_restart) = tokio::sync::oneshot::channel::<()>();
-        let (ready_restart, mut restart_ready) = ControllerReady::channel();
-        let mut restarted = Box::pin(restarted.run(
-            async {
-                let _ = stopped_restart.await;
-            },
-            ready_restart,
-        ));
+        let restarted_ready = restarted.readiness.clone();
+        let (stop_restart, stopped_restart) = super::stop_channel();
+        let mut restarted = Box::pin(restarted.run(stopped_restart, ControllerReady::channel().0));
         assert!(futures::poll!(restarted.as_mut()).is_pending());
-        restart_ready.try_recv()?;
-        assert!(!restarted_state.ready());
-        for _ in 0..4 {
-            old.clock.advance(interval);
-            assert!(futures::poll!(restarted.as_mut()).is_pending());
-            assert!(
-                !restarted_state.ready(),
-                "old host cannot become an active contender"
-            );
-            assert!(!restarted_state.is_leading());
-            let snapshots = replacement.scheduler.snapshots().get();
-            assert!(futures::poll!(second.as_mut()).is_pending());
-            assert!(
-                second_state.is_leading(),
-                "replacement must not yield to an old host restart"
-            );
-            assert!(replacement.scheduler.snapshots().get() > snapshots);
-            assert_eq!(replacement.scheduler.controller_runs().get(), 1);
-            assert_eq!(restart.scheduler.snapshots().get(), 0);
-        }
+        assert!(!restarted_ready.is_leading());
+        old.clock.advance(interval);
+        assert!(futures::poll!(restarted.as_mut()).is_pending());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert!(successor_ready.is_leading());
+        stop_new.send(()).map_err(|()| "successor stopped early")?;
+        second.await?;
+        old.clock.advance(interval);
+        assert!(futures::poll!(restarted.as_mut()).is_pending());
+        assert!(
+            restarted_ready.is_leading(),
+            "restarted standby must take over"
+        );
         stop_restart
             .send(())
-            .map_err(|()| "restarted process stopped early")?;
+            .map_err(|()| "restart stopped early")?;
         restarted.await?;
         Ok(())
     }
 
     #[tokio::test]
-    async fn slow_large_preparation_precedes_launch_completion_and_takeover()
+    async fn shutdown_timeout_must_exceed_attempt_budget() {
+        let (parts, _, _) = crate::test_support::plain_parts();
+        let mut settings = crate::test_support::plain_settings();
+        settings.attempt_budget = settings.stop_timeout.get();
+        assert!(matches!(
+            super::Server::prepare(parts, settings).await,
+            Err(super::ServerError::InvalidStopTimeout { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_returns_an_error() -> gang_testkit::TestResult {
+        let (parts, _, handles) = crate::test_support::plain_parts();
+        let _release = handles.scheduler.hold_drain();
+        let mut settings = crate::test_support::plain_settings();
+        settings.attempt_budget = std::time::Duration::from_secs(1);
+        settings.stop_timeout = gang_types::NonZeroDuration::from_secs(2);
+        let server = super::Server::prepare(parts, settings).await?;
+        let (stop, stopped) = super::stop_channel();
+        let mut run = Box::pin(server.run(stopped, gang_spi::ControllerReady::channel().0));
+        assert!(futures::poll!(run.as_mut()).is_pending());
+        stop.send(()).map_err(|()| "controller stopped early")?;
+        assert!(futures::poll!(run.as_mut()).is_pending());
+        handles.clock.advance(std::time::Duration::from_secs(2));
+        assert!(matches!(
+            futures::poll!(run.as_mut()),
+            std::task::Poll::Ready(Err(super::ServerError::ShutdownTimedOut(_)))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_preparation_keeps_standby_unready_and_does_not_request_handoff()
     -> gang_testkit::TestResult {
         use gang_clock::Clock;
-        use gang_spi::{ControllerHostIdentity, ControllerId, ControllerReady, RecordKind};
-        use std::sync::Arc;
-        use std::time::Duration;
-        let (mut first, _dials, old) = crate::test_support::plain_parts();
-        let (mut second, _dials, replacement) = crate::test_support::plain_parts();
-        first.provisioner =
-            first
-                .provisioner
-                .with_host_identity(ControllerHostIdentity::Launched {
-                    at: old.clock.wall(),
-                    instance: gang_types::InstanceId::try_from("local-old")?,
-                });
-        second.provisioner =
-            second
-                .provisioner
-                .with_host_identity(ControllerHostIdentity::Launched {
-                    at: old.clock.wall() + Duration::from_secs(1),
-                    instance: gang_types::InstanceId::try_from("local-new")?,
-                });
-        let host = second.provisioner.clone();
+        use gang_spi::{ControllerId, ControllerReady, RecordKind, SchedulerPort};
+
+        let (first, _, old) = crate::test_support::plain_parts();
+        let (mut second, _, replacement) = crate::test_support::plain_parts();
         second.repository = first.repository.clone();
         second.clock = first.clock.clone();
         second.controller = ControllerId::new("prepared-successor");
-        let release_drain = old.scheduler.hold_drain();
         let mut settings = crate::test_support::plain_settings();
         settings.actions = Arc::new(gang_config::ActionsConfig {
             history_flush_interval: gang_types::NonZeroDuration::from_secs(1),
             ..gang_config::ActionsConfig::default()
         });
         let renew = settings.leadership.renew_interval.get();
-        let bound =
-            gang_types::handover::handover_window(renew, settings.leadership.call_timeout.get());
         let first = super::Server::prepare(first, settings.clone()).await?;
         let second = super::Server::prepare(second, settings).await?;
         let old_state = first.readiness.clone();
         let new_state = second.readiness.clone();
-        let mut first = Box::pin(first.run(std::future::pending(), ControllerReady::channel().0));
+        let (stop_old, stopped_old) = super::stop_channel();
+        let mut first = Box::pin(first.run(stopped_old, ControllerReady::channel().0));
         assert!(futures::poll!(first.as_mut()).is_pending());
         let expected = seed_large_live_history(&old, first.as_mut()).await?;
         let (mut entered, release) = old
             .repository
             .hold_next_record_page(RecordKind::ResourceHistory);
-        let (stop, stopped) = super::stop_channel();
-        let (ready, mut fully_prepared) = ControllerReady::channel();
-        let mut second = Box::pin(second.run(stopped, ready));
+        let (stop_new, stopped_new) = super::stop_channel();
+        let (ready, mut prepared) = ControllerReady::channel();
+        let mut second = Box::pin(second.run(stopped_new, ready));
         assert!(futures::poll!(second.as_mut()).is_pending());
         entered.try_recv()?;
-        // Even a successful read delayed beyond the entire planned-switch budget is
-        // preparation, not a reason to deregister the still-serving original controller.
-        assert_passive_preparation(
-            (&old, &host),
-            (&old_state, &new_state),
-            (first.as_mut(), second.as_mut()),
-            bound,
-        )
-        .await;
-        assert_eq!(
-            host.prepared_attempts().get(),
-            0,
-            "history import precedes routing preparation"
-        );
-        assert!(matches!(
-            fully_prepared.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
-        let release_prepared = host.hold_prepared();
+        assert!(old_state.is_leading());
+        assert!(!new_state.ready());
+        assert_eq!(old.scheduler.drains().get(), 0);
         release
             .send(())
-            .map_err(|()| "preparation read was cancelled")?;
+            .map_err(|()| "history preparation cancelled")?;
         assert!(futures::poll!(second.as_mut()).is_pending());
-        assert_eq!(host.prepared_attempts().get(), 1);
-        assert_passive_preparation(
-            (&old, &host),
-            (&old_state, &new_state),
-            (first.as_mut(), second.as_mut()),
-            bound,
-        )
-        .await;
-        assert!(matches!(
-            fully_prepared.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
-        release_prepared
-            .send(())
-            .map_err(|()| "routing preparation was cancelled")?;
-        assert!(futures::poll!(second.as_mut()).is_pending());
-        fully_prepared.try_recv()?;
-        assert_eq!(host.milestones(), vec![gang_spi::HostMilestone::Prepared]);
-        assert_prepared_activation(
-            (&old, &replacement.scheduler, &host),
-            &new_state,
-            (first.as_mut(), second.as_mut()),
-            &expected,
-            (stop, release_drain),
-            renew,
-        )
-        .await?;
-        assert_eq!(old.scheduler.controller_runs().get(), 1);
-        assert_eq!(replacement.scheduler.controller_runs().get(), 1);
-        Ok(())
-    }
-
-    async fn assert_passive_preparation(
-        handles: (
-            &crate::test_support_deployment::Handles,
-            &gang_testkit::FakeProvisioner,
-        ),
-        states: (&crate::health::Readiness, &crate::health::Readiness),
-        runs: (
-            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-        ),
-        bound: std::time::Duration,
-    ) {
-        let (old, host) = handles;
-        let (old_state, new_state) = states;
-        let (mut first, mut second) = runs;
-        for _ in 0..=bound.as_secs() {
-            old.clock.advance(std::time::Duration::from_secs(1));
-            assert!(futures::poll!(first.as_mut()).is_pending());
-            assert!(futures::poll!(second.as_mut()).is_pending());
-            assert!(old_state.ready());
-            assert!(!new_state.ready());
-            assert_eq!(host.serving_attempts().get(), 0);
-            assert!(host.milestones().is_empty());
-            assert_eq!(old.scheduler.drains().get(), 0, "no early takeover request");
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn passive_host_preparation_cancels_on_shutdown_or_retirement() -> gang_testkit::TestResult
-    {
-        for retiring in [false, true] {
-            let (parts, _dials, handles) = crate::test_support::plain_parts();
-            let host = parts.provisioner.clone();
-            let release = host.hold_prepared();
-            let mut settings = crate::test_support::plain_settings();
-            settings.dashboard.enabled = false;
-            let server = super::Server::prepare(parts, settings).await?;
-            let readiness = server.readiness.clone();
-            let (ready, prepared) = gang_spi::ControllerReady::channel();
-            let (stop, stopped) = super::stop_channel();
-            let mut run = Box::pin(server.run(stopped, ready));
-            assert!(futures::poll!(run.as_mut()).is_pending());
-            assert_eq!(host.prepared_attempts().get(), 1);
-            assert!(!readiness.ready());
-            if retiring {
-                host.retire();
-            } else {
-                stop.send(()).map_err(|()| "server stopped early")?;
-            }
-            tokio::time::timeout(std::time::Duration::from_secs(1), run).await??;
-            assert!(
-                prepared.await.is_err(),
-                "an incomplete Prepared stage never signals readiness"
-            );
-            assert!(
-                release.send(()).is_err(),
-                "the host registration future must be cancelled"
-            );
-            assert!(!host.milestones().iter().any(|milestone| matches!(
-                milestone,
-                gang_spi::HostMilestone::Prepared | gang_spi::HostMilestone::Serving
-            )));
-            assert_eq!(
-                handles.scheduler.snapshots().get(),
-                0,
-                "leader work never starts"
-            );
-        }
-        Ok(())
-    }
-
-    async fn assert_prepared_activation(
-        handles: (
-            &crate::test_support_deployment::Handles,
-            &gang_testkit::FakeScheduler,
-            &gang_testkit::FakeProvisioner,
-        ),
-        readiness: &crate::health::Readiness,
-        runs: (
-            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-            Pin<&mut impl Future<Output = Result<(), super::ServerError>>>,
-        ),
-        expected: &[gang_spi::LearnedHistory],
-        stops: (
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Sender<()>,
-        ),
-        renew: std::time::Duration,
-    ) -> gang_testkit::TestResult {
-        use gang_clock::Clock;
-        use gang_spi::{RecordKind, SchedulerPort};
-        let (old, replacement, host) = handles;
-        let (mut first, mut second) = runs;
-        let (stop, release_drain) = stops;
-        let (mut reread, release_reread) = old
-            .repository
-            .hold_next_record_page(RecordKind::ResourceHistory);
-        old.clock.advance(renew);
-        let release_serving = host.hold_serving();
-        assert!(futures::poll!(first.as_mut()).is_pending());
-        assert!(futures::poll!(second.as_mut()).is_pending());
-        assert!(
-            readiness.ready(),
-            "post-acquire activation must not reload the full history"
-        );
-        assert!(matches!(
-            reread.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
-        assert_eq!(host.serving_attempts().get(), 1);
-        assert_eq!(
-            host.milestones(),
-            vec![gang_spi::HostMilestone::Prepared],
-            "the launch hook is held after leader health becomes ready"
-        );
-        release_serving
-            .send(())
-            .map_err(|()| "launch completion hold disappeared")?;
-        assert!(futures::poll!(second.as_mut()).is_pending());
-        assert_eq!(
-            host.milestones(),
-            vec![
-                gang_spi::HostMilestone::Prepared,
-                gang_spi::HostMilestone::Serving
-            ]
-        );
+        prepared.try_recv()?;
+        assert!(!new_state.ready());
+        assert!(!new_state.is_leading());
+        assert!(old_state.is_leading());
         let mut restored = Vec::new();
         replacement
+            .scheduler
             .learned_history(old.clock.wall(), &mut restored)
             .await?;
-        assert_eq!(
-            restored.as_slice(),
-            expected,
-            "preparation restores every chunk and page"
-        );
-        release_reread
-            .send(())
-            .map_err(|()| "canonical refresh gate was cancelled")?;
-        stop.send(()).map_err(|()| "successor stopped early")?;
-        second.await?;
-        release_drain
-            .send(())
-            .map_err(|()| "old response hold disappeared")?;
+        assert_eq!(restored, expected);
         old.clock.advance(renew);
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(!old_state.is_leading());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert!(new_state.is_leading());
+        stop_old.send(()).map_err(|()| "original stopped early")?;
         first.await?;
+        stop_new.send(()).map_err(|()| "successor stopped early")?;
+        second.await?;
         Ok(())
     }
 
@@ -2864,7 +2014,6 @@ mod tests {
             policies,
             std::sync::Arc::clone(&settings.scaling),
             profiles.clone(),
-            settings.actions.cpu_oversubscription,
         );
         let mut fleets: Vec<_> = policies.iter().cloned().map(FleetPass::new).collect();
         let mut queued = crate::test_support::queued_demand(gang_types::FleetSet::prefix(1)?);
@@ -2979,12 +2128,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn voluntary_yield_flushes_snapshot_without_waiting_for_drain() -> gang_testkit::TestResult
-    {
+    async fn sigterm_flushes_snapshot_without_waiting_for_drain() -> gang_testkit::TestResult {
         use gang_clock::Clock;
         use gang_spi::{
-            Acquisition, ControllerHostIdentity, ControllerId, ControllerReady, LeaderLeasePort,
-            LearnedHistory, RecordId, RecordKey, RecordKind, SchedulerPort, Takeover,
+            ControllerHostIdentity, ControllerId, ControllerReady, LeaderLeasePort, LearnedHistory,
+            RecordId, RecordKey, RecordKind, SchedulerPort,
         };
 
         let (parts, _dials, handles) = crate::test_support::plain_parts();
@@ -2995,7 +2143,6 @@ mod tests {
             history_flush_interval: gang_types::NonZeroDuration::from_secs(3),
             ..gang_config::ActionsConfig::default()
         });
-        let renew = settings.leadership.renew_interval.get();
         let ttl = settings.leadership.ttl.get();
         let snapshot_bound = settings.leadership.call_timeout.get();
         let server = super::Server::prepare(parts, settings).await?;
@@ -3032,15 +2179,7 @@ mod tests {
                 &ControllerHostIdentity::Persistent(gang_types::InstanceId::try_new("yield-host")?),
             )
             .await?;
-        let now = handles.clock.wall();
-        assert!(matches!(
-            handles
-                .repository
-                .acquire(&successor, now, now, now + ttl, Takeover::Request)
-                .await?,
-            Acquisition::Contending(_)
-        ));
-        handles.clock.advance(renew);
+        stop.send(()).map_err(|()| "controller stopped early")?;
         tokio::select! {
             result = run.as_mut() => {
                 result?;
@@ -3048,22 +2187,16 @@ mod tests {
             }
             result = snapshot_entered => result?,
         }
-        assert!(readiness.is_leading(), "snapshot precedes admission stop");
-        assert_eq!(drains.get(), 0);
+        assert!(!readiness.ready(), "shutdown immediately freezes admission");
+        assert_eq!(drains.get(), 1);
         handles
             .clock
             .advance(snapshot_bound.saturating_sub(std::time::Duration::from_millis(1)));
         assert!(futures::poll!(run.as_mut()).is_pending());
-        assert!(readiness.is_leading());
-        assert_eq!(drains.get(), 0);
+        assert!(!readiness.ready());
+        assert_eq!(drains.get(), 1);
         handles.clock.advance(std::time::Duration::from_millis(1));
-        tokio::select! {
-            result = run.as_mut() => {
-                result?;
-                return Err("yield exited before drain".into());
-            }
-            () = drains.reached(1) => {}
-        }
+        assert!(futures::poll!(run.as_mut()).is_pending());
         assert!(!readiness.ready());
         assert!(
             release_snapshot.send(()).is_err(),
@@ -3078,7 +2211,6 @@ mod tests {
             run.as_mut(),
         )
         .await?;
-        drop(stop);
         Ok(())
     }
 
@@ -3251,7 +2383,7 @@ mod tests {
         let now = handles.clock.wall();
         let Acquisition::Acquired(lease) = handles
             .repository
-            .acquire(successor, now, now, now + ttl, Takeover::Request)
+            .acquire(successor, now, now, now + ttl, Takeover::Observe)
             .await?
         else {
             return Err("voluntary lease release waited for admitted drain".into());

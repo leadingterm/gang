@@ -39,6 +39,12 @@ mock_provider "aws" {
       instance_disks             = [{ count = 1, size = 950, type = "ssd" }]
     }
   }
+  mock_data "aws_ami" {
+    defaults = { id = "ami-0123456789abcdef0", root_device_name = "/dev/xvda" }
+  }
+  mock_data "aws_ssm_parameter" {
+    defaults = { value = "ami-0123456789abcdef0" }
+  }
   mock_data "aws_iam_policy_document" {
     defaults = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
   }
@@ -58,7 +64,7 @@ mock_provider "aws" {
     }
   }
   mock_resource "aws_launch_template" {
-    defaults = { id = "lt-0123456789abcdef0" }
+    # LAUNCH_TEMPLATE_DEFAULTS
   }
   mock_resource "aws_eip" {
     defaults = { public_ip = "203.0.113.10" }
@@ -88,16 +94,10 @@ mock_provider "http" {
     }
   }
 }
+# CONTROLLER_ECS_OVERRIDES
 
-override_data {
-  target = data.aws_ami.image
-  values = {
-    name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
-    boot_mode        = "uefi"
-    tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
-    deprecation_time = ""
-  }
-}
+
+# IMAGE_OVERRIDES
 
 override_resource {
   target = module.worker_fleet.module.instance_role.aws_iam_instance_profile.this
@@ -121,19 +121,20 @@ override_data {
 }
 
 variables {
-  client_token_providers   = ["google", "github-actions"]
-  region                   = "eu-north-1"
-  cidr_block               = "10.20.0.0/16"
-  cache_bucket_name        = "example-gang-cache"
-  controller_instance_type = "c7i.large"
-  default_isa              = "x86-64"
-  trust_domain             = "example.com"
-  database                 = { engine = "dynamodb" }
-  controller_count         = 1
-  hostname                 = "gang.example.com"
-  load_balancer            = {}
-  nat_mode                 = "per_az"
-  gang_settings            = { poll_interval = "50ms" }
+  # CONTROLLER_ECS_INPUTS
+  client_token_providers = ["google", "github-actions"]
+  region                 = "eu-north-1"
+  cidr_block             = "10.20.0.0/16"
+  cache_bucket_name      = "example-gang-cache"
+  # CONTROLLER_INSTANCE_TYPE
+  default_isa      = "x86-64"
+  trust_domain     = "example.com"
+  database         = { engine = "dynamodb" }
+  controller_count = 1
+  hostname         = "gang.example.com"
+  load_balancer    = {}
+  nat_mode         = "per_az"
+  gang_settings    = { poll_interval = "50ms" }
   fleets = [{
     name               = "gang-worker-x86-64"
     isa                = "x86-64"

@@ -34,6 +34,7 @@ alias(
 upgrade_fixture(
     name = "v035_fixture",
     srcs = ["@gang_v035_source//:sources"],
+    handoff_protocol = "drain_before_release",
     source_root = "@gang_v035_source//:Cargo.toml",
     target_compatible_with = ["@platforms//os:linux"],
 )
@@ -50,6 +51,7 @@ alias(
 upgrade_fixture(
     name = "v039_fixture",
     srcs = ["@gang_v039_source//:sources"],
+    handoff_protocol = "release_before_drain",
     source_root = "@gang_v039_source//:Cargo.toml",
     target_compatible_with = ["@platforms//os:linux"],
 )
@@ -73,6 +75,7 @@ upgrade_fixture(
         "//infra/terraform/modules/storage:sources",
         "//infra/terraform/modules/worker-fleet:sources",
     ],
+    handoff_protocol = "release_before_drain",
     source_root = "//:Cargo.toml",
     target_compatible_with = ["@platforms//os:linux"],
 )
@@ -86,7 +89,6 @@ workspace_rust_library(
         "//crates/gang-postgres:gang_postgres",
         "//crates/gang-server:gang_server",
         "//crates/gang-sqlite:gang_sqlite",
-        "//crates/gang-engine:gang_engine",
         "//crates/gang-scheduler:gang_scheduler",
     ],
     test_data = glob(
@@ -118,6 +120,7 @@ workspace_rust_library(
         "//crates/gang-client:gang_client",
         "//crates/gang-clock:gang_clock",
         "//crates/gang-config:gang_config",
+        "//crates/gang-engine:gang_engine",
         "//crates/gang-local:gang_local",
         "//crates/gang-main:gang_main",
         "//crates/gang-mtls:gang_mtls",

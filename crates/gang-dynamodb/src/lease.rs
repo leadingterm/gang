@@ -21,9 +21,10 @@ const COUNTER_PK: &str = "counter";
 const CANDIDATE_SK: &str = "lease_candidate";
 const HOST_PK: &str = "controller_host";
 const UPDATE_ITEM: &str = "UpdateItem";
-const SNAPSHOT: [(&str, &str, &str); 8] = [
+const SNAPSHOT: [(&str, &str, &str); 9] = [
     ("holder", "#oldholder", ":oldholder"),
     ("epoch", "#oldepoch", ":oldepoch"),
+    ("safe_yield_epoch", "#oldsafeyield", ":oldsafeyield"),
     ("expires_at", "#oldexpires", ":oldexpires"),
     ("holder_priority", "#oldownerpriority", ":oldownerpriority"),
     ("holder_priority_epoch", "#oldbinding", ":oldbinding"),
@@ -127,6 +128,7 @@ impl DynamoDb {
                 ("#expires".into(), "expires_at".into()),
                 ("#ownerpriority".into(), "holder_priority".into()),
                 ("#binding".into(), "holder_priority_epoch".into()),
+                ("#safeyield".into(), "safe_yield_epoch".into()),
                 ("#record_sequence".into(), "record_sequence".into()),
             ]);
         }
@@ -295,7 +297,7 @@ impl LeaderLeasePort for DynamoDb {
                     (":zero".into(), n(0)),
                 ]);
                 (
-                    "SET #holder = :holder, #epoch = :epoch, #expires = :expires, #ownerpriority = :priority, #binding = :epoch, #record_sequence = :zero REMOVE #successor, #priority, #target, #deadline",
+                    "SET #holder = :holder, #epoch = :epoch, #expires = :expires, #ownerpriority = :priority, #binding = :epoch, #safeyield = :epoch, #record_sequence = :zero REMOVE #successor, #priority, #target, #deadline",
                     values,
                 )
             } else {
@@ -304,7 +306,11 @@ impl LeaderLeasePort for DynamoDb {
                 })?;
                 let newer = candidate.holder != lease.holder
                     && Some(priority) > holder_priority(&item, epoch)?;
-                if !newer || !matches!(takeover, Takeover::Request) || !can_reserve {
+                if !newer
+                    || !matches!(takeover, Takeover::Request)
+                    || !can_reserve
+                    || optional_number(&item, "safe_yield_epoch").ok().flatten() != Some(epoch)
+                {
                     return Ok(if newer && lease.expires_at > now {
                         Acquisition::Contending(lease.clone())
                     } else {
@@ -434,6 +440,7 @@ mod tests {
         let attributes = [
             "holder",
             "epoch",
+            "safe_yield_epoch",
             "expires_at",
             "holder_priority",
             "holder_priority_epoch",
@@ -466,6 +473,67 @@ mod tests {
         assert!(values.is_empty());
         for name in names.keys() {
             assert!(condition.contains(&format!("attribute_not_exists({name})")));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_safe_yield_marker_races() -> gang_testkit::TestResult {
+        for initially_present in [false, true] {
+            let (database, _fake) = crate::contract_tests::setup().await?;
+            let candidate = database
+                .register_candidate(
+                    &ControllerId::new("owner"),
+                    &ControllerHostIdentity::Persistent(gang_types::InstanceId::try_new("host")?),
+                )
+                .await?;
+            let now = Timestamp::from_unix_millis(1);
+            let expiry = Timestamp::from_unix_millis(100);
+            let Acquisition::Acquired(lease) = database
+                .acquire(&candidate, now, now, expiry, Takeover::Observe)
+                .await?
+            else {
+                return Err("owner did not acquire lease".into());
+            };
+            let mut snapshot = database
+                .get(LEASE_PK, LEASE_SK)
+                .await?
+                .ok_or("lease missing")?;
+            if !initially_present {
+                snapshot.remove("safe_yield_epoch");
+            }
+            let mut changed = snapshot.clone();
+            changed.insert("safe_yield_epoch".into(), n(lease.epoch.get() + 1));
+            database
+                .client()
+                .await
+                .put_item()
+                .table_name(database.table())
+                .set_item(Some(changed))
+                .send()
+                .await?;
+            let values = Item::from([
+                (":holder".into(), s("successor")),
+                (":priority".into(), s(candidate.priority.as_str())),
+                (":epoch".into(), n(lease.epoch.get())),
+                (":expires".into(), n(expiry.as_unix_millis())),
+            ]);
+            assert!(
+                database
+                    .update_lease_snapshot(
+                        &snapshot,
+                        "SET #successor = :holder, #priority = :priority, #target = :epoch, #deadline = :expires",
+                        values,
+                        false,
+                    )
+                    .await?
+                    .is_none()
+            );
+            let stored = database
+                .get(LEASE_PK, LEASE_SK)
+                .await?
+                .ok_or("lease missing")?;
+            assert!(!stored.contains_key("successor_holder"));
         }
         Ok(())
     }

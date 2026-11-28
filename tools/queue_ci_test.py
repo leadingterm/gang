@@ -65,8 +65,8 @@ class QueueCiTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "output"
             self.assertEqual(queue_ci.main(["--sha", SHA, "--github-output", str(path), "--require-working-sets"], self.api), 0)
-            self.assertEqual(path.read_text(), f"run-id=1\ntree-sha={TREE}\nworking-set-artifact-ids=3,4,5,6,7\n")
-        self.assertEqual(self.select().working_set_artifact_ids, ())
+            self.assertEqual(path.read_text(), f"run-id=1\ntree-sha={TREE}\nx86-working-set-artifact-ids=3,4,5,6,7\narm-working-set-artifact-ids=8,9,10\n")
+        self.assertEqual(self.select().x86_working_set_artifact_ids, ())
 
     def test_invalid_sha_and_ancestry(self):
         for sha in ("A" * 40, "a" * 39, "a" * 41):
@@ -144,10 +144,20 @@ class QueueCiTest(unittest.TestCase):
         self.api.artifacts[1] = copy.deepcopy(original)
         self.api.artifacts[1][1]["id"] = self.api.artifacts[1][0]["id"]
         self.rejected()
-        self.api.artifacts[1] = copy.deepcopy(original) + [{"name": queue_ci.DARWIN, "id": 8, "expired": False}]
+        self.api.artifacts[1] = copy.deepcopy(original) + [{"name": queue_ci.DARWIN, "id": 11, "expired": False}]
         self.assertEqual(self.select().run_id, 1)
-        self.api.artifacts[1].append({"name": queue_ci.DARWIN, "id": 9, "expired": False})
+        self.api.artifacts[1].append({"name": queue_ci.DARWIN, "id": 12, "expired": False})
         self.rejected()
+
+    def test_arm_working_sets_missing_or_duplicate_fail_closed(self):
+        original = copy.deepcopy(self.api.artifacts[1])
+        for name in queue_ci.ARM_WORKING:
+            with self.subTest(name=name):
+                self.api.artifacts[1] = [artifact for artifact in copy.deepcopy(original) if artifact["name"] != name]
+                self.rejected()
+                artifact = next(artifact for artifact in original if artifact["name"] == name)
+                self.api.artifacts[1] = copy.deepcopy(original) + [copy.deepcopy(artifact)]
+                self.rejected()
 
     def test_older_run_fallback_and_latest_jobs(self):
         self.api.runs = [run(1), run(2)]

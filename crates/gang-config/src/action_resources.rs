@@ -85,6 +85,46 @@ impl fmt::Display for EscalationError {
 }
 impl std::error::Error for EscalationError {}
 
+/// Worker CPU reclamation and feedback settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CpuTuning {
+    /// Percentage of physical CPU withheld as headroom. Default: 15.
+    pub headroom_percent: u8,
+    /// Utilization percentage that latches saturation. Default: 85.
+    pub saturate_utilization_percent: Percent,
+    /// Utilization percentage at which saturation can clear. Default: 75.
+    pub clear_utilization_percent: Percent,
+    /// PSI percentage that latches saturation. Default: 10.
+    pub saturate_psi_percent: Percent,
+    /// PSI percentage at which saturation can clear. Default: 5.
+    pub clear_psi_percent: Percent,
+    /// Time constant for decreasing observed CPU. Default: 25 seconds.
+    pub decay_window: NonZeroDuration,
+    /// CPU sampling interval. Default: 1 second.
+    pub sample_interval: NonZeroDuration,
+    /// Minimum proportional increase for reporting live attempt usage. Default: 25.
+    pub inflight_report_delta_percent: Percent,
+    /// Maximum ratio of reserved to physical CPU when reclaiming. Default: 4.
+    pub max_reclaimed_cpu_ratio: NonZeroU32,
+}
+
+impl Default for CpuTuning {
+    fn default() -> Self {
+        Self {
+            headroom_percent: 15,
+            saturate_utilization_percent: Percent::from_percent(85),
+            clear_utilization_percent: Percent::from_percent(75),
+            saturate_psi_percent: Percent::from_percent(10),
+            clear_psi_percent: Percent::from_percent(5),
+            decay_window: NonZeroDuration::from_secs(25),
+            sample_interval: NonZeroDuration::from_secs(1),
+            inflight_report_delta_percent: Percent::from_percent(25),
+            max_reclaimed_cpu_ratio: NonZeroU32::MIN.saturating_add(3),
+        }
+    }
+}
+
 /// Memory reservation and enforcement settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]

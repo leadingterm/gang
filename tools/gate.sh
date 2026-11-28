@@ -5,7 +5,9 @@
 # Run these harnesses sequentially: coverage matches CI, without launching sixteen
 # independent harness jobs together on one bounded host.
 # ARM, cross and advisory macOS validation run separately in the merge queue.
-# Usage: nix develop -c tools/gate.sh [--list-e2e]. BAZEL names the Bazel command (default: the devShell's `bazel`).
+# Usage: GANG_CONTROLLER_BINARY=<qualified-same-commit-ARM64-static-gang> nix develop -c tools/gate.sh
+# The binary must be a readable file; --list-e2e does not require it.
+# BAZEL names the Bazel command (default: the devShell's `bazel`).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if (($# > 1)) || { (($# == 1)) && [[ $1 != --list-e2e ]]; }; then
@@ -30,6 +32,10 @@ selections=$(yq -o=json '.jobs' .github/workflows/ci.yml | jq -er '
 if (($# == 1)); then
   printf '%s\n' "$selections"
   exit 0
+fi
+if [[ -z ${GANG_CONTROLLER_BINARY:-} || ! -f $GANG_CONTROLLER_BINARY || ! -r $GANG_CONTROLLER_BINARY ]]; then
+  echo 'Set GANG_CONTROLLER_BINARY to a readable, qualified same-commit ARM64 static gang binary.' >&2
+  exit 1
 fi
 tools/lint.sh
 bazel=${BAZEL:-bazel}

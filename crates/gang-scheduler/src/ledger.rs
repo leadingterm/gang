@@ -5,7 +5,6 @@
 //! distributed placement.
 
 use std::cmp::Ordering;
-use std::num::NonZeroU32;
 
 use gang_types::{ActionResources, Bytes, Resources, property};
 use thiserror::Error;
@@ -27,15 +26,13 @@ pub enum LedgerError {
     },
 }
 
-/// Computes a worker's ledger capacity from physical instance resources and CPU oversubscription.
+/// Computes a worker's ledger capacity from physical instance resources.
 ///
-/// CPU capacity equals `physical.vcpus * 1000 * cpu_oversubscription`; memory and disk match the
+/// CPU capacity equals `physical.vcpus * 1000`; memory and disk match the
 /// physical/post-reserve worker capacities.
 #[must_use]
-pub fn ledger_capacity(physical: Resources, cpu_oversubscription: NonZeroU32) -> ActionResources {
-    let cpu_millicores = u64::from(physical.vcpus)
-        .saturating_mul(property::MILLICORES_PER_CORE)
-        .saturating_mul(u64::from(cpu_oversubscription.get()));
+pub fn ledger_capacity(physical: Resources) -> ActionResources {
+    let cpu_millicores = u64::from(physical.vcpus).saturating_mul(property::MILLICORES_PER_CORE);
     ActionResources {
         cpu_millicores,
         memory: physical.memory,
@@ -167,8 +164,32 @@ impl WorkerLedger {
     /// Returns [`LedgerError::InsufficientCapacity`] if any dimension exceeds [`Self::free`],
     /// leaving `self` unchanged.
     pub fn try_reserve(&mut self, request: ActionResources) -> Result<(), LedgerError> {
+        self.try_reserve_with_cpu_free(request, self.free().cpu_millicores)
+    }
+
+    pub(crate) fn ratchet_compute(&mut self, cpu: u64, memory: Bytes) -> Result<(), LedgerError> {
+        let cpu_millicores = self.reserved.cpu_millicores.checked_add(cpu).ok_or(
+            LedgerError::InsufficientCapacity {
+                resource: "cpu_millicores",
+            },
+        )?;
+        let memory = self
+            .reserved
+            .memory
+            .checked_add(memory)
+            .ok_or(LedgerError::InsufficientCapacity { resource: "memory" })?;
+        self.reserved.cpu_millicores = cpu_millicores;
+        self.reserved.memory = memory;
+        Ok(())
+    }
+
+    pub(crate) fn try_reserve_with_cpu_free(
+        &mut self,
+        request: ActionResources,
+        cpu_free: u64,
+    ) -> Result<(), LedgerError> {
         let free = self.free();
-        if request.cpu_millicores > free.cpu_millicores {
+        if request.cpu_millicores > cpu_free {
             return Err(LedgerError::InsufficientCapacity {
                 resource: "cpu_millicores",
             });
@@ -314,14 +335,13 @@ mod tests {
     }
 
     #[test]
-    fn ledger_capacity_applies_oversubscription_to_cpu_only() {
+    fn ledger_capacity_uses_physical_resources() {
         let physical = Resources {
             vcpus: 8,
             memory: Bytes::gib(32),
             disk: Bytes::gib(200),
         };
-        let factor = NonZeroU32::new(2).expect("2 is nonzero");
-        assert_eq!(ledger_capacity(physical, factor), res(16_000, 32, 200));
+        assert_eq!(ledger_capacity(physical), res(8_000, 32, 200));
     }
 
     #[test]

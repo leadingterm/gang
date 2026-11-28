@@ -2553,6 +2553,7 @@ fn worker_server_settings(
         proxy_protocol: None,
         leadership: gang_config::LeadershipConfig::default(),
         attempt_budget,
+        stop_timeout: NonZeroDuration::from_secs(2460),
         revocation_refresh_interval: NonZeroDuration::from_secs(1),
         poll_interval: NonZeroDuration::from_secs(1),
         client_action_timeout: NonZeroDuration::from_mins(1),
@@ -3308,6 +3309,8 @@ async fn observe_worker_keepalives(server: &WorkerServer, worker: &mut HeldWorke
             worker_wire::KeepAlive {
                 cache: None,
                 memory_capacity,
+                load: None,
+                inflight: Vec::new(),
             },
         ))?;
         loop {
@@ -3432,10 +3435,7 @@ async fn higher_priority_actions_dispatch_first_through_engine() -> TestResult {
             vec![single_slot.clone()],
             TestGate::allow(),
             Vec::new(),
-            gang_config::ActionsConfig {
-                cpu_oversubscription: NonZeroU32::MIN,
-                ..Default::default()
-            },
+            gang_config::ActionsConfig::default(),
             gang_config::WorkerConfig::default(),
         )
         .await?;

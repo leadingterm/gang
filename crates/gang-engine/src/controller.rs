@@ -1162,6 +1162,7 @@ mod tests {
                 WorkerEvent::Executed(WorkerExecuted {
                     attempt_id: attempt_id.clone(),
                     usage: AttemptUsage {
+                        peak_window_cpu_millicores: None,
                         peak_memory: Some(Bytes::mib(256)),
                         peak_disk: Some(Bytes::mib(32)),
                         cpu_time: Duration::from_secs(exec_secs),
@@ -1411,6 +1412,7 @@ mod tests {
             observations: Some(sink),
             handoff: None,
             control_acquire_timeout: None,
+            invalidate_existence: None,
         };
         let (handle, task) = spawn_controller(
             make_scheduler(test_policy()),

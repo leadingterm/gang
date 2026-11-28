@@ -114,10 +114,11 @@ impl Parameters {
             .readable_resources
             .iter()
             .any(|resource| resource_matches(resource, &arn))
-            || !role
-                .excluded_from_deny
-                .iter()
-                .any(|resource| resource_matches(resource, &arn))
+            || (!role.excluded_from_deny.is_empty()
+                && !role
+                    .excluded_from_deny
+                    .iter()
+                    .any(|resource| resource_matches(resource, &arn)))
         {
             return Err(E2eError::system(format!(
                 "parameter access denied for {reference:?}"
@@ -509,8 +510,10 @@ mod tests {
         let candidate = plan("new");
         let store = Parameters::seeded(&candidate, &Arc::from("old")).expect("seed");
         let mut role = candidate.controller.clone();
-        role.excluded_from_deny.clear();
+        role.excluded_from_deny = vec!["arn:aws:ssm:other".into()];
         assert!(store.fetch(&role.reference, &role).is_err());
+        role.excluded_from_deny.clear();
+        assert!(store.fetch(&role.reference, &role).is_ok());
         role = candidate.controller.clone();
         role.readable_resources.clear();
         assert!(store.fetch(&role.reference, &role).is_err());
@@ -535,7 +538,7 @@ mod tests {
         let previous = plan("old");
         let mut candidate = plan("new");
         let mut denied = candidate.controller.clone();
-        denied.excluded_from_deny.clear();
+        denied.excluded_from_deny = vec!["arn:aws:ssm:other".into()];
         candidate.workers.push(denied);
         let mut store = Parameters::seeded(&previous, &Arc::from("old")).expect("seed");
         store

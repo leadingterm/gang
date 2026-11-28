@@ -318,6 +318,7 @@ mod tests {
                     disk: Bytes::gib(1),
                 },
                 false,
+                false,
             )
             .expect("assign");
     }
@@ -454,6 +455,8 @@ mod tests {
                     disk: Bytes::gib(1),
                 },
                 false,
+                false,
+                0,
             )
             .expect("executed");
         deadlines.remove(&busy);

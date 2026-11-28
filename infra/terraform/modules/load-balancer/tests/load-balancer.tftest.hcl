@@ -115,6 +115,11 @@ run "forwards_tls_to_the_controller_with_the_client_address" {
   }
 
   assert {
+    condition     = aws_lb_target_group.this.name == var.name && length(output.target_groups) == 0
+    error_message = "SQLite retains its instance target group and exposes no ECS service target groups."
+  }
+
+  assert {
     condition     = aws_lb_target_group_attachment.this[0].target_id == var.controller_instance_id && aws_lb_target_group_attachment.this[0].target_group_arn == aws_lb_target_group.this.arn
     error_message = "The SQLite controller must be registered with the public target group."
   }
@@ -232,11 +237,20 @@ run "shared_database_load_balancers" {
     worker_security_group_id = "sg-workers"
     private_zone_id          = "ZPRIVATE"
     deregistration_delay     = 120
+    health_port              = 8080
   }
 
   assert {
     condition     = aws_lb_listener.this.protocol == "TLS" && aws_lb_listener.this.port == 443 && aws_lb_target_group.this.port == 443
     error_message = "The public NLB must use one TLS client listener on port 443."
+  }
+  assert {
+    condition     = aws_lb_listener.this.alpn_policy == "HTTP2Preferred" && aws_lb_listener.this.ssl_policy == var.ssl_policy
+    error_message = "The shared public listener must retain its TLS 1.3 policy and HTTP/2 ALPN."
+  }
+  assert {
+    condition     = aws_lb_target_group.this.target_type == "instance" && aws_lb_target_group.this.name == var.name && alltrue([for key, tg in aws_lb_target_group.internal : tg.target_type == "instance" && tg.name == "${substr(var.name, 0, 22)}-i-${key}"])
+    error_message = "Shared controllers must use the original instance target group identities."
   }
   assert {
     condition     = aws_lb.internal[0].internal && toset(keys(aws_lb_listener.internal)) == toset(["serve", "workers"]) && aws_lb_listener.internal["serve"].port == 443 && aws_lb_listener.internal["workers"].port == 9090 && toset(keys(aws_lb_target_group.internal)) == toset(["serve", "workers"]) && aws_lb_target_group.internal["serve"].port == 443 && aws_lb_target_group.internal["workers"].port == 9090 && alltrue([for listener in values(aws_lb_listener.internal) : listener.protocol == "TCP" && listener.certificate_arn == null])
@@ -263,12 +277,45 @@ run "shared_database_load_balancers" {
     error_message = "All three target groups must send PROXY v2 and disable source preservation."
   }
   assert {
+    condition     = aws_lb_listener.this.default_action[0].target_group_arn == aws_lb_target_group.this.arn && alltrue([for key, listener in aws_lb_listener.internal : listener.default_action[0].type == "forward" && listener.default_action[0].target_group_arn == aws_lb_target_group.internal[key].arn])
+    error_message = "Each listener must forward to its controller target group."
+  }
+  assert {
     condition     = aws_route53_record.controller.zone_id == "ZPRIVATE" && aws_route53_record.controller.name == "gang.example.com" && length(aws_route53_record.controller.alias) == 1 && length(aws_lb_target_group_attachment.this) == 0
     error_message = "The private hostname must alias the internal NLB."
   }
   assert {
     condition     = length(aws_vpc_security_group_ingress_rule.internal) == 4 && length(aws_vpc_security_group_ingress_rule.controller_internal) == 2 && length(aws_vpc_security_group_egress_rule.internal) == 2
     error_message = "The two internal listeners must have matching security group rules."
+  }
+}
+
+run "shared_service_target_group_outputs" {
+  command = apply
+
+  variables {
+    shared_database          = true
+    public_subnet_ids        = ["subnet-public"]
+    private_subnet_ids       = ["subnet-private"]
+    worker_security_group_id = "sg-workers"
+  }
+
+  assert {
+    condition = (
+      toset(keys(output.target_groups)) == toset(["serve", "internal_serve", "workers"]) &&
+      output.target_groups.serve.arn == aws_lb_target_group.this.arn &&
+      output.target_groups.serve.port == 443 &&
+      output.target_groups.internal_serve.arn == aws_lb_target_group.internal["serve"].arn &&
+      output.target_groups.internal_serve.port == 443 &&
+      output.target_groups.workers.arn == aws_lb_target_group.internal["workers"].arn &&
+      output.target_groups.workers.port == 9090
+    )
+    error_message = "ECS must receive all three target group ARNs and their container ports."
+  }
+
+  assert {
+    condition     = aws_lb_listener.this.default_action[0].target_group_arn == output.target_groups.serve.arn && aws_lb_listener.internal["serve"].default_action[0].target_group_arn == output.target_groups.internal_serve.arn && aws_lb_listener.internal["workers"].default_action[0].target_group_arn == output.target_groups.workers.arn
+    error_message = "All ECS target groups must be associated with their corresponding listeners."
   }
 }
 

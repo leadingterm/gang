@@ -48,7 +48,7 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-version = "0.4.0"
+version = "0.4.1"
 
 [workspace.lints.rust]
 missing_docs = "deny"
@@ -86,10 +86,6 @@ aws-sdk-ec2 = { default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",
 ], version = "1.275" }
-aws-sdk-elasticloadbalancingv2 = { default-features = false, features = [
-    "behavior-version-latest",
-    "rt-tokio",
-], version = "1.138" }
 aws-sdk-kms = { default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",

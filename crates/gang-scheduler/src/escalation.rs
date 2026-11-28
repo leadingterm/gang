@@ -463,7 +463,7 @@ mod tests {
             fleet_with_caps("other", 32, 256, 100, None, None),
         ])
         .expect("catalog");
-        let mut cap = CapacityCatalog::new(cat, NonZeroU32::MIN);
+        let mut cap = CapacityCatalog::new(cat);
         cap.set_local_observations([gang_spi::FleetResourceCapacity {
             fleet: 0,
             capacity: gang_types::Resources {
@@ -514,7 +514,7 @@ mod tests {
     fn escalation_formula_and_whole_cpu_promotion_at_physical_cap() {
         let cat = FleetCatalog::try_new(vec![fleet_with_caps("a", 8, 16, 100, None, Some(6))])
             .expect("catalog");
-        let cap = CapacityCatalog::new(cat, NonZeroU32::new(2).expect("nonzero"));
+        let cap = CapacityCatalog::new(cat);
         let actions = ActionsConfig::default(); // 20% headroom, 200% escalation, 8 max_steps
         let name = op_name();
         let candidates = FleetSet::try_from_indices([0]).expect("candidates");
@@ -647,7 +647,7 @@ mod tests {
     fn peak_above_cap_policy_cap_soft_disk_and_budget_exhaustion_fail() {
         let cat = FleetCatalog::try_new(vec![fleet_with_caps("capped", 8, 16, 100, Some(8), None)])
             .expect("catalog");
-        let cap = CapacityCatalog::new(cat, NonZeroU32::new(2).expect("nonzero"));
+        let cap = CapacityCatalog::new(cat);
         let mut actions = ActionsConfig::default();
         actions.memory.escalation_percent = EscalationPercent::try_new(150).expect("150");
         actions.memory.max_steps = NonZeroU32::new(2).expect("2");

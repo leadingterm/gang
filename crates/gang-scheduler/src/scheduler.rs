@@ -4,6 +4,8 @@
 //! placement, attempt lifecycle, escalation, timers, cordons, handoff, learning, and projections
 //! behind a pure `&mut self` API with caller-owned [`Effects`] output buffers.
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -184,6 +186,10 @@ pub enum WorkerEvent {
         cache: Option<WorkerCacheStats>,
         /// Latest physical/post-reserve memory capacity fact, if reported.
         memory_capacity: Option<Bytes>,
+        /// Most recent sampled CPU load.
+        load: Option<crate::workers::WorkerLoadSnapshot>,
+        /// Material live usage increases for active attempts.
+        inflight: Vec<crate::attempts::AttemptUsageUpdate>,
     },
     /// Worker announced graceful shutdown and must receive no new work.
     GoingAway,
@@ -203,12 +209,90 @@ pub struct Scheduler {
     handoff: ControllerHandOff,
     learned: Learned,
     profiles: HashMap<OperationKey, ActionProfile>,
+    history_operations: HashMap<crate::sketch::SketchKey, BTreeSet<OperationKey>>,
     placement_scratch: Vec<PlacedAssignment>,
     handoff_scratch: HandOffEffects,
     next_attempt_seq: u64,
 }
 
 impl Scheduler {
+    fn remove_profile(&mut self, operation: OperationKey) {
+        let Some(profile) = self.profiles.remove(&operation) else {
+            return;
+        };
+        let Some(key) = profile.history_key else {
+            return;
+        };
+        if let Some(operations) = self.history_operations.get_mut(&key) {
+            operations.remove(&operation);
+            if operations.is_empty() {
+                self.history_operations.remove(&key);
+            }
+        }
+    }
+
+    fn refresh_live_siblings(&mut self, key: &crate::sketch::SketchKey, now: Now) {
+        let Some(entry) = self
+            .learned
+            .histories_mut()
+            .resource_mut()
+            .lookup(key, now.wall.as_unix_millis() / 1000)
+        else {
+            return;
+        };
+        let shaped = self.learned.histories().resource().shape(&entry);
+        let siblings: Vec<_> = self
+            .history_operations
+            .get(key)
+            .map_or_else(Vec::new, |operations| operations.iter().copied().collect());
+        for operation in siblings {
+            let Some(op) = self.operations.get(operation) else {
+                continue;
+            };
+            if op.stage != crate::operations::OperationStage::Queued {
+                continue;
+            }
+            let desired = ActionResources {
+                cpu_millicores: op.reservation.cpu_millicores.max(shaped.cpu_count),
+                memory: op.reservation.memory.max(Bytes::kib(shaped.memory_kb)),
+                disk: op.reservation.disk,
+            };
+            if desired == op.reservation {
+                continue;
+            }
+            let Some(profile) = self.profiles.get(&operation) else {
+                continue;
+            };
+            let Ok(fit) = crate::fitting::fit_reservation(
+                self.capacity.current(),
+                op.candidates,
+                &BTreeMap::new(),
+                profile.floors,
+                desired,
+                self.policy.actions.memory.min_reservation,
+                self.policy.actions.disk.min_reservation,
+            ) else {
+                continue;
+            };
+            if let Some(op) = self.operations.get_mut(operation) {
+                op.reservation.cpu_millicores = op
+                    .reservation
+                    .cpu_millicores
+                    .max(fit.reservation.cpu_millicores);
+                op.reservation.memory = op.reservation.memory.max(fit.reservation.memory);
+                op.cpu_weight =
+                    crate::qos::weight_for_reservation(op.priority, op.reservation.cpu_millicores);
+                op.learned_reservation = fit.learned_reservation;
+            }
+            if let Some(profile) = self.profiles.get_mut(&operation) {
+                profile.desired_reservation = fit.desired;
+                profile.cpu_before_memory_fit = fit.cpu_before_memory_fit;
+                profile.fitted_fleet = fit.fleet;
+                profile.capacity_revision = self.capacity.revision();
+            }
+        }
+    }
+
     /// Constructs a new [`Scheduler`] term from `policy`, `catalog`, and `learned` (`§5.1`).
     ///
     /// # Errors
@@ -263,9 +347,10 @@ impl Scheduler {
         }
 
         let queue = OperationQueue::new(catalog.len())?;
-        let workers = WorkerRegistry::from_catalog(catalog)?;
+        let mut workers = WorkerRegistry::from_catalog(catalog)?;
+        workers.set_cpu_tuning(policy.actions.cpu);
         let cordons = CordonRegistry::from_catalog(catalog)?;
-        let capacity = CapacityCatalog::new(catalog.clone(), policy.actions.cpu_oversubscription);
+        let capacity = CapacityCatalog::new(catalog.clone());
 
         let mut scheduler = Self {
             operations: Operations::with_terminal_limit(policy.max_retained_terminal_operations),
@@ -279,6 +364,7 @@ impl Scheduler {
             handoff: ControllerHandOff::new(),
             learned,
             profiles: HashMap::new(),
+            history_operations: HashMap::new(),
             placement_scratch: Vec::new(),
             handoff_scratch: HandOffEffects::default(),
             next_attempt_seq: 1,
@@ -368,6 +454,12 @@ impl Scheduler {
                 profile,
                 ..
             } => {
+                if let Some(history_key) = &profile.history_key {
+                    self.history_operations
+                        .entry(history_key.clone())
+                        .or_default()
+                        .insert(key);
+                }
                 self.profiles.insert(key, profile);
                 if let Some(audit) = gate_audit {
                     out.push(Effect::AuditGateTier(audit));
@@ -438,7 +530,7 @@ impl Scheduler {
             self.push_publish(publish, out);
         }
         if outcome.previous_stage.is_some() {
-            self.profiles.remove(&key);
+            self.remove_profile(key);
         }
     }
 
@@ -507,14 +599,49 @@ impl Scheduler {
             WorkerEvent::KeepAlive {
                 cache,
                 memory_capacity,
+                load,
+                inflight,
             } => {
+                let mut cooled = false;
+                if let Some(load) = load
+                    && let Some(entry) = self.workers.get_mut(worker)
+                {
+                    cooled = entry.accept_load(load);
+                } else if let Some(entry) = self.workers.get_mut(worker) {
+                    entry.live_load = None;
+                }
+                for update in inflight {
+                    let Some(operation) =
+                        self.attempts
+                            .ratchet_inflight(worker, &update, &mut self.workers)
+                    else {
+                        continue;
+                    };
+                    let Some(key) = self
+                        .profiles
+                        .get(&operation)
+                        .and_then(|profile| profile.history_key.clone())
+                    else {
+                        continue;
+                    };
+                    self.learned
+                        .histories_mut()
+                        .resource_mut()
+                        .observe_inflight(
+                            key.clone(),
+                            (update.cpu_millicores > 0).then_some(update.cpu_millicores),
+                            (update.memory.get() > 0).then_some(update.memory.get().div_ceil(1024)),
+                            now.wall.as_unix_millis() / 1000,
+                        );
+                    self.refresh_live_siblings(&key, now);
+                }
                 let cleared_hold = self
                     .workers
                     .on_keepalive(worker, now, cache, memory_capacity);
                 if memory_capacity.is_some() {
                     self.refresh_local_capacity_observations();
                 }
-                if cleared_hold == Some(true) {
+                if cleared_hold == Some(true) || cooled {
                     self.dispatch_for_worker(worker, now, out);
                 }
             }
@@ -585,7 +712,7 @@ impl Scheduler {
             out.push(Effect::CloseWorker { worker });
         }
         for dropped in effects.dropped_operations {
-            self.profiles.remove(&dropped);
+            self.remove_profile(dropped);
         }
         for publish in effects.publish {
             self.cleanup_terminal_publish(&publish);
@@ -922,7 +1049,7 @@ impl Scheduler {
                 operation, publish, ..
             } => {
                 self.timers.disarm(TimerSubject::ClientLess(operation));
-                self.profiles.remove(&operation);
+                self.remove_profile(operation);
                 self.push_publish(publish, out);
             }
             ExecutedOutcome::Ignored => return,
@@ -981,7 +1108,7 @@ impl Scheduler {
             } => {
                 self.timers.disarm_attempt(attempt_key);
                 self.timers.disarm(TimerSubject::ClientLess(operation));
-                self.profiles.remove(&operation);
+                self.remove_profile(operation);
                 self.push_publish(publish, out);
                 if let (Some(op), Some(worker_id)) = (self.operations.get(operation), worker_id) {
                     out.push(Effect::RecordObservation(CompletedObservation {
@@ -1019,7 +1146,7 @@ impl Scheduler {
             } => {
                 self.timers.disarm_attempt(attempt_key);
                 self.timers.disarm(TimerSubject::ClientLess(operation));
-                self.profiles.remove(&operation);
+                self.remove_profile(operation);
                 self.push_publish(publish, out);
             }
             CompletedOutcome::ReleasedDiskOnly { attempt_key, .. } => {
@@ -1122,6 +1249,8 @@ impl Scheduler {
                 assignment.worker,
                 assignment.reservation,
                 crate::qos::is_gate(assignment.priority),
+                assignment.guaranteed,
+                assignment.assign_seq,
             );
             let _ = self
                 .operations
@@ -1144,6 +1273,8 @@ impl Scheduler {
             attempt_id,
             operation: assignment.operation,
             cpu_weight: assignment.cpu_weight,
+            guaranteed: assignment.guaranteed,
+            assign_seq: assignment.assign_seq,
             reservation: assignment.reservation,
             deadline: attempt_deadline,
             deadline_wall,
@@ -1193,7 +1324,7 @@ impl Scheduler {
             | PublishEvent::Cancelled { operation }
             | PublishEvent::Completed { operation } => {
                 self.timers.disarm(TimerSubject::ClientLess(*operation));
-                self.profiles.remove(operation);
+                self.remove_profile(*operation);
             }
             PublishEvent::Executing { .. } => {}
         }
@@ -1214,7 +1345,7 @@ impl Scheduler {
 
 const fn fallback_profile() -> ActionProfile {
     ActionProfile {
-        command_digest: String::new(),
+        history_key: None,
         floors: ClientFloors {
             cpu_millicores: None,
             memory_kb: None,
@@ -1402,12 +1533,295 @@ mod tests {
 
     fn ok_usage() -> AttemptUsage {
         AttemptUsage {
+            peak_window_cpu_millicores: None,
             peak_memory: Some(Bytes::gib(1)),
             peak_disk: Some(Bytes::gib(1)),
             cpu_time: Duration::from_secs(2),
             wall_time: Duration::from_secs(2),
             oom_kills: 0,
         }
+    }
+
+    #[test]
+    fn inflight_cpu_spike_learns_measured_memory_not_reservation() {
+        let catalog = FleetCatalog::try_new(vec![fleet_props("small", 16, None)]).expect("catalog");
+        let mut sched = make_scheduler(&catalog, default_policy());
+        let mut out = Effects::new();
+        let mut reg = worker_reg("small", "i-live", 1, 8_000, 16, 100);
+        reg.ceilings.cpu_millicores = 8_000;
+        reg.max_inflight = NonZeroU32::new(1);
+        let worker = sched.register(now(1), reg, &mut out).expect("worker");
+        let operation = sched
+            .execute(
+                now(2),
+                exec_req("operations/first", b"first", 100),
+                &mut out,
+            )
+            .expect("first");
+        let (_, _, attempt_id, _) = extract_assign(&out).expect("assigned");
+        let sibling = sched
+            .execute(
+                now(3),
+                exec_req("operations/sibling", b"sibling", 100),
+                &mut out,
+            )
+            .expect("sibling");
+        let key = sched
+            .profiles
+            .get(&operation)
+            .and_then(|profile| profile.history_key.clone())
+            .expect("history key");
+        for time in [4, 5] {
+            sched.on_worker(
+                now(time),
+                worker,
+                WorkerEvent::KeepAlive {
+                    cache: None,
+                    memory_capacity: None,
+                    load: None,
+                    inflight: vec![crate::attempts::AttemptUsageUpdate {
+                        attempt_id: attempt_id.clone(),
+                        cpu_millicores: 6_000,
+                        memory: Bytes::new(512 * 1024 * 1024),
+                    }],
+                },
+                &mut out,
+            );
+        }
+        let sketch = sched.learned.histories_mut().resource_mut();
+        let entry = sketch.lookup(&key, 5).expect("live entry");
+        assert_eq!(entry.live_memory_kb, 512 * 1024);
+        assert_eq!(
+            sched
+                .operations()
+                .get(sibling)
+                .expect("sibling")
+                .reservation
+                .memory,
+            Bytes::gib(4)
+        );
+    }
+
+    #[test]
+    fn inflight_ratchet_updates_queued_sibling_and_releases_exactly() {
+        let catalog = FleetCatalog::try_new(vec![fleet_props("small", 16, None)]).expect("catalog");
+        let mut sched = make_scheduler(&catalog, default_policy());
+        let mut out = Effects::new();
+        let mut reg = worker_reg("small", "i-live", 1, 8_000, 16, 100);
+        reg.ceilings.cpu_millicores = 8_000;
+        reg.max_inflight = NonZeroU32::new(1);
+        let worker = sched.register(now(1), reg, &mut out).expect("worker");
+        sched
+            .execute(
+                now(2),
+                exec_req("operations/first", b"first", 100),
+                &mut out,
+            )
+            .expect("first");
+        let (_, attempt_key, attempt_id, _) = extract_assign(&out).expect("assigned");
+        let sibling = sched
+            .execute(
+                now(3),
+                exec_req("operations/sibling", b"sibling", 100),
+                &mut out,
+            )
+            .expect("sibling");
+        assert_eq!(
+            sched.operations().get(sibling).expect("sibling").stage,
+            OperationStage::Queued
+        );
+        sched.on_worker(
+            now(4),
+            worker,
+            WorkerEvent::KeepAlive {
+                cache: None,
+                memory_capacity: None,
+                load: None,
+                inflight: vec![crate::attempts::AttemptUsageUpdate {
+                    attempt_id: attempt_id.clone(),
+                    cpu_millicores: 6_000,
+                    memory: Bytes::gib(6),
+                }],
+            },
+            &mut out,
+        );
+        let attempt = sched.attempts().get(attempt_key).expect("active");
+        assert_eq!(attempt.reservation.cpu_millicores, 6_000);
+        assert_eq!(attempt.reservation.memory, Bytes::gib(6));
+        let queued = sched.operations().get(sibling).expect("queued");
+        assert_eq!(queued.stage, OperationStage::Queued);
+        assert!(queued.reservation.cpu_millicores >= 6_000);
+        assert!(queued.reservation.memory >= Bytes::gib(6));
+        let reserved = sched
+            .workers()
+            .get(worker)
+            .expect("worker")
+            .ledger
+            .reserved();
+        assert_eq!(reserved.cpu_millicores, 6_000);
+        assert_eq!(reserved.memory, Bytes::gib(6));
+        sched.workers.set_going_away(worker);
+        sched.on_worker(
+            now(5),
+            worker,
+            WorkerEvent::Executed(WorkerExecuted {
+                attempt_id: attempt_id.clone(),
+                usage: AttemptUsage::default(),
+                kill: None,
+                side_channel_memory_failure: false,
+                deadline_exceeded: false,
+            }),
+            &mut out,
+        );
+        let reserved = sched
+            .workers()
+            .get(worker)
+            .expect("worker")
+            .ledger
+            .reserved();
+        assert_eq!(reserved.cpu_millicores, 0);
+        assert_eq!(reserved.memory, Bytes::new(0));
+        assert_eq!(reserved.disk, Bytes::gib(10));
+        sched.on_worker(
+            now(6),
+            worker,
+            WorkerEvent::Completed(WorkerCompleted {
+                attempt_id,
+                status: CompletionStatus::Ok,
+                execution_timestamps: None,
+            }),
+            &mut out,
+        );
+        assert_eq!(
+            sched
+                .workers()
+                .get(worker)
+                .expect("worker")
+                .ledger
+                .reserved(),
+            ActionResources::default()
+        );
+    }
+
+    #[test]
+    fn cpu_pressure_decline_waits_for_a_fresh_cool_sample() {
+        let catalog = FleetCatalog::try_new(vec![fleet_props("small", 16, None)]).expect("catalog");
+        let mut sched = make_scheduler(&catalog, default_policy());
+        let mut out = Effects::new();
+        let mut reg = worker_reg("small", "i-pressure", 1, 8_000, 16, 100);
+        reg.ceilings.cpu_millicores = 8_000;
+        let worker = sched.register(now(1), reg, &mut out).expect("worker");
+        sched
+            .execute(
+                now(2),
+                exec_req("operations/running", b"running", 100),
+                &mut out,
+            )
+            .expect("running");
+        let (_, _, first, _) = extract_assign(&out).expect("first assignment");
+        sched.on_worker(
+            now(3),
+            worker,
+            WorkerEvent::Accept { attempt_id: first },
+            &mut out,
+        );
+        out.clear();
+        let queued = sched
+            .execute(
+                now(4),
+                exec_req("operations/declined", b"declined", 100),
+                &mut out,
+            )
+            .expect("second");
+        let (_, _, second, _) = extract_assign(&out).expect("second assignment");
+        out.clear();
+        sched.on_worker(
+            now(5),
+            worker,
+            WorkerEvent::Decline {
+                attempt_id: second,
+                reason: crate::DeclineReason::CpuPressure,
+            },
+            &mut out,
+        );
+        let operation = sched.operations().get(queued).expect("queued");
+        assert_eq!(operation.stage, OperationStage::Queued);
+        assert_eq!(
+            operation.retry_counts,
+            crate::operations::RetryCounts::default()
+        );
+        assert!(
+            extract_assign(&out).is_none(),
+            "must not immediately retry on a saturated worker"
+        );
+        out.clear();
+        sched.on_worker(
+            now(6),
+            worker,
+            WorkerEvent::KeepAlive {
+                cache: None,
+                memory_capacity: None,
+                inflight: Vec::new(),
+                load: Some(crate::workers::WorkerLoadSnapshot {
+                    non_guaranteed_observed_cpu_millicores: 0,
+                    observed_cpu_millicores: 1_000,
+                    cpu_psi_percent: 0,
+                    cpu_saturated: false,
+                    reclaimable_cpu_millicores: 5_800,
+                    sample_seq: 1,
+                    observed_assign_seq: 1,
+                }),
+            },
+            &mut out,
+        );
+        assert!(
+            extract_assign(&out).is_some(),
+            "cool heartbeat must resume queued work"
+        );
+    }
+
+    #[test]
+    fn explicit_cpu_floor_requires_unreserved_physical_cpu() {
+        let catalog = FleetCatalog::try_new(vec![fleet_props("small", 16, None)]).expect("catalog");
+        let mut sched = make_scheduler(&catalog, default_policy());
+        let mut out = Effects::new();
+        let mut reg = worker_reg("small", "i-floor", 1, 8_000, 16, 100);
+        reg.ceilings.cpu_millicores = 8_000;
+        let worker = sched.register(now(1), reg, &mut out).expect("worker");
+        sched
+            .execute(
+                now(2),
+                exec_req("operations/running", b"running", 100),
+                &mut out,
+            )
+            .expect("running");
+        sched.on_worker(
+            now(3),
+            worker,
+            WorkerEvent::KeepAlive {
+                cache: None,
+                memory_capacity: None,
+                inflight: Vec::new(),
+                load: Some(crate::workers::WorkerLoadSnapshot {
+                    non_guaranteed_observed_cpu_millicores: 0,
+                    observed_cpu_millicores: 1_000,
+                    cpu_psi_percent: 0,
+                    cpu_saturated: false,
+                    reclaimable_cpu_millicores: 5_800,
+                    sample_seq: 1,
+                    observed_assign_seq: 1,
+                }),
+            },
+            &mut out,
+        );
+        let mut request = exec_req("operations/floor", b"floor", 100);
+        request
+            .platform_properties
+            .insert(property::CPU_COUNT.to_owned(), "5".to_owned());
+        let key = sched.execute(now(4), request, &mut out).expect("floor");
+        let operation = sched.operations().get(key).expect("operation");
+        assert!(operation.has_explicit_cpu_floor);
+        assert_eq!(operation.stage, OperationStage::Queued);
     }
 
     #[test]
@@ -1761,8 +2175,7 @@ mod tests {
 
     fn assert_gate_precedes_retry(kill: Option<KillCause>) {
         let cat = FleetCatalog::try_new(vec![fleet_props("small", 16, None)]).expect("catalog");
-        let mut policy = default_policy();
-        policy.actions.cpu_oversubscription = NonZeroU32::MIN;
+        let policy = default_policy();
         let mut sched = make_scheduler(&cat, policy);
         let mut out = Effects::new();
         let mut reg = worker_reg("small", "i-priority", 1, 4_000, 16, 100);
@@ -1845,7 +2258,6 @@ mod tests {
     fn blocked_fleet_prefix_does_not_starve_another_fleet() {
         let cat = two_fleet_catalog();
         let mut policy = default_policy();
-        policy.actions.cpu_oversubscription = NonZeroU32::MIN;
         policy.dispatch_scan_limit = 3;
         let blocked_count = policy.dispatch_scan_limit + 5;
         let mut sched = make_scheduler(&cat, policy);
@@ -1940,6 +2352,8 @@ mod tests {
                 WorkerEvent::KeepAlive {
                     cache: None,
                     memory_capacity: None,
+                    load: None,
+                    inflight: Vec::new(),
                 },
                 out,
             );
@@ -2113,6 +2527,8 @@ mod tests {
                 WorkerEvent::KeepAlive {
                     cache: None,
                     memory_capacity: None,
+                    load: None,
+                    inflight: Vec::new(),
                 },
                 &mut out,
             );

@@ -90,6 +90,11 @@ impl ByteRange {
 /// Content-addressed blob storage.
 #[port]
 pub trait ContentStore: fmt::Debug + Send + Sync + 'static {
+    /// Discards cached presence information for blobs known to be absent.
+    fn invalidate_existence(&self, digests: &[Digest]) {
+        let _ = digests;
+    }
+
     /// Clears `missing`, then pushes each digest of `digests` the store lacks, in input order.
     /// [`Digest::EMPTY`] is never missing.
     ///
