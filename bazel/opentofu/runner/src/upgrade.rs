@@ -18,11 +18,14 @@ use serde_json::Value;
 
 const TEST: &str = "tests/upgrade.tftest.hcl";
 const MIGRATION_TEST: &str = "tests/ecs_migration.tftest.hcl";
-const MIGRATION_RUNS: [&str; 7] = [
+const MIGRATION_RUNS: [&str; 10] = [
     "baseline",
     "bootstrap_plan",
     "bootstrap_apply",
     "bootstrap_converge",
+    "worker_plan",
+    "worker_apply",
+    "worker_converge",
     "handoff_plan",
     "handoff_apply",
     "handoff_converge",
@@ -321,10 +324,21 @@ override_resource {
 }"#,
         );
     }
-    fs::write(root.join(TEST), &test_content)?;
     if ecs {
         stage_migration_test(root, &test_content)?;
     }
+    test_content = test_content
+        .replace("# LAUNCH_TEMPLATE_DEFAULTS", "defaults = { id = \"lt-0123456789abcdef0\" }")
+        .replace("# IMAGE_OVERRIDES", r#"override_data {
+  target = data.aws_ami.image
+  values = {
+    name = "gang-x86_64-aaaaaaaaaaaaaaaa"
+    boot_mode = "uefi"
+    tags = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+    deprecation_time = ""
+  }
+}"#);
+    fs::write(root.join(TEST), &test_content)?;
     Ok(ecs)
 }
 
@@ -334,12 +348,33 @@ fn stage_migration_test(root: &Path, content: &str) -> Result<()> {
     let (prefix, _) = content
         .split_once("run \"seed\" {")
         .ok_or("missing seed run")?;
+    let image_overrides = r#"override_data {
+  target = data.aws_ami.image["072320588884/x86_64/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+  values = { id = "ami-00000000000000002", name = "new-image", boot_mode = "uefi", tags = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, deprecation_time = "" }
+}
+override_data {
+  target = data.aws_ami.image["072320588884/x86_64/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+  values = { id = "ami-00000000000000001", name = "old-image", boot_mode = "uefi", tags = { "ec2:SharedTag/ImageSha256" = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, deprecation_time = "" }
+}"#;
+    let prefix = prefix
+        .replace("# IMAGE_OVERRIDES", image_overrides)
+        .replace(
+            "# LAUNCH_TEMPLATE_DEFAULTS",
+            "defaults = { id = \"lt-0123456789abcdef0\", latest_version = 2, default_version = 2 }",
+        );
     let runs = r#"
 run "baseline" {
   command = apply
-  variables { gang_settings = { poll_interval = "100ms" } }
+  variables {
+    gang_settings = { poll_interval = "100ms" }
+    images = { x86_64 = { owner = "072320588884", sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } }
+  }
   plan_options {
     target = [module.network, module.storage, module.load_balancer, module.worker_fleet, module.controller.module.instance_role, aws_ssm_parameter.config_generation]
+  }
+  override_resource {
+    target = module.worker_fleet.aws_launch_template.this
+    values = { id = "lt-0123456789abcdef0", latest_version = 1, default_version = 1 }
   }
 }
 run "bootstrap_plan" {
@@ -353,6 +388,22 @@ run "bootstrap_apply" {
 run "bootstrap_converge" {
   command = plan
   plan_options { target = [module.controller.aws_ecr_repository.controller, aws_ssm_parameter.config_generation] }
+}
+run "worker_plan" {
+  command = plan
+  plan_options { target = [module.worker_fleet.aws_launch_template.this, module.worker_fleet.aws_autoscaling_group.this, aws_ssm_parameter.config_generation] }
+}
+run "worker_apply" {
+  command = apply
+  plan_options { target = [module.worker_fleet.aws_launch_template.this, module.worker_fleet.aws_autoscaling_group.this, aws_ssm_parameter.config_generation] }
+  override_resource {
+    target = module.worker_fleet.aws_launch_template.this
+    values = { id = "lt-0123456789abcdef0", latest_version = 2, default_version = 2 }
+  }
+}
+run "worker_converge" {
+  command = plan
+  plan_options { target = [module.worker_fleet.aws_launch_template.this, module.worker_fleet.aws_autoscaling_group.this, aws_ssm_parameter.config_generation] }
 }
 run "handoff_plan" {
   command = plan
@@ -372,8 +423,8 @@ run "handoff_converge" {
 }
 
 fn validate_migration_evidence(stdout: &[u8], gang: &str) -> Result<()> {
-    let mut runs = [false; 7];
-    let mut payloads: [Option<Value>; 7] = std::array::from_fn(|_| None);
+    let mut runs = [false; 10];
+    let mut payloads: [Option<Value>; 10] = std::array::from_fn(|_| None);
     let mut abstract_seen = false;
     let mut file_seen = false;
     let mut summary_seen = false;
@@ -422,7 +473,7 @@ fn validate_migration_evidence(stdout: &[u8], gang: &str) -> Result<()> {
                     }
                     runs[index] = true;
                 } else {
-                    let expected = if matches!(index, 0 | 2 | 5) {
+                    let expected = if matches!(index, 0 | 2 | 5 | 8) {
                         "test_state"
                     } else {
                         "test_plan"
@@ -447,7 +498,7 @@ fn validate_migration_evidence(stdout: &[u8], gang: &str) -> Result<()> {
                 let summary = &event[&kind];
                 if summary_seen
                     || summary["status"] != "pass"
-                    || summary["passed"] != 7
+                    || summary["passed"] != MIGRATION_RUNS.len()
                     || summary["failed"] != 0
                     || summary["errored"] != 0
                     || summary["skipped"] != 0
@@ -499,10 +550,10 @@ fn migration_diagnostic(event: &Value, forgotten: &mut bool, complete: bool) -> 
     .into())
 }
 
-fn validate_migration_payloads(payloads: &[Option<Value>; 7], gang: &str) -> Result<()> {
+fn validate_migration_payloads(payloads: &[Option<Value>; 10], gang: &str) -> Result<()> {
     let get = |index: usize| payloads[index].as_ref().ok_or("missing migration payload");
-    for index in [1, 3, 4, 6] {
-        validate_target_plan(get(index)?, gang, matches!(index, 3 | 6))?;
+    for index in [1, 3, 4, 6, 7, 9] {
+        validate_target_plan_phase(get(index)?, gang, matches!(index, 3 | 6 | 9), index == 4)?;
     }
     if !has_actions(
         get(1)?,
@@ -517,13 +568,13 @@ fn validate_migration_payloads(payloads: &[Option<Value>; 7], gang: &str) -> Res
         "module.controller.aws_ecr_repository.controller[0]",
         &["create"],
     )? || !has_actions(
-        get(4)?,
+        get(7)?,
         "module.controller.aws_ecs_service.controller[0]",
         &["create"],
     )? {
         return Err("migration plans lack expected actions".into());
     }
-    for index in [0, 2, 5] {
+    for index in [0, 2, 5, 8] {
         let resources = state_resources(get(index)?)?;
         let config = &resource(&resources, "aws_ssm_parameter.config_generation")?["values"];
         if (index == 0 && string(config, "value")? == gang)
@@ -537,7 +588,7 @@ fn validate_migration_payloads(payloads: &[Option<Value>; 7], gang: &str) -> Res
             "module.controller.aws_autoscaling_group.capacity[0]",
         ] {
             let exists = resources.iter().any(|r| r["address"] == address);
-            if exists != (index == 5) {
+            if exists != (index == 8) {
                 return Err(format!("migration applied {address} in wrong phase").into());
             }
         }
@@ -548,6 +599,7 @@ fn validate_migration_payloads(payloads: &[Option<Value>; 7], gang: &str) -> Res
             return Err("migration repository exists in wrong phase".into());
         }
     }
+    validate_worker_transition(get(0)?, get(4)?, get(5)?)?;
     Ok(())
 }
 
@@ -828,7 +880,17 @@ fn extract(stdout: &[u8], local_config: String) -> Result<Fixture> {
     })
 }
 
+#[cfg(test)]
 fn validate_target_plan(plan: &Value, gang: &str, convergence: bool) -> Result<()> {
+    validate_target_plan_phase(plan, gang, convergence, false)
+}
+
+fn validate_target_plan_phase(
+    plan: &Value,
+    gang: &str,
+    convergence: bool,
+    worker_update: bool,
+) -> Result<()> {
     let changes = plan["resource_changes"]
         .as_array()
         .ok_or("missing targeted resource changes")?;
@@ -852,13 +914,21 @@ fn validate_target_plan(plan: &Value, gang: &str, convergence: bool) -> Result<(
         let protected = address.starts_with("module.worker_fleet.")
             || address.contains(".aws_lb_listener.")
             || address.contains(".aws_lb_target_group.");
-        if protected && !is(&["no-op"]) && !(resource["mode"] == "data" && is(&["read"])) {
+        let worker_version_update = worker_update
+            && is(&["update"])
+            && (address.starts_with("module.worker_fleet.aws_launch_template.this[")
+                && worker_template_image_only(&resource["change"])?
+                || address.starts_with("module.worker_fleet.aws_autoscaling_group.this[")
+                    && worker_asg_version_only(&resource["change"])?);
+        let unchanged = is(&["no-op"]) || (resource["mode"] == "data" && is(&["read"]));
+        if protected && !(worker_version_update || unchanged) {
             return Err(format!("targeted plan mutates protected resource {address}").into());
         }
         if convergence && !is(&["no-op"]) && !(resource["mode"] == "data" && is(&["read"])) {
             return Err(format!("targeted plan did not converge for {address}").into());
         }
-        if !(is(&["no-op"])
+        if !(worker_version_update
+            || is(&["no-op"])
             || is(&["create"])
             || (resource["mode"] == "data" && is(&["read"]))
             || (address == "terraform_data.config_generation" && is(&["delete", "create"]))
@@ -883,6 +953,130 @@ fn validate_target_plan(plan: &Value, gang: &str, convergence: bool) -> Result<(
     }
     if !config_seen {
         return Err("targeted plan omits configuration generation".into());
+    }
+    Ok(())
+}
+
+fn worker_template_image_only(change: &Value) -> Result<bool> {
+    let mut before = change["before"].clone();
+    let mut after = change["after"].clone();
+    let old = string(&before, "image_id")?.to_owned();
+    let new = string(&after, "image_id")?;
+    if old.is_empty() || new.is_empty() || old == new {
+        return Ok(false);
+    }
+    for field in ["image_id", "user_data", "latest_version", "default_version"] {
+        before
+            .as_object_mut()
+            .ok_or("invalid old worker template")?
+            .remove(field);
+        after
+            .as_object_mut()
+            .ok_or("invalid new worker template")?
+            .remove(field);
+    }
+    Ok(before == after)
+}
+
+fn worker_asg_version_only(change: &Value) -> Result<bool> {
+    const VERSION: &str =
+        "/mixed_instances_policy/0/launch_template/0/launch_template_specification/0/version";
+    let mut before = change["before"].clone();
+    let mut after = change["after"].clone();
+    let old = before
+        .pointer(VERSION)
+        .and_then(Value::as_str)
+        .ok_or("missing old worker ASG version")?
+        .to_owned();
+    let new = after.pointer(VERSION).and_then(Value::as_str);
+    if new == Some(old.as_str()) {
+        return Ok(false);
+    }
+    *before
+        .pointer_mut(VERSION)
+        .ok_or("missing old worker ASG version")? = Value::Null;
+    *after
+        .pointer_mut(VERSION)
+        .ok_or("missing new worker ASG version")? = Value::Null;
+    Ok(before == after)
+}
+
+fn validate_worker_transition(baseline: &Value, plan: &Value, applied: &Value) -> Result<()> {
+    let old = state_resources(baseline)?;
+    let new = state_resources(applied)?;
+    let templates: Vec<_> = old
+        .iter()
+        .filter(|r| {
+            r["address"]
+                .as_str()
+                .is_some_and(|a| a.starts_with("module.worker_fleet.aws_launch_template.this["))
+        })
+        .collect();
+    let groups: Vec<_> = old
+        .iter()
+        .filter(|r| {
+            r["address"]
+                .as_str()
+                .is_some_and(|a| a.starts_with("module.worker_fleet.aws_autoscaling_group.this["))
+        })
+        .collect();
+    if templates.is_empty() || groups.is_empty() {
+        return Err("missing baseline worker templates or groups".into());
+    }
+    for template in templates {
+        let address = string(template, "address")?;
+        let before = &template["values"];
+        let after = &resource(&new, address)?["values"];
+        let old_image = string(before, "image_id")?;
+        let new_image = string(after, "image_id")?;
+        let old_version = before["latest_version"]
+            .as_i64()
+            .ok_or("missing old worker template version")?;
+        let new_version = after["latest_version"]
+            .as_i64()
+            .ok_or("missing new worker template version")?;
+        if string(before, "id")? != string(after, "id")?
+            || old_image.is_empty()
+            || new_image.is_empty()
+            || old_image == new_image
+            || new_version <= old_version
+            || !has_actions(plan, address, &["update"])?
+        {
+            return Err(
+                format!("worker template did not update its image in place: {address}").into(),
+            );
+        }
+    }
+    for group in groups {
+        let address = string(group, "address")?;
+        let after = &resource(&new, address)?["values"];
+        let before = &group["values"];
+        let old_specification = before
+            .pointer("/mixed_instances_policy/0/launch_template/0/launch_template_specification/0")
+            .ok_or("missing old worker ASG launch template")?;
+        let specification = after
+            .pointer("/mixed_instances_policy/0/launch_template/0/launch_template_specification/0")
+            .ok_or("missing worker ASG launch template")?;
+        let id = string(specification, "launch_template_id")?;
+        let version = string(specification, "version")?;
+        let template =
+            new.iter()
+                .find(|r| {
+                    r["address"].as_str().is_some_and(|a| {
+                        a.starts_with("module.worker_fleet.aws_launch_template.this[")
+                    }) && r["values"]["id"] == id
+                })
+                .ok_or("worker ASG does not reference an updated template")?;
+        let latest = template["values"]["latest_version"]
+            .as_i64()
+            .ok_or("missing worker template version")?;
+        if string(old_specification, "launch_template_id")? != id
+            || string(old_specification, "version")? == version
+            || version != latest.to_string()
+            || !has_actions(plan, address, &["update"])?
+        {
+            return Err(format!("worker ASG did not adopt the latest template: {address}").into());
+        }
     }
     Ok(())
 }
@@ -2134,6 +2328,36 @@ mod tests {
     }
 
     #[test]
+    fn handoff_allows_worker_version_update_without_capacity_changes() {
+        let plan = json!({"resource_changes":[
+            {"address":"aws_ssm_parameter.config_generation","mode":"managed",
+             "change":{"actions":["no-op"],"after":{"value":"config"},"after_unknown":{}}},
+            {"address":"module.worker_fleet.aws_launch_template.this[\"fleet\"]","mode":"managed",
+             "change":{"actions":["update"],"before":{"image_id":"ami-old"},"after":{"image_id":"ami-new"}}},
+            {"address":"module.worker_fleet.aws_autoscaling_group.this[\"fleet\"]","mode":"managed",
+             "change":{"actions":["update"],"before":{"min_size":0,"max_size":2,"desired_capacity":1,"mixed_instances_policy":[{"launch_template":[{"launch_template_specification":[{"launch_template_id":"lt-1","version":"1"}]}]}]},"after":{"min_size":0,"max_size":2,"desired_capacity":1,"mixed_instances_policy":[{"launch_template":[{"launch_template_specification":[{"launch_template_id":"lt-1","version":"2"}]}]}]}}}
+        ]});
+        assert!(validate_target_plan_phase(&plan, "config", false, true).is_ok());
+        assert!(validate_target_plan(&plan, "config", false).is_err());
+        for (field, value) in [
+            ("min_size", json!(1)),
+            ("max_size", json!(1)),
+            ("desired_capacity", json!(0)),
+        ] {
+            let mut unsafe_plan = plan.clone();
+            unsafe_plan["resource_changes"][2]["change"]["after"][field] = value;
+            assert!(validate_target_plan_phase(&unsafe_plan, "config", false, true).is_err());
+        }
+        let mut unsafe_template = plan.clone();
+        unsafe_template["resource_changes"][1]["change"]["after"]["vpc_security_group_ids"] =
+            json!(["sg-unexpected"]);
+        assert!(validate_target_plan_phase(&unsafe_template, "config", false, true).is_err());
+        let mut unsafe_plan = plan;
+        unsafe_plan["resource_changes"][2]["change"]["actions"] = json!(["delete", "create"]);
+        assert!(validate_target_plan_phase(&unsafe_plan, "config", false, true).is_err());
+    }
+
+    #[test]
     fn fixture_document_requires_explicit_known_handoff_protocol() {
         let fixture = extract(&stream(GANG), "local".into()).expect("historical fixture");
         for name in ["drain_before_release", "release_before_drain"] {
@@ -2175,16 +2399,44 @@ mod tests {
         let handoff = json!({"resource_changes":[config_change(json!(["no-op"])),
             {"address":"module.controller.aws_ecs_service.controller[0]","change":{"actions":["create"]}}
         ]});
+        let template = |image: &str, version: i64| json!({"address":"module.worker_fleet.aws_launch_template.this[\"fleet\"]", "values":{"id":"lt-1", "image_id":image, "latest_version":version}});
+        let group = |version: &str| json!({"address":"module.worker_fleet.aws_autoscaling_group.this[\"fleet\"]", "values":{"mixed_instances_policy":[{"launch_template":[{"launch_template_specification":[{"launch_template_id":"lt-1", "version":version}]}]}]}});
+        let old_group = group("1");
+        let new_group = group("2");
+        let worker_plan = json!({"resource_changes":[config_change(json!(["no-op"])),
+            {"address":"module.worker_fleet.aws_launch_template.this[\"fleet\"]","mode":"managed","change":{"actions":["update"],"before":{"image_id":"ami-old"},"after":{"image_id":"ami-new"}}},
+            {"address":"module.worker_fleet.aws_autoscaling_group.this[\"fleet\"]","mode":"managed","change":{"actions":["update"],"before":old_group["values"],"after":new_group["values"]}}
+        ]});
         let mut payloads = [
-            Some(state(vec![config("old")])),
+            Some(state(vec![
+                config("old"),
+                template("ami-old", 1),
+                old_group,
+            ])),
             Some(bootstrap),
             Some(state(vec![config("new"), ecr.clone()])),
+            Some(no_op.clone()),
+            Some(worker_plan),
+            Some(state(vec![
+                config("new"),
+                ecr.clone(),
+                template("ami-new", 2),
+                new_group,
+            ])),
             Some(no_op.clone()),
             Some(handoff),
             Some(state(vec![config("new"), ecr, service, task, asg])),
             Some(no_op),
         ];
         assert!(validate_migration_payloads(&payloads, "new").is_ok());
+        let mut outdated = payloads.clone();
+        outdated[5].as_mut().expect("state")["values"]["root_module"]["resources"][3]["values"]["mixed_instances_policy"]
+            [0]["launch_template"][0]["launch_template_specification"][0]["version"] = json!("1");
+        assert!(validate_migration_payloads(&outdated, "new").is_err());
+        let mut unchanged = payloads.clone();
+        unchanged[5].as_mut().expect("state")["values"]["root_module"]["resources"][2]["values"]
+            ["image_id"] = json!("ami-old");
+        assert!(validate_migration_payloads(&unchanged, "new").is_err());
         payloads[3] = payloads[1].clone();
         assert!(validate_migration_payloads(&payloads, "new").is_err());
     }

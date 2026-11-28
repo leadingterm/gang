@@ -64,7 +64,7 @@ mock_provider "aws" {
     }
   }
   mock_resource "aws_launch_template" {
-    defaults = { id = "lt-0123456789abcdef0" }
+    # LAUNCH_TEMPLATE_DEFAULTS
   }
   mock_resource "aws_eip" {
     defaults = { public_ip = "203.0.113.10" }
@@ -97,15 +97,7 @@ mock_provider "http" {
 # CONTROLLER_ECS_OVERRIDES
 
 
-override_data {
-  target = data.aws_ami.image
-  values = {
-    name             = "gang-x86_64-aaaaaaaaaaaaaaaa"
-    boot_mode        = "uefi"
-    tags             = { "ec2:SharedTag/ImageSha256" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ec2:SharedTag/ActionEnvironment" = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
-    deprecation_time = ""
-  }
-}
+# IMAGE_OVERRIDES
 
 override_resource {
   target = module.worker_fleet.module.instance_role.aws_iam_instance_profile.this
