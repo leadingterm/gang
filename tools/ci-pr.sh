@@ -13,7 +13,7 @@ trap 'rm -rf "$scratch"' EXIT
 tools/lint.sh --portable
 python3 tools/ci_pr_targets.py "$1" "$2" > "$scratch/manifest.json"
 # Parse data, never shell code; validate the entire manifest before invoking Bazel.
-python3 - "$scratch/manifest.json" "$scratch/lint" "$scratch/unit" <<'PY'
+python3 - "$scratch/manifest.json" "$scratch/lint" "$scratch/unit" "$scratch/build" <<'PY'
 import json
 import re
 import sys
@@ -31,8 +31,11 @@ def object_without_duplicates(pairs):
 
 with open(sys.argv[1], encoding="utf-8") as stream:
     manifest = json.load(stream, object_pairs_hook=object_without_duplicates)
-if not isinstance(manifest, dict) or set(manifest) != {"lint", "unit"}:
-    raise ValueError("manifest must contain exactly lint and unit")
+if not isinstance(manifest, dict) or set(manifest) != {"lint", "unit", "build_binary"}:
+    raise ValueError("manifest must contain lint, unit and build_binary")
+if not isinstance(manifest["build_binary"], bool) or (manifest["unit"] and not manifest["build_binary"]):
+    raise ValueError("invalid build_binary")
+Path(sys.argv[4]).write_text("1" if manifest["build_binary"] else "0", encoding="utf-8")
 label_pattern = re.compile(r"(?:@@?[A-Za-z0-9._+~-]+)?//([A-Za-z0-9._+/-]*):([A-Za-z0-9._+@=-]+(?:/[A-Za-z0-9._+@=-]+)*)")
 for key in ("lint", "unit"):
     labels = manifest[key]
@@ -48,7 +51,9 @@ for key in ("lint", "unit"):
 PY
 
 bazel=${BAZEL:-bazel}
-"$bazel" build //:gang
+if [[ $(<"$scratch/build") == 1 ]]; then
+  "$bazel" build //:gang
+fi
 "$bazel" test --skip_incompatible_explicit_targets --target_pattern_file="$scratch/lint"
 if [[ -s $scratch/unit ]]; then
   "$bazel" test --skip_incompatible_explicit_targets --target_pattern_file="$scratch/unit"

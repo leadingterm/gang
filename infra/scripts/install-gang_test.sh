@@ -12,6 +12,10 @@ cat >"$fixtures/gh" <<'GH'
 # gh release download <tag> --repo <repository> --pattern <asset> --dir <dir>
 set -euo pipefail
 printf '%s\n' "$*" >>"$GH_CALLS"
+if [[ $1 == attestation ]]; then
+  [[ $* == *"--source-ref refs/tags/v0.4.1" ]] || exit 1
+  exit 0
+fi
 mkdir -p "$9"
 printf 'gang-binary\n' >"$9/$7"
 GH
@@ -74,6 +78,16 @@ if run branch example-org/gang/.github/workflows/deploy.yml@refs/heads/main "$as
 fi
 if [[ -s "$TEST_TMPDIR/branch/gh-calls" ]]; then
   fail "branch: downloaded although the workflow is not pinned to a tag"
+fi
+
+if ! GANG_RELEASE_TAG=v0.4.1 run override "$ref" "$asset_sha256"; then
+  fail "override: valid release tag failed"
+fi
+if ! grep -q '^release download v0.4.1 ' "$TEST_TMPDIR/override/gh-calls"; then
+  fail "override: wrong release tag"
+fi
+if GANG_RELEASE_TAG=invalid run invalid "$ref" "$asset_sha256"; then
+  fail "invalid: malformed release tag accepted"
 fi
 
 exit "$((failures > 0))"

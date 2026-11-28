@@ -52,7 +52,7 @@ def graph_input(path: str) -> bool:
     )
 
 
-def select(base: str, head: str) -> dict[str, list[str]]:
+def select(base: str, head: str) -> dict[str, list[str] | bool]:
     if base.startswith("-") or head.startswith("-"):
         raise ValueError("Git refs must not start with '-'")
     diff = subprocess.run(
@@ -69,7 +69,7 @@ def select(base: str, head: str) -> dict[str, list[str]]:
     for path in paths:
         # Even documentation deletions and unsafe paths must not hide graph changes.
         if not PATH.fullmatch(path) or not Path(path).is_file() or graph_input(path):
-            return {"lint": lint, "unit": sorted(units)}
+            return {"lint": lint, "unit": sorted(units), "build_binary": True}
         if ordinary_doc(path):
             continue
         if sources is None:
@@ -80,12 +80,13 @@ def select(base: str, head: str) -> dict[str, list[str]]:
                 sources[filename] = label
         label = sources.get(path)
         if label is None:
-            return {"lint": lint, "unit": sorted(units)}
+            return {"lint": lint, "unit": sorted(units), "build_binary": True}
         seeds.append(label)
     if not seeds:
-        return {"lint": lint, "unit": []}
+        return {"lint": lint, "unit": [], "build_binary": False}
     affected = query(f"rdeps(//..., set({' '.join(sorted(set(seeds)))}))")
-    return {"lint": lint, "unit": sorted(units & affected)}
+    selected = sorted(units & affected)
+    return {"lint": lint, "unit": selected, "build_binary": bool(selected) or "//:gang" in affected}
 
 
 def main(argv: list[str] | None = None) -> int:

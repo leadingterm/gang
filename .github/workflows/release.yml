@@ -75,10 +75,14 @@ jobs:
       contents: read
       actions: read
       id-token: write
+      attestations: read
     env:
       SYSTEM: ${{ matrix.arch }}-linux
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: ./.github/actions/setup-nix
         with:
           kvm: ${{ matrix.arch == 'x86_64' }}
@@ -88,25 +92,43 @@ jobs:
           path: staged
           run-id: ${{ needs.locate.outputs.run-id }}
           github-token: ${{ github.token }}
+      - name: Reuse published image
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          if infra/scripts/reuse-release-image.sh disk "$ARCH" dist; then
+            echo 'reused=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'reused=false' >> "$GITHUB_OUTPUT"
+          fi
+      - run: echo '${{ steps.reuse.outputs.reused }}' > reuse.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reuse-${{ matrix.arch }}
+          path: reuse.txt
       # Each image build boots the image under UEFI firmware: KVM where the runner has it (x86_64), qemu's TCG fallback otherwise (aarch64).
       - name: Build the images
+        if: steps.reuse.outputs.reused != 'true'
         env:
           NIX_CONFIG: extra-system-features = kvm
         run: |
           install -D -m 0755 "staged/gang-${{ matrix.arch }}-unknown-linux-musl" "gang-binaries/$SYSTEM/gang"
-          mkdir dist
+          mkdir -p dist
           nix build -L --override-input gang-binaries "path:$PWD/gang-binaries" ".#packages.$SYSTEM.image" --out-link image
-          # The second build runs against a store whose identical files are hard-linked, as on a host with auto-optimise-store, so a disk that carried the builder's store layout differs.
-          nix store optimise
-          # Nix builds the disk a second time and fails if the bytes differ.
-          nix build -L --rebuild --override-input gang-binaries "path:$PWD/gang-binaries" ".#packages.$SYSTEM.image.disk" --no-link
       - name: Compress the images
+        if: steps.reuse.outputs.reused != 'true'
         shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
         run: |
           # The image output links its disk; zstd skips a symbolic link, so it gets the store file itself.
-          zstd -19 --long=27 -T0 -q "$(realpath image/*.raw)" -o "dist/gang-image-${{ matrix.arch }}.raw.zst"
+          zstd -9 -T0 -q "$(realpath image/*.raw)" -o "dist/gang-image-${{ matrix.arch }}.raw.zst"
           cp image/nix-support/image-info.json "dist/gang-image-${{ matrix.arch }}.json"
           jq -e '.action_environment | strings | test("^[0-9a-f]{64}\\z")' "dist/gang-image-${{ matrix.arch }}.json" >/dev/null
+      - name: Record image checksums
+        run: |
           (cd dist && sha256sum gang-*) >"images-${{ matrix.arch }}.sha256"
           (cd dist && wc -c gang-* && cat ../"images-${{ matrix.arch }}.sha256") >>"$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -131,9 +153,11 @@ jobs:
     permissions:
       contents: read
       actions: read
+      attestations: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/setup-nix
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -142,12 +166,29 @@ jobs:
           path: staged
           run-id: ${{ needs.locate.outputs.run-id }}
           github-token: ${{ github.token }}
+      - name: Reuse published controller image
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if infra/scripts/reuse-release-image.sh controller aarch64 .; then
+            echo 'reused=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'reused=false' >> "$GITHUB_OUTPUT"
+          fi
+      - run: echo '${{ steps.reuse.outputs.reused }}' > reuse.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reuse-controller
+          path: reuse.txt
       - name: Build controller image
+        if: steps.reuse.outputs.reused != 'true'
         shell: nix develop .#release -c bash --noprofile --norc -euo pipefail {0}
         run: |
           install -D -m 0755 staged/gang-aarch64-unknown-linux-musl gang-binaries/aarch64-linux/gang
           nix build -L --no-write-lock-file --override-input gang-binaries "path:$PWD/gang-binaries" .#packages.x86_64-linux.controller-oci --out-link controller-image
-          nix build -L --rebuild --no-write-lock-file --override-input gang-binaries "path:$PWD/gang-binaries" .#packages.x86_64-linux.controller-oci --no-link
           cp -L controller-image gang-controller.oci.tar
           digest="$(tar -xOf gang-controller.oci.tar index.json | jq -er '.manifests | select(length == 1) | .[0].digest | strings | select(test("^sha256:[0-9a-f]{64}$"))')"
           [[ "$(tar -xOf gang-controller.oci.tar "blobs/sha256/${digest#sha256:}" | sha256sum | cut -d' ' -f1)" == "${digest#sha256:}" ]]
@@ -161,6 +202,62 @@ jobs:
             gang-controller.json
           retention-days: 1
           compression-level: 0
+
+  verify_reproducibility:
+    needs: [locate, images, controller_image]
+    if: ${{ !(github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: x86_64
+            arch: x86_64
+            runner: ubuntu-24.04
+          - kind: aarch64
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+          - kind: controller
+            arch: aarch64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: reuse-${{ matrix.kind }}
+      - id: reuse
+        run: echo "reused=$(cat reuse.txt)" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/setup-nix
+        if: steps.reuse.outputs.reused != 'true'
+        with:
+          kvm: ${{ matrix.kind == 'x86_64' }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: steps.reuse.outputs.reused != 'true'
+        with:
+          name: gang-${{ matrix.arch }}-unknown-linux-musl
+          path: staged
+          run-id: ${{ needs.locate.outputs.run-id }}
+          github-token: ${{ github.token }}
+      - name: Verify reproducibility
+        if: steps.reuse.outputs.reused != 'true'
+        env:
+          ARCH: ${{ matrix.arch }}
+          KIND: ${{ matrix.kind }}
+          NIX_CONFIG: extra-system-features = kvm
+        run: |
+          install -D -m 0755 "staged/gang-$ARCH-unknown-linux-musl" "gang-binaries/$ARCH-linux/gang"
+          if [[ "$KIND" == controller ]]; then
+            target=.#packages.x86_64-linux.controller-oci
+          else
+            target=".#packages.$ARCH-linux.image.disk"
+          fi
+          nix build -L --override-input gang-binaries "path:$PWD/gang-binaries" "$target" --no-link
+          nix store optimise
+          nix build -L --rebuild --override-input gang-binaries "path:$PWD/gang-binaries" "$target" --no-link
 
   amis:
     needs: [locate, images]

@@ -8,6 +8,11 @@
 set -euo pipefail
 
 : "${RUNNER_TEMP:?}" "${GANG_WORKFLOW_REF:?}" "${GANG_REPOSITORY:?}"
+tag=${GANG_RELEASE_TAG:-}
+if [[ -n $tag && ! $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+  echo 'invalid release tag' >&2
+  exit 1
+fi
 plan="$RUNNER_TEMP/infra-plan.json"
 [[ -f "$plan" ]] || { echo 'verified plan JSON is missing' >&2; exit 1; }
 
@@ -44,13 +49,20 @@ name=${repo#*/}
 [[ $image == "$repo"@sha256:* ]] || { echo 'controller image is not in its reviewed repository' >&2; exit 1; }
 digest=${image#"$repo"@}
 [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'invalid controller image digest' >&2; exit 1; }
-ref=${GANG_WORKFLOW_REF#*@}
-[[ $ref == refs/tags/* && $ref != refs/tags/ ]] || { echo 'workflow must be pinned to a release tag' >&2; exit 1; }
-tag=${ref#refs/tags/}
+if [[ -z $tag ]]; then
+  ref=${GANG_WORKFLOW_REF#*@}
+  [[ $ref == refs/tags/* && $ref != refs/tags/ ]] || { echo 'workflow must be pinned to a release tag' >&2; exit 1; }
+  tag=${ref#refs/tags/}
+fi
 work=$(mktemp -d "${RUNNER_TEMP}/gang-image.XXXXXXXX")
 trap 'rm -rf "$work"' EXIT
 gh release download "$tag" --repo "$GANG_REPOSITORY" --pattern gang-controller.oci.tar --pattern gang-controller.json --pattern SHA256SUMS --dir "$work"
 for asset in gang-controller.oci.tar gang-controller.json; do
+  if [[ -n ${GANG_RELEASE_TAG:-} ]]; then
+    gh attestation verify "$work/$asset" --repo "$GANG_REPOSITORY" \
+      --cert-identity "https://github.com/$GANG_REPOSITORY/.github/workflows/release.yml@refs/tags/$tag" \
+      --cert-oidc-issuer https://token.actions.githubusercontent.com --source-ref "refs/tags/$tag"
+  fi
   checksum=$(jq -Rrn --arg asset "$asset" '[inputs | capture("^(?<hash>[0-9a-f]{64})  [*]?(?<name>.+)$")? | select(.name == $asset) | .hash] | if length == 1 then .[0] else error("missing or duplicate asset checksum") end' <"$work/SHA256SUMS")
   sha256sum --check --strict <<<"$checksum  $work/$asset"
 done

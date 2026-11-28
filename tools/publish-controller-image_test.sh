@@ -23,7 +23,11 @@ jq -n --arg repo "$repo" --arg digest "$DIGEST" '
     {type:"aws_ecs_task_definition",name:"controller",values:{container_definitions:([{name:"controller",image:($repo+"@"+$digest)}] | tojson)}}
   ]}]}}}' >"$scratch/plan.json"
 gh() {
-  [[ $* == "release download v1.2.3 --repo example-org/gang --pattern gang-controller.oci.tar --pattern gang-controller.json --pattern SHA256SUMS --dir "* ]] || return 1
+  if [[ $1 == attestation ]]; then
+    [[ $* == *"--source-ref refs/tags/v0.4.1" ]]
+    return
+  fi
+  [[ $* == "release download ${GANG_RELEASE_TAG:-v1.2.3} --repo example-org/gang --pattern gang-controller.oci.tar --pattern gang-controller.json --pattern SHA256SUMS --dir "* ]] || return 1
   printf 'gh\n' >>"$CALLS"
   local dir=${!#}
   cp "$FIXTURE/gang-controller.oci.tar" "$FIXTURE/SHA256SUMS" "$dir/"
@@ -80,12 +84,12 @@ run_case() {
   if [[ $CASE == bootstrap ]]; then jq 'del(.planned_values.root_module.child_modules[0].resources[1])' "$scratch/plan.json" >"$RUNNER_TEMP/infra-plan.json"; fi
   if [[ $CASE == initial_plan ]]; then jq '(.planned_values.root_module.child_modules[0].resources[0].values.repository_url, .planned_values.root_module.child_modules[0].resources[1].values.container_definitions) = null' "$scratch/plan.json" >"$RUNNER_TEMP/infra-plan.json"; fi
   if bash "$root/infra/scripts/publish-controller-image.sh" >"$scratch/output" 2>&1; then
-    [[ $CASE == success || $CASE == existing || $CASE == sqlite || $CASE == bootstrap ]] || { echo "$CASE unexpectedly succeeded" >&2; exit 1; }
+    [[ $CASE == success || $CASE == override || $CASE == existing || $CASE == sqlite || $CASE == bootstrap ]] || { echo "$CASE unexpectedly succeeded" >&2; exit 1; }
   else
-    [[ $CASE != success && $CASE != existing && $CASE != sqlite && $CASE != bootstrap ]] || { cat "$scratch/output" >&2; exit 1; }
+    [[ $CASE != success && $CASE != override && $CASE != existing && $CASE != sqlite && $CASE != bootstrap ]] || { cat "$scratch/output" >&2; exit 1; }
   fi
   case "$CASE" in
-    success)
+    success | override)
       grep -q '^skopeo --policy .* copy --authfile .* --preserve-digests ' "$CALLS"
       [[ $(grep -c 'ecr describe-images' "$CALLS") == 2 ]] ;;
     existing)
@@ -100,3 +104,6 @@ run_case() {
   esac
 }
 for case_name in success existing aws_error tamper tamper_manifest mismatch missing_repo failed_push missing_manifest sqlite bootstrap initial_plan; do run_case "$case_name"; done
+
+GANG_RELEASE_TAG=v0.4.1 run_case override
+GANG_RELEASE_TAG=bad run_case invalid

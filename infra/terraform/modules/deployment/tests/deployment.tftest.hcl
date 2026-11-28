@@ -1995,3 +1995,26 @@ run "accepts_unrelated_secret" {
     error_message = "An unrelated controller secret remains accessible to the controller."
   }
 }
+
+run "default_release_tag" {
+  command = plan
+  assert {
+    condition     = data.http.sha256sums[0].url == "https://github.com/${var.release_repository}/releases/download/v${local.version}/SHA256SUMS"
+    error_message = "Default release URL must use the module version."
+  }
+}
+
+run "explicit_release_tag" {
+  command = plan
+  variables { release_tag = "v0.4.1" }
+  assert {
+    condition     = data.http.sha256sums[0].url == "https://github.com/${var.release_repository}/releases/download/v0.4.1/SHA256SUMS"
+    error_message = "Explicit release URL must use the selected tag."
+  }
+}
+
+run "invalid_release_tag" {
+  command = plan
+  variables { release_tag = "../bad" }
+  expect_failures = [var.release_tag]
+}

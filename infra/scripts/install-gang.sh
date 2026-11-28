@@ -7,16 +7,27 @@
 # GANG_REPOSITORY (job.workflow_repository), GANG_SHA256, GH_TOKEN, RUNNER_TEMP, GITHUB_ENV.
 set -euo pipefail
 
-ref="${GANG_WORKFLOW_REF#*@}"
-tag="${ref#refs/tags/}"
-if [[ "$tag" == "$ref" ]]; then
-  echo "::error::pin the deploy workflow to a Gang release tag, not ${ref}" >&2
-  exit 1
+tag=${GANG_RELEASE_TAG:-}
+if [[ -n $tag ]]; then
+  [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo 'invalid release tag' >&2; exit 1; }
+else
+  ref="${GANG_WORKFLOW_REF#*@}"
+  tag="${ref#refs/tags/}"
+  if [[ "$tag" == "$ref" ]]; then
+    echo "::error::pin the deploy workflow to a Gang release tag, not ${ref}" >&2
+    exit 1
+  fi
 fi
 
 asset="gang-$(uname -m)-unknown-linux-musl"
 dir="${RUNNER_TEMP}/gang-bin"
 gh release download "$tag" --repo "$GANG_REPOSITORY" --pattern "$asset" --dir "$dir"
+
+if [[ -n ${GANG_RELEASE_TAG:-} ]]; then
+  gh attestation verify "$dir/$asset" --repo "$GANG_REPOSITORY" \
+    --cert-identity "https://github.com/$GANG_REPOSITORY/.github/workflows/release.yml@refs/tags/$tag" \
+    --cert-oidc-issuer https://token.actions.githubusercontent.com --source-ref "refs/tags/$tag"
+fi
 
 # A release's assets can be replaced, and a checksum published beside them with them, so the
 # caller's pin decides, never the release's SHA256SUMS.

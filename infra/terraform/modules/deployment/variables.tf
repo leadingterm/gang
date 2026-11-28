@@ -1,3 +1,14 @@
+variable "release_tag" {
+  type        = string
+  default     = null
+  description = "Release tag used to resolve public images; null selects this module's version."
+
+  validation {
+    condition     = var.release_tag == null ? true : can(regex("^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$", var.release_tag))
+    error_message = "release_tag must be a version tag such as v0.4.1."
+  }
+}
+
 variable "region" {
   type        = string
   description = "AWS region of the deployment."
