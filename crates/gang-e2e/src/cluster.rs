@@ -440,8 +440,17 @@ impl<'a> Cluster<'a> {
         let startup = (|| -> Result<()> {
             for _ in 0..controllers {
                 cluster.start_controller()?;
+                cluster.wait_for_initial_leader()?;
             }
-            cluster.wait_for_initial_leader()?;
+            let leader = controllers - 1;
+            for standby in 0..leader {
+                let pid = cluster.controller_pid(standby)?;
+                cluster.observe_restarted_standby(standby, leader, pid)?;
+                cluster.wait_for_controller_prepared_within(
+                    standby,
+                    cluster.stack.settings().startup_timeout,
+                )?;
+            }
             cluster
                 .stack
                 .connect_external(cluster.frontend_url(Frontend::Serve, "https")?)

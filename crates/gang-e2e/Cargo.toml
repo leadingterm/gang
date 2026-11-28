@@ -19,6 +19,7 @@ gang-cgroup = { workspace = true }
 gang-client = { workspace = true }
 gang-clock = { workspace = true }
 gang-config = { workspace = true }
+gang-engine = { workspace = true }
 gang-local = { workspace = true }
 gang-main = { workspace = true }
 gang-mtls = { workspace = true }
@@ -63,7 +64,6 @@ aws-sdk-dynamodb = { workspace = true }
 futures = { workspace = true }
 gang-aws-sdk = { workspace = true }
 gang-dynamodb = { workspace = true, features = ["test-support"] }
-gang-engine = { workspace = true }
 gang-postgres = { workspace = true }
 gang-scheduler = { workspace = true }
 gang-server = { workspace = true }

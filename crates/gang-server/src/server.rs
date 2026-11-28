@@ -1691,6 +1691,8 @@ mod tests {
         assert!(futures::poll!(second.as_mut()).is_pending());
         assert!(successor_ready.is_leading());
 
+        stop_old.send(()).map_err(|()| "original stopped early")?;
+        first.await?;
         let (mut restarted, _, _) = crate::test_support::plain_parts();
         restarted.provisioner = identity;
         restarted.repository = old.repository.clone();
@@ -1706,14 +1708,18 @@ mod tests {
         assert!(futures::poll!(restarted.as_mut()).is_pending());
         assert!(futures::poll!(second.as_mut()).is_pending());
         assert!(successor_ready.is_leading());
-        stop_old.send(()).map_err(|()| "original stopped early")?;
-        first.await?;
+        stop_new.send(()).map_err(|()| "successor stopped early")?;
+        second.await?;
+        old.clock.advance(interval);
+        assert!(futures::poll!(restarted.as_mut()).is_pending());
+        assert!(
+            restarted_ready.is_leading(),
+            "restarted standby must take over"
+        );
         stop_restart
             .send(())
             .map_err(|()| "restart stopped early")?;
         restarted.await?;
-        stop_new.send(()).map_err(|()| "successor stopped early")?;
-        second.await?;
         Ok(())
     }
 

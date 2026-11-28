@@ -55,6 +55,13 @@ use crate::template::{ConfigTemplate, Transport};
 pub(crate) const DEMAND_ROOT: &str = "demand-bazel";
 pub(crate) const FOLLOWER_ROOT: &str = "follower-bazel";
 
+#[cfg(any(target_os = "linux", test))]
+fn pressure_working_set(cgroup: &Path) -> Option<u64> {
+    gang_engine::read_cgroup_sample(cgroup)
+        .working_set_memory_bytes
+        .filter(|&bytes| bytes > 0)
+}
+
 thread_local! {
     /// Placements of the scenario running on this thread, kept alive until its verdict is known;
     /// `None` outside [`with_failure_evidence`].
@@ -228,6 +235,8 @@ pub struct Stack<'a> {
     /// Sustained memory pressure duration configured for this scenario.
     #[cfg(target_os = "linux")]
     pressure_kill_after: Option<Duration>,
+    #[cfg(target_os = "linux")]
+    pressure_sample_interval: Option<Duration>,
     /// Parameters used to stage another copy of this deployment's sample.
     sample_parameters: SampleParameters,
     /// The sample workspace this deployment was staged from.
@@ -405,6 +414,11 @@ impl<'a> Stack<'a> {
                 .execution
                 .resource_policy
                 .map(|policy| policy.memory.pressure_kill_after.get()),
+            #[cfg(target_os = "linux")]
+            pressure_sample_interval: variant
+                .execution
+                .resource_policy
+                .map(|policy| policy.memory.sample_interval.get()),
             sample_parameters: parameters,
             sample_source: invocation.sample.clone(),
             server: Mutex::new(None),
@@ -1482,24 +1496,38 @@ impl Limits for Stack<'_> {
             .saturating_mul(3);
         let hold_timeout = self.settings.hold_timeout.max(settle);
         let deadline = Instant::now() + hold_timeout;
-        let mut previous_peak = None;
+        let sample_interval = self
+            .pressure_sample_interval
+            .ok_or_else(|| E2eError::system("pressure scenario has no resource sample interval"))?;
+        let mut held_since = None;
         let mut stable_peak = None;
         while Instant::now() < deadline {
             let held = self.pressure_number(&victim.join("memory.current"))?
                 >= self.settings.pressure_victim_minimum.as_u64()
                 && self.pressure_number(&neighbour.join("memory.current"))?
                     >= self.settings.pressure_neighbour_minimum.as_u64();
-            let peak = self.pressure_number(&victim.join("memory.peak"))?;
-            if held && previous_peak == Some(peak) {
-                stable_peak = Some(peak);
-                break;
+            if held {
+                let working_set = pressure_working_set(&victim)
+                    .ok_or_else(|| E2eError::system("victim working set unavailable"))?;
+                let start = held_since.get_or_insert_with(Instant::now);
+                stable_peak =
+                    Some(stable_peak.map_or(working_set, |old: u64| old.min(working_set)));
+                if start.elapsed() >= sample_interval.saturating_mul(2) {
+                    break;
+                }
+            } else {
+                held_since = None;
+                stable_peak = None;
             }
-            previous_peak = held.then_some(peak);
             std::thread::sleep(self.settings.pressure_observe_interval);
         }
-        let peak = stable_peak.ok_or_else(|| {
-            E2eError::system("pressure probes did not reach stable held allocations")
-        })?;
+        let peak = stable_peak
+            .filter(|_| {
+                held_since.is_some_and(|start| start.elapsed() >= sample_interval.saturating_mul(2))
+            })
+            .ok_or_else(|| {
+                E2eError::system("pressure probes did not reach stable held allocations")
+            })?;
         let high = pool.join("memory.high");
         let original = read_trimmed(&high)?;
         let victim_current = self.pressure_number(&victim.join("memory.current"))?;
@@ -1652,6 +1680,24 @@ impl Drop for Stack<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pressure_observation_uses_worker_working_set() -> gang_testkit::TestResult {
+        let directory = tempfile::tempdir()?;
+        let cgroup = directory.path();
+        fs::write(cgroup.join("memory.current"), "203587584\n")?;
+        fs::write(cgroup.join("memory.peak"), "203587584\n")?;
+        fs::write(
+            cgroup.join("memory.stat"),
+            "anon 200000000\nshmem 1024000\nactive_file 1203712\ninactive_file 1359872\n",
+        )?;
+        assert_eq!(pressure_working_set(cgroup), Some(202_227_712));
+        fs::write(cgroup.join("memory.stat"), "inactive_file 1359872\n")?;
+        assert_eq!(pressure_working_set(cgroup), Some(202_227_712));
+        fs::remove_file(cgroup.join("memory.stat"))?;
+        assert_eq!(pressure_working_set(cgroup), Some(203_587_584));
+        Ok(())
+    }
 
     #[test]
     fn failure_evidence_contains_server_and_worker_log_tails() {
