@@ -37,10 +37,10 @@ use gang_scheduler::{
     AttemptUsage, CompletionStatus, DeclineReason, KillCause, RegisterError, RegistrationError,
     WorkerCompleted, WorkerEvent, WorkerExecuted, WorkerKey, WorkerRegistration,
 };
-use gang_spi::{ContentStore, WorkerCacheStats};
+use gang_spi::WorkerCacheStats;
 use gang_types::{
-    ActionEnvironment, ActionResources, AttemptId, Bytes, Digest, FleetName, InstanceId,
-    NonZeroDuration, WorkerId,
+    ActionEnvironment, ActionResources, AttemptId, Bytes, FleetName, InstanceId, NonZeroDuration,
+    WorkerId,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -60,8 +60,6 @@ const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Upper bound on per-session cached `Executed` metadata awaiting its paired `Completed` frame.
 const MAX_TRACKED_EXECUTED_META: usize = 4096;
-
-type ExistenceInvalidator = dyn Fn(&[Digest]) + Send + Sync;
 
 /// Configuration for [`WorkerGrpcService`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +100,6 @@ pub struct WorkerGrpcService {
     controller: ControllerHandle,
     config: WorkerServiceConfig,
     clock: Arc<dyn Clock>,
-    invalidate_existence: Arc<ExistenceInvalidator>,
 }
 
 impl fmt::Debug for WorkerGrpcService {
@@ -118,34 +115,28 @@ impl fmt::Debug for WorkerGrpcService {
 impl WorkerGrpcService {
     /// Creates a [`WorkerGrpcService`] backed by `controller` and `config` using [`SystemClock`].
     #[must_use]
-    pub fn new<C: ContentStore>(
-        controller: ControllerHandle,
-        config: WorkerServiceConfig,
-        content: Arc<C>,
-    ) -> Self {
-        Self::with_clock(controller, config, Arc::new(SystemClock::new()), content)
+    pub fn new(controller: ControllerHandle, config: WorkerServiceConfig) -> Self {
+        Self::with_clock(controller, config, Arc::new(SystemClock::new()))
     }
 
     /// Creates a [`WorkerGrpcService`] with [`WorkerServiceConfig::default`] and [`SystemClock`].
     #[must_use]
-    pub fn with_defaults<C: ContentStore>(controller: ControllerHandle, content: Arc<C>) -> Self {
-        Self::new(controller, WorkerServiceConfig::default(), content)
+    pub fn with_defaults(controller: ControllerHandle) -> Self {
+        Self::new(controller, WorkerServiceConfig::default())
     }
 
     /// Creates a [`WorkerGrpcService`] with an explicit injectable [`Clock`] (for deterministic
     /// handshake timeout testing).
     #[must_use]
-    pub fn with_clock<C: ContentStore>(
+    pub fn with_clock(
         controller: ControllerHandle,
         config: WorkerServiceConfig,
         clock: Arc<dyn Clock>,
-        content: Arc<C>,
     ) -> Self {
         Self {
             controller,
             config,
             clock,
-            invalidate_existence: Arc::new(move |digests| content.invalidate_existence(digests)),
         }
     }
 
@@ -347,7 +338,6 @@ impl WorkerService for WorkerGrpcService {
             registered.worker_id.clone(),
             Arc::clone(&loss),
             protocol_error_tx,
-            Arc::clone(&self.invalidate_existence),
         ));
 
         let initial_registered = proto::ControllerMessage {
@@ -434,7 +424,6 @@ async fn run_inbound_loop(
     worker_id: WorkerId,
     loss: Arc<WorkerLossGuard>,
     protocol_error_tx: oneshot::Sender<Status>,
-    invalidate_existence: Arc<ExistenceInvalidator>,
 ) {
     let _drop_guard = InboundDropGuard {
         loss: Arc::clone(&loss),
@@ -461,7 +450,6 @@ async fn run_inbound_loop(
             worker_key,
             &worker_id,
             &mut executed_meta,
-            &*invalidate_existence,
         )
         .await;
 
@@ -496,7 +484,6 @@ async fn dispatch_inbound_frame(
     worker_key: WorkerKey,
     worker_id: &WorkerId,
     executed_meta: &mut HashMap<AttemptId, ExecutedMeta>,
-    invalidate_existence: &(dyn Fn(&[Digest]) + Send + Sync),
 ) -> Result<(), InboundError> {
     let Some(kind) = frame.kind else {
         return Err(InboundError::Protocol(Status::invalid_argument(
@@ -544,9 +531,6 @@ async fn dispatch_inbound_frame(
         }
         WorkerKind::Completed(completed) => {
             let (worker_completed, payload) = parse_completed_frame(completed, executed_meta)?;
-            if let CompletionStatus::MissingBlobs { digests, .. } = &worker_completed.status {
-                invalidate_existence(digests);
-            }
             controller
                 .worker_event_with_completion(
                     worker_key,
@@ -918,7 +902,8 @@ mod tests {
     use gang_reapi::leadingterm::gang::worker::v1::worker_service_client::WorkerServiceClient;
     use gang_scheduler::{AdmissionRequest, Learned, OperationUpdate, Scheduler, SchedulerPolicy};
     use gang_spi::{
-        ControllerDrain, Observation, ObservationSink, Origin, SchedulerSnapshot, WorkerCacheStats,
+        ContentStore, ControllerDrain, Observation, ObservationSink, Origin, SchedulerSnapshot,
+        WorkerCacheStats,
     };
     use gang_testkit::TestResult;
     use gang_types::{
@@ -976,19 +961,23 @@ mod tests {
 
     #[tokio::test]
     async fn missing_blob_completion_invalidates_and_finishes_without_retry() -> TestResult {
+        let content = Arc::new(TrackingStore::default());
+        let store = Arc::clone(&content);
+        let runtime = ControllerRuntime {
+            invalidate_existence: Some(Arc::new(move |digests| {
+                store.invalidate_existence(digests);
+            })),
+            ..ControllerRuntime::new()
+        };
         let (controller, actor_task) = spawn_controller(
             make_scheduler(test_policy()),
             SystemClock::new(),
             ActorConfig::default(),
             LearnedSlot::empty(),
-            ControllerRuntime::new(),
+            runtime,
         );
-        let content = Arc::new(TrackingStore::default());
-        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::with_defaults(
-            controller.clone(),
-            Arc::clone(&content),
-        ))
-        .await?;
+        let (addr, server_task) =
+            spawn_worker_server(WorkerGrpcService::with_defaults(controller.clone())).await?;
         let mut worker = LiveSessionClient::spawn(addr, "inst-missing");
         let SessionEvent::Registered { outbound, .. } = recv_event(&mut worker.events).await?
         else {
@@ -1023,6 +1012,83 @@ mod tests {
         controller.shutdown().await?;
         actor_task.await?;
         server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_completions_do_not_invalidate_existence() -> TestResult {
+        let content = Arc::new(TrackingStore::default());
+        let store = Arc::clone(&content);
+        let runtime = ControllerRuntime {
+            invalidate_existence: Some(Arc::new(move |digests| {
+                store.invalidate_existence(digests);
+            })),
+            ..ControllerRuntime::new()
+        };
+        let (controller, task) = spawn_controller(
+            make_scheduler(test_policy()),
+            SystemClock::new(),
+            ActorConfig::default(),
+            LearnedSlot::empty(),
+            runtime,
+        );
+        let mut owner = controller
+            .register_worker(parse_register_frame(sample_register("owner"))?)
+            .await?;
+        let mut watch = controller
+            .execute(exec_spec("operations/ownership", b"owner", None))
+            .await?;
+        let Some(WorkerOutbound::Assign(assign)) =
+            tokio::time::timeout(Duration::from_secs(5), owner.outbound.recv()).await?
+        else {
+            return Err("expected assignment".into());
+        };
+        let attempt: AttemptId = assign.attempt.parse()?;
+        let foreign = controller
+            .register_worker(parse_register_frame(sample_register("foreign"))?)
+            .await?;
+        let bad = Digest::from_bytes(b"untrusted");
+        let good = Digest::from_bytes(b"legitimate");
+        let completed = |attempt_id, digest| {
+            WorkerEvent::Completed(WorkerCompleted {
+                attempt_id,
+                status: CompletionStatus::MissingBlobs {
+                    digests: vec![digest],
+                    message: "missing".to_owned(),
+                },
+                execution_timestamps: None,
+            })
+        };
+        controller
+            .worker_event(
+                owner.key,
+                completed(AttemptId::from_random_bytes([91; 16]), bad),
+            )
+            .await?;
+        controller
+            .worker_event(foreign.key, completed(attempt.clone(), bad))
+            .await?;
+        controller
+            .worker_event(
+                owner.key,
+                WorkerEvent::Accept {
+                    attempt_id: attempt.clone(),
+                },
+            )
+            .await?;
+        controller
+            .worker_event(owner.key, completed(attempt.clone(), good))
+            .await?;
+        let _ = wait_terminal(&mut watch).await?;
+        controller
+            .worker_event(owner.key, completed(attempt, bad))
+            .await?;
+        let _barrier = controller
+            .register_worker(parse_register_frame(sample_register("barrier"))?)
+            .await?;
+        assert_eq!(*content.invalidated.lock(), vec![good]);
+        controller.shutdown().await?;
+        task.await?;
         Ok(())
     }
 
@@ -1086,20 +1152,24 @@ mod tests {
         use gang_types::WorkerLifetime;
         use prost::Message as _;
 
+        let content = Arc::new(TrackingStore::default());
+        let store = Arc::clone(&content);
+        let runtime = ControllerRuntime {
+            invalidate_existence: Some(Arc::new(move |digests| {
+                store.invalidate_existence(digests);
+            })),
+            ..ControllerRuntime::new()
+        };
         let (controller, actor_task) = spawn_controller(
             make_scheduler(test_policy()),
             SystemClock::new(),
             ActorConfig::default(),
             LearnedSlot::empty(),
-            ControllerRuntime::new(),
+            runtime,
         );
-        let content = Arc::new(TrackingStore::default());
         let actions = Arc::new(gang_testkit::MemoryActionStore::new());
-        let (addr, server) = spawn_worker_server(WorkerGrpcService::with_defaults(
-            controller.clone(),
-            Arc::clone(&content),
-        ))
-        .await?;
+        let (addr, server) =
+            spawn_worker_server(WorkerGrpcService::with_defaults(controller.clone())).await?;
         let execution = crate::reapi_execution::ExecutionService::with_defaults(
             controller.clone(),
             Arc::clone(&content),
@@ -1159,6 +1229,26 @@ mod tests {
         actor_task.await?;
         server.abort();
         Ok(())
+    }
+
+    #[test]
+    fn empty_digest_does_not_classify_as_missing_blob() {
+        use prost::Message as _;
+        let failure = gang_reapi::google::rpc::PreconditionFailure {
+            violations: vec![gang_reapi::google::rpc::precondition_failure::Violation {
+                r#type: "MISSING".to_owned(),
+                subject: format!("blobs/{}/0", Digest::EMPTY.hex()),
+                description: String::new(),
+            }],
+        };
+        let mut status = gang_reapi::missing_blobs_rpc_status(&[], "missing");
+        status.details[0].value = failure.encode_to_vec();
+        let frame = proto::Completed {
+            attempt: AttemptId::from_random_bytes([33; 16]).to_string(),
+            outcome: Some(CompletedOutcome::Status(status)),
+        };
+        let (completed, _) = parse_completed_frame(frame, &mut HashMap::new()).expect("frame");
+        assert!(matches!(completed.status, CompletionStatus::Failed { .. }));
     }
 
     #[test]
@@ -1490,12 +1580,8 @@ mod tests {
             keepalive_interval: NonZeroDuration::from_secs(3),
             registration_timeout: NonZeroDuration::from_secs(5),
         };
-        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::new(
-            controller.clone(),
-            svc_config,
-            Arc::new(gang_testkit::MemoryContentStore::new()),
-        ))
-        .await?;
+        let (addr, server_task) =
+            spawn_worker_server(WorkerGrpcService::new(controller.clone(), svc_config)).await?;
         let mut worker = LiveSessionClient::spawn(addr, "inst-e2e");
 
         let SessionEvent::Registered {
@@ -1593,11 +1679,8 @@ mod tests {
             LearnedSlot::empty(),
             ControllerRuntime::new(),
         );
-        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::with_defaults(
-            controller.clone(),
-            Arc::new(gang_testkit::MemoryContentStore::new()),
-        ))
-        .await?;
+        let (addr, server_task) =
+            spawn_worker_server(WorkerGrpcService::with_defaults(controller.clone())).await?;
 
         // Start Worker 1.
         let (ev1_tx, mut ev1_rx) = mpsc::channel(32);
@@ -1690,11 +1773,8 @@ mod tests {
             LearnedSlot::empty(),
             ControllerRuntime::new(),
         );
-        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::with_defaults(
-            controller.clone(),
-            Arc::new(gang_testkit::MemoryContentStore::new()),
-        ))
-        .await?;
+        let (addr, server_task) =
+            spawn_worker_server(WorkerGrpcService::with_defaults(controller.clone())).await?;
 
         let fleet = FleetName::try_new("small")?;
         let instance = InstanceId::try_new("inst-cordon")?;
@@ -1761,11 +1841,8 @@ mod tests {
             LearnedSlot::empty(),
             ControllerRuntime::new(),
         );
-        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::with_defaults(
-            controller.clone(),
-            Arc::new(gang_testkit::MemoryContentStore::new()),
-        ))
-        .await?;
+        let (addr, server_task) =
+            spawn_worker_server(WorkerGrpcService::with_defaults(controller.clone())).await?;
 
         let (events_tx, mut events_rx) = mpsc::channel(32);
         let stop = Arc::new(Notify::new());
@@ -1877,11 +1954,8 @@ mod tests {
             LearnedSlot::empty(),
             ControllerRuntime::new(),
         );
-        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::with_defaults(
-            controller.clone(),
-            Arc::new(gang_testkit::MemoryContentStore::new()),
-        ))
-        .await?;
+        let (addr, server_task) =
+            spawn_worker_server(WorkerGrpcService::with_defaults(controller.clone())).await?;
 
         let mut crashed = connect_raw_worker(addr, "inst-crash").await?;
 
@@ -1986,7 +2060,6 @@ mod tests {
             controller.clone(),
             svc_config,
             dyn_clock,
-            Arc::new(gang_testkit::MemoryContentStore::new()),
         ))
         .await?;
 
@@ -2098,11 +2171,8 @@ mod tests {
             LearnedSlot::empty(),
             ControllerRuntime::new(),
         );
-        let (addr, server_task) = spawn_worker_server(WorkerGrpcService::with_defaults(
-            controller.clone(),
-            Arc::new(gang_testkit::MemoryContentStore::new()),
-        ))
-        .await?;
+        let (addr, server_task) =
+            spawn_worker_server(WorkerGrpcService::with_defaults(controller.clone())).await?;
 
         // Connect gen1 and gen2 for the EXACT SAME (small, inst-renew) concurrently.
         let gen1 = connect_raw_worker(addr, "inst-renew").await?;

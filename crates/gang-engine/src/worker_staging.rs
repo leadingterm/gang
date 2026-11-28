@@ -239,7 +239,7 @@ pub enum StagingError {
         reason: String,
     },
     /// A required CAS object was missing from both fast and slow stores.
-    #[error("missing {kind} blobs: {digests:?}")]
+    #[error("missing {kind} blobs")]
     MissingBlobs {
         /// Kind of missing object (`Action`, `Command`, `Directory`, `input file`).
         kind: &'static str,
@@ -862,7 +862,7 @@ where
             for item in fetched {
                 let (digest, dir) = item?;
                 let Some(dir) = dir else {
-                    missing.push(digest);
+                    record_missing(&mut missing, digest);
                     continue;
                 };
                 dir_cache.insert(digest, Arc::new(dir.clone()));
@@ -1491,7 +1491,7 @@ where
                 bypassed.insert(key);
             }
             FetchOutcome::Missing => {
-                missing.push(key.digest);
+                record_missing(&mut missing, key.digest);
             }
         }
     }
@@ -1503,6 +1503,12 @@ where
         });
     }
     Ok((pins, bypassed))
+}
+
+fn record_missing(missing: &mut Vec<Digest>, digest: Digest) {
+    if missing.len() < gang_reapi::MAX_REPORTED_MISSING_BLOBS {
+        missing.push(digest);
+    }
 }
 
 #[allow(deprecated)]

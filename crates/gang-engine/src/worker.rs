@@ -1345,10 +1345,10 @@ fn rpc_status(code: rpc_proto::Code, message: impl Into<String>) -> rpc_proto::S
 }
 
 fn staging_error_status(error: &StagingError) -> rpc_proto::Status {
-    if let StagingError::MissingBlobs { digests, .. } = error {
+    if let StagingError::MissingBlobs { kind, digests } = error {
         return gang_reapi::missing_blobs_rpc_status(
             digests,
-            gang_types::error_chain(error).to_string(),
+            format!("missing {} {kind} blob(s)", digests.len()),
         );
     }
     let code = match error {

@@ -20,6 +20,7 @@ const INPUT_PROTOS: &[&str] = &[
     "google/bytestream/bytestream.proto",
     "google/longrunning/operations.proto",
     "google/rpc/code.proto",
+    "google/rpc/error_details.proto",
     "google/rpc/status.proto",
     "leadingterm/gang/worker/v1/worker.proto",
 ];

@@ -19,7 +19,13 @@ use crate::config::{ExpiryAge, S3Tuning};
 pub(crate) struct S3ExistenceCache {
     consider_expired_after: Option<Duration>,
     existence_ttl: Duration,
-    entries: Mutex<LruCache<Digest, Timestamp>>,
+    state: Mutex<ExistenceState>,
+}
+
+#[derive(Debug)]
+struct ExistenceState {
+    entries: LruCache<Digest, Timestamp>,
+    generation: u64,
 }
 
 impl S3ExistenceCache {
@@ -42,7 +48,10 @@ impl S3ExistenceCache {
             consider_expired_after: consider_expired_after
                 .map(|age| Duration::from_secs(u64::from(age.as_secs()))),
             existence_ttl,
-            entries: Mutex::new(LruCache::new(capacity)),
+            state: Mutex::new(ExistenceState {
+                entries: LruCache::new(capacity),
+                generation: 0,
+            }),
         }
     }
 
@@ -50,14 +59,14 @@ impl S3ExistenceCache {
     ///
     /// Expired entries are evicted immediately on lookup.
     pub(crate) fn contains_fresh(&self, digest: &Digest, now: Timestamp) -> bool {
-        let mut entries = self.entries.lock();
-        let Some(&expires_at) = entries.get(digest) else {
+        let mut state = self.state.lock();
+        let Some(&expires_at) = state.entries.get(digest) else {
             return false;
         };
         if now < expires_at {
             true
         } else {
-            entries.pop(digest);
+            state.entries.pop(digest);
             false
         }
     }
@@ -70,28 +79,42 @@ impl S3ExistenceCache {
         digest: Digest,
         last_modified: Option<Timestamp>,
         now: Timestamp,
+        generation: u64,
     ) {
         let expires_at = self.compute_expiry(last_modified, now);
-        self.insert_or_evict(digest, expires_at, now);
+        let mut state = self.state.lock();
+        if state.generation == generation && generation != u64::MAX {
+            Self::insert_or_evict(&mut state, digest, expires_at, now);
+        }
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.state.lock().generation
     }
 
     /// Records a verified `PutObject` or completed multipart upload at `now`.
     pub(crate) fn record_write(&self, digest: Digest, now: Timestamp) {
         let expires_at = self.compute_expiry(Some(now), now);
-        self.insert_or_evict(digest, expires_at, now);
+        Self::insert_or_evict(&mut self.state.lock(), digest, expires_at, now);
     }
 
     /// Removes `digest` immediately (for example on `NotFound`, expiry, or corruption).
     pub(crate) fn invalidate(&self, digest: &Digest) {
-        self.entries.lock().pop(digest);
+        let mut state = self.state.lock();
+        state.generation = state.generation.saturating_add(1);
+        state.entries.pop(digest);
     }
 
-    fn insert_or_evict(&self, digest: Digest, expires_at: Timestamp, now: Timestamp) {
-        let mut entries = self.entries.lock();
+    fn insert_or_evict(
+        state: &mut ExistenceState,
+        digest: Digest,
+        expires_at: Timestamp,
+        now: Timestamp,
+    ) {
         if now < expires_at {
-            entries.put(digest, expires_at);
+            state.entries.put(digest, expires_at);
         } else {
-            entries.pop(&digest);
+            state.entries.pop(&digest);
         }
     }
 
@@ -142,7 +165,7 @@ mod tests {
         // Object is already 500s old at head time: remaining age is 100s < 1h TTL.
         let head_now = last_modified + Duration::from_secs(500);
 
-        cache.record_head(digest, Some(last_modified), head_now);
+        cache.record_head(digest, Some(last_modified), head_now, cache.generation());
         assert!(cache.contains_fresh(&digest, head_now + Duration::from_secs(99)));
         assert!(!cache.contains_fresh(&digest, head_now + Duration::from_secs(100)));
         Ok(())
@@ -157,7 +180,7 @@ mod tests {
         let last_modified = Timestamp::from_unix_millis(1_000_000);
         let head_now = last_modified + Duration::from_secs(10);
 
-        cache.record_head(digest, Some(last_modified), head_now);
+        cache.record_head(digest, Some(last_modified), head_now, cache.generation());
         assert!(cache.contains_fresh(&digest, head_now + Duration::from_secs(59)));
         assert!(!cache.contains_fresh(&digest, head_now + Duration::from_mins(1)));
         Ok(())
@@ -175,7 +198,12 @@ mod tests {
         assert!(cache.contains_fresh(&digest, t0));
 
         // Recording a stale head removes any prior entry.
-        cache.record_head(digest, Some(t0), t0 + Duration::from_mins(1));
+        cache.record_head(
+            digest,
+            Some(t0),
+            t0 + Duration::from_mins(1),
+            cache.generation(),
+        );
         assert!(!cache.contains_fresh(&digest, t0));
         Ok(())
     }

@@ -515,10 +515,14 @@ impl Engine {
             worker_outbound_depth: self.config.worker_outbound_depth,
             assign_inline_max: self.config.assign_inline_max,
         };
+        let content = Arc::clone(&spec.stores.content);
         let runtime = ControllerRuntime {
             observations: Some(spec.observations.clone()),
             handoff: Some(handoff.clone()),
             control_acquire_timeout: Some(spec.control_acquire_timeout),
+            invalidate_existence: Some(Arc::new(move |digests| {
+                content.invalidate_existence(digests);
+            })),
         };
         let (handle, actor_task) = spawn_controller(
             scheduler,
@@ -894,7 +898,6 @@ fn build_controller_routes<C: ContentStore, A: ActionStore, Api: ApiService>(
         handle.clone(),
         WorkerServiceConfig::from_worker_timeout(NonZeroDuration::from(config.worker_timeout)),
         Arc::clone(&spec.clock),
-        Arc::clone(&spec.stores.content),
     )
     .into_server()
     .max_decoding_message_size(limit)

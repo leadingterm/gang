@@ -1147,6 +1147,7 @@ mod tests {
             observations,
             handoff: None,
             control_acquire_timeout: None,
+            invalidate_existence: None,
         };
         let (controller, task) = spawn_controller(
             make_scheduler(test_policy()),

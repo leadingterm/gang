@@ -96,6 +96,8 @@ impl ActorConfig {
     }
 }
 
+type ExistenceInvalidator = dyn Fn(&[gang_types::Digest]) + Send + Sync;
+
 /// Optional shell collaborators wired into a running controller actor.
 #[derive(Clone, Default)]
 pub struct ControllerRuntime {
@@ -105,6 +107,7 @@ pub struct ControllerRuntime {
     pub(crate) handoff: Option<HandOff>,
     /// Optional acquisition timeout bounding control-plane enqueueing (`§5.10`).
     pub control_acquire_timeout: Option<NonZeroDuration>,
+    pub(crate) invalidate_existence: Option<Arc<ExistenceInvalidator>>,
 }
 
 impl ControllerRuntime {
@@ -641,6 +644,7 @@ struct ControllerActor<C> {
     config: ActorConfig,
     observations: Option<ObservationSink>,
     handoff: Option<HandOff>,
+    invalidate_existence: Option<Arc<ExistenceInvalidator>>,
     control_rx: mpsc::Receiver<ControlMsg>,
     worker_rx: mpsc::Receiver<WorkerMsg>,
     client_rx: mpsc::Receiver<ClientMsg>,
@@ -675,6 +679,7 @@ impl<C: Clock> ControllerActor<C> {
             config,
             observations: runtime.observations,
             handoff: runtime.handoff,
+            invalidate_existence: runtime.invalidate_existence,
             control_rx: inboxes.control_rx,
             worker_rx: inboxes.worker_rx,
             client_rx: inboxes.client_rx,
@@ -1203,6 +1208,14 @@ impl<C: Clock> ControllerActor<C> {
                 self.worker_outbound.remove(&worker);
             }
             Effect::NotifyWatchers { operation, event } => {
+                if let OperationUpdate::Failed(gang_scheduler::TerminalFailure::MissingBlobs {
+                    digests,
+                    ..
+                }) = &event
+                    && let Some(invalidate) = &self.invalidate_existence
+                {
+                    invalidate(digests);
+                }
                 self.notify_watchers(operation, event);
             }
             Effect::AuditGateTier(audit) => {

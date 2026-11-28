@@ -1411,6 +1411,7 @@ mod tests {
             observations: Some(sink),
             handoff: None,
             control_acquire_timeout: None,
+            invalidate_existence: None,
         };
         let (handle, task) = spawn_controller(
             make_scheduler(test_policy()),

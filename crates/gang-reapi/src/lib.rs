@@ -7,6 +7,7 @@ pub mod google;
 pub mod leadingterm;
 
 pub use digest::{
-    DigestConversionError, PRECONDITION_FAILURE_TYPE_URL, extract_missing_blobs, from_proto,
-    missing_blobs_precondition_failure, missing_blobs_rpc_status, to_proto,
+    DigestConversionError, MAX_REPORTED_MISSING_BLOBS, PRECONDITION_FAILURE_TYPE_URL,
+    extract_missing_blobs, from_proto, missing_blobs_precondition_failure,
+    missing_blobs_rpc_status, to_proto,
 };
