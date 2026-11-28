@@ -929,10 +929,12 @@ impl ResourceSketch {
     pub fn observe_inflight(
         &mut self,
         key: SketchKey,
-        cpu_millicores: u64,
-        memory_kb: u64,
+        cpu_millicores: Option<u64>,
+        memory_kb: Option<u64>,
         now_s: u64,
     ) -> bool {
+        let cpu_millicores = cpu_millicores.unwrap_or(0);
+        let memory_kb = memory_kb.unwrap_or(0);
         let memory_kb = self
             .memory_ceiling_kb
             .map_or(memory_kb, |ceiling| memory_kb.min(ceiling));
@@ -1833,7 +1835,7 @@ mod tests {
             1,
         );
         let key = SketchKey::for_attempt(Some("//pkg:heavy"), Some("Rustc"), "");
-        assert!(sketch.observe_inflight(key.clone(), 4_000, 2_000, 10));
+        assert!(sketch.observe_inflight(key.clone(), Some(4_000), Some(2_000), 10));
         let entry = sketch.lookup(&key, 10).expect("live entry");
         assert_eq!(entry.samples, 0);
         assert_eq!(entry.memory_samples(), 0);
@@ -1864,8 +1866,8 @@ mod tests {
                 ..Entry::default()
             }
         ));
-        assert!(sketch.observe_inflight(key.clone(), 4_000, 0, 10));
-        assert!(sketch.observe_inflight(key.clone(), 1_000, 0, 111));
+        assert!(sketch.observe_inflight(key.clone(), Some(4_000), None, 10));
+        assert!(sketch.observe_inflight(key.clone(), Some(1_000), None, 111));
         let entry = sketch.lookup(&key, 111).expect("seeded entry");
         assert_eq!(entry.live_cpu_millicores, 1_000);
     }
@@ -1885,7 +1887,7 @@ mod tests {
             1,
         );
         let key = SketchKey::for_attempt(Some("//pkg:heavy"), Some("Rustc"), "");
-        assert!(sketch.observe_inflight(key.clone(), 4_000, 2_000, 10));
+        assert!(sketch.observe_inflight(key.clone(), Some(4_000), Some(2_000), 10));
         let entry = sketch.lookup(&key, 10).expect("entry");
         let shaped = sketch.shape(&entry);
         assert!(shaped.cpu_count >= 4_000);
@@ -2046,8 +2048,8 @@ mod tests {
 
         assert!(sketch.observe_inflight(
             SketchKey::for_attempt(Some("a"), Some("cc"), ""),
-            4_000,
-            2_000,
+            Some(4_000),
+            Some(2_000),
             105,
         ));
         let snapshot = sketch.snapshot(105);

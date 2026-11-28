@@ -566,6 +566,8 @@ async fn dispatch_inbound_frame(
                             .load
                             .map(|load| gang_scheduler::WorkerLoadSnapshot {
                                 observed_cpu_millicores: load.observed_cpu_millicores,
+                                non_guaranteed_observed_cpu_millicores: load
+                                    .non_guaranteed_observed_cpu_millicores,
                                 cpu_psi_percent: load.cpu_psi_percent,
                                 cpu_saturated: load.cpu_saturated,
                                 reclaimable_cpu_millicores: load.reclaimable_cpu_millicores,

@@ -591,6 +591,8 @@ pub struct RunSpec {
     pub reserved_memory_bytes: u64,
     /// Reserved CPU in millicores used as the initial live reporting threshold.
     pub reserved_cpu_millicores: u64,
+    /// Whether the CPU reservation is guaranteed.
+    pub guaranteed: bool,
     /// Reserved disk in bytes for soft-ceiling and pressure-victim ranking.
     pub reserved_disk_bytes: u64,
     /// Action execution timeout starting when the process spawns.
@@ -601,6 +603,26 @@ pub struct RunSpec {
     pub kill_grace: NonZeroDuration,
     /// Maximum stdout/stderr bytes retained per stream in memory before spilling to a file.
     pub max_output_bytes: usize,
+}
+
+impl RunSpec {
+    fn registration(
+        &self,
+        attempt_dir: &Path,
+        side_channel_dir: &Path,
+        kill: KillTrigger,
+    ) -> AttemptRegistration {
+        AttemptRegistration {
+            attempt: self.attempt.clone(),
+            attempt_dir: attempt_dir.to_path_buf(),
+            side_channel_dir: side_channel_dir.to_path_buf(),
+            reserved_memory_bytes: self.reserved_memory_bytes,
+            reserved_cpu_millicores: self.reserved_cpu_millicores,
+            guaranteed: self.guaranteed,
+            reserved_disk_bytes: self.reserved_disk_bytes,
+            kill,
+        }
+    }
 }
 
 /// Executes one staged action attempt under `spec`, returning [`RunOutcome`] once the process and
@@ -639,15 +661,11 @@ pub async fn run_attempt<K: Clock>(
     );
 
     let tracked = sampler.map(|registry| {
-        registry.register(AttemptRegistration {
-            attempt: spec.attempt.clone(),
-            attempt_dir: dirs.attempt_dir.clone(),
-            side_channel_dir: side_channel.dir().to_path_buf(),
-            reserved_memory_bytes: spec.reserved_memory_bytes,
-            reserved_cpu_millicores: spec.reserved_cpu_millicores,
-            reserved_disk_bytes: spec.reserved_disk_bytes,
-            kill: kill_trigger.clone(),
-        })
+        registry.register(spec.registration(
+            &dirs.attempt_dir,
+            side_channel.dir(),
+            kill_trigger.clone(),
+        ))
     });
 
     let mut command = Command::new(&spec.entrypoint);
@@ -1436,6 +1454,7 @@ mod tests {
             side_channel: SideChannelInputs::default(),
             reserved_memory_bytes: 0,
             reserved_cpu_millicores: 0,
+            guaranteed: false,
             reserved_disk_bytes: 0,
             timeout: Some(Duration::from_secs(15)),
             attempt_deadline: None,

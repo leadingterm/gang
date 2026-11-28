@@ -207,6 +207,8 @@ pub enum RegistrationError {
 pub struct WorkerLoadSnapshot {
     /// Smoothed observed CPU burn.
     pub observed_cpu_millicores: u64,
+    /// Smoothed CPU use by non-guaranteed attempts.
+    pub non_guaranteed_observed_cpu_millicores: u64,
     /// CPU pressure percentage.
     pub cpu_psi_percent: u32,
     /// Whether CPU pressure is latched.
@@ -318,21 +320,29 @@ impl Worker {
             u128::from(physical) * u128::from(self.cpu_tuning.headroom_percent) / 100,
         )
         .unwrap_or(u64::MAX);
-        let pool = physical
-            .saturating_sub(headroom)
-            .saturating_sub(self.guaranteed_cpu_millicores);
+        let protected_free = self.live_load.map_or(physical_free, |load| {
+            let used = load
+                .observed_cpu_millicores
+                .max(
+                    self.guaranteed_cpu_millicores
+                        .saturating_add(load.non_guaranteed_observed_cpu_millicores),
+                )
+                .saturating_add(self.dispatched_since_load_cpu);
+            physical.saturating_sub(headroom).saturating_sub(used)
+        });
         let reclaimed = self
             .live_load
             .filter(|load| !load.cpu_saturated && !self.cpu_pressure_hold)
             .map_or(0, |load| {
                 load.reclaimable_cpu_millicores
-                    .min(pool)
                     .saturating_sub(self.dispatched_since_load_cpu)
+                    .min(protected_free)
             });
         let ceiling =
             physical.saturating_mul(u64::from(self.cpu_tuning.max_reclaimed_cpu_ratio.get()));
         physical_free
             .max(reclaimed)
+            .min(protected_free)
             .min(ceiling.saturating_sub(self.ledger.reserved().cpu_millicores))
     }
 

@@ -740,6 +740,8 @@ pub struct AttemptRegistration {
     pub reserved_memory_bytes: u64,
     /// Initial reserved CPU in millicores.
     pub reserved_cpu_millicores: u64,
+    /// Whether the CPU reservation is guaranteed.
+    pub guaranteed: bool,
     /// Disk reservation in bytes (`0` when unreserved).
     pub reserved_disk_bytes: u64,
     /// Kill handle used by pressure and soft-ceiling monitors to terminate this attempt.
@@ -756,6 +758,8 @@ struct TrackedAttempt {
     pgid: Option<u32>,
     accounting_pid: Option<u32>,
     reserved_memory_bytes: u64,
+    reserved_cpu_millicores: u64,
+    guaranteed: bool,
     last_reported_cpu_millicores: u64,
     last_reported_memory_bytes: u64,
     last_working_set_bytes: u64,
@@ -850,6 +854,26 @@ impl SamplingRegistry {
         updates
     }
 
+    fn cpu_totals(&self) -> (u64, u64) {
+        let state = self.state.lock();
+        state
+            .attempts
+            .iter()
+            .fold((0_u64, 0_u64), |(reserved, observed), attempt| {
+                if attempt.guaranteed {
+                    (
+                        reserved.saturating_add(attempt.reserved_cpu_millicores),
+                        observed,
+                    )
+                } else {
+                    (
+                        reserved,
+                        observed.saturating_add(attempt.observed_cpu_millicores),
+                    )
+                }
+            })
+    }
+
     /// Creates a new registry configured with `memory` and `disk` soft-ceiling policies.
     #[must_use]
     pub fn new(cpu: CpuTuning, memory: MemoryTuning, disk: DiskTuning) -> Self {
@@ -906,6 +930,8 @@ impl SamplingRegistry {
             pgid: None,
             accounting_pid: None,
             reserved_memory_bytes: registration.reserved_memory_bytes,
+            reserved_cpu_millicores: registration.reserved_cpu_millicores,
+            guaranteed: registration.guaranteed,
             last_reported_cpu_millicores: registration.reserved_cpu_millicores,
             last_reported_memory_bytes: registration.reserved_memory_bytes,
             last_working_set_bytes: 0,
@@ -1162,15 +1188,21 @@ impl<P: SampleProbe> WorkerSampler<P> {
         };
         let headroom = u64::try_from(u128::from(physical) * u128::from(cpu.headroom_percent) / 100)
             .unwrap_or(u64::MAX);
+        let (guaranteed_reserved, non_guaranteed_observed) = self.registry.cpu_totals();
+        let protected_used =
+            observed.max(guaranteed_reserved.saturating_add(non_guaranteed_observed));
         self.cpu_sample_seq = self.cpu_sample_seq.saturating_add(1);
         let load = proto::WorkerLoad {
             observed_cpu_millicores: observed,
+            non_guaranteed_observed_cpu_millicores: non_guaranteed_observed,
             cpu_psi_percent: psi,
             cpu_saturated: saturated,
             reclaimable_cpu_millicores: if saturated {
                 0
             } else {
-                physical.saturating_sub(observed).saturating_sub(headroom)
+                physical
+                    .saturating_sub(protected_used)
+                    .saturating_sub(headroom)
             },
             sample_seq: self.cpu_sample_seq,
             observed_assign_seq,
@@ -1826,6 +1858,67 @@ mod tests {
     }
 
     #[test]
+    fn cpu_load_protects_guaranteed_reservation_from_normal_burn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let probe = FakeProbe::default();
+        let mut config = base_config();
+        config.physical_cpu_millicores = 16_000;
+        let mut sampler = WorkerSampler::new(config, probe.clone());
+        let registry = sampler.registry();
+        let (guaranteed_kill, _) = kill_channel();
+        let (normal_kill, _) = kill_channel();
+        let _guaranteed = registry.register(AttemptRegistration {
+            attempt: AttemptId::try_new("guaranteed")?,
+            attempt_dir: PathBuf::from("/work/guaranteed"),
+            side_channel_dir: PathBuf::from("/side/guaranteed"),
+            reserved_cpu_millicores: 8_000,
+            guaranteed: true,
+            reserved_memory_bytes: 0,
+            reserved_disk_bytes: 0,
+            kill: guaranteed_kill,
+        });
+        let _normal = registry.register(AttemptRegistration {
+            attempt: AttemptId::try_new("normal")?,
+            attempt_dir: PathBuf::from("/work/normal"),
+            side_channel_dir: PathBuf::from("/side/normal"),
+            reserved_cpu_millicores: 6_000,
+            guaranteed: false,
+            reserved_memory_bytes: 0,
+            reserved_disk_bytes: 0,
+            kill: normal_kill,
+        });
+        probe.set_cgroup_path(Path::new("/side/normal"), PathBuf::from("/cg/normal"));
+        probe.set_attempt_cgroup(
+            Path::new("/cg/normal"),
+            AttemptCgroupSample {
+                cpu_time: Some(Duration::ZERO),
+                ..AttemptCgroupSample::default()
+            },
+        );
+        probe.set_cpu_pool(CpuPoolSample {
+            usage_usec: Some(0),
+            psi_total_usec: Some(0),
+        });
+        sampler.sample_cpu(t(0));
+        probe.set_attempt_cgroup(
+            Path::new("/cg/normal"),
+            AttemptCgroupSample {
+                cpu_time: Some(Duration::from_secs(6)),
+                ..AttemptCgroupSample::default()
+            },
+        );
+        probe.set_cpu_pool(CpuPoolSample {
+            usage_usec: Some(6_000_000),
+            psi_total_usec: Some(0),
+        });
+        sampler.sample_cpu(t(1_000));
+        let load = registry.cpu_load().expect("load");
+        assert_eq!(load.non_guaranteed_observed_cpu_millicores, 6_000);
+        assert_eq!(load.reclaimable_cpu_millicores, 0);
+        Ok(())
+    }
+
+    #[test]
     fn inflight_reports_only_material_increases() -> Result<(), Box<dyn std::error::Error>> {
         let probe = FakeProbe::default();
         let mut sampler = WorkerSampler::new(base_config(), probe.clone());
@@ -1837,6 +1930,7 @@ mod tests {
             attempt_dir: PathBuf::from("/work/live"),
             side_channel_dir: PathBuf::from("/side/live"),
             reserved_cpu_millicores: 1_000,
+            guaranteed: false,
             reserved_memory_bytes: 1_000,
             reserved_disk_bytes: 0,
             kill,
@@ -1887,6 +1981,7 @@ mod tests {
             attempt_dir: PathBuf::from("/work/attempt-1"),
             side_channel_dir: PathBuf::from("/work/.side_channels/attempt-1"),
             reserved_cpu_millicores: 0,
+            guaranteed: false,
             reserved_memory_bytes: 500_000,
             reserved_disk_bytes: 0,
             kill: tx1,
@@ -1896,6 +1991,7 @@ mod tests {
             attempt_dir: PathBuf::from("/work/attempt-2"),
             side_channel_dir: PathBuf::from("/work/.side_channels/attempt-2"),
             reserved_cpu_millicores: 0,
+            guaranteed: false,
             reserved_memory_bytes: 100_000,
             reserved_disk_bytes: 0,
             kill: tx2,
@@ -1989,6 +2085,7 @@ mod tests {
             attempt_dir: PathBuf::from("/work/disk-small"),
             side_channel_dir: PathBuf::from("/work/.side_channels/disk-small"),
             reserved_cpu_millicores: 0,
+            guaranteed: false,
             reserved_memory_bytes: 0,
             reserved_disk_bytes: 500,
             kill: tx1,
@@ -1998,6 +2095,7 @@ mod tests {
             attempt_dir: PathBuf::from("/work/disk-big"),
             side_channel_dir: PathBuf::from("/work/.side_channels/disk-big"),
             reserved_cpu_millicores: 0,
+            guaranteed: false,
             reserved_memory_bytes: 0,
             reserved_disk_bytes: 500,
             kill: tx2,
@@ -2052,6 +2150,7 @@ mod tests {
             attempt_dir: PathBuf::from("/work/unavailable-pss"),
             side_channel_dir: PathBuf::from("/work/.side_channels/unavailable-pss"),
             reserved_cpu_millicores: 0,
+            guaranteed: false,
             reserved_memory_bytes: 1,
             reserved_disk_bytes: 0,
             kill: tx,
@@ -2081,6 +2180,7 @@ mod tests {
             attempt_dir: PathBuf::from("/work/soft-disk"),
             side_channel_dir: PathBuf::from("/work/.side_channels/soft-disk"),
             reserved_cpu_millicores: 0,
+            guaranteed: false,
             reserved_memory_bytes: 0,
             reserved_disk_bytes: 1_000,
             kill: tx,
@@ -2156,6 +2256,7 @@ mod tests {
             attempt_dir: dir.path().to_path_buf(),
             side_channel_dir: side_channel.clone(),
             reserved_cpu_millicores: 0,
+            guaranteed: false,
             reserved_memory_bytes: 10_000,
             reserved_disk_bytes: 0,
             kill,
@@ -2180,6 +2281,7 @@ mod tests {
             attempt_dir: dir.path().to_path_buf(),
             side_channel_dir: side_channel.clone(),
             reserved_cpu_millicores: 0,
+            guaranteed: false,
             reserved_memory_bytes: 10_000,
             reserved_disk_bytes: 0,
             kill,
@@ -2216,6 +2318,7 @@ mod tests {
             attempt_dir: PathBuf::from("/work/loop-attempt"),
             side_channel_dir: PathBuf::from("/work/.side_channels/loop-attempt"),
             reserved_cpu_millicores: 0,
+            guaranteed: false,
             reserved_memory_bytes: 1024,
             reserved_disk_bytes: 1024,
             kill: tx,

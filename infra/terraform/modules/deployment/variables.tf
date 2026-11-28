@@ -490,6 +490,17 @@ variable "gang_settings" {
     poll_interval         = optional(string, "2s")
     client_action_timeout = optional(string, "2m")
     input_links           = optional(string, "break")
+    cpu = optional(object({
+      headroom_percent              = optional(number)
+      saturate_utilization_percent  = optional(number)
+      clear_utilization_percent     = optional(number)
+      saturate_psi_percent          = optional(number)
+      clear_psi_percent             = optional(number)
+      decay_window                  = optional(string)
+      sample_interval               = optional(string)
+      inflight_report_delta_percent = optional(number)
+      max_reclaimed_cpu_ratio       = optional(number)
+    }))
   })
   nullable    = false
   default     = {}
@@ -499,6 +510,30 @@ variable "gang_settings" {
     2s and 2m. input_links defaults to break rather than gang's keep to protect the CAS.
     Each value must satisfy gang's own rule; the validations repeat it for plan-time feedback.
   EOT
+
+  validation {
+    condition = var.gang_settings.cpu == null ? true : alltrue([
+      for key, value in var.gang_settings.cpu :
+      value == null ? true : (
+        contains(["decay_window", "sample_interval"], key) ?
+        try(
+          tonumber(regex("^(0*[1-9][0-9]*)(ms|s|m|h|d)$", tostring(value))[0]) *
+          { ms = 1, s = 1000, m = 60000, h = 3600000, d = 86400000 }[regex("^(0*[1-9][0-9]*)(ms|s|m|h|d)$", tostring(value))[1]] <= 18446744073709551615,
+          false
+        ) :
+        try(floor(tonumber(value)) == tonumber(value) && tonumber(value) >= (key == "max_reclaimed_cpu_ratio" ? 1 : 0) && tonumber(value) <= (key == "headroom_percent" ? 99 : key == "max_reclaimed_cpu_ratio" ? 4294967295 : 100), false)
+      )
+    ])
+    error_message = "gang_settings.cpu percentages must be whole numbers from 0 to 100 (headroom below 100), ratio a positive u32, and durations positive."
+  }
+
+  validation {
+    condition = var.gang_settings.cpu == null ? true : (
+      coalesce(var.gang_settings.cpu.clear_utilization_percent, 75) <= coalesce(var.gang_settings.cpu.saturate_utilization_percent, 85) &&
+      coalesce(var.gang_settings.cpu.clear_psi_percent, 5) <= coalesce(var.gang_settings.cpu.saturate_psi_percent, 10)
+    )
+    error_message = "gang_settings.cpu clear thresholds must not exceed saturation thresholds."
+  }
 
   validation {
     condition     = contains(["keep", "break"], var.gang_settings.input_links)

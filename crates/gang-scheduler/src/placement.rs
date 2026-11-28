@@ -465,6 +465,7 @@ mod tests {
         let quiet = workers.get_mut(worker).expect("worker");
         let observed_assign_seq = quiet.last_assigned_seq;
         quiet.accept_load(crate::workers::WorkerLoadSnapshot {
+            non_guaranteed_observed_cpu_millicores: 0,
             observed_cpu_millicores: 2_000,
             cpu_psi_percent: 0,
             cpu_saturated: false,
@@ -515,6 +516,7 @@ mod tests {
             disk: Bytes::gib(1),
         };
         let sample = crate::workers::WorkerLoadSnapshot {
+            non_guaranteed_observed_cpu_millicores: 0,
             observed_cpu_millicores: 0,
             cpu_psi_percent: 0,
             cpu_saturated: false,
@@ -558,6 +560,7 @@ mod tests {
         assert!(place_operation(gate, &mut ops, &mut queue, &mut workers).is_some());
         let entry = workers.get_mut(worker).expect("worker");
         entry.accept_load(crate::workers::WorkerLoadSnapshot {
+            non_guaranteed_observed_cpu_millicores: 0,
             observed_cpu_millicores: 0,
             cpu_psi_percent: 0,
             cpu_saturated: false,
@@ -581,12 +584,56 @@ mod tests {
     }
 
     #[test]
+    fn normal_cpu_burn_cannot_invade_guaranteed_headroom() {
+        let cat = two_fleet_catalog();
+        let mut workers = WorkerRegistry::from_catalog(&cat).expect("registry");
+        let worker = register_worker(&mut workers, "preferred", "worker", 1, 16_000, 32);
+        for (cpu, guaranteed) in [(8_000, true), (6_000, false)] {
+            workers
+                .commit_assignment(
+                    worker,
+                    ActionResources {
+                        cpu_millicores: cpu,
+                        memory: Bytes::gib(1),
+                        disk: Bytes::gib(1),
+                    },
+                    false,
+                    guaranteed,
+                )
+                .expect("reservation");
+        }
+        let entry = workers.get_mut(worker).expect("worker");
+        let seq = entry.last_assigned_seq;
+        entry.accept_load(crate::workers::WorkerLoadSnapshot {
+            observed_cpu_millicores: 6_000,
+            non_guaranteed_observed_cpu_millicores: 6_000,
+            cpu_psi_percent: 0,
+            cpu_saturated: false,
+            reclaimable_cpu_millicores: 7_600,
+            sample_seq: 1,
+            observed_assign_seq: seq,
+        });
+        assert_eq!(entry.effective_cpu_free(false), 0);
+        entry.accept_load(crate::workers::WorkerLoadSnapshot {
+            observed_cpu_millicores: 8_000,
+            non_guaranteed_observed_cpu_millicores: 0,
+            cpu_psi_percent: 0,
+            cpu_saturated: false,
+            reclaimable_cpu_millicores: 5_600,
+            sample_seq: 2,
+            observed_assign_seq: seq,
+        });
+        assert_eq!(entry.effective_cpu_free(false), 5_600);
+    }
+
+    #[test]
     fn ranking_accounts_for_observed_cpu_spikes() {
         let cat = two_fleet_catalog();
         let mut workers = WorkerRegistry::from_catalog(&cat).expect("registry");
         let hot = register_worker(&mut workers, "preferred", "hot", 1, 8_000, 32);
         let cool = register_worker(&mut workers, "preferred", "cool", 2, 8_000, 32);
         let load = crate::workers::WorkerLoadSnapshot {
+            non_guaranteed_observed_cpu_millicores: 0,
             observed_cpu_millicores: 6_000,
             cpu_psi_percent: 0,
             cpu_saturated: false,
@@ -599,6 +646,7 @@ mod tests {
             .get_mut(cool)
             .expect("cool")
             .accept_load(crate::workers::WorkerLoadSnapshot {
+                non_guaranteed_observed_cpu_millicores: 0,
                 observed_cpu_millicores: 1_000,
                 ..load
             });

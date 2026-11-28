@@ -130,6 +130,8 @@ message WorkerLoad {
   uint64 sample_seq = 5;
   // Highest assignment admitted before the sampling interval began.
   uint64 observed_assign_seq = 6;
+  // Smoothed CPU use by non-guaranteed active attempts.
+  uint64 non_guaranteed_observed_cpu_millicores = 7;
 }
 
 // Live lower-bound measurements for an active attempt.
@@ -202,6 +204,8 @@ message Assign {
   uint32 cpu_weight = 14;
   // Scheduler assignment sequence within this worker session.
   uint64 assign_seq = 15;
+  // Whether this reservation is protected from reclamation.
+  bool guaranteed = 16;
 }
 
 // Requests or reports termination of a running attempt.

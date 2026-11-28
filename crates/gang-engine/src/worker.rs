@@ -11,7 +11,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -361,15 +361,34 @@ struct WorkerRuntime<C, A, K> {
     shared_channel: Arc<Mutex<Option<Channel>>>,
     via_controller: bool,
     active_kills: Arc<Mutex<HashMap<String, KillTrigger>>>,
+    executing_attempts: Arc<AtomicUsize>,
+}
+
+struct AttemptControl {
+    trigger: KillTrigger,
+    waiter: KillWaiter,
+    active: ActiveAttemptGuard,
 }
 
 struct ActiveAttemptGuard {
     attempt: String,
     active_kills: Arc<Mutex<HashMap<String, KillTrigger>>>,
+    executing_attempts: Arc<AtomicUsize>,
+    computing: bool,
+}
+
+impl ActiveAttemptGuard {
+    fn finish_compute(&mut self) {
+        if self.computing {
+            self.computing = false;
+            self.executing_attempts.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl Drop for ActiveAttemptGuard {
     fn drop(&mut self) {
+        self.finish_compute();
         self.active_kills.lock().remove(&self.attempt);
     }
 }
@@ -424,6 +443,22 @@ where
 {
     start_orphan_reaper();
     let prepared = prepare_worker_runtime(spec, stores, clock).await?;
+    run_prepared_worker(spec, prepared, connector, clock, stop).await
+}
+
+async fn run_prepared_worker<Conn, C, A, K>(
+    spec: &WorkerRuntimeSpec,
+    prepared: PreparedWorker<C, A, K>,
+    connector: Conn,
+    clock: &K,
+    stop: impl Future<Output = ()> + Send,
+) -> Result<(), WorkerError>
+where
+    Conn: SessionConnector + 'static,
+    C: ContentStore,
+    A: ActionStore,
+    K: Clock + Clone + 'static,
+{
     let mut wrapped_connector = ChannelCapturingConnector {
         inner: connector,
         shared: Arc::clone(&prepared.runtime.shared_channel),
@@ -591,6 +626,7 @@ where
         shared_channel,
         via_controller,
         active_kills: Arc::new(Mutex::new(HashMap::new())),
+        executing_attempts: Arc::new(AtomicUsize::new(0)),
     });
 
     Ok(PreparedWorker {
@@ -746,8 +782,7 @@ where
                             continue;
                         }
                         let saturated = runtime.sampling.cpu_load().is_some_and(|load| load.cpu_saturated);
-                        let has_running = !runtime.active_kills.lock().is_empty();
-                        if saturated && has_running {
+                        if cpu_pressure_decline(saturated, &runtime.executing_attempts) {
                             let free = free_work_bytes(&runtime.spec.work_directory);
                             let _ = outbound
                                 .decline(&assign.attempt, proto::DeclineReason::CpuPressure, free)
@@ -783,18 +818,21 @@ where
                         let (kill_trigger, kill_waiter) = kill_channel();
                         runtime.active_kills.lock().insert(assign.attempt.clone(), kill_trigger.clone());
                         runtime.sampling.admit_assignment(assign.assign_seq);
-                        let active_guard = ActiveAttemptGuard { attempt: assign.attempt.clone(), active_kills: Arc::clone(&runtime.active_kills) };
+                        runtime.executing_attempts.fetch_add(1, Ordering::AcqRel);
+                        let active_guard = ActiveAttemptGuard { attempt: assign.attempt.clone(), active_kills: Arc::clone(&runtime.active_kills), executing_attempts: Arc::clone(&runtime.executing_attempts), computing: true };
                         let rt = Arc::clone(runtime);
                         attempt_tasks.spawn(async move {
-                            let _active_guard = active_guard;
                             execute_assigned_attempt(
                                 rt,
                                 *assign,
                                 worker_id,
                                 outbound,
                                 owned_reservation,
-                                kill_trigger,
-                                kill_waiter,
+                                AttemptControl {
+                                    trigger: kill_trigger,
+                                    waiter: kill_waiter,
+                                    active: active_guard,
+                                },
                             )
                             .await;
                         });
@@ -832,6 +870,10 @@ async fn drain_attempts(tasks: &mut JoinSet<()>) {
     while tasks.join_next().await.is_some() {}
 }
 
+fn cpu_pressure_decline(saturated: bool, executing_attempts: &AtomicUsize) -> bool {
+    saturated && executing_attempts.load(Ordering::Acquire) > 0
+}
+
 fn cancel_all_attempts(active_kills: &Mutex<HashMap<String, KillTrigger>>) {
     let triggers: Vec<KillTrigger> = active_kills.lock().values().cloned().collect();
     for trigger in triggers {
@@ -845,13 +887,17 @@ async fn execute_assigned_attempt<C, A, K>(
     worker_id: WorkerId,
     outbound: SessionOutbound,
     mut reservation: OwnedDiskReservation,
-    kill_trigger: KillTrigger,
-    kill_waiter: KillWaiter,
+    control: AttemptControl,
 ) where
     C: ContentStore,
     A: ActionStore,
     K: Clock + Clone + 'static,
 {
+    let AttemptControl {
+        trigger: kill_trigger,
+        waiter: kill_waiter,
+        active: mut active_guard,
+    } = control;
     let worker_start = runtime.clock.wall();
     let attempt_id = match AttemptId::try_from(assign.attempt.as_str()) {
         Ok(id) => id,
@@ -910,6 +956,9 @@ async fn execute_assigned_attempt<C, A, K>(
     // Release TreeLeases and input CasPins immediately on child exit BEFORE upload (`§6.3`).
     staged.release_for_upload();
     retire_guard.walk_bytes = run_outcome.usage.peak_disk_bytes.unwrap_or(0);
+
+    // Match the controller compute lifecycle before reporting process exit.
+    active_guard.finish_compute();
 
     // Emit `ConnectRequest::Executed` immediately before upload (`§6.4`).
     let executed_proto = run_outcome.to_executed_proto(&attempt_id);
@@ -1302,6 +1351,7 @@ fn build_run_spec(
             .reservation
             .as_ref()
             .map_or(0, |res| res.cpu_millicores),
+        guaranteed: assign.guaranteed,
         reserved_disk_bytes,
         timeout,
         attempt_deadline,
@@ -1760,6 +1810,7 @@ pub(crate) mod tests {
                 do_not_cache: false,
                 cpu_weight: 100,
                 assign_seq: 1,
+                guaranteed: false,
             })),
         })
     }
@@ -1934,6 +1985,8 @@ pub(crate) mod tests {
         server: JoinHandle<()>,
         stop: oneshot::Sender<()>,
         attempt: &'static str,
+        executing_attempts: Arc<AtomicUsize>,
+        active_kills: Arc<Mutex<HashMap<String, KillTrigger>>>,
     }
 
     async fn start_blocked_upload(root: &Path) -> TestResult<UploadAttempt> {
@@ -1951,13 +2004,31 @@ pub(crate) mod tests {
         let (controller, mut sessions) = MockController::new();
         let (addr, server) = spawn_mock_server(controller, None).await?;
         let (stop, stop_rx) = oneshot::channel();
-        let worker = spawn_direct_worker(
-            spec.clone(),
-            Arc::clone(&content),
-            Arc::clone(&actions),
-            addr,
-            stop_rx,
-        );
+        start_orphan_reaper();
+        let prepared = prepare_worker_runtime(
+            &spec,
+            WorkerStores::Direct {
+                content: Arc::clone(&content),
+                actions: Arc::clone(&actions),
+            },
+            &SystemClock::new(),
+        )
+        .await?;
+        let executing_attempts = Arc::clone(&prepared.runtime.executing_attempts);
+        let active_kills = Arc::clone(&prepared.runtime.active_kills);
+        let worker_spec = spec.clone();
+        let worker = tokio::spawn(async move {
+            run_prepared_worker(
+                &worker_spec,
+                prepared,
+                endpoint_connector(addr),
+                &SystemClock::new(),
+                async move {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+        });
         let (mut session, _) = expect_register_and_ack(
             &mut sessions,
             "inst-e5-00000000-0000-4000-8000-000000000024",
@@ -1995,6 +2066,22 @@ pub(crate) mod tests {
             server,
             stop,
             attempt,
+            executing_attempts,
+            active_kills,
+        })
+    }
+
+    #[test]
+    fn upload_does_not_trigger_cpu_pressure_decline() -> TestResult {
+        run_gated(async {
+            let tmp = TempDir::new()?;
+            let upload = start_blocked_upload(&tmp.path().canonicalize()?).await?;
+            assert!(upload.active_kills.lock().contains_key(upload.attempt));
+            assert!(!cpu_pressure_decline(true, &upload.executing_attempts));
+            let _ = upload.stop.send(());
+            tokio::time::timeout(Duration::from_secs(5), upload.worker).await???;
+            upload.server.abort();
+            Ok(())
         })
     }
 

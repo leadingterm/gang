@@ -62,16 +62,14 @@ time_zone = ${jsonencode(w.time_zone)}
 
 [actions]
 
+%{ if gang_settings.cpu == null ? false : length([for value in values(gang_settings.cpu) : value if value != null]) > 0 ~}
 [actions.cpu]
-headroom_percent = 15
-saturate_utilization_percent = 85
-clear_utilization_percent = 75
-saturate_psi_percent = 10
-clear_psi_percent = 5
-decay_window = "25s"
-sample_interval = "1s"
-inflight_report_delta_percent = 25
-max_reclaimed_cpu_ratio = 4
+%{ for key, value in gang_settings.cpu ~}
+%{ if value != null ~}
+${key} = ${jsonencode(value)}
+%{ endif ~}
+%{ endfor ~}
+%{ endif ~}
 
 [execution]
 input_links = ${jsonencode(gang_settings.input_links)}

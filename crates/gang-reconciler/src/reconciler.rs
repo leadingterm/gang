@@ -364,6 +364,9 @@ impl Reconciler {
                             resources.memory.max(fleet.policy.memory_per_instance.get());
                         resources.disk = resources.disk.max(fleet.policy.disk_per_instance.get());
                     }
+                    let physical_cpu = u64::from(fleet.policy.vcpus_per_instance.get())
+                        .saturating_mul(gang_types::property::MILLICORES_PER_CORE);
+                    resources.cpu_millicores = resources.cpu_millicores.min(physical_cpu);
                     fleet.outlook.demand.add_running_resources(resources);
                 }
             }
@@ -1124,6 +1127,36 @@ mod tests {
         assert_eq!(resources.memory, fleets[0].policy.memory_per_instance.get());
         assert_eq!(resources.disk, fleets[0].policy.disk_per_instance.get());
         assert_eq!(fleets[0].outlook.demand.actions(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn reclaimed_running_cpu_does_not_add_capacity_demand() -> TestResult {
+        let (mut reconciler, mut fleets, mut hosted) = fixture(0, false, false)?;
+        fleets[0].policy.vcpus_per_instance = gang_types::nonzero_u32(8);
+        let mut snapshot = hosted.snapshot().clone();
+        snapshot.workers[0].running_actions = 1;
+        let physical = u64::from(fleets[0].policy.vcpus_per_instance.get())
+            * gang_types::property::MILLICORES_PER_CORE;
+        snapshot.executing.push(gang_spi::ExecutingDemand {
+            source: None,
+            candidates: gang_types::FleetSet::prefix(1)?,
+            resources: gang_types::ActionResources {
+                cpu_millicores: physical * 2,
+                ..Default::default()
+            },
+            worker: 0,
+            started: Timestamp::default(),
+            expected: None,
+        });
+        hosted.replace(&mut snapshot);
+        let mut plan = Plan::new();
+        reconciler.reconcile(&mut fleets, &hosted, time(1), &mut plan);
+        assert_eq!(
+            fleets[0].outlook.demand.resources().cpu_millicores,
+            physical
+        );
+        assert_eq!(fleets[0].outlook.needed, 1);
         Ok(())
     }
 

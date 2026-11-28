@@ -638,6 +638,12 @@ struct RetainedOperation {
     state: OperationWatchState,
 }
 
+#[derive(Clone, Copy)]
+struct AssignmentCpu {
+    weight: CpuWeight,
+    guaranteed: bool,
+}
+
 struct ControllerActor<C> {
     scheduler: Scheduler,
     clock: Arc<C>,
@@ -1167,6 +1173,7 @@ impl<C: Clock> ControllerActor<C> {
                 attempt_id,
                 operation,
                 cpu_weight,
+                guaranteed,
                 assign_seq,
                 reservation,
                 deadline_wall,
@@ -1175,7 +1182,10 @@ impl<C: Clock> ControllerActor<C> {
                 if let Some(assign) = self.build_assign(
                     &attempt_id,
                     operation,
-                    cpu_weight,
+                    AssignmentCpu {
+                        weight: cpu_weight,
+                        guaranteed,
+                    },
                     assign_seq,
                     reservation,
                     deadline_wall,
@@ -1233,7 +1243,7 @@ impl<C: Clock> ControllerActor<C> {
         &self,
         attempt_id: &AttemptId,
         operation: OperationKey,
-        cpu_weight: CpuWeight,
+        cpu: AssignmentCpu,
         assign_seq: u64,
         reservation: ActionResources,
         deadline_wall: Timestamp,
@@ -1298,7 +1308,8 @@ impl<C: Clock> ControllerActor<C> {
                 .map_or_else(String::new, |m| m.as_str().to_owned()),
             skip_cache_lookup: op.skip_cache_lookup,
             do_not_cache: op.do_not_cache,
-            cpu_weight: cpu_weight.get(),
+            cpu_weight: cpu.weight.get(),
+            guaranteed: cpu.guaranteed,
             assign_seq,
         })
     }

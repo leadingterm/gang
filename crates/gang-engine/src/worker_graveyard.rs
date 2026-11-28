@@ -790,6 +790,7 @@ mod tests {
             attempt_dir: attempt_dir.clone(),
             side_channel_dir: work.join(".side_channels").join(attempt.as_str()),
             reserved_cpu_millicores: 0,
+            guaranteed: false,
             reserved_memory_bytes: 0,
             reserved_disk_bytes: 100,
             kill: tx,

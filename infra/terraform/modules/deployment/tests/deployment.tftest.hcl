@@ -771,6 +771,32 @@ run "renders_default_poll_interval" {
 
 }
 
+run "cpu_defaults_allow_extra_config" {
+  command = plan
+
+  variables {
+    extra_config_toml = "[actions.cpu]\nmax_reclaimed_cpu_ratio = 1\n"
+  }
+
+  assert {
+    condition     = length(regexall("\\[actions\\.cpu\\]", output.gang_toml)) == 1
+    error_message = "The generated defaults must not reopen the extra CPU table."
+  }
+}
+
+run "cpu_settings_render_only_overrides" {
+  command = plan
+
+  variables {
+    gang_settings = { cpu = { max_reclaimed_cpu_ratio = 1 } }
+  }
+
+  assert {
+    condition     = strcontains(output.gang_toml, "[actions.cpu]\nmax_reclaimed_cpu_ratio = 1") && !strcontains(output.gang_toml, "headroom_percent =")
+    error_message = "Only specified CPU settings should be rendered."
+  }
+}
+
 run "renders_gang_settings_override" {
   command = plan
 

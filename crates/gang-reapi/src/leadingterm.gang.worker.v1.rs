@@ -173,6 +173,9 @@ pub struct WorkerLoad {
     /// Highest assignment admitted before the sampling interval began.
     #[prost(uint64, tag = "6")]
     pub observed_assign_seq: u64,
+    /// Smoothed CPU use by non-guaranteed active attempts.
+    #[prost(uint64, tag = "7")]
+    pub non_guaranteed_observed_cpu_millicores: u64,
 }
 /// Live lower-bound measurements for an active attempt.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -280,6 +283,9 @@ pub struct Assign {
     /// Scheduler assignment sequence within this worker session.
     #[prost(uint64, tag = "15")]
     pub assign_seq: u64,
+    /// Whether this reservation is protected from reclamation.
+    #[prost(bool, tag = "16")]
+    pub guaranteed: bool,
 }
 /// Requests or reports termination of a running attempt.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

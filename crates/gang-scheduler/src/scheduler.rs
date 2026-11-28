@@ -624,21 +624,15 @@ impl Scheduler {
                     else {
                         continue;
                     };
-                    if let Some(attempt) = self
-                        .attempts
-                        .lookup_id(&update.attempt_id)
-                        .and_then(|key| self.attempts.get(key))
-                    {
-                        self.learned
-                            .histories_mut()
-                            .resource_mut()
-                            .observe_inflight(
-                                key.clone(),
-                                attempt.reservation.cpu_millicores,
-                                attempt.reservation.memory.get().div_ceil(1024),
-                                now.wall.as_unix_millis() / 1000,
-                            );
-                    }
+                    self.learned
+                        .histories_mut()
+                        .resource_mut()
+                        .observe_inflight(
+                            key.clone(),
+                            (update.cpu_millicores > 0).then_some(update.cpu_millicores),
+                            (update.memory.get() > 0).then_some(update.memory.get().div_ceil(1024)),
+                            now.wall.as_unix_millis() / 1000,
+                        );
                     self.refresh_live_siblings(&key, now);
                 }
                 let cleared_hold = self
@@ -1279,6 +1273,7 @@ impl Scheduler {
             attempt_id,
             operation: assignment.operation,
             cpu_weight: assignment.cpu_weight,
+            guaranteed: assignment.guaranteed,
             assign_seq: assignment.assign_seq,
             reservation: assignment.reservation,
             deadline: attempt_deadline,
@@ -1548,6 +1543,66 @@ mod tests {
     }
 
     #[test]
+    fn inflight_cpu_spike_learns_measured_memory_not_reservation() {
+        let catalog = FleetCatalog::try_new(vec![fleet_props("small", 16, None)]).expect("catalog");
+        let mut sched = make_scheduler(&catalog, default_policy());
+        let mut out = Effects::new();
+        let mut reg = worker_reg("small", "i-live", 1, 8_000, 16, 100);
+        reg.ceilings.cpu_millicores = 8_000;
+        reg.max_inflight = NonZeroU32::new(1);
+        let worker = sched.register(now(1), reg, &mut out).expect("worker");
+        let operation = sched
+            .execute(
+                now(2),
+                exec_req("operations/first", b"first", 100),
+                &mut out,
+            )
+            .expect("first");
+        let (_, _, attempt_id, _) = extract_assign(&out).expect("assigned");
+        let sibling = sched
+            .execute(
+                now(3),
+                exec_req("operations/sibling", b"sibling", 100),
+                &mut out,
+            )
+            .expect("sibling");
+        let key = sched
+            .profiles
+            .get(&operation)
+            .and_then(|profile| profile.history_key.clone())
+            .expect("history key");
+        for time in [4, 5] {
+            sched.on_worker(
+                now(time),
+                worker,
+                WorkerEvent::KeepAlive {
+                    cache: None,
+                    memory_capacity: None,
+                    load: None,
+                    inflight: vec![crate::attempts::AttemptUsageUpdate {
+                        attempt_id: attempt_id.clone(),
+                        cpu_millicores: 6_000,
+                        memory: Bytes::new(512 * 1024 * 1024),
+                    }],
+                },
+                &mut out,
+            );
+        }
+        let sketch = sched.learned.histories_mut().resource_mut();
+        let entry = sketch.lookup(&key, 5).expect("live entry");
+        assert_eq!(entry.live_memory_kb, 512 * 1024);
+        assert_eq!(
+            sched
+                .operations()
+                .get(sibling)
+                .expect("sibling")
+                .reservation
+                .memory,
+            Bytes::gib(4)
+        );
+    }
+
+    #[test]
     fn inflight_ratchet_updates_queued_sibling_and_releases_exactly() {
         let catalog = FleetCatalog::try_new(vec![fleet_props("small", 16, None)]).expect("catalog");
         let mut sched = make_scheduler(&catalog, default_policy());
@@ -1708,6 +1763,7 @@ mod tests {
                 memory_capacity: None,
                 inflight: Vec::new(),
                 load: Some(crate::workers::WorkerLoadSnapshot {
+                    non_guaranteed_observed_cpu_millicores: 0,
                     observed_cpu_millicores: 1_000,
                     cpu_psi_percent: 0,
                     cpu_saturated: false,
@@ -1747,6 +1803,7 @@ mod tests {
                 memory_capacity: None,
                 inflight: Vec::new(),
                 load: Some(crate::workers::WorkerLoadSnapshot {
+                    non_guaranteed_observed_cpu_millicores: 0,
                     observed_cpu_millicores: 1_000,
                     cpu_psi_percent: 0,
                     cpu_saturated: false,

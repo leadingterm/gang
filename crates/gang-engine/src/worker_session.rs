@@ -1118,6 +1118,7 @@ mod tests {
             do_not_cache: false,
             cpu_weight: 100,
             assign_seq: 1,
+            guaranteed: false,
         }
     }
 
