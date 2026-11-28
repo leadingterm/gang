@@ -398,6 +398,10 @@ where
     F: Borrow<DiskCas> + fmt::Debug + Send + Sync + 'static,
     S: ContentStore,
 {
+    fn invalidate_existence(&self, digests: &[Digest]) {
+        self.inner.slow.invalidate_existence(digests);
+    }
+
     async fn find_missing(
         &self,
         digests: &[Digest],

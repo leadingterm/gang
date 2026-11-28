@@ -470,7 +470,7 @@ impl TreeCache {
     ///
     /// Returns [`PortError::Rejected`] with [`Rejection::MalformedRequest`] if the REAPI
     /// `Directory` graph is invalid (missing directory, cycle, invalid node name, or bad digest),
-    /// or [`PortError::Backend`] on missing blobs or filesystem errors.
+    /// [`PortError::NotFound`] on missing blobs, or [`PortError::Backend`] on filesystem errors.
     pub async fn get_or_materialize(
         &self,
         root: Digest,
@@ -523,7 +523,7 @@ impl TreeCache {
         self.drive_materialization(root, plan, move |plan, cancel| {
             let tiered = tiered.clone();
             let cas = cas.clone();
-            async move { fetch_tree_files(root, &plan, &cas, &tiered, &cancel).await }
+            async move { fetch_tree_files(&plan, &cas, &tiered, &cancel).await }
         })
         .await
     }
@@ -597,7 +597,6 @@ impl TreeCache {
 }
 
 async fn fetch_tree_files<F, S>(
-    root: Digest,
     plan: &TreePlan,
     cas: &DiskCas,
     tiered: &Tiered<F, S>,
@@ -634,10 +633,7 @@ where
             FetchOutcome::Cached(pin) => pins.push(pin),
             FetchOutcome::Bypassed => return Ok(None),
             FetchOutcome::Missing => {
-                return Err(PortError::backend(format!(
-                    "missing blob {} for tree {}",
-                    file.digest, root
-                )));
+                return Err(PortError::NotFound(gang_spi::Subject::Blob(file.digest)));
             }
         }
     }
@@ -1087,10 +1083,7 @@ async fn acquire_tree_pins(
                         }
                     }
                 }
-                return Err(PortError::backend(format!(
-                    "missing DiskCas blob {} for tree materialization",
-                    file.digest
-                )));
+                return Err(PortError::NotFound(gang_spi::Subject::Blob(file.digest)));
             }
 
             // Cap reached: evict an unleased LRU tree and wait for its pins to release.
@@ -1190,11 +1183,11 @@ fn build_and_publish_tree(
                 Ok(()) => {}
                 Err(error) if is_link_fallback_errno(&error) => {
                     if !cas.hardlink_or_reflink_to(file.digest, file.executable, &dest)? {
-                        return Err(PortError::backend(format!(
-                            "missing DiskCas blob {} during tree link",
-                            file.digest
-                        )));
+                        return Err(PortError::NotFound(gang_spi::Subject::Blob(file.digest)));
                     }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound && !cas_blob.exists() => {
+                    return Err(PortError::NotFound(gang_spi::Subject::Blob(file.digest)));
                 }
                 Err(error) => return Err(PortError::backend(error)),
             }
@@ -1685,6 +1678,33 @@ mod tests {
             .await?
             .ok_or("failed eviction must retain leaseable entry")?;
         assert_eq!(fs::read(lease.path().join("sub/file"))?, b"resident");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_tree_file_preserves_its_digest() -> TestResult {
+        let dir = TempDir::new()?;
+        let cas = DiskCas::open(dir.path().join("cas"), 1024 * 1024).await?;
+        let slow = Arc::new(gang_testkit::MemoryContentStore::new());
+        let tiered = crate::Tiered::new(cas.clone(), slow);
+        let cache = TreeCache::open(
+            dir.path().join("trees"),
+            None,
+            cas,
+            TreeCacheConfig {
+                min_files: 1,
+                ..TreeCacheConfig::default()
+            },
+        )
+        .await?;
+        let digest = Digest::from_bytes(b"missing file");
+        let (root, directories) = build_single_file_tree("file", digest, false)?;
+        let result = cache
+            .get_or_materialize_from(root, &directories, &tiered)
+            .await;
+        assert!(
+            matches!(result, Err(gang_spi::PortError::NotFound(gang_spi::Subject::Blob(found))) if found == digest)
+        );
         Ok(())
     }
 

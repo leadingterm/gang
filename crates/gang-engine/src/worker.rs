@@ -147,6 +147,12 @@ impl ControllerCas {
 }
 
 impl<C: ContentStore> ContentStore for WorkerContentStore<C> {
+    fn invalidate_existence(&self, digests: &[Digest]) {
+        if let Self::Direct(store) = self {
+            store.invalidate_existence(digests);
+        }
+    }
+
     async fn find_missing(
         &self,
         digests: &[Digest],
@@ -1339,6 +1345,12 @@ fn rpc_status(code: rpc_proto::Code, message: impl Into<String>) -> rpc_proto::S
 }
 
 fn staging_error_status(error: &StagingError) -> rpc_proto::Status {
+    if let StagingError::MissingBlobs { kind, digests } = error {
+        return gang_reapi::missing_blobs_rpc_status(
+            digests,
+            format!("missing {} {kind} blob(s)", digests.len()),
+        );
+    }
     let code = match error {
         StagingError::InvalidAttemptId(_)
         | StagingError::MissingField { .. }
@@ -1346,7 +1358,7 @@ fn staging_error_status(error: &StagingError) -> rpc_proto::Status {
         | StagingError::MalformedProto { .. }
         | StagingError::InvalidPath { .. }
         | StagingError::InvalidTree { .. } => rpc_proto::Code::InvalidArgument,
-        StagingError::MissingBlob { .. } => rpc_proto::Code::FailedPrecondition,
+        StagingError::MissingBlobs { .. } => rpc_proto::Code::FailedPrecondition,
         StagingError::Cancelled => rpc_proto::Code::Cancelled,
         StagingError::Io { .. } | StagingError::Store(_) => rpc_proto::Code::Internal,
     };
@@ -1378,7 +1390,7 @@ fn upload_error_status(error: &UploadError) -> rpc_proto::Status {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::num::NonZeroUsize;
@@ -1525,9 +1537,12 @@ mod tests {
                 let budget = InflightBlobBudget::new(NonZeroBytes::mib(64));
                 let cas =
                     CasService::new(Arc::clone(&content), budget.clone(), CasConfig::default());
-                let bytestream =
-                    ByteStreamService::new(content, budget, ByteStreamConfig::default());
-                let action_cache = ActionCacheService::new(ac);
+                let bytestream = ByteStreamService::new(
+                    Arc::clone(&content),
+                    budget,
+                    ByteStreamConfig::default(),
+                );
+                let action_cache = ActionCacheService::new(ac, content);
                 let _ = builder
                     .add_service(ContentAddressableStorageServer::new(cas))
                     .add_service(ByteStreamServer::new(bytestream))
@@ -1560,7 +1575,7 @@ mod tests {
         }
     }
 
-    fn test_spec(
+    pub(crate) fn test_spec(
         root: &Path,
         lifetime: WorkerLifetime,
         with_trees: bool,
@@ -1729,7 +1744,7 @@ mod tests {
         runtime.block_on(future)
     }
 
-    fn spawn_direct_worker<C: ContentStore>(
+    pub(crate) fn spawn_direct_worker<C: ContentStore>(
         spec: WorkerRuntimeSpec,
         content: Arc<C>,
         actions: Arc<MemoryActionStore>,
@@ -2381,6 +2396,86 @@ mod tests {
                 WorkerKind::GoingAway(_)
             ));
             server.abort();
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn missing_inputs_produce_rich_worker_status() -> TestResult {
+        run_gated(async {
+            for kind in 0..3 {
+                let tmp = TempDir::new()?;
+                let root = tmp.path().canonicalize()?;
+                let mut spec = test_spec(&root, WorkerLifetime::LongLived, kind == 1)?;
+                spec.worker.tree_cache_min_files = NonZeroUsize::MIN;
+                let content = Arc::new(MemoryContentStore::new());
+                let actions = Arc::new(MemoryActionStore::new());
+                let (action_digest, action_bytes, command) = seed_action_in_store(
+                    &content,
+                    WRITE_OUTPUT_CHILD,
+                    Vec::new(),
+                    Vec::new(),
+                    vec![("input".to_owned(), Bytes::from_static(b"missing-input"))],
+                )
+                .await?;
+                let missing_file = Digest::from_bytes(b"missing-input");
+                let mut action = reapi::Action::decode(action_bytes)?;
+                let directory = from_proto(action.input_root_digest.as_ref().ok_or("root")?)?;
+                let missing = if kind == 0 {
+                    let _ = content.remove(directory);
+                    directory
+                } else {
+                    if kind == 1 {
+                        let parent = reapi::Directory {
+                            directories: vec![reapi::DirectoryNode {
+                                name: "sub".to_owned(),
+                                digest: Some(to_proto(&directory)?),
+                            }],
+                            ..Default::default()
+                        };
+                        let parent_digest = content.insert(Bytes::from(parent.encode_to_vec()));
+                        action.input_root_digest = Some(to_proto(&parent_digest)?);
+                    }
+                    let _ = content.remove(missing_file);
+                    missing_file
+                };
+                let (controller, mut sessions) = MockController::new();
+                let (addr, server) = spawn_mock_server(controller, None).await?;
+                let (stop_tx, stop_rx) = oneshot::channel();
+                let worker = spawn_direct_worker(spec, content, actions, addr, stop_rx);
+                let (mut session, _) = expect_register_and_ack(
+                    &mut sessions,
+                    "inst-e5-00000000-0000-4000-8000-000000000001",
+                )
+                .await?;
+                let attempt = "00000000-0000-4000-8000-000000000101";
+                session
+                    .outbound_tx
+                    .send(Ok(assign_frame(
+                        attempt,
+                        action_digest,
+                        Some(Bytes::from(action.encode_to_vec())),
+                        Some(command),
+                        1024,
+                    )?))
+                    .await?;
+                assert!(matches!(
+                    next_non_keepalive(&mut session.inbound_rx).await?,
+                    WorkerKind::Accept(_)
+                ));
+                let WorkerKind::Completed(completed) =
+                    next_non_keepalive(&mut session.inbound_rx).await?
+                else {
+                    return Err("expected failed completion".into());
+                };
+                let Some(proto::completed::Outcome::Status(status)) = completed.outcome else {
+                    return Err("expected rich status".into());
+                };
+                assert_eq!(gang_reapi::extract_missing_blobs(&status), vec![missing]);
+                let _ = stop_tx.send(());
+                worker.await??;
+                server.abort();
+            }
             Ok(())
         })
     }

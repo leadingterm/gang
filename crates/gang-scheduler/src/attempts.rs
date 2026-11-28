@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use gang_clock::{Tick, Timestamp};
 use gang_config::ActionsConfig;
-use gang_types::{ActionResources, AttemptId, Bytes, OperationName};
+use gang_types::{ActionResources, AttemptId, Bytes, Digest, OperationName};
 
 use crate::admission::ActionProfile;
 use crate::capacity::CapacityCatalog;
@@ -98,6 +98,15 @@ pub struct KillDirective {
 /// Terminal failure summary for an operation that will not be retried.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalFailure {
+    /// The action references CAS objects that must be uploaded again.
+    MissingBlobs {
+        /// Operation name.
+        operation: OperationName,
+        /// Absent blobs.
+        digests: Vec<Digest>,
+        /// Worker diagnostic.
+        message: String,
+    },
     /// Dispatch-stamped `attempt_deadline` passed without execution finishing.
     DeadlineExceeded {
         /// Operation name.
@@ -193,6 +202,13 @@ pub struct ExecutedReport<'a> {
 pub enum CompletionStatus {
     /// Action execution and output upload succeeded (`REAPI` status `OK`).
     Ok,
+    /// Required CAS blobs are absent; retrying the worker cannot repair them.
+    MissingBlobs {
+        /// Absent blobs.
+        digests: Vec<Digest>,
+        /// Worker diagnostic.
+        message: String,
+    },
     /// Non-OK completion not classified as a resource kill.
     Failed {
         /// Failure diagnostic message.
@@ -866,6 +882,30 @@ impl Attempts {
         }
 
         match report.status {
+            CompletionStatus::MissingBlobs { digests, message } => {
+                let Some(operation) = operations.get(attempt.operation).map(|op| op.name.clone())
+                else {
+                    return CompletedOutcome::ReleasedDiskOnly {
+                        attempt_key: key,
+                        operation: attempt.operation,
+                        worker: attempt.worker,
+                    };
+                };
+                operations.complete(attempt.operation, queue);
+                CompletedOutcome::Failed {
+                    attempt_key: key,
+                    operation: attempt.operation,
+                    worker: attempt.worker,
+                    publish: PublishEvent::Failed {
+                        operation: attempt.operation,
+                        failure: TerminalFailure::MissingBlobs {
+                            operation,
+                            digests,
+                            message,
+                        },
+                    },
+                }
+            }
             CompletionStatus::Ok => {
                 self.completed_count = self.completed_count.saturating_add(1);
                 record_successful_completion(
@@ -1644,6 +1684,66 @@ mod tests {
             durations,
             rates,
         }
+    }
+
+    #[test]
+    fn missing_blobs_finish_without_retry_and_release_resources() {
+        let mut env = setup_env();
+        let resources = ActionResources {
+            cpu_millicores: 2_000,
+            memory: Bytes::gib(4),
+            disk: Bytes::gib(8),
+        };
+        let (op, _) = admit_test_op(
+            &mut env.ops,
+            &mut env.queue,
+            "operations/missing",
+            100,
+            resources,
+        );
+        let assigned =
+            place_operation(op, &mut env.ops, &mut env.queue, &mut env.workers).expect("place");
+        let id = AttemptId::from_random_bytes([43; 16]);
+        env.attempts
+            .dispatch(
+                assigned,
+                id.clone(),
+                now(2),
+                Duration::from_secs(10),
+                Duration::from_mins(10),
+            )
+            .expect("dispatch");
+        env.attempts.on_accept(&id, now(3), &env.ops);
+        let digest = Digest::from_bytes(b"missing");
+        let outcome = env.attempts.on_completed(
+            CompletedReport {
+                attempt_id: &id,
+                now: now(4),
+                status: CompletionStatus::MissingBlobs {
+                    digests: vec![digest],
+                    message: "missing".to_owned(),
+                },
+                execution_timestamps: None,
+            },
+            &env.actions,
+            &mut env.ops,
+            &mut env.queue,
+            &mut env.workers,
+            &mut env.durations,
+            &mut env.rates,
+        );
+        assert!(
+            matches!(outcome, CompletedOutcome::Failed { publish: PublishEvent::Failed { failure: TerminalFailure::MissingBlobs { digests, .. }, .. }, .. } if digests == vec![digest])
+        );
+        assert_eq!(env.ops.get(op).expect("operation").retry_counts.generic, 0);
+        assert_eq!(
+            env.workers
+                .get(env.worker)
+                .expect("worker")
+                .ledger
+                .reserved(),
+            ActionResources::default()
+        );
     }
 
     #[test]

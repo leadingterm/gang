@@ -515,10 +515,14 @@ impl Engine {
             worker_outbound_depth: self.config.worker_outbound_depth,
             assign_inline_max: self.config.assign_inline_max,
         };
+        let content = Arc::clone(&spec.stores.content);
         let runtime = ControllerRuntime {
             observations: Some(spec.observations.clone()),
             handoff: Some(handoff.clone()),
             control_acquire_timeout: Some(spec.control_acquire_timeout),
+            invalidate_existence: Some(Arc::new(move |digests| {
+                content.invalidate_existence(digests);
+            })),
         };
         let (handle, actor_task) = spawn_controller(
             scheduler,
@@ -797,10 +801,11 @@ fn shared_cache_routes<C: ContentStore, A: ActionStore>(
     bytestream_config: ByteStreamConfig,
     limit: usize,
 ) -> (Routes, crate::reapi_bytestream::ByteStreamShutdown) {
-    let action_cache = ActionCacheService::new(Arc::clone(&stores.actions))
-        .into_server()
-        .max_decoding_message_size(limit)
-        .max_encoding_message_size(limit);
+    let action_cache =
+        ActionCacheService::new(Arc::clone(&stores.actions), Arc::clone(&stores.content))
+            .into_server()
+            .max_decoding_message_size(limit)
+            .max_encoding_message_size(limit);
     let cas = CasService::new(Arc::clone(&stores.content), budget.clone(), cas_config)
         .into_server()
         .max_decoding_message_size(limit)
