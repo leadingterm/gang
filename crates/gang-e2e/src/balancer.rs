@@ -1032,10 +1032,21 @@ mod tests {
         let balancer = Balancer::start(Arc::clone(&clock), Probe::default()).await?;
         let first = Echo::start(1).await?;
         let second = Echo::start(2).await?;
-        let health = HttpTarget::start(StatusCode::OK).await?;
+        let old_health = HttpTarget::start(StatusCode::OK).await?;
+        let new_health = HttpTarget::start(StatusCode::OK).await?;
         let targets = [
-            register(&balancer, Frontend::Serve, first.address, health.address),
-            register(&balancer, Frontend::Serve, second.address, health.address),
+            register(
+                &balancer,
+                Frontend::Serve,
+                first.address,
+                old_health.address,
+            ),
+            register(
+                &balancer,
+                Frontend::Serve,
+                second.address,
+                new_health.address,
+            ),
         ];
         for _ in 0..Probe::default().threshold.get() {
             round(&clock, &targets, false).await;
@@ -1048,6 +1059,19 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(request(&balancer, Frontend::Serve).await?, a);
         assert_eq!(request(&balancer, Frontend::Serve).await?, b);
+        old_health
+            .status
+            .store(StatusCode::SERVICE_UNAVAILABLE.as_u16(), Ordering::SeqCst);
+        for _ in 1..Probe::default().threshold.get() {
+            round(&clock, &targets, false).await;
+            assert_eq!(balancer.healthy(Frontend::Serve), sorted);
+            let one = request(&balancer, Frontend::Serve).await?;
+            let two = request(&balancer, Frontend::Serve).await?;
+            assert_ne!(one, two);
+        }
+        round(&clock, &targets, false).await;
+        assert_eq!(balancer.healthy(Frontend::Serve), vec![second.address]);
+        assert_eq!(request(&balancer, Frontend::Serve).await?, 2);
         Ok(())
     }
 }

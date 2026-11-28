@@ -10,7 +10,7 @@ workspace_rust_library(
             "tests/fixtures/**",
         ],
         allow_empty = True,
-    ) + ["//infra/terraform/modules/controller:lifecycle-hook.json"],  # keep
+    ),
     deps = [
         "//crates/gang-aws-sdk:gang_aws_sdk",
         "//crates/gang-clock:gang_clock",

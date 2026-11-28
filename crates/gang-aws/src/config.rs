@@ -63,9 +63,6 @@ pub struct AwsConfig {
     /// Bound on each instance metadata (IMDS) request. Default `1s`. Must be greater than zero.
     #[serde(default = "default_imds_request_timeout")]
     pub imds_request_timeout: NonZeroDuration,
-    /// Interval between controller retirement metadata reads. Default `5s`.
-    #[serde(default = "default_retirement_poll_interval")]
-    pub retirement_poll_interval: NonZeroDuration,
     /// Key of the EC2 instance tag, readable through the instance metadata service, that names
     /// the node's fleet. Defaults to `gang-fleet`. Must be 1 to 128 characters of `a-z`, `A-Z`, `0-9` and
     /// `_ . : = + - @ ,`, and must not be `.`, `..` or `_index`, which the instance metadata
@@ -653,10 +650,6 @@ pub struct KmsSignerConfig {
 /// Default bound on each instance metadata request.
 fn default_imds_request_timeout() -> NonZeroDuration {
     NonZeroDuration::from_secs(1)
-}
-
-fn default_retirement_poll_interval() -> NonZeroDuration {
-    NonZeroDuration::from_secs(5)
 }
 
 impl AwsFleetOptions {

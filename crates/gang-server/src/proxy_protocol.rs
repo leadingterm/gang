@@ -39,10 +39,14 @@ pub(crate) async fn prepare<IO: AsyncRead + Unpin>(
     kind: HeaderKind,
 ) -> Result<(IO, Option<IpAddr>), ProxyProtocolError> {
     let raw = raw.map(|ip| ip.to_canonical());
-    if !trusted(config, raw) {
+    let is_trusted = trusted(config, raw);
+    // An otherwise untrusted local health probe may not claim a proxy source.
+    let local_only =
+        !is_trusted && matches!(kind, HeaderKind::Health) && raw.is_some_and(|ip| ip.is_loopback());
+    if !is_trusted && !local_only {
         return Err(ProxyProtocolError::Untrusted);
     }
-    prepare_trusted(io, raw, config, kind).await
+    prepare_trusted(io, raw, config, kind, local_only).await
 }
 
 async fn prepare_trusted<IO: AsyncRead + Unpin>(
@@ -50,6 +54,7 @@ async fn prepare_trusted<IO: AsyncRead + Unpin>(
     raw: Option<IpAddr>,
     config: &ProxyProtocolConfig,
     kind: HeaderKind,
+    local_only: bool,
 ) -> Result<(IO, Option<IpAddr>), ProxyProtocolError> {
     let mut stack = [0u8; 52];
     io.read_exact(&mut stack[..12]).await?;
@@ -61,6 +66,9 @@ async fn prepare_trusted<IO: AsyncRead + Unpin>(
         (kind, stack[12]),
         (HeaderKind::Application, 0x21) | (HeaderKind::Health, 0x20 | 0x21)
     ) {
+        return Err(ProxyProtocolError::Invalid);
+    }
+    if local_only && stack[12] != 0x20 {
         return Err(ProxyProtocolError::Invalid);
     }
     let length = 16 + usize::from(u16::from_be_bytes([stack[14], stack[15]]));
@@ -169,7 +177,7 @@ impl<L: Listener, C: Clock + 'static> Listener for ProxyListener<L, C> {
                     }
                     let config = Arc::clone(config);
                     let deadline = self.clock.timeout(config.header_timeout.get(), async move {
-                        let (io, effective) = prepare_trusted(io, ip, &config, HeaderKind::Application).await?;
+                        let (io, effective) = prepare_trusted(io, ip, &config, HeaderKind::Application, false).await?;
                         Ok((io, raw, effective))
                     });
                     self.pending.spawn(async move { deadline.await.map_err(|_| ProxyProtocolError::Timeout)? });
@@ -212,6 +220,74 @@ mod tests {
         let mut bytes = SIGNATURE.to_vec();
         bytes.extend_from_slice(&[0x21, 0x11, 0, 12, 192, 0, 2, 1, 192, 0, 2, 2, 0, 1, 0, 2]);
         bytes
+    }
+
+    #[tokio::test]
+    async fn loopback_local_exception_is_only_for_health() {
+        let config = config();
+        for raw in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+        ] {
+            let (mut client, server) = tokio::io::duplex(64);
+            client
+                .write_all(b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0")
+                .await
+                .expect("write local frame");
+            let (_, source) = prepare(server, Some(raw), &config, HeaderKind::Health)
+                .await
+                .expect("loopback health local frame");
+            assert_eq!(source, Some(raw.to_canonical()));
+
+            let (mut client, server) = tokio::io::duplex(64);
+            client.write_all(&frame()).await.expect("write proxy frame");
+            assert!(
+                prepare(server, Some(raw), &config, HeaderKind::Health)
+                    .await
+                    .is_err()
+            );
+
+            let (mut client, server) = tokio::io::duplex(64);
+            client
+                .write_all(b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0")
+                .await
+                .expect("write local frame");
+            assert!(
+                prepare(server, Some(raw), &config, HeaderKind::Application)
+                    .await
+                    .is_err()
+            );
+        }
+        let (mut client, server) = tokio::io::duplex(64);
+        client
+            .write_all(b"\r\n\r\n\0\r\nQUIT\n\x20\0\0\0")
+            .await
+            .expect("write local frame");
+        assert!(
+            prepare(server, Some(ip(4)), &config, HeaderKind::Application)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicitly_trusted_loopback_health_can_claim_proxy_source() {
+        let mut config = config();
+        config
+            .trusted_cidrs
+            .push("127.0.0.1/32".parse().expect("valid test network"));
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(&frame()).await.expect("write proxy frame");
+        let (_, source) = prepare(
+            server,
+            Some(Ipv4Addr::LOCALHOST.into()),
+            &config,
+            HeaderKind::Health,
+        )
+        .await
+        .expect("trusted loopback proxy frame");
+        assert_eq!(source, Some(Ipv4Addr::new(192, 0, 2, 1).into()));
     }
 
     #[tokio::test]

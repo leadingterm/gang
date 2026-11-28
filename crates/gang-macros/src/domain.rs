@@ -99,7 +99,7 @@ pub const DOMAINS: [Domain; 9] = [
                 }],
             },
             PortSpec::plain("NodeLifecyclePort"),
-            PortSpec::plain("ControllerHostPort"),
+            PortSpec::plain("ControllerIdentityPort"),
             PortSpec::plain("ScratchVolumePort"),
             PortSpec::plain("WorkloadCredentialPort"),
         ],

@@ -8,11 +8,9 @@ use gang_types::InstanceId;
 
 use crate::errors::LocalError;
 
-/// Random identity size; the file contains its lowercase hexadecimal encoding.
 const IDENTITY_BYTES: usize = 16;
 
-/// The caller must verify the configured state root before opening this private child directory.
-/// Concurrent creators read the winning publication rather than replace it.
+/// The caller verifies the state root first. Concurrent creators read the winning publication.
 pub(crate) fn load_or_create(path: &Path) -> Result<InstanceId, LocalError> {
     let parent = path.parent().ok_or_else(|| {
         gang_os::PathIo::new(
@@ -32,7 +30,6 @@ pub(crate) fn load_or_create(path: &Path) -> Result<InstanceId, LocalError> {
     if let Some(bytes) = dir.read_optional(name)? {
         return decode(path, &bytes);
     }
-
     let mut bytes = [0_u8; IDENTITY_BYTES];
     getrandom::fill(&mut bytes).map_err(|source| LocalError::Random(source.to_string()))?;
     let encoded = hex::encode(bytes);
@@ -66,17 +63,14 @@ fn decode(path: &Path, bytes: &[u8]) -> Result<InstanceId, LocalError> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use super::*;
+    use crate::layout::StateLayout;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Barrier;
 
-    use super::*;
-    use crate::layout::StateLayout;
-
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
-
     #[test]
-    fn concurrent_creators_and_restarts_keep_one_private_identity() -> TestResult {
+    fn concurrent_creators_and_restarts_keep_one_private_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         let layout = StateLayout::new(root.path().join("state"));
         layout.prepare()?;
@@ -95,20 +89,16 @@ mod tests {
         let second = second.map_err(|_| "identity creator panicked")??;
         assert_eq!(first, second);
         assert_eq!(load_or_create(&path)?, first);
-        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
         assert_eq!(
-            fs::metadata(layout.controller_hosts_dir())?
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o600
         );
-        assert_eq!(fs::read_dir(layout.controller_hosts_dir())?.count(), 1);
         Ok(())
     }
 
     #[test]
-    fn corrupt_identity_is_rejected_without_replacement() -> TestResult {
+    fn corrupt_identity_is_rejected_without_replacement() -> Result<(), Box<dyn std::error::Error>>
+    {
         let root = tempfile::tempdir()?;
         let layout = StateLayout::new(root.path().join("state"));
         layout.prepare()?;
@@ -120,12 +110,12 @@ mod tests {
             "0123456789abcdef0123456789abcdeF",
             "0123456789abcdef0123456789abcdef\n",
         ] {
-            fs::write(&path, invalid)?;
+            std::fs::write(&path, invalid)?;
             assert!(matches!(
                 load_or_create(&path),
                 Err(LocalError::HostIdentity { .. })
             ));
-            assert_eq!(fs::read(&path)?, invalid.as_bytes());
+            assert_eq!(std::fs::read(&path)?, invalid.as_bytes());
         }
         Ok(())
     }

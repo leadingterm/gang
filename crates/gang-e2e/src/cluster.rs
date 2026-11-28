@@ -17,7 +17,7 @@ use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
 use rustix::process::{Pid, Signal, kill_process};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
@@ -57,11 +57,12 @@ struct LeadershipHealth {
     leading: bool,
 }
 
-async fn probe_leadership(
+async fn probe_health(
     address: SocketAddr,
     policy: &Policy,
+    path: &str,
     timeout: Duration,
-) -> Option<LeadershipHealth> {
+) -> Option<(StatusCode, bool)> {
     tokio::time::timeout(policy.timeout.min(timeout), async {
         let mut stream = TcpStream::connect(address).await.ok()?;
         if policy.proxy_protocol_v2 {
@@ -76,23 +77,33 @@ async fn probe_leadership(
                 .ok()?;
         let mut connections = JoinSet::new();
         connections.spawn(connection);
-        let request = Request::get(policy.path.as_str())
+        let request = Request::get(path)
             .header(hyper::header::HOST, address.to_string())
             .body(Body::empty())
             .ok()?;
         let response = sender.send_request(request).await.ok()?;
         let values = response.headers().get_all(LEADING_HEADER);
         let mut values = values.iter();
-        let leading = response.status() == StatusCode::OK
-            && values
-                .next()
-                .is_some_and(|value| value.as_bytes() == b"true")
+        let leading = values
+            .next()
+            .is_some_and(|value| value.as_bytes() == b"true")
             && values.next().is_none();
-        Some(LeadershipHealth { leading })
+        Some((response.status(), leading))
     })
     .await
     .ok()
     .flatten()
+}
+
+async fn probe_leadership(
+    address: SocketAddr,
+    policy: &Policy,
+    timeout: Duration,
+) -> Option<LeadershipHealth> {
+    let (status, leading) = probe_health(address, policy, &policy.path, timeout).await?;
+    Some(LeadershipHealth {
+        leading: status == StatusCode::OK && leading,
+    })
 }
 
 fn observed_leaders(observations: &[Option<LeadershipHealth>]) -> impl Iterator<Item = usize> + '_ {
@@ -118,6 +129,9 @@ fn initial_leader(observations: &[Option<LeadershipHealth>]) -> Option<usize> {
 #[derive(Default)]
 struct LinkState {
     cut: bool,
+    stalled: bool,
+    stall_postgres_history: bool,
+    stalled_connections: usize,
     flows: Vec<AbortHandle>,
 }
 
@@ -212,6 +226,17 @@ impl DatabaseLink {
                         if state.cut {
                             continue;
                         }
+                        if state.stalled {
+                            state.stalled_connections += 1;
+                            let flow = flows.spawn(async move {
+                                std::future::pending::<()>().await;
+                                drop(incoming);
+                            });
+                            state.flows.push(flow);
+                            continue;
+                        }
+                        let stall_postgres_history = state.stall_postgres_history;
+                        let shared = Arc::clone(&shared);
                         state.flows.retain(|flow| !flow.is_finished());
                         let target = target.clone();
                         let flow = flows.spawn(async move {
@@ -223,7 +248,16 @@ impl DatabaseLink {
                                 }
                                 LinkTarget::Unix(path) => {
                                     if let Ok(mut outgoing) = UnixStream::connect(path).await {
-                                        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+                                        if stall_postgres_history {
+                                            let (read, mut write) = incoming.split();
+                                            let (mut response, request) = outgoing.split();
+                                            tokio::select! {
+                                                _ = forward_postgres_preparation(read, request, &shared) => {}
+                                                _ = tokio::io::copy(&mut response, &mut write) => {}
+                                            }
+                                        } else {
+                                            let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+                                        }
                                     }
                                 }
                             }
@@ -249,6 +283,50 @@ impl DatabaseLink {
                 flow.abort();
             }
         }
+    }
+}
+
+// PostgreSQL's initial authentication reads fail fast on timeout. Let those and schema setup
+// finish, then hold the read-only history import, which retries without requesting takeover.
+async fn forward_postgres_preparation(
+    mut incoming: impl AsyncRead + Unpin,
+    mut outgoing: impl AsyncWrite + Unpin,
+    state: &Mutex<LinkState>,
+) -> std::io::Result<()> {
+    const HISTORY_QUERY: &[u8] = b"SELECT id, body, version, expires_at FROM expiring_records";
+    let mut startup = true;
+    let mut header = [0; 5];
+    let mut payload = Vec::new();
+    loop {
+        let prefix = usize::from(!startup);
+        let header = &mut header[..4 + prefix];
+        incoming.read_exact(header).await?;
+        let length = u32::from_be_bytes([
+            header[prefix],
+            header[prefix + 1],
+            header[prefix + 2],
+            header[prefix + 3],
+        ]);
+        let length = length.checked_sub(4).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid postgres frame length",
+            )
+        })?;
+        payload.resize(length as usize, 0);
+        incoming.read_exact(&mut payload).await?;
+        if !startup
+            && matches!(header[0], b'P' | b'Q')
+            && payload
+                .windows(HISTORY_QUERY.len())
+                .any(|part| part == HISTORY_QUERY)
+        {
+            state.lock().stalled_connections += 1;
+            std::future::pending::<()>().await;
+        }
+        outgoing.write_all(header).await?;
+        outgoing.write_all(&payload).await?;
+        startup = false;
     }
 }
 
@@ -289,7 +367,7 @@ struct Controller {
 
 pub(crate) struct Retiring {
     index: usize,
-    child: ControllerHost,
+    started: Instant,
 }
 
 /// Controllers with shared database, S3, local provisioner state and signing key.
@@ -434,7 +512,7 @@ impl<'a> Cluster<'a> {
             )
         };
         self.release_evidence.lock().push(format!(
-            "public={}; workers={}; controllers={}, health={}, min={}%, max={}%",
+            "public={}; workers={}; controllers={}, health={:?}, min={}%, max={}%",
             plan(&fixture.public),
             plan(&fixture.workers),
             fixture.controller.instances,
@@ -478,6 +556,55 @@ impl<'a> Cluster<'a> {
             )));
         }
         Ok(())
+    }
+
+    /// Waits for the same candidate process to report completed preparation.
+    pub(crate) fn wait_for_controller_prepared_within(
+        &self,
+        index: usize,
+        timeout: Duration,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let pid = self.controller_pid(index)?;
+        let (address, policy) = {
+            let controllers = self.controllers.lock();
+            let controller = controllers
+                .get(index)
+                .ok_or_else(|| E2eError::system("unknown controller"))?;
+            (controller.health, Arc::clone(&controller.health_policy))
+        };
+        loop {
+            if self.controller_pid(index)? != pid {
+                return Err(E2eError::system(
+                    "candidate controller process changed during preparation",
+                ));
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(E2eError::timeout(
+                    format!("controller {index} preparation"),
+                    timeout,
+                ));
+            }
+            let response =
+                self.runtime
+                    .block_on(probe_health(address, &policy, "/prepared", remaining));
+            if self.controller_pid(index)? != pid {
+                return Err(E2eError::system(
+                    "candidate controller process changed during preparation",
+                ));
+            }
+            if started.elapsed() >= timeout {
+                return Err(E2eError::timeout(
+                    format!("controller {index} preparation"),
+                    timeout,
+                ));
+            }
+            if response.is_some_and(|(status, _)| status == StatusCode::OK) {
+                return Ok(());
+            }
+            std::thread::sleep(LEASE_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
+        }
     }
 
     pub(crate) fn deregister_controller(&self, index: usize) -> Result<()> {
@@ -627,6 +754,51 @@ impl<'a> Cluster<'a> {
         }
     }
 
+    pub(crate) fn observe_restarted_standby(
+        &self,
+        old: usize,
+        successor: usize,
+        original_pid: u32,
+    ) -> Result<()> {
+        // Cooperative yield keeps refusal listeners alive until actual shutdown. Exercise the
+        // host's Restart=always policy with SIGTERM, without disabling its supervisor.
+        if self.controller_pid(old)? != original_pid {
+            return Err(E2eError::system(
+                "outgoing controller changed before SIGTERM",
+            ));
+        }
+        self.signal(old, Signal::TERM, false)?;
+        let (pid, _) = {
+            let controllers = self.controllers.lock();
+            let child = controllers
+                .get(old)
+                .and_then(|controller| controller.child.as_ref())
+                .ok_or_else(|| E2eError::system("original controller host is not running"))?;
+            child.wait_restarted(self.stack.settings().startup_timeout)?
+        };
+        if pid == original_pid {
+            return Err(E2eError::system("original controller did not restart"));
+        }
+        self.wait_for_serving(&[successor])?;
+        let start = Instant::now();
+        let window = gang_types::health::health_check().healthy_window();
+        loop {
+            if self.controller_pid(old)? != pid
+                || !self.controller_is_leader(successor)?
+                || self.controller_is_leader(old)?
+                || !self.only_healthy_controller(successor)?
+            {
+                return Err(E2eError::system(
+                    "restarted older controller displaced the successor",
+                ));
+            }
+            if start.elapsed() >= window {
+                return Ok(());
+            }
+            std::thread::sleep(LEASE_POLL_INTERVAL.min(window.saturating_sub(start.elapsed())));
+        }
+    }
+
     fn frontend_url(&self, frontend: Frontend, scheme: &str) -> Result<Url> {
         Url::parse(&format!("{scheme}://{}", self.balancer.address(frontend)))
             .map_err(E2eError::system_from("forming balancer endpoint"))
@@ -696,20 +868,31 @@ impl<'a> Cluster<'a> {
                     index,
                     controller.health,
                     Arc::clone(&controller.health_policy),
+                    controller.child.as_ref().map(ControllerHost::identity),
                 )
             })
             .collect();
         drop(controllers);
+        let lease = self.observe_leader_lease().ok().flatten();
+        let now = unix_millis().ok();
         self.runtime.block_on(async {
             let mut checks = JoinSet::new();
-            for (index, address, policy) in probes {
-                checks.spawn(
-                    async move { (index, probe_leadership(address, &policy, timeout).await) },
-                );
+            for (index, address, policy, identity) in probes {
+                checks.spawn(async move {
+                    (
+                        index,
+                        identity,
+                        probe_leadership(address, &policy, timeout).await,
+                    )
+                });
             }
             while let Some(result) = checks.join_next().await {
-                if let Ok((index, health)) = result {
-                    observations[index] = health;
+                if let Ok((index, identity, Some(_))) = result {
+                    let leading =
+                        lease.as_ref().zip(identity.as_ref()).zip(now).is_some_and(
+                            |((lease, identity), now)| lease.is_held_by(identity, now),
+                        );
+                    observations[index] = Some(LeadershipHealth { leading });
                 }
             }
         });
@@ -820,6 +1003,75 @@ impl<'a> Cluster<'a> {
             None,
             self.stack.settings().startup_timeout,
         )
+    }
+
+    /// Launches a real candidate with its database link stalled, and collects it without promotion.
+    pub(crate) fn observe_unprepared_candidate(
+        &self,
+        leader: usize,
+        mut work_is_held: impl FnMut() -> Result<bool>,
+    ) -> Result<()> {
+        let index = self.controllers.lock().len();
+        let addr =
+            || -> Result<SocketAddr> { Ok(SocketAddr::from(([127, 0, 0, 1], ports::reserve()?))) };
+        let (public, worker, health) = (addr()?, addr()?, addr()?);
+        let database_link = self.start_database_link()?;
+        {
+            let mut state = database_link.state.lock();
+            match &self.database {
+                ClusterDatabase::DynamoDb(_) => state.stalled = true,
+                ClusterDatabase::Postgres { .. } => state.stall_postgres_history = true,
+            }
+        }
+        let config = self
+            .stack
+            .placement()
+            .root()
+            .join("controller-unprepared.toml");
+        self.write_controller_config(&config, public, worker, health, &database_link)?;
+        for (frontend, traffic) in [(Frontend::Serve, public), (Frontend::Workers, worker)] {
+            self.balancer.register(frontend, Target { traffic, health });
+        }
+        let result = (|| {
+            let (mut child, _) = self.spawn_controller(index, self.stack.binary(), &config)?;
+            let start = Instant::now();
+            let window = gang_types::health::health_check().healthy_window();
+            loop {
+                if child.has_exited()? {
+                    return Err(self.controller_start_error(
+                        index,
+                        &mut child,
+                        "exited during deliberately stalled preparation",
+                        &self.controller_log_path(index),
+                        false,
+                    ));
+                }
+                if !work_is_held()?
+                    || !self.controller_is_leader(leader)?
+                    || !self.controller_is_healthy(leader)?
+                    || self.balancer.healthy(Frontend::Serve).contains(&public)
+                    || self.balancer.healthy(Frontend::Workers).contains(&worker)
+                {
+                    return Err(E2eError::system(
+                        "unprepared candidate or original held leader violated the handover contract",
+                    ));
+                }
+                if start.elapsed() >= window {
+                    break;
+                }
+                std::thread::sleep(LEASE_POLL_INTERVAL.min(window.saturating_sub(start.elapsed())));
+            }
+            if database_link.state.lock().stalled_connections == 0 {
+                return Err(E2eError::system(
+                    "candidate did not reach the stalled database",
+                ));
+            }
+            child.kill()?;
+            Ok(())
+        })();
+        self.balancer.deregister(Frontend::Serve, public);
+        self.balancer.deregister(Frontend::Workers, worker);
+        result
     }
 
     pub(crate) fn start_controller_release(
@@ -1097,6 +1349,49 @@ impl<'a> Cluster<'a> {
         Ok(child.pid())
     }
 
+    /// Disables automatic replacement without signalling or relinquishing the original child.
+    pub(crate) fn suppress_controller_restart(&self, index: usize) -> Result<u32> {
+        let mut controllers = self.controllers.lock();
+        let child = controllers
+            .get_mut(index)
+            .and_then(|controller| controller.child.as_mut())
+            .ok_or_else(|| E2eError::system("controller is not running"))?;
+        child.suppress_restart();
+        if child.has_exited()? {
+            return Err(E2eError::system(
+                "controller exited before restart suppression",
+            ));
+        }
+        Ok(child.pid())
+    }
+
+    /// Requires a response from the original process's health listener after it yields.
+    pub(crate) fn observe_yielded_controller(&self, index: usize, pid: u32) -> Result<()> {
+        if self.controller_pid(index)? != pid {
+            return Err(E2eError::system(
+                "outgoing controller PID changed before SIGTERM",
+            ));
+        }
+        let (address, policy) = {
+            let controllers = self.controllers.lock();
+            let controller = controllers
+                .get(index)
+                .ok_or_else(|| E2eError::system("unknown controller"))?;
+            (controller.health, Arc::clone(&controller.health_policy))
+        };
+        let health = self.runtime.block_on(probe_leadership(
+            address,
+            &policy,
+            self.stack.settings().handshake_timeout,
+        ));
+        if health.is_none_or(|health| health.leading) {
+            return Err(E2eError::system(format!(
+                "original outgoing controller health did not answer nonleading: {health:?}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Reboots the pinned process from fetched bytes, without re-rendering or changing topology.
     pub(crate) fn restart_release_controller(
         &self,
@@ -1255,18 +1550,35 @@ impl<'a> Cluster<'a> {
 
     /// Requests graceful handoff without waiting for the controller to exit.
     pub(crate) fn begin_retire(&self, index: usize) -> Result<Retiring> {
-        let mut child = self.take_controller(index)?;
-        child
-            .request_exit()
-            .map_err(|error| self.timeout_evidence(error))?;
-        Ok(Retiring { index, child })
+        let started = Instant::now();
+        {
+            let mut controllers = self.controllers.lock();
+            let child = controllers
+                .get_mut(index)
+                .and_then(|controller| controller.child.as_mut())
+                .ok_or_else(|| E2eError::system("controller is not running"))?;
+            child.request_exit()?;
+        }
+        Ok(Retiring { index, started })
     }
 
     /// Waits for a controller whose graceful handoff has been requested.
-    pub(crate) fn finish_retire(&self, mut retiring: Retiring) -> Result<ExitStatus> {
-        let status = retiring
-            .child
-            .wait_stopped(self.stack.settings().startup_timeout)
+    pub(crate) fn finish_retire(&self, retiring: &Retiring) -> Result<ExitStatus> {
+        self.finish_retire_within(retiring, self.stack.settings().startup_timeout)
+    }
+
+    pub(crate) fn finish_retire_within(
+        &self,
+        retiring: &Retiring,
+        budget: Duration,
+    ) -> Result<ExitStatus> {
+        let remaining = budget.saturating_sub(retiring.started.elapsed());
+        if remaining.is_zero() {
+            return Err(E2eError::timeout("controller graceful stop", budget));
+        }
+        let mut child = self.take_controller(retiring.index)?;
+        let status = child
+            .wait_stopped(remaining)
             .map_err(|error| self.timeout_evidence(error))?;
         self.remember_exit(retiring.index, status);
         Ok(status)
@@ -1277,7 +1589,7 @@ impl<'a> Cluster<'a> {
     /// # Errors
     /// Returns an error for an unknown controller, a signal failure, or an expired deadline.
     pub fn retire(&self, index: usize) -> Result<ExitStatus> {
-        self.finish_retire(self.begin_retire(index)?)
+        self.finish_retire(&self.begin_retire(index)?)
     }
     /// Waits for the original controller child to exit, without stopping its host supervisor.
     ///
@@ -1299,34 +1611,6 @@ impl<'a> Cluster<'a> {
             .as_mut()
             .ok_or_else(|| E2eError::system("controller is not running"))?;
         child.wait_within(timeout, &format!("original controller {index} to exit"))
-    }
-
-    /// Proves a natural drain caused a fresh passive child on the same local host.
-    pub(crate) fn wait_for_host_restart(
-        &self,
-        index: usize,
-        original_pid: u32,
-        original_holder: &str,
-    ) -> Result<u32> {
-        let (pid, identity) = {
-            let controllers = self.controllers.lock();
-            let child = controllers
-                .get(index)
-                .and_then(|controller| controller.child.as_ref())
-                .ok_or_else(|| E2eError::system("controller host is not running"))?;
-            child.wait_restarted(self.stack.settings().startup_timeout)?
-        };
-        if pid == original_pid || identity.as_ref() == original_holder {
-            return Err(E2eError::system(
-                "host restart retained original PID or holder",
-            ));
-        }
-        if self.controller_is_leader(index)? {
-            return Err(E2eError::system(
-                "older restarted host reacquired leadership",
-            ));
-        }
-        Ok(pid)
     }
 
     /// Reads the captured standard output and standard error of a controller.
@@ -1422,6 +1706,17 @@ impl<'a> Cluster<'a> {
             address: controller.public,
             proxy_protocol_v2: controller.public_proxy_protocol_v2,
         })
+    }
+
+    pub(crate) fn controller_targets_registered(&self, index: usize) -> Result<bool> {
+        let controllers = self.controllers.lock();
+        let controller = controllers
+            .get(index)
+            .ok_or_else(|| E2eError::system("unknown controller"))?;
+        Ok(self.balancer.registered(Frontend::Serve, controller.public)
+            && self
+                .balancer
+                .registered(Frontend::Workers, controller.worker))
     }
 
     /// Stops routing new public connections to a controller, preserving existing streams.
@@ -2439,6 +2734,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_probe_uses_explicit_path_and_local_proxy_framing() -> TestResult {
+        let listener = TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let address = listener.local_addr()?;
+        let mut policy = leadership_policy("/ready");
+        policy.proxy_protocol_v2 = true;
+        for (response, status) in [
+            (
+                &b"HTTP/1.1 503 Unavailable\r\ncontent-length: 0\r\n\r\n"[..],
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"[..],
+                hyper::StatusCode::OK,
+            ),
+        ] {
+            let (health, served) = tokio::join!(
+                super::probe_health(address, &policy, "/prepared", DEADLINE),
+                answer_health(&listener, "/prepared", response, true),
+            );
+            served?;
+            assert_eq!(health, Some((status, false)));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn leadership_changes_are_visible_without_balancer_revision_or_membership() -> TestResult
     {
         let clock = std::sync::Arc::new(gang_clock::TestClock::default());
@@ -2869,6 +3190,69 @@ providers = ["local-workers"]
         restored.write_all(b"b").await?;
         timeout(DEADLINE, server.read_exact(&mut byte)).await??;
         assert_eq!(byte, *b"b");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_stall_allows_bootstrap_but_withholds_fragmented_history_queries() -> TestResult
+    {
+        let frame = |tag, body: &[u8]| {
+            let mut bytes = vec![tag];
+            bytes.extend_from_slice(&u32::try_from(body.len() + 4)?.to_be_bytes());
+            bytes.extend_from_slice(body);
+            Ok::<_, Box<dyn std::error::Error>>(bytes)
+        };
+        for tag in *b"PQ" {
+            let (mut client, incoming) = tokio::io::duplex(4096);
+            let (outgoing, mut backend) = tokio::io::duplex(4096);
+            let state = parking_lot::Mutex::new(super::LinkState::default());
+            let mut forwarding = Box::pin(super::forward_postgres_preparation(
+                incoming, outgoing, &state,
+            ));
+            let startup = b"\0\0\0\x08\0\x03\0\0";
+            let authentication = frame(b'P', b"\0SELECT revoked_at FROM principals\0\0\0")?;
+            let schema = frame(b'Q', b"CREATE TABLE expiring_records (id bytea)\0")?;
+            let bootstrap: Vec<_> = startup
+                .iter()
+                .chain(&authentication)
+                .chain(&schema)
+                .copied()
+                .collect();
+            client.write_all(&bootstrap).await?;
+            assert!(futures::poll!(forwarding.as_mut()).is_pending());
+            let mut received = vec![0; bootstrap.len()];
+            timeout(DEADLINE, backend.read_exact(&mut received)).await??;
+            assert_eq!(received, bootstrap);
+            assert_eq!(state.lock().stalled_connections, 0);
+
+            let query =
+                b"SELECT id, body, version, expires_at FROM expiring_records WHERE kind = $1";
+            let mut body = Vec::new();
+            if tag == b'P' {
+                body.extend_from_slice(b"statement\0");
+            }
+            body.extend_from_slice(query);
+            body.push(0);
+            if tag == b'P' {
+                body.extend_from_slice(&0u16.to_be_bytes());
+            }
+            let history = frame(tag, &body)?;
+            let split = history.len() / 2;
+            client.write_all(&history[..split]).await?;
+            assert!(futures::poll!(forwarding.as_mut()).is_pending());
+            assert_eq!(state.lock().stalled_connections, 0);
+            client.write_all(&history[split..]).await?;
+            assert!(futures::poll!(forwarding.as_mut()).is_pending());
+            assert_eq!(state.lock().stalled_connections, 1);
+            let mut byte = [0];
+            {
+                let read = backend.read(&mut byte);
+                tokio::pin!(read);
+                assert!(futures::poll!(read.as_mut()).is_pending());
+            }
+            drop(forwarding);
+            assert_eq!(timeout(DEADLINE, backend.read(&mut byte)).await??, 0);
+        }
         Ok(())
     }
 

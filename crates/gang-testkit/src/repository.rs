@@ -72,6 +72,7 @@ struct State {
 struct LeaseRow {
     holder: Option<ControllerId>,
     epoch: LeaseEpoch,
+    safe_yield_epoch: Option<LeaseEpoch>,
     expires_at: Timestamp,
     record_sequence: u64,
     holder_priority: Option<CandidatePriority>,
@@ -627,6 +628,7 @@ impl LeaderLeasePort for FakeRepository {
                 };
                 if eligible
                     && takeover == Takeover::Request
+                    && row.safe_yield_epoch == Some(row.epoch)
                     && live_request.is_none_or(|(pending, _, _)| {
                         pending == candidate || candidate.priority > pending.priority
                     })
@@ -660,6 +662,7 @@ impl LeaderLeasePort for FakeRepository {
         state.lease = Some(LeaseRow {
             holder: Some(candidate.holder.clone()),
             epoch: lease.epoch,
+            safe_yield_epoch: Some(lease.epoch),
             expires_at,
             record_sequence: 0,
             holder_priority: Some(candidate.priority.clone()),
@@ -1112,6 +1115,7 @@ mod tests {
             repository.state.lock().lease = Some(LeaseRow {
                 holder: Some(leader.holder.clone()),
                 epoch: leader.epoch,
+                safe_yield_epoch: Some(leader.epoch),
                 expires_at: leader.expires_at,
                 record_sequence: 0,
                 holder_priority_epoch: if priority.is_none() {
@@ -1137,6 +1141,105 @@ mod tests {
                 repository.renew(&leader, now, leader.expires_at).await?,
                 Renewal::YieldRequested(leader)
             );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsupported_safe_yield_markers_do_not_request_handoff() -> TestResult {
+        for marker in [None, Some(LeaseEpoch::new(1))] {
+            for release in [false, true] {
+                let repository = FakeRepository::default();
+                let leader = Lease {
+                    holder: ControllerId::new("legacy"),
+                    epoch: LeaseEpoch::new(2),
+                    expires_at: Timestamp::from_unix_millis(100),
+                };
+                let candidate = LeaseCandidate {
+                    holder: ControllerId::new("successor"),
+                    priority: CandidatePriority::registered(CandidateGeneration::new(2)),
+                };
+                repository.state.lock().lease = Some(LeaseRow {
+                    holder: Some(leader.holder.clone()),
+                    epoch: leader.epoch,
+                    safe_yield_epoch: marker,
+                    expires_at: leader.expires_at,
+                    record_sequence: 0,
+                    holder_priority: Some(CandidatePriority::registered(CandidateGeneration::new(
+                        1,
+                    ))),
+                    holder_priority_epoch: leader.epoch,
+                    request: None,
+                });
+                let before_expiry = Timestamp::from_unix_millis(1);
+                let after_expiry = Timestamp::from_unix_millis(101);
+                let renewed_expiry = Timestamp::from_unix_millis(150);
+                let next_expiry = Timestamp::from_unix_millis(300);
+                for now in [before_expiry, after_expiry] {
+                    repository
+                        .acquire(
+                            &candidate,
+                            now,
+                            before_expiry,
+                            next_expiry,
+                            Takeover::Request,
+                        )
+                        .await?;
+                    assert!(
+                        repository
+                            .state
+                            .lock()
+                            .lease
+                            .as_ref()
+                            .is_some_and(|row| row.request.is_none())
+                    );
+                }
+                let Renewal::Renewed(renewed) = repository
+                    .renew(&leader, after_expiry, renewed_expiry)
+                    .await?
+                else {
+                    return Err("unsupported holder was asked to yield".into());
+                };
+                if release {
+                    repository.release(&renewed).await?;
+                }
+                let takeover_at = Timestamp::from_unix_millis(151);
+                let Acquisition::Acquired(acquired) = repository
+                    .acquire(
+                        &candidate,
+                        takeover_at,
+                        takeover_at,
+                        next_expiry,
+                        Takeover::Request,
+                    )
+                    .await?
+                else {
+                    return Err("released or stale legacy lease was not acquired".into());
+                };
+                assert_eq!(acquired.epoch, LeaseEpoch::new(3));
+                let next = LeaseCandidate {
+                    holder: ControllerId::new("next"),
+                    priority: CandidatePriority::registered(CandidateGeneration::new(3)),
+                };
+                assert_eq!(
+                    repository
+                        .acquire(
+                            &next,
+                            takeover_at,
+                            takeover_at,
+                            next_expiry,
+                            Takeover::Request
+                        )
+                        .await?,
+                    Acquisition::Contending(acquired.clone())
+                );
+                assert_eq!(
+                    repository
+                        .renew(&acquired, takeover_at, next_expiry)
+                        .await?,
+                    Renewal::YieldRequested(acquired)
+                );
+            }
         }
         Ok(())
     }
@@ -1486,6 +1589,7 @@ mod tests {
         repository.state.lock().lease = Some(LeaseRow {
             holder: Some(leader.holder.clone()),
             epoch: leader.epoch,
+            safe_yield_epoch: Some(leader.epoch),
             expires_at: leader.expires_at,
             record_sequence: 0,
             holder_priority: Some(priority.clone()),

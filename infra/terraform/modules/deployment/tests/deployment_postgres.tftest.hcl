@@ -1,4 +1,34 @@
+override_data {
+  target = module.controller.data.aws_ec2_instance_type.this
+  values = { supported_architectures = ["arm64"], boot_modes = ["uefi"], burstable_performance_supported = true }
+}
+
 mock_provider "aws" {
+  mock_data "aws_ami" {
+    defaults = { root_device_name = "/dev/xvda" }
+  }
+  mock_data "aws_ssm_parameter" {
+    defaults = { value = "ami-0123456789abcdef0" }
+  }
+  mock_data "aws_security_group" {
+    defaults = { vpc_id = "vpc-0123456789abcdef0" }
+  }
+  mock_resource "aws_iam_role" {
+    defaults = { arn = "arn:aws:iam::000000000000:role/gang-ecs-execution" }
+  }
+  mock_resource "aws_autoscaling_group" {
+    defaults = { arn = "arn:aws:autoscaling:eu-north-1:000000000000:autoScalingGroup:00000000-0000-0000-0000-000000000000:autoScalingGroupName/gang-ecs-capacity" }
+  }
+  mock_resource "aws_ecs_cluster" {
+    defaults = { arn = "arn:aws:ecs:eu-north-1:000000000000:cluster/gang-controller" }
+  }
+  mock_resource "aws_ecs_task_definition" {
+    defaults = { arn = "arn:aws:ecs:eu-north-1:000000000000:task-definition/gang-controller:1" }
+  }
+  mock_resource "aws_ecr_repository" {
+    defaults = { arn = "arn:aws:ecr:eu-north-1:000000000000:repository/gang-controller", repository_url = "000000000000.dkr.ecr.eu-north-1.amazonaws.com/gang-controller" }
+  }
+
   mock_data "aws_caller_identity" {
     defaults = { account_id = "000000000000" }
   }
@@ -190,13 +220,13 @@ override_module {
 }
 
 variables {
-  client_token_providers   = ["google", "github-actions"]
-  region                   = "eu-north-1"
-  cidr_block               = "10.20.0.0/16"
-  cache_bucket_name        = "example-gang-cache"
-  controller_instance_type = "c7i.large"
-  default_isa              = "x86-64"
-  trust_domain             = "example.com"
+  client_token_providers  = ["google", "github-actions"]
+  region                  = "eu-north-1"
+  cidr_block              = "10.20.0.0/16"
+  cache_bucket_name       = "example-gang-cache"
+  controller_image_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  default_isa             = "x86-64"
+  trust_domain            = "example.com"
   fleets = [
     {
       name               = "gang-worker-x86-64"
@@ -225,14 +255,14 @@ run "rds_group_shape" {
   command = apply
   variables {
     database         = { engine = "postgres", postgres = { rds = {} } }
-    controller_count = 2
+    controller_count = 1
     hostname         = "gang.example.com"
     load_balancer    = {}
     nat_mode         = "per_az"
   }
 
   assert {
-    condition     = output.controller_shape == "group" && strcontains(output.gang_toml, "[database.postgres]") && !strcontains(output.gang_toml, "[database.sqlite]") && strcontains(output.gang_toml, "host = \"${module.storage.postgres_address}\"") && module.storage.postgres_address != ""
+    condition     = output.controller_shape == "service" && strcontains(output.gang_toml, "[database.postgres]") && !strcontains(output.gang_toml, "[database.sqlite]") && strcontains(output.gang_toml, "host = \"${module.storage.postgres_address}\"") && module.storage.postgres_address != ""
     error_message = "RDS must use the group shape and render the instance address in the PostgreSQL section."
   }
   assert {
@@ -267,7 +297,7 @@ run "rds_password_rotation_refreshes_controllers" {
   command = apply
   variables {
     database           = { engine = "postgres", postgres = { rds = { password_version = 2 } } }
-    controller_count   = 2
+    controller_count   = 1
     hostname           = "gang.example.com"
     load_balancer      = {}
     nat_mode           = "per_az"
@@ -306,7 +336,7 @@ run "external_with_ca" {
     load_balancer = {}
   }
   assert {
-    condition     = output.controller_shape == "group" && strcontains(output.gang_toml, "host = \"db.example.com\"") && strcontains(output.gang_toml, "port = 5432") && strcontains(output.gang_toml, "ca_file = \"/etc/gang/secrets/database-ca.pem\"")
+    condition     = output.controller_shape == "service" && strcontains(output.gang_toml, "host = \"db.example.com\"") && strcontains(output.gang_toml, "port = 5432") && strcontains(output.gang_toml, "ca_file = \"/etc/gang/secrets/database-ca.pem\"")
     error_message = "External PostgreSQL must use the group shape and render its host, port and CA file."
   }
   assert {

@@ -46,7 +46,8 @@ jq -en --slurpfile ci "$scratch/ci.json" --slurpfile pr "$scratch/pr.json" '
       | require([.steps[]? | select((.uses // "") | startswith("actions/checkout@")) | checkout] | length == 1; "critical job must check out the queue SHA")
       | require(all(.steps[]?; .if == null or (.uses == "./.github/actions/save-bazel-cache" and .if == "always() && job.status == '\''success'\''") or (.with.name == "bazel-metrics-x86-bundle" and .if == "always()")); "critical steps must not skip")
       | no_continue)
-  | reduce ($critical - ["linux-arm64-checks", "e2e-gate-1-shards", "e2e-gate-2-shards", "e2e-v035-upgrade"])[] as $id (.; $jobs[$id] | require(deps == []; "unexpected dependency for " + $id))
+  | reduce ($critical - ["nix-vm", "linux-arm64-checks", "e2e-gate-1-shards", "e2e-gate-2-shards", "e2e-v035-upgrade"])[] as $id (.; $jobs[$id] | require(deps == []; "unexpected dependency for " + $id))
+  | $jobs["nix-vm"] | require(deps == ["linux-arm64-bundle"]; "Nix VM checks must depend only on the ARM bundle")
   | $jobs["linux-arm64-checks"] | require(deps == ["linux-arm64-bundle"]; "ARM checks must depend on the ARM bundle")
   | reduce ["nix-vm", "lint-checks", "linux-x86_64-shards", "linux-x86_64-bundle", "e2e-gate-1-shards", "e2e-gate-2-shards", "e2e-v035-upgrade"][] as $id (.;
       $jobs[$id] | require((."runs-on" | strings | contains("linux-x64") and contains("ubuntu-24.04")); "x86 job must use x86 runners"))

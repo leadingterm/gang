@@ -173,6 +173,31 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_configuration_requires_generation_but_not_consumers() {
+        let configuration = "[server]\nname = \"example\"\n\n";
+        let mut resources = vec![resource(
+            "aws_ecr_repository",
+            "module.gang.module.controller.aws_ecr_repository.controller[0]",
+            &["create"],
+        )];
+        assert!(matches!(
+            plan(&resources).configuration(),
+            Err(DeployError::ConfigurationMissing)
+        ));
+
+        let mut generation = resource(
+            "aws_ssm_parameter",
+            "module.gang.aws_ssm_parameter.config_generation",
+            &["create"],
+        );
+        generation["change"]["after"] = json!({"value": configuration});
+        resources.push(generation);
+        let plan = plan(&resources);
+        assert!(!plan.is_blocked(&[]));
+        assert_eq!(plan.configuration().expect("configuration"), configuration);
+    }
+
+    #[test]
     fn configuration_rejects_unknown_value_even_when_after_contains_a_value() {
         let address = "module.gang.aws_ssm_parameter.config_generation";
         let generation = parameter_update(

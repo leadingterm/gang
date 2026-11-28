@@ -75,51 +75,6 @@ data "aws_iam_policy_document" "this" {
     ]
   }
 
-  dynamic "statement" {
-    for_each = local.group_shape ? [1] : []
-    content {
-      sid       = "ControllerLifecycle"
-      effect    = "Allow"
-      actions   = ["autoscaling:CompleteLifecycleAction", "autoscaling:RecordLifecycleActionHeartbeat"]
-      resources = ["arn:${data.aws_partition.this.partition}:autoscaling:${data.aws_region.this.region}:${data.aws_caller_identity.this.account_id}:autoScalingGroup:*:autoScalingGroupName/${var.name}"]
-    }
-  }
-
-  # DescribeLifecycleHooks does not support resource-level scoping.
-  dynamic "statement" {
-    for_each = local.group_shape ? [1] : []
-    content {
-      sid       = "DescribeControllerLifecycleHooks"
-      effect    = "Allow"
-      actions   = ["autoscaling:DescribeLifecycleHooks"]
-      resources = ["*"]
-    }
-  }
-
-  # AWS lists no resource types for DescribeTargetHealth:
-  # https://docs.aws.amazon.com/service-authorization/latest/reference/list_elbv2.html
-  dynamic "statement" {
-    for_each = local.group_shape ? [1] : []
-    content {
-      sid       = "DescribeControllerTargetHealth"
-      effect    = "Allow"
-      actions   = ["elasticloadbalancing:DescribeTargetHealth"]
-      resources = ["*"]
-    }
-  }
-
-  # AWS supports target-group resources, but no condition restricting the target instance.
-  # The adapter registers only its own IMDS instance ID in its ASG's target groups.
-  # https://docs.aws.amazon.com/service-authorization/latest/reference/list_elbv2.html
-  dynamic "statement" {
-    for_each = local.group_shape ? [1] : []
-    content {
-      sid       = "RegisterControllerTarget"
-      effect    = "Allow"
-      actions   = ["elasticloadbalancing:RegisterTargets"]
-      resources = var.target_group_arns
-    }
-  }
 
   dynamic "statement" {
     for_each = var.dynamodb_table_arn == null ? [] : [var.dynamodb_table_arn]
@@ -183,5 +138,6 @@ module "instance_role" {
   iam_permissions_boundary_arn = var.iam_permissions_boundary_arn
   tags                         = var.tags
   readable_parameter_arns      = concat(var.config_parameter_arns, local.secret_parameter_arns)
+  assume_role_services         = local.service_shape ? ["ec2.amazonaws.com", "ecs-tasks.amazonaws.com"] : ["ec2.amazonaws.com"]
   policy_json                  = data.aws_iam_policy_document.this.json
 }

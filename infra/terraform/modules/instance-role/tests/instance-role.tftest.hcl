@@ -31,6 +31,25 @@ run "role_and_profile_default_to_the_name" {
   }
 }
 
+run "worker_assume_role_defaults_to_ec2" {
+  command = plan
+  assert {
+    condition     = toset(one(one(data.aws_iam_policy_document.assume_role.statement).principals).identifiers) == toset(["ec2.amazonaws.com"])
+    error_message = "The default worker trust policy must remain EC2-only."
+  }
+}
+
+run "controller_can_add_ecs_tasks" {
+  command = plan
+  variables {
+    assume_role_services = ["ec2.amazonaws.com", "ecs-tasks.amazonaws.com"]
+  }
+  assert {
+    condition     = toset(one(one(data.aws_iam_policy_document.assume_role.statement).principals).identifiers) == toset(["ec2.amazonaws.com", "ecs-tasks.amazonaws.com"])
+    error_message = "The existing role must permit both legacy EC2 and ECS tasks."
+  }
+}
+
 run "iam_name_prefix_names_the_role_and_the_instance_profile" {
   command = plan
 

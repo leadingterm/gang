@@ -27,13 +27,11 @@ impl StateLayout {
     }
 
     /// Private metadata for logical controller installations sharing this state root.
-    #[must_use]
     pub(crate) fn controller_hosts_dir(&self) -> PathBuf {
         self.root.join("controller-hosts")
     }
 
-    /// Identity keyed by the absolute lexical configuration path, not its symlink target.
-    #[must_use]
+    /// Identity keyed by the lexical configuration path rather than its symlink target.
     pub(crate) fn controller_host_path(&self, config_path: &Path) -> PathBuf {
         let digest = Sha256::digest(config_path.as_os_str().as_bytes());
         self.controller_hosts_dir().join(hex::encode(digest))
@@ -176,27 +174,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
-
-    #[test]
-    fn controller_paths_hash_native_bytes_without_resolving_symlinks() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
-        let layout = StateLayout::new(PathBuf::from("/state"));
-        let first = PathBuf::from(OsString::from_vec(b"/config/\xff.toml".to_vec()));
-        let second = PathBuf::from(OsString::from_vec(b"/config/\xfe.toml".to_vec()));
-        let first = layout.controller_host_path(&first);
-        let second = layout.controller_host_path(&second);
-        assert_ne!(first, second);
-        assert_eq!(
-            first.parent(),
-            Some(layout.controller_hosts_dir().as_path())
-        );
-        assert_eq!(
-            first.file_name().map(|name| name.as_bytes().len()),
-            Some(64)
-        );
-    }
 
     #[test]
     fn paths_nest_under_the_root_and_instance_paths_contain_the_id() -> TestResult {

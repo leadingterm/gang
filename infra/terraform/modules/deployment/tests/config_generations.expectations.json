@@ -4,10 +4,12 @@
       "aws_ssm_parameter.config_generation": ["no-op"]
     },
     "planB": {
-      "aws_ssm_parameter.config_generation": ["forget", "create"]
+      "aws_ssm_parameter.config_generation": ["forget", "create"],
+      "module.controller.aws_ecs_task_definition.controller[0]": ["update"]
     },
     "planRollbackA": {
-      "aws_ssm_parameter.config_generation": ["forget", "create"]
+      "aws_ssm_parameter.config_generation": ["forget", "create"],
+      "module.controller.aws_ecs_task_definition.controller[0]": ["update"]
     }
   },
   "state_checks": [
@@ -35,6 +37,31 @@
       "relation": "not_equal",
       "left": {"kind": "output", "run": "applyB", "name": "config_parameter_name"},
       "right": {"kind": "output", "run": "applyRollbackA", "name": "config_parameter_name"}
+    },
+    {
+      "relation": "not_equal",
+      "left": {"kind": "output", "run": "applyA", "name": "config_parameter_reference"},
+      "right": {"kind": "output", "run": "applyB", "name": "config_parameter_reference"}
+    },
+    {
+      "relation": "not_equal",
+      "left": {"kind": "output", "run": "applyA", "name": "config_parameter_reference"},
+      "right": {"kind": "output", "run": "applyRollbackA", "name": "config_parameter_reference"}
+    },
+    {
+      "relation": "not_equal",
+      "left": {"kind": "output", "run": "applyB", "name": "config_parameter_reference"},
+      "right": {"kind": "output", "run": "applyRollbackA", "name": "config_parameter_reference"}
+    },
+    {
+      "relation": "not_equal",
+      "left": {"kind": "output", "run": "applyA", "name": "controller_config_digest"},
+      "right": {"kind": "output", "run": "applyB", "name": "controller_config_digest"}
+    },
+    {
+      "relation": "equal",
+      "left": {"kind": "output", "run": "applyA", "name": "controller_config_digest"},
+      "right": {"kind": "output", "run": "applyRollbackA", "name": "controller_config_digest"}
     }
   ],
   "retention": {
